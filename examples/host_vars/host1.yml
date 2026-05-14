@@ -1,0 +1,2 @@
+# Per-host overrides for host1. Higher precedence than group_vars.
+instance_marker: alpha

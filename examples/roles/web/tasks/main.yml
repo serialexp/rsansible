@@ -1,0 +1,12 @@
+# Role entry-point. Demonstrates `import_tasks:` (resolved from the role's
+# tasks/ dir) plus a `template:` that resolves its src against the role's
+# templates/ dir.
+- name: include install steps
+  import_tasks: install.yml
+
+- name: render web config
+  template:
+    src: web.conf.j2
+    dest: /tmp/rsansible-role-template
+    mode: 0o644
+  notify: bump marker

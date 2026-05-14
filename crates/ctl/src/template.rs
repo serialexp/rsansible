@@ -29,6 +29,10 @@ use crate::playbook::{
 pub fn make_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    // Preserve trailing newlines in rendered output — write_file.content
+    // sources frequently end in `\n` and we don't want minijinja stripping
+    // them silently. Matches Ansible's behavior.
+    env.set_keep_trailing_newline(true);
     env.add_filter("mandatory", mandatory_filter);
     env.add_filter("subelements", subelements_filter);
     env
@@ -174,6 +178,16 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 .map_err(|e| anyhow!("write_file.path: {e}"))?;
             env.template_from_str(content)
                 .map_err(|e| anyhow!("write_file.content: {e}"))?;
+        }
+        TaskOp::Template(t) => {
+            // `src:` was resolved at load time; only `dest:` is Jinja-able
+            // at task time. The template body itself is compiled via the
+            // playbook's `TemplateRegistry` rather than here.
+            env.template_from_str(&t.dest)
+                .map_err(|e| anyhow!("template.dest: {e}"))?;
+        }
+        TaskOp::GatherFacts => {
+            // Implicit op — no user-supplied fields to compile.
         }
     }
     Ok(())

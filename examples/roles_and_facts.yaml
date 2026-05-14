@@ -1,0 +1,23 @@
+# End-to-end exercise of Phase 2b features:
+#   - roles:                          (loads ./roles/web/{defaults,tasks,handlers,templates})
+#   - gather_facts: true              (implicit `Gathering Facts` task)
+#   - template: web.conf.j2           (resolved from role's templates/ dir)
+#   - import_tasks: install.yml       (resolved from role's tasks/ dir)
+#   - role_defaults precedence        (service_name comes from defaults/main.yml)
+#
+# Run against the three-container test fixture:
+#   examples/roles_and_facts.inventory.yml
+#   examples/roles/web/...
+
+- name: roles + facts demo
+  hosts: web
+  gather_facts: true
+  roles:
+    - web
+  tasks:
+    - name: assert facts visible
+      assert:
+        that:
+          - ansible_distribution is defined
+          - ansible_hostname is defined
+        msg: "expected ansible_* facts to be populated by the implicit gather"

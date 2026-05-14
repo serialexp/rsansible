@@ -9,3 +9,4 @@ pub mod orchestrator;
 pub mod playbook;
 pub mod ssh;
 pub mod template;
+pub mod vault;

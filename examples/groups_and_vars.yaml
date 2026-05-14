@@ -1,0 +1,58 @@
+# End-to-end exercise of Phase 2a features:
+#   - hosts: web                       (group selector)
+#   - {{ ansible_user }}               (from group_vars/all/main.yml)
+#   - {{ region }}                     (from group_vars/web/main.yml)
+#   - {{ instance_marker }}            (from host_vars/host1.yml)
+#   - {{ groups['web'] }} / {{ hostvars[...] }}  (WorldVars lookups)
+#   - {{ deployment_key }}             (from vault-encrypted secrets.yml)
+#   - {{ run_flavor }}                 (from play.vars)
+#
+# Run against the three-container test fixture:
+#   examples/groups_and_vars.inventory.yml
+#   examples/group_vars/all/main.yml
+#   examples/group_vars/web/main.yml
+#   examples/group_vars/web/secrets.yml  (vault-encrypted, pw=testpass)
+#   examples/host_vars/host1.yml
+
+- name: phase2a exercise
+  hosts: web
+  strategy: per_task
+  on_failure: stop
+  vars:
+    run_flavor: smoke
+  tasks:
+    - name: marker from all_vars
+      write_file:
+        path: /tmp/rsansible-allvar
+        mode: 0o644
+        content: "user={{ ansible_user }}\n"
+
+    - name: marker from group_vars/web
+      write_file:
+        path: /tmp/rsansible-groupvar
+        mode: 0o644
+        content: "region={{ region }} role={{ service_role }}\n"
+
+    - name: marker from host_vars (host1 only — others get unknown)
+      write_file:
+        path: /tmp/rsansible-hostvar
+        mode: 0o644
+        content: "marker={{ instance_marker | default('none') }}\n"
+
+    - name: marker from world-scoped lookups
+      write_file:
+        path: /tmp/rsansible-world
+        mode: 0o644
+        content: "first={{ groups['web'][0] }} first_region={{ hostvars[groups['web'][0]].region }}\n"
+
+    - name: marker from vault-decrypted secret
+      write_file:
+        path: /tmp/rsansible-vault
+        mode: 0o600
+        content: "key={{ deployment_key }}\n"
+
+    - name: marker from play.vars
+      write_file:
+        path: /tmp/rsansible-playvar
+        mode: 0o644
+        content: "flavor={{ run_flavor }}\n"

@@ -1,0 +1,3 @@
+# Baseline vars applied to every host. Lowest precedence.
+ansible_user: deploy
+deployment_environment: staging

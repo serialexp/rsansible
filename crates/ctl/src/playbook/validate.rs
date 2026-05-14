@@ -26,22 +26,33 @@ pub fn validate(pb: &Playbook, inventory: Option<&Inventory>) -> Result<()> {
 
 fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()> {
     let where_ = || format!("play[{idx}] {:?}", play.name);
+    // After the role-flatten pass any `roles:` content has been moved into
+    // `play.tasks`/`play.handlers`. So at validate time the test is just:
+    // there must be at least one task body to run.
     if play.tasks.is_empty() {
-        bail!("{}: no tasks", where_());
+        bail!("{}: no tasks (and no roles contributing tasks)", where_());
     }
-    if let HostSelector::Names(names) = &play.hosts {
-        if names.is_empty() {
-            bail!("{}: empty hosts list", where_());
+    let names_to_check: Vec<&str> = match &play.hosts {
+        HostSelector::All(_) => Vec::new(),
+        HostSelector::Names(names) => {
+            if names.is_empty() {
+                bail!("{}: empty hosts list", where_());
+            }
+            names.iter().map(String::as_str).collect()
         }
-        if let Some(inv) = inv {
-            for n in names {
-                if !inv.hosts.contains_key(n) {
-                    return Err(anyhow!(
-                        "{}: host {:?} not found in inventory",
-                        where_(),
-                        n
-                    ));
-                }
+        HostSelector::Name(n) => vec![n.as_str()],
+    };
+    if let Some(inv) = inv {
+        for n in &names_to_check {
+            // A `hosts:` entry resolves to either a known host name or
+            // a known group name. Group wins if both exist (Ansible's
+            // behavior). Anything else is a typo and fails validation.
+            if !inv.hosts.contains_key(*n) && !inv.groups.contains_key(*n) {
+                return Err(anyhow!(
+                    "{}: {:?} is not a known host or group in the inventory",
+                    where_(),
+                    n
+                ));
             }
         }
     }
@@ -219,6 +230,45 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
         TaskOp::Shell(s) if s.command().is_empty() => {
             bail!(
                 "{}: task[{ti}] {:?}: shell command is empty",
+                where_,
+                task.name
+            )
+        }
+        TaskOp::Template(t) => {
+            if t.src.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: template.src is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if t.dest.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: template.dest is empty",
+                    where_,
+                    task.name
+                );
+            }
+            // The body should have been populated by the role-flatten /
+            // template-resolution pass run in `playbook::load`. A `None`
+            // here means the caller bypassed load() or the file is missing.
+            if t.body.is_none() {
+                bail!(
+                    "{}: task[{ti}] {:?}: template src {:?} was not resolved at load time; \
+                     call playbook::load() or ensure the file exists",
+                    where_,
+                    task.name,
+                    t.src
+                );
+            }
+            Ok(())
+        }
+        TaskOp::GatherFacts => {
+            // Implicit op — only the orchestrator constructs it. If we see
+            // one here it means user YAML somehow produced one, which
+            // shouldn't happen (no body-key surfaces it).
+            bail!(
+                "{}: task[{ti}] {:?}: gather_facts isn't a user-callable task body",
                 where_,
                 task.name
             )

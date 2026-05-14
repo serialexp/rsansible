@@ -48,6 +48,10 @@ pub fn op_write_file(path: String, mode: u32, content: Vec<u8>) -> Op {
     })
 }
 
+pub fn op_gather_facts() -> Op {
+    Op::OpGatherFacts(OpGatherFactsOutput { kind: 3 })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(
@@ -84,14 +88,39 @@ pub fn task_progress(seq: u32, stream: u8, chunk: Vec<u8>) -> Message {
     })
 }
 
-pub fn task_done(seq: u32, exit_code: i32, changed: bool, took_ms: u32) -> Message {
+/// Build a `TaskDone` frame. `started_unix_ns` and `finished_unix_ns`
+/// are nanoseconds since the UNIX epoch as observed by the *agent's*
+/// wall clock — captured before/after the module's work. The
+/// controller compares these against its own observed dispatch/receive
+/// instants to surface wire latencies (under the `rsansible::timing`
+/// tracing target). Skew between the two clocks doesn't affect the
+/// agent-local duration `(finished − started)`.
+pub fn task_done(
+    seq: u32,
+    exit_code: i32,
+    changed: bool,
+    started_unix_ns: u64,
+    finished_unix_ns: u64,
+) -> Message {
     Message::TaskDone(TaskDoneOutput {
         kind: 3,
         seq,
         exit_code,
         changed: if changed { 1 } else { 0 },
-        took_ms,
+        started_unix_ns,
+        finished_unix_ns,
     })
+}
+
+/// Capture the wall-clock instant `SystemTime::now()` as nanoseconds
+/// since the UNIX epoch. Saturates to 0 on pre-epoch clocks (which
+/// shouldn't happen on a sane host but isn't worth panicking over).
+pub fn now_unix_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 pub fn task_error(seq: u32, code: u8, message: String) -> Message {
@@ -105,6 +134,24 @@ pub fn task_error(seq: u32, code: u8, message: String) -> Message {
 
 pub fn bye() -> Message {
     Message::Bye(ByeOutput { kind: 5 })
+}
+
+/// Sent controller → agent immediately after Hello. The controller
+/// remembers its own send time locally; the wire frame is just the
+/// kind byte.
+pub fn ping() -> Message {
+    Message::Ping(PingOutput { kind: 6 })
+}
+
+/// Sent agent → controller in response to `Ping`. Carries the agent's
+/// wall-clock receive and send timestamps so the controller can
+/// estimate clock offset.
+pub fn pong(agent_recv_unix_ns: u64, agent_sent_unix_ns: u64) -> Message {
+    Message::Pong(PongOutput {
+        kind: 7,
+        agent_recv_unix_ns,
+        agent_sent_unix_ns,
+    })
 }
 
 // ── Error-code constants for TaskError.code ─────────────────────────

@@ -29,6 +29,13 @@ serde_yaml.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+aes.workspace = true
+ctr.workspace = true
+pbkdf2.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

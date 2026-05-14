@@ -14,7 +14,7 @@ mod writer;
 use std::sync::Arc;
 
 use anyhow::Context;
-use rsansible_wire::{read_frame, Message};
+use rsansible_wire::{msg, read_frame, Message};
 use tokio::io::BufReader;
 use tracing::{debug, error, info, warn};
 
@@ -95,13 +95,25 @@ async fn main() -> anyhow::Result<()> {
                 info!("received Bye; flushing and exiting");
                 break;
             }
+            Message::Ping(_) => {
+                // Clock-skew probe. T2 is captured right after the read
+                // identifies this as a Ping; T3 is captured just before
+                // queuing the Pong. Any queue-drain latency between T3
+                // and the actual stdout write rolls into the controller's
+                // RTT measurement and shows up as half-RTT noise on the
+                // offset estimate — fine for a one-shot startup probe.
+                let agent_recv = msg::now_unix_ns();
+                let agent_sent = msg::now_unix_ns();
+                ctx.emit(msg::pong(agent_recv, agent_sent)).await;
+            }
             // The controller should never send these — they're agent → ctrl
             // messages. Tolerate them by logging and continuing rather than
             // crashing the loop.
             unexpected @ (Message::Hello(_)
             | Message::TaskProgress(_)
             | Message::TaskDone(_)
-            | Message::TaskError(_)) => {
+            | Message::TaskError(_)
+            | Message::Pong(_)) => {
                 warn!(?unexpected, "ignoring ctrl→agent message of unexpected variant");
             }
         }

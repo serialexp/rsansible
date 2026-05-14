@@ -1,0 +1,5 @@
+- name: bump marker
+  write_file:
+    path: /tmp/rsansible-handler-fired
+    mode: 0o644
+    content: "fired={{ service_name }}\n"

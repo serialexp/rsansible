@@ -8,16 +8,14 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::time::Instant;
-
 use rsansible_wire::generated::OpWriteFileOutput;
-use rsansible_wire::msg;
+use rsansible_wire::msg::{self, now_unix_ns};
 use tokio::io::AsyncWriteExt;
 
 use super::{emit_error, Context};
 
 pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput) -> anyhow::Result<()> {
-    let started = Instant::now();
+    let started_unix_ns = now_unix_ns();
     let path = PathBuf::from(&op.path);
     let mode = op.mode;
 
@@ -96,8 +94,8 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput) -> anyhow::Resu
     let changed = prior.as_deref() != Some(op.content.as_slice())
         || prior_mode.map(|m| m != (mode & 0o7777)).unwrap_or(true);
 
-    let took_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-    ctx.emit(msg::task_done(seq, 0, changed, took_ms)).await;
+    let finished_unix_ns = now_unix_ns();
+    ctx.emit(msg::task_done(seq, 0, changed, started_unix_ns, finished_unix_ns)).await;
     Ok(())
 }
 

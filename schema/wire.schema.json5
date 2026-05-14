@@ -83,6 +83,13 @@
       ],
     },
 
+    OpGatherFacts: {
+      description: "Collect a small set of `ansible_*` facts about the host. The agent writes a UTF-8 JSON object to stdout via TaskProgress (one chunk) and then sends TaskDone with exit_code=0. Failures still produce TaskDone with non-zero exit_code instead of TaskError, so the controller can treat missing facts as non-fatal without special-casing.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 3 },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -93,6 +100,7 @@
         { type: "OpExec", when: "value === 0" },
         { type: "OpShell", when: "value === 1" },
         { type: "OpWriteFile", when: "value === 2" },
+        { type: "OpGatherFacts", when: "value === 3" },
       ],
     },
 
@@ -141,14 +149,15 @@
     },
 
     TaskDone: {
-      description: "Sent agent → controller. Terminal — no further messages for this seq.",
+      description: "Sent agent → controller. Terminal — no further messages for this seq. `started_unix_ns` and `finished_unix_ns` are the agent's host-wall-clock timestamps (nanoseconds since the UNIX epoch) bracketing the module's work, captured before the first side-effect and after the last. Always on the wire — surfaced behind the `rsansible::timing` tracing target. Note: the host's clock can be skewed from the controller's; (finished − started) is skew-immune work time; absolute values are only meaningful when compared to the controller's own dispatch/receive instants with skew in mind.",
       sequence: [
         { name: "kind", type: "uint8", const: 3 },
         { name: "seq", type: "uint32" },
         { name: "exit_code", type: "int32" },
         // 0 = unchanged, 1 = changed. Idempotency reporting (Ansible-style).
         { name: "changed", type: "uint8" },
-        { name: "took_ms", type: "uint32" },
+        { name: "started_unix_ns", type: "uint64" },
+        { name: "finished_unix_ns", type: "uint64" },
       ],
     },
 
@@ -171,6 +180,22 @@
       ],
     },
 
+    Ping: {
+      description: "Sent controller → agent immediately after Hello. The agent responds with `Pong` carrying its wall-clock receive and send timestamps so the controller can estimate the clock offset between the two hosts (NTP-style). The Ping itself carries no timestamp; the controller remembers its own send time and captures its own receive time on Pong, so all four timestamps (T1=ctl-send, T2=agent-recv, T3=agent-send, T4=ctl-recv) feed into `offset = ((T2-T1) + (T3-T4)) / 2`.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 6 },
+      ],
+    },
+
+    Pong: {
+      description: "Sent agent → controller in response to `Ping`. `agent_recv_unix_ns` is captured as close to the Ping frame's read as practical; `agent_sent_unix_ns` is captured just before the Pong is queued for writing. Together with the controller's own T1/T4 these let the controller compute the host's clock offset for the duration of this connection.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 7 },
+        { name: "agent_recv_unix_ns", type: "uint64" },
+        { name: "agent_sent_unix_ns", type: "uint64" },
+      ],
+    },
+
     // Top-level union for the whole protocol.
     Message: {
       description: "Discriminated union of every wire message in either direction.",
@@ -183,6 +208,8 @@
         { type: "TaskDone", when: "value === 3" },
         { type: "TaskError", when: "value === 4" },
         { type: "Bye", when: "value === 5" },
+        { type: "Ping", when: "value === 6" },
+        { type: "Pong", when: "value === 7" },
       ],
     },
   },

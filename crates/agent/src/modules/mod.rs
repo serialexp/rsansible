@@ -7,6 +7,7 @@ use rsansible_wire::{msg, Op};
 use crate::writer::Sender;
 
 mod exec;
+mod gather_facts;
 mod write_file;
 
 /// Shared state passed to every handler. Currently just the writer; future
@@ -35,6 +36,7 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
         Op::OpExec(o) => exec::run_exec(ctx, seq, o).await,
         Op::OpShell(o) => exec::run_shell(ctx, seq, o).await,
         Op::OpWriteFile(o) => write_file::run(ctx, seq, o).await,
+        Op::OpGatherFacts(_) => gather_facts::run(ctx, seq).await,
     }
 }
 

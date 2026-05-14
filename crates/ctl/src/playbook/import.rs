@@ -34,7 +34,10 @@ pub fn flatten_playbook(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn flatten_tasks(
+/// Flatten a list of tasks loaded from disk, resolving any
+/// `import_tasks:` entries against `base_dir`. The role-flatten pass
+/// calls this directly with the role's `tasks/` directory.
+pub(crate) fn flatten_tasks(
     tasks: Vec<Task>,
     base_dir: &Path,
     visited: &mut BTreeSet<PathBuf>,

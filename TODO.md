@@ -108,44 +108,89 @@ real gothab playbook is its own unit of work.
 **Estimated:** ~800 LoC. Mostly a precedence-walker and a small protocol
 change.
 
-- [ ] **Inventory groups**
-  - groups + group membership; a host can be in multiple groups. Top-level
-    `all`. Inventory file format extension:
-    ```yaml
-    groups:
-      postgres:
-        hosts: [pg1, pg2]
-      etcd:
-        hosts: [e1, e2, e3]
-        children: [some_other_group]
-    ```
-  - resolve `hosts: [postgres, !pg1]` syntax (exclusions) — common in
-    gothab.
-- [ ] **`group_vars/` and `host_vars/` directories**
-  - load `inventory_dir/group_vars/<group>.yml` and `host_vars/<host>.yml`
-    for every host. Mirror Ansible's discovery rules.
-- [ ] **Role `defaults/main.yml` and `vars/main.yml`**
-  - lowest-priority defaults, slightly-higher-priority vars. 8 roles in
-    gothab use these heavily.
-- [ ] **Variable precedence chain** (matches Ansible's where reasonable):
-  ```
-  role defaults  <  inventory group_vars  <  inventory host_vars
-                <  play vars  <  set_fact  <  register  <  CLI --extra-vars
-  ```
-- [ ] **Templated value resolution**
-  - any string in any var, any op argument, any when/register/set_fact
-    field can contain Jinja. Resolved against the current `HostCtx` at
-    the moment the task starts. Single pass — no recursive lazy
-    expansion (Ansible does this; keep it simple).
-- [ ] **`OpGatherFacts` agent op + corresponding `gather_facts:` directive**
-  - returns a flat string-keyed dict. Minimum keys for gothab:
-    `ansible_hostname`, `ansible_fqdn`, `ansible_host`, `ansible_port`,
-    `ansible_date_time` (ISO-8601), `ansible_distribution`,
-    `ansible_distribution_release`, `ansible_default_ipv4` (best-effort).
-  - implies one new op kind in the schema.
+### Phase 2a — landed
 
-**Acceptance:** `site.yml`'s first play (common role) renders correctly
-against gothab's inventory + group_vars.
+- [x] **Inventory schema rewrite**
+  - Ansible-shaped `all.children.<group>.{vars,hosts}`. Connection-coord
+    keys (`ansible_host`, `ansible_port`, `ansible_user`,
+    `ansible_ssh_private_key_file`) are lifted; other host-level keys
+    become per-host inventory vars. Flat groups only (no nested
+    `children:`); no boolean/exclusion selectors yet.
+- [x] **`group_vars/` and `host_vars/` directories**
+  - `<inv_dir>/group_vars/<group>/*.yml` (dir form, alphabetical merge)
+    and `<group>.yml` (file form); same for host_vars. Loaded by
+    `inventory::load_with_vars()` and folded into the connection-coord
+    resolution AND the runtime template view.
+- [x] **Ansible Vault decryption**
+  - `crates/ctl/src/vault.rs` — `$ANSIBLE_VAULT;1.1` / `1.2;AES256`,
+    PBKDF2-SHA256(10k, 80B) → AES-256-CTR + HMAC-SHA256. Detected on the
+    first line of any group_vars/host_vars file; `--vault-password-file`
+    CLI flag (or `ANSIBLE_VAULT_PASSWORD_FILE` env var). Files skipped
+    with a warning when no password is supplied.
+- [x] **Variable precedence chain (Phase 2a slice)**
+  ```
+  all_vars  <  group_vars (inline + on-disk; member_of order)
+            <  host_vars (on-disk)  <  inline host vars
+            <  play.vars  <  set_fact  <  register
+  ```
+  Lower layers resolved at startup into `HostCtx.inventory_vars`;
+  `play.vars` rendered into `HostCtx.play_vars` at the start of each
+  play. set_fact / register layer on top as before.
+- [x] **`groups[]` / `hostvars[]` template globals**
+  - Computed once per run as `Arc<WorldVars>`; every `build_template_ctx`
+    call receives it. `{{ groups['web'][0] }}` and
+    `{{ hostvars[...].region }}` work end-to-end.
+- [x] **`Play.vars`**
+  - Per-play layer, rendered against each host's inventory_vars-only
+    view at play start (no chicken-and-egg with set_fact).
+- [x] **Group selectors in `hosts:`**
+  - `hosts: web` / `hosts: [web, host3]` / `hosts: all`. Group wins on
+    name collision (Ansible's behavior). Unknown names error at validate
+    time.
+
+**Phase 2a acceptance (met):** `tests/groups_and_vars.rs`'s 3-container
+e2e exercises group selector resolution, every precedence layer (all,
+group, host, inline, play), `groups[]`/`hostvars[]` lookups, and vault
+decryption, all against `examples/groups_and_vars.yaml` +
+`examples/group_vars/{all,web}/` + `examples/host_vars/host1.yml` +
+a vault-encrypted `examples/group_vars/web/secrets.yml`.
+
+### Phase 2b — landed
+
+- [x] **Roles** (`roles/<name>/{tasks,handlers,defaults,templates}/main.yml`
+  discovery + `roles:` directive on plays). Role flatten pass in
+  `crates/ctl/src/playbook/role.rs` runs after `import::flatten_playbook`;
+  `defaults/main.yml` feeds `play.role_defaults` (lowest-precedence
+  user-defined layer, below `inventory_vars`); role tasks/handlers are
+  prepended to the play's own lists (Ansible's ordering). Bare-string
+  and `{ role: name, tags: [...] }` invocation forms both accepted;
+  `tags:` parsed-and-ignored for now.
+- [x] **`template:` task module** — controller-side desugar to
+  `OpWriteFile`. `src:` resolved at load time against
+  `<role_dir>/templates/`, `<playbook_dir>/templates/`, then
+  `<playbook_dir>/`; body inlined onto the parsed `TemplateOp` and
+  rendered through the standard minijinja env at task time.
+- [x] **`OpGatherFacts` agent op + `gather_facts:` directive**
+  (default true, Ansible-faithful). Facts emitted: `ansible_hostname`,
+  `ansible_distribution`, `ansible_distribution_release`,
+  `ansible_date_time` (nested, with `iso8601`/`date`/`time`/`epoch`),
+  `ansible_default_ipv4` (best-effort via UDP-connect trick). First
+  wire-schema change since v0 (Op kind=3); facts ride back on
+  `TaskProgress.stdout` as a JSON object and the orchestrator lifts
+  them into per-host `HostCtx.facts` (persists across plays). Failures
+  are best-effort — logged, don't halt the play.
+- [ ] **Nested groups / boolean selectors** — defer; gothab doesn't
+  use either. Add if/when something needs them.
+- [ ] **CLI `--extra-vars`** — top-of-stack precedence layer.
+
+**Phase 2b acceptance (met):** `tests/roles_and_facts.rs`'s 3-container
+e2e exercises role flatten, role defaults precedence, the `template:`
+op resolving against the role's `templates/` dir, the implicit
+`Gathering Facts` task populating `ansible_*` keys, and the role's
+handler firing at end-of-play on template change. 118 ctl lib tests
+green plus +5 agent tests for the gather_facts module (os-release
+parsing, civil-from-days date decomposition, fact collection) and a
+new wire framing roundtrip for `OpGatherFacts`.
 
 ---
 
@@ -252,9 +297,10 @@ These don't fit neatly into a phase but should happen alongside the work:
 - [ ] **Better progress output** — current `info!` stream is fine but a
   per-host status line ("[pg1] task 7/15: Configure patroni — changed
   (41ms)") would be a big quality bump.
-- [ ] **Vault** — none used in gothab today (verified by survey), so
-  defer. If it ever shows up, look at `age` or `aws-lc-rs` for symmetric
-  decryption.
+- [x] **Vault** — landed in Phase 2a (`crates/ctl/src/vault.rs`).
+  rustcrypto stack (`aes`+`ctr`+`pbkdf2`+`hmac`+`sha2`+`subtle`+`hex`).
+  Used by group_vars/host_vars discovery; one example is
+  vault-encrypted in `examples/group_vars/web/secrets.yml`.
 - [ ] **Ansible compat shim** — at some point, decide whether we want
   `rsansible run playbook.yaml` to **accept Ansible's exact YAML** or
   diverge. Gothab is the test case. Aim for "accept what gothab uses"

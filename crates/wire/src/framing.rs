@@ -149,13 +149,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_gather_facts() {
+        roundtrip(msg::task_dispatch(101, msg::op_gather_facts())).await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_progress() {
         roundtrip(msg::task_progress(42, 0, b"line of output\n".to_vec())).await;
     }
 
     #[tokio::test]
     async fn roundtrip_task_done() {
-        roundtrip(msg::task_done(42, 0, true, 137)).await;
+        roundtrip(msg::task_done(42, 0, true, 1_700_000_000_000_000_000, 1_700_000_000_137_000_000)).await;
     }
 
     #[tokio::test]
@@ -166,6 +171,16 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_bye() {
         roundtrip(msg::bye()).await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_ping() {
+        roundtrip(msg::ping()).await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_pong() {
+        roundtrip(msg::pong(1_700_000_000_111_000_000, 1_700_000_000_222_000_000)).await;
     }
 
     #[tokio::test]
@@ -195,14 +210,14 @@ mod tests {
     async fn multiple_frames_back_to_back() {
         let mut buf: Vec<u8> = Vec::new();
         write_frame(&mut buf, &msg::bye()).await.unwrap();
-        write_frame(&mut buf, &msg::task_done(1, 0, false, 10))
+        write_frame(&mut buf, &msg::task_done(1, 0, false, 100, 110))
             .await
             .unwrap();
         let mut r = BufReader::new(Cursor::new(buf));
         assert_eq!(read_frame(&mut r).await.unwrap().unwrap(), msg::bye());
         assert_eq!(
             read_frame(&mut r).await.unwrap().unwrap(),
-            msg::task_done(1, 0, false, 10)
+            msg::task_done(1, 0, false, 100, 110)
         );
         assert!(read_frame(&mut r).await.unwrap().is_none());
     }

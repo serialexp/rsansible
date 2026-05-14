@@ -10,17 +10,20 @@
 //! `validate()` does semantic checks on top of that.
 
 pub mod import;
+pub mod role;
 pub mod task_op;
 mod validate;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
     AssertTask, ExecOp, FailTask, LoopControl, LoopSpec, MetaAction, SetFactMap, ShellOp, Task,
-    TaskBody, TaskOp, WriteFileOp,
+    TaskBody, TaskOp, TemplateOp, WriteFileOp,
 };
 pub use validate::validate;
 
@@ -40,21 +43,81 @@ pub struct Play {
     pub strategy: Strategy,
     #[serde(default)]
     pub on_failure: OnFailure,
+    /// When true (the default), the orchestrator runs an implicit
+    /// `Gathering Facts` task as the first step of the play. Matches
+    /// Ansible's default; set `gather_facts: false` to skip the
+    /// per-host round-trip.
+    #[serde(default = "default_gather_facts")]
+    pub gather_facts: bool,
+    /// Play-scoped variables. Resolved (templated against the inventory_vars-
+    /// only view) at the start of each play and layered into every host's
+    /// [`crate::exec_ctx::HostCtx::play_vars`].
+    #[serde(default)]
+    pub vars: BTreeMap<String, serde_yaml::Value>,
+    /// `roles:` directive. Each entry resolves to a directory under
+    /// `<playbook_dir>/roles/<name>/`; its tasks are prepended to
+    /// `tasks` (and handlers to `handlers`) by the role-flatten pass.
+    /// Role defaults accumulate into `role_defaults`.
+    #[serde(default)]
+    pub roles: Vec<RoleInvocation>,
+    #[serde(default)]
     pub tasks: Vec<Task>,
     /// Handlers defined at play level. Tasks notify by name; the matching
     /// handler is queued onto the host's pending set and flushed at end-of-
     /// play (or on `meta: flush_handlers`).
     #[serde(default)]
     pub handlers: Vec<Task>,
+    /// Merged defaults from every role in this play, in declaration
+    /// order (last-wins). Populated by the role-flatten pass; not
+    /// Deserialize-able. Lowest-precedence user-defined source — sits
+    /// below `inventory_vars` in the precedence chain.
+    #[serde(skip)]
+    pub role_defaults: BTreeMap<String, JsonValue>,
 }
 
-/// `hosts:` accepts either the literal `all` or an explicit list of host names
-/// from the inventory.
+fn default_gather_facts() -> bool {
+    true
+}
+
+/// `roles:` entry — bare string (`- common`) or full form
+/// (`- { role: common, tags: [...] }`). Bart's choice: we accept and
+/// ignore `tags:` for now — tag filtering isn't wired up yet (cross-
+/// cutting TODO).
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[serde(untagged)]
+pub enum RoleInvocation {
+    Bare(String),
+    Full(RoleSpec),
+}
+
+impl RoleInvocation {
+    pub fn name(&self) -> &str {
+        match self {
+            RoleInvocation::Bare(n) => n,
+            RoleInvocation::Full(s) => &s.role,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSpec {
+    pub role: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// `hosts:` accepts either the literal `all`, a bare host/group name, or
+/// an explicit list. The bare-string and list forms both end up as
+/// `Names(...)`; the orchestrator resolves names to either a host or a
+/// group at run time.
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum HostSelector {
     All(AllKeyword),
     Names(Vec<String>),
+    /// Single name shorthand: `hosts: web` → `Names(vec!["web"])`.
+    Name(String),
 }
 
 impl Default for HostSelector {
@@ -98,6 +161,10 @@ pub fn load(path: &Path) -> Result<Playbook> {
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     import::flatten_playbook(&mut pb, base)
         .with_context(|| format!("resolving imports in {}", path.display()))?;
+    role::flatten_playbook(&mut pb, base)
+        .with_context(|| format!("resolving roles in {}", path.display()))?;
+    role::load_templates(&mut pb, base)
+        .with_context(|| format!("loading template sources in {}", path.display()))?;
     Ok(pb)
 }
 
@@ -112,7 +179,6 @@ pub fn parse(text: &str) -> Result<Playbook> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn task_op(t: &Task) -> &TaskOp {
         match &t.body {
@@ -284,6 +350,17 @@ mod tests {
         );
     }
 
+    const SIMPLE_INV: &str = r#"
+all:
+  vars:
+    ansible_user: deploy
+  children:
+    web:
+      hosts:
+        web1:
+          ansible_host: 10.0.0.1
+"#;
+
     #[test]
     fn validate_happy_path() {
         let pb = parse(
@@ -296,15 +373,7 @@ mod tests {
 "#,
         )
         .unwrap();
-        let inv = crate::inventory::parse(
-            r#"
-hosts:
-  web1:
-    host: 10.0.0.1
-    user: deploy
-"#,
-        )
-        .unwrap();
+        let inv = crate::inventory::parse(SIMPLE_INV).unwrap();
         validate(&pb, Some(&inv)).unwrap();
     }
 
@@ -320,15 +389,7 @@ hosts:
 "#,
         )
         .unwrap();
-        let inv = crate::inventory::parse(
-            r#"
-hosts:
-  web1:
-    host: 10.0.0.1
-    user: deploy
-"#,
-        )
-        .unwrap();
+        let inv = crate::inventory::parse(SIMPLE_INV).unwrap();
         let err = validate(&pb, Some(&inv)).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("missing"), "got: {msg}");
@@ -342,8 +403,12 @@ hosts:
                 hosts: HostSelector::default(),
                 strategy: Strategy::PerTask,
                 on_failure: OnFailure::Stop,
+                gather_facts: true,
+                vars: BTreeMap::new(),
+                roles: Vec::new(),
                 tasks: vec![],
                 handlers: vec![],
+                role_defaults: BTreeMap::new(),
             }],
         };
         let err = validate(&pb, None).unwrap_err();

@@ -29,7 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use minijinja::Environment;
 use rsansible_wire::{
     generated::{Message, TaskDoneOutput},
-    msg::{bye, task_dispatch},
+    msg::{bye, now_unix_ns, task_dispatch},
     read_frame, write_frame, Op,
 };
 use serde_json::Value as JsonValue;
@@ -37,8 +37,8 @@ use tokio::sync::{Mutex as TokioMutex, OnceCell, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue};
-use crate::inventory::{Host, Inventory};
+use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
+use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, ExecOp, FailTask, HostSelector, LoopSpec, MetaAction, OnFailure, Play, Playbook,
     SetFactMap, ShellOp, Strategy, Task, TaskBody, TaskOp, WriteFileOp,
@@ -89,6 +89,10 @@ impl HostOutcome {
 /// What the orchestrator was asked to do.
 pub struct RunSpec {
     pub inventory: Inventory,
+    /// On-disk vars discovered next to the inventory (group_vars/, host_vars/).
+    /// Empty by default; callers that load from disk pass the result of
+    /// [`crate::inventory::load_with_vars`] here.
+    pub inventory_vars: InventoryVars,
     pub playbook: Playbook,
     pub agent_binary: Arc<Vec<u8>>,
     /// Cap on concurrent SSH dials during the initial connect phase.
@@ -99,6 +103,7 @@ impl RunSpec {
     pub fn new(inventory: Inventory, playbook: Playbook, agent_binary: Vec<u8>) -> Self {
         Self {
             inventory,
+            inventory_vars: InventoryVars::default(),
             playbook,
             agent_binary: Arc::new(agent_binary),
             max_concurrent_hosts: DEFAULT_MAX_CONCURRENT_HOSTS,
@@ -123,10 +128,15 @@ impl RunReport {
 pub async fn run(spec: RunSpec) -> Result<RunReport> {
     let RunSpec {
         inventory,
+        inventory_vars,
         playbook,
         agent_binary,
         max_concurrent_hosts,
     } = spec;
+
+    // Build the per-host inventory_vars views + the shared WorldVars
+    // once at startup. Both are stable for the run.
+    let world = Arc::new(build_world_vars(&inventory, &inventory_vars));
 
     let target_hosts = compute_all_targeted_hosts(&playbook, &inventory);
 
@@ -199,7 +209,10 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     let mut ctxs: BTreeMap<String, HostCtx> = BTreeMap::new();
     for name in conns.keys() {
         let host = inventory.hosts.get(name).expect("conn host in inventory");
-        ctxs.insert(name.clone(), make_initial_ctx(name, host));
+        ctxs.insert(
+            name.clone(),
+            make_initial_ctx(name, host, &world),
+        );
     }
 
     let mut report = RunReport {
@@ -220,6 +233,36 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                     && matches!(report.host_outcomes.get(n), Some(HostOutcome::Ok))
             })
             .collect();
+
+        // Per-play WorldVars: same groups + hostvars as the base, but with
+        // role_defaults overlaid at the bottom (lowest precedence) of each
+        // host's view, so `hostvars[other].some_default` resolves while
+        // inventory_vars still wins over a default with the same key.
+        let world_for_play = Arc::new(build_world_vars_for_play(&world, play));
+
+        // Set per-host role_defaults from the play's merged role defaults.
+        // Cleared and re-seeded on every play (no carry-over).
+        apply_role_defaults_layer(play, &play_targets, &mut ctxs);
+
+        // Implicit `Gathering Facts` task (Ansible-faithful default). Runs
+        // before play.vars rendering so play.vars can reference facts.
+        // Failures don't halt the play — Ansible's behavior.
+        gather_facts_for_play(
+            play,
+            &play_targets,
+            &conns,
+            &mut ctxs,
+            &mut report,
+            &next_seq,
+            &env,
+            &world_for_play,
+        )
+        .await?;
+
+        // Layer the play's vars onto every live ctx (clearing the previous
+        // play's vars first). play.vars render against the
+        // (role_defaults ∪ inventory_vars ∪ facts) view per host.
+        apply_play_vars(play, &play_targets, &mut ctxs, &env, &world_for_play);
         info!(
             play = %play.name,
             strategy = ?play.strategy,
@@ -241,6 +284,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                     &mut report,
                     &next_seq,
                     &env,
+                    &world_for_play,
                 )
                 .await?
             }
@@ -253,6 +297,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                     &mut report,
                     &next_seq,
                     &env,
+                    &world_for_play,
                 )
                 .await?
             }
@@ -281,19 +326,298 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     Ok(report)
 }
 
-fn make_initial_ctx(name: &str, host: &Host) -> HostCtx {
+fn make_initial_ctx(name: &str, host: &Host, world: &WorldVars) -> HostCtx {
     let mut ctx = HostCtx::new(name.to_string());
-    ctx.inventory_vars.insert(
-        "ansible_host".into(),
-        JsonValue::String(host.host.clone()),
-    );
+    // Seed inventory_vars from the world-scoped per-host map (precedence
+    // steps 1..=4 already resolved by build_world_vars).
+    if let Some(view) = world.hostvars.get(name) {
+        for (k, v) in view {
+            ctx.inventory_vars.insert(k.clone(), v.clone());
+        }
+    }
+    // Always make sure the four canonical connection coords are present
+    // (build_world_vars normally seeds them too, but this protects against
+    // an empty world e.g. in unit tests).
     ctx.inventory_vars
-        .insert("ansible_port".into(), JsonValue::from(host.port));
-    ctx.inventory_vars.insert(
-        "ansible_user".into(),
-        JsonValue::String(host.user.clone()),
-    );
+        .entry("ansible_host".into())
+        .or_insert_with(|| JsonValue::String(host.host.clone()));
+    ctx.inventory_vars
+        .entry("ansible_port".into())
+        .or_insert_with(|| JsonValue::from(host.port));
+    ctx.inventory_vars
+        .entry("ansible_user".into())
+        .or_insert_with(|| JsonValue::String(host.user.clone()));
     ctx
+}
+
+/// Compute the run-scoped `WorldVars`: per-host resolved inventory_vars
+/// (precedence steps 1..=4) and the group → hosts map. Done once at
+/// startup; every render uses these.
+fn build_world_vars(inv: &Inventory, vars: &InventoryVars) -> WorldVars {
+    let mut hostvars: BTreeMap<String, BTreeMap<String, JsonValue>> = BTreeMap::new();
+    for (name, host) in &inv.hosts {
+        let mut view: BTreeMap<String, JsonValue> = BTreeMap::new();
+        // 1. all_vars (inline at all.vars)
+        for (k, v) in &inv.all_vars {
+            view.insert(k.clone(), v.clone());
+        }
+        // 1b. on-disk group_vars/all (treated as an extension of all_vars).
+        if let Some(av) = vars.group_vars.get("all") {
+            for (k, v) in av {
+                view.insert(k.clone(), v.clone());
+            }
+        }
+        // 2. group_vars (inline + on-disk) in declaration order. `all` is
+        //    already covered above; skip it here to avoid double-applying.
+        for g in &host.member_of {
+            if g == "all" {
+                continue;
+            }
+            if let Some(gv) = inv.group_inline_vars.get(g) {
+                for (k, v) in gv {
+                    view.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(gv) = vars.group_vars.get(g) {
+                for (k, v) in gv {
+                    view.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        // 3. host_vars (on-disk)
+        if let Some(hv) = vars.host_vars.get(name) {
+            for (k, v) in hv {
+                view.insert(k.clone(), v.clone());
+            }
+        }
+        // 4. host inline vars (from the inventory YAML, non-connection keys)
+        for (k, v) in &host.inline_vars {
+            view.insert(k.clone(), v.clone());
+        }
+        // Always expose the four connection coords as resolved here, so
+        // templates referencing `{{ ansible_host }}` see the merged value.
+        view.insert(
+            "ansible_host".into(),
+            JsonValue::String(host.host.clone()),
+        );
+        view.insert("ansible_port".into(), JsonValue::from(host.port));
+        view.insert(
+            "ansible_user".into(),
+            JsonValue::String(host.user.clone()),
+        );
+        if let Some(p) = &host.key_path {
+            view.insert(
+                "ansible_ssh_private_key_file".into(),
+                JsonValue::String(p.to_string_lossy().into_owned()),
+            );
+        }
+        hostvars.insert(name.clone(), view);
+    }
+    WorldVars {
+        groups: inv.groups.clone(),
+        hostvars,
+    }
+}
+
+/// Clear any prior play's `role_defaults` from each host's ctx and seed
+/// the current play's merged defaults. Lowest-precedence user-defined
+/// source — sits below `inventory_vars`.
+fn apply_role_defaults_layer(
+    play: &Play,
+    targets: &[String],
+    ctxs: &mut BTreeMap<String, HostCtx>,
+) {
+    for name in targets {
+        let Some(ctx) = ctxs.get_mut(name) else { continue };
+        ctx.role_defaults.clear();
+        for (k, v) in &play.role_defaults {
+            ctx.role_defaults.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// Build a per-play `WorldVars`: same groups + hostvars as the base,
+/// but with `role_defaults` overlaid at the bottom of each host's view
+/// so `hostvars[other].some_default` resolves while inventory_vars still
+/// wins over any defaults that share a key.
+fn build_world_vars_for_play(base: &WorldVars, play: &Play) -> WorldVars {
+    if play.role_defaults.is_empty() {
+        return base.clone();
+    }
+    let mut hostvars = base.hostvars.clone();
+    for view in hostvars.values_mut() {
+        for (k, v) in &play.role_defaults {
+            view.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    WorldVars {
+        groups: base.groups.clone(),
+        hostvars,
+    }
+}
+
+/// Render `play.vars` against each host's (role_defaults ∪ inventory_vars
+/// ∪ facts) view and store the result in `ctx.play_vars`. Clears prior
+/// plays' vars first.
+fn apply_play_vars(
+    play: &Play,
+    targets: &[String],
+    ctxs: &mut BTreeMap<String, HostCtx>,
+    env: &Arc<Environment<'static>>,
+    world: &WorldVars,
+) {
+    for name in targets {
+        let Some(ctx) = ctxs.get_mut(name) else { continue };
+        ctx.play_vars.clear();
+        if play.vars.is_empty() {
+            continue;
+        }
+        // Render against a ctx that exposes role_defaults + inventory_vars
+        // + facts (no set_facts/registers/play_vars). Ansible allows
+        // play.vars to reference role defaults and gathered facts but not
+        // task-time state.
+        let mut scratch = HostCtx::new(name.clone());
+        scratch.role_defaults = ctx.role_defaults.clone();
+        scratch.inventory_vars = ctx.inventory_vars.clone();
+        scratch.facts = ctx.facts.clone();
+        let view = build_template_ctx(&scratch, world);
+        for (k, v) in &play.vars {
+            let val = match v {
+                serde_yaml::Value::String(s) => match render_str(env, s, &view) {
+                    Ok(rendered) => {
+                        let trimmed = rendered.trim();
+                        if looks_jsonish(trimmed) {
+                            serde_json::from_str::<JsonValue>(trimmed)
+                                .unwrap_or(JsonValue::String(rendered))
+                        } else {
+                            JsonValue::String(rendered)
+                        }
+                    }
+                    Err(e) => {
+                        warn!(host = %name, play = %play.name, var = %k, "play.vars render failed: {e:#}");
+                        continue;
+                    }
+                },
+                other => match yaml_to_json(other.clone()) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        warn!(host = %name, play = %play.name, var = %k, "play.vars coerce failed: {e:#}");
+                        continue;
+                    }
+                },
+            };
+            ctx.play_vars.insert(k.clone(), val);
+        }
+    }
+}
+
+// ---------- implicit gather_facts ----------
+
+/// Transient register name the implicit gather task writes into. The
+/// orchestrator drains it into `ctx.facts` and removes it before user
+/// tasks run, so it's never visible in user templates.
+const GATHER_FACTS_REGISTER: &str = "__rsansible_gather_facts__";
+
+/// Synthetic `Gathering Facts` task — name is Ansible-conventional.
+fn make_gather_facts_task() -> Task {
+    Task {
+        name: "Gathering Facts".to_string(),
+        body: TaskBody::Op(TaskOp::GatherFacts),
+        when: None,
+        register: Some(GATHER_FACTS_REGISTER.to_string()),
+        loop_spec: None,
+        loop_control: None,
+        tags: Vec::new(),
+        delegate_to: None,
+        run_once: false,
+        notify: Vec::new(),
+        role_dir: None,
+    }
+}
+
+/// Run the implicit `Gathering Facts` task against every live host in
+/// parallel (regardless of the play's `strategy:` — each host gathers
+/// its own facts; there's no broadcast). The stdout is parsed as a JSON
+/// object and merged into `ctx.facts`. Failures are logged but don't
+/// fail the play — matches Ansible.
+async fn gather_facts_for_play(
+    play: &Play,
+    targets: &[String],
+    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    ctxs: &mut BTreeMap<String, HostCtx>,
+    report: &mut RunReport,
+    next_seq: &Arc<AtomicU32>,
+    env: &Arc<Environment<'static>>,
+    world: &Arc<WorldVars>,
+) -> Result<()> {
+    if !play.gather_facts {
+        return Ok(());
+    }
+    let live: Vec<String> = targets
+        .iter()
+        .filter(|n| matches!(report.host_outcomes.get(*n), Some(HostOutcome::Ok)))
+        .cloned()
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+    info!(play = %play.name, hosts = live.len(), "gathering facts");
+    let task = make_gather_facts_task();
+    let mut set: JoinSet<PerHostTaskResult> = JoinSet::new();
+    for name in &live {
+        let own_conn = conns.get(name).expect("live host has handle").clone();
+        let ctx = ctxs
+            .remove(name)
+            .unwrap_or_else(|| HostCtx::new(name.clone()));
+        let task = task.clone();
+        let seq_src = next_seq.clone();
+        let env = env.clone();
+        let world = world.clone();
+        let conns_for = conns.clone();
+        set.spawn(async move {
+            run_task_on_one_host(&task, own_conn, conns_for, ctx, seq_src, env, world).await
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        let mut r = joined.context("gather_facts task panicked")?;
+        // Drain the transient register; user code never sees it.
+        let reg = r.ctx.registers.remove(GATHER_FACTS_REGISTER);
+        match &r.outcome {
+            HostTaskOutcome::Ok => {
+                if let Some(reg) = reg {
+                    match reg.json {
+                        Some(JsonValue::Object(map)) => {
+                            for (k, v) in map {
+                                r.ctx.facts.insert(k, v);
+                            }
+                        }
+                        Some(other) => {
+                            warn!(
+                                host = %r.name,
+                                "gather_facts: stdout was JSON but not an object: {other:?}; ignoring"
+                            );
+                        }
+                        None => {
+                            warn!(
+                                host = %r.name,
+                                "gather_facts: stdout did not parse as JSON; ignoring"
+                            );
+                        }
+                    }
+                }
+                debug!(host = %r.name, "facts gathered");
+            }
+            HostTaskOutcome::Skipped => {}
+            HostTaskOutcome::Failed { reason } => {
+                warn!(
+                    host = %r.name,
+                    "gather_facts failed (continuing; play.gather_facts is best-effort): {reason}"
+                );
+            }
+        }
+        ctxs.insert(r.name, r.ctx);
+    }
+    Ok(())
 }
 
 // ---------- per-task strategy ----------
@@ -306,12 +630,14 @@ async fn run_play_per_task(
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
+    world: &Arc<WorldVars>,
 ) -> Result<bool> {
     for task in &play.tasks {
         // `meta: flush_handlers` is not dispatched to hosts — it's a
         // control-flow marker that drains the per-host pending queue.
         if let TaskBody::Meta(MetaAction::FlushHandlers) = &task.body {
-            let stop = flush_handlers(play, targets, conns, ctxs, report, next_seq, env).await?;
+            let stop =
+                flush_handlers(play, targets, conns, ctxs, report, next_seq, env, world).await?;
             if stop {
                 return Ok(true);
             }
@@ -330,9 +656,10 @@ async fn run_play_per_task(
         }
 
         let any_failed = if task.run_once {
-            run_task_once_per_task(task, &live, conns, ctxs, report, next_seq, env, play).await?
+            run_task_once_per_task(task, &live, conns, ctxs, report, next_seq, env, world, play)
+                .await?
         } else {
-            run_task_fanout(task, &live, conns, ctxs, report, next_seq, env, play).await?
+            run_task_fanout(task, &live, conns, ctxs, report, next_seq, env, world, play).await?
         };
 
         if any_failed && play.on_failure == OnFailure::Stop {
@@ -340,7 +667,7 @@ async fn run_play_per_task(
         }
     }
     // Implicit end-of-play flush.
-    let stop = flush_handlers(play, targets, conns, ctxs, report, next_seq, env).await?;
+    let stop = flush_handlers(play, targets, conns, ctxs, report, next_seq, env, world).await?;
     Ok(stop)
 }
 
@@ -353,6 +680,7 @@ async fn run_task_fanout(
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
+    world: &Arc<WorldVars>,
     play: &Play,
 ) -> Result<bool> {
     let mut set: JoinSet<PerHostTaskResult> = JoinSet::new();
@@ -364,9 +692,10 @@ async fn run_task_fanout(
         let task = task.clone();
         let seq_src = next_seq.clone();
         let env = env.clone();
+        let world = world.clone();
         let conns_for = conns.clone();
         set.spawn(async move {
-            run_task_on_one_host(&task, own_conn, conns_for, ctx, seq_src, env).await
+            run_task_on_one_host(&task, own_conn, conns_for, ctx, seq_src, env, world).await
         });
     }
     let mut any_failed = false;
@@ -388,6 +717,7 @@ async fn run_task_once_per_task(
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
+    world: &Arc<WorldVars>,
     play: &Play,
 ) -> Result<bool> {
     // Pick the runner. We don't pre-resolve delegate_to here — the
@@ -416,6 +746,7 @@ async fn run_task_once_per_task(
         ctx,
         next_seq.clone(),
         env.clone(),
+        world.clone(),
     )
     .await;
 
@@ -455,7 +786,7 @@ async fn run_task_once_per_task(
             for n in &notify_snapshot {
                 // Render against the *other host's* ctx — the templated
                 // notify name should reflect that host's view of vars.
-                let rendered = match render_str(env, n, &build_template_ctx(ctx)) {
+                let rendered = match render_str(env, n, &build_template_ctx(ctx, world)) {
                     Ok(s) => s,
                     Err(_) => n.clone(),
                 };
@@ -476,6 +807,7 @@ async fn run_play_per_play(
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
+    world: &Arc<WorldVars>,
 ) -> Result<bool> {
     // Snapshot the live target set; per-host futures don't see each other.
     let live: Vec<String> = targets
@@ -507,6 +839,7 @@ async fn run_play_per_play(
         let play_name = play.name.clone();
         let seq_src = next_seq.clone();
         let env = env.clone();
+        let world = world.clone();
         let conns_for = conns.clone();
         let own_conn = conns.get(name).expect("live host has handle").clone();
         let ctx = ctxs
@@ -529,6 +862,7 @@ async fn run_play_per_play(
                         &mut ctx,
                         seq_src.clone(),
                         env.clone(),
+                        world.clone(),
                         &play_name,
                     )
                     .await;
@@ -557,6 +891,7 @@ async fn run_play_per_play(
                             ctx,
                             seq_src.clone(),
                             env.clone(),
+                            world.clone(),
                         )
                         .await;
                         let register_val = task
@@ -601,7 +936,7 @@ async fn run_play_per_play(
                         {
                             for n in &task.notify {
                                 let rendered =
-                                    match render_str(&env, n, &build_template_ctx(&ctx)) {
+                                    match render_str(&env, n, &build_template_ctx(&ctx, &world)) {
                                         Ok(s) => s,
                                         Err(_) => n.clone(),
                                     };
@@ -640,6 +975,7 @@ async fn run_play_per_play(
                         ctx,
                         seq_src.clone(),
                         env.clone(),
+                        world.clone(),
                     )
                     .await;
                 }
@@ -676,6 +1012,7 @@ async fn run_play_per_play(
                     &mut ctx,
                     seq_src.clone(),
                     env.clone(),
+                    world.clone(),
                     &play_name,
                 )
                 .await
@@ -780,11 +1117,12 @@ async fn run_task_on_one_host(
     mut ctx: HostCtx,
     next_seq: Arc<AtomicU32>,
     env: Arc<Environment<'static>>,
+    world: Arc<WorldVars>,
 ) -> PerHostTaskResult {
     let name = ctx.host_name.clone();
 
     // when: evaluation — bypasses everything else if false.
-    match eval_when(&env, task.when.as_deref(), &ctx) {
+    match eval_when(&env, task.when.as_deref(), &ctx, &world) {
         Ok(true) => {}
         Ok(false) => {
             if let Some(reg) = &task.register {
@@ -810,7 +1148,7 @@ async fn run_task_on_one_host(
     }
 
     // Resolve loop items (None → run once with no iter_item).
-    let items: Vec<JsonValue> = match resolve_loop_items(&env, task.loop_spec.as_ref(), &ctx) {
+    let items: Vec<JsonValue> = match resolve_loop_items(&env, task.loop_spec.as_ref(), &ctx, &world) {
         Ok(items) => items,
         Err(e) => {
             return PerHostTaskResult {
@@ -834,7 +1172,7 @@ async fn run_task_on_one_host(
         match &task.delegate_to {
             None => Ok(own_conn.clone()),
             Some(expr) => {
-                let view = build_template_ctx(ctx);
+                let view = build_template_ctx(ctx, &world);
                 let rendered = render_str(&env, expr, &view)
                     .map_err(|e| format!("delegate_to render: {e:#}"))?;
                 conns_map
@@ -860,13 +1198,13 @@ async fn run_task_on_one_host(
                 };
             }
         };
-        let exec = run_body_once(task, &target, &mut ctx, &env, &next_seq).await;
+        let exec = run_body_once(task, &target, &mut ctx, &env, &world, &next_seq).await;
         let outcome = match exec {
             BodyResult::Ok { register, changed } => {
                 if let Some(reg_name) = &task.register {
                     ctx.record_register(reg_name, register);
                 }
-                enqueue_notifies(task, changed, false, &mut ctx, &env);
+                enqueue_notifies(task, changed, false, &mut ctx, &env, &world);
                 HostTaskOutcome::Ok
             }
             BodyResult::Failed { reason, register, conn_alive } => {
@@ -922,7 +1260,7 @@ async fn run_task_on_one_host(
                 continue;
             }
         };
-        let exec = run_body_once(task, &target, &mut ctx, &env, &next_seq).await;
+        let exec = run_body_once(task, &target, &mut ctx, &env, &world, &next_seq).await;
         match exec {
             BodyResult::Ok { register, changed: _ } => iter_registers.push(register),
             BodyResult::Failed { reason, register, conn_alive } => {
@@ -955,7 +1293,7 @@ async fn run_task_on_one_host(
     }
     let outcome = match any_failed {
         None => {
-            enqueue_notifies(task, any_changed, false, &mut ctx, &env);
+            enqueue_notifies(task, any_changed, false, &mut ctx, &env, &world);
             HostTaskOutcome::Ok
         }
         Some(reason) => {
@@ -980,11 +1318,12 @@ fn enqueue_notifies(
     skipped: bool,
     ctx: &mut HostCtx,
     env: &Environment<'static>,
+    world: &WorldVars,
 ) {
     if skipped || !changed || task.notify.is_empty() {
         return;
     }
-    let view = build_template_ctx(ctx);
+    let view = build_template_ctx(ctx, world);
     for n in &task.notify {
         let rendered = match render_str(env, n, &view) {
             Ok(s) => s,
@@ -1023,13 +1362,14 @@ async fn run_body_once(
     target_conn: &ConnHandle,
     ctx: &mut HostCtx,
     env: &Environment<'static>,
+    world: &WorldVars,
     next_seq: &Arc<AtomicU32>,
 ) -> BodyResult {
     match &task.body {
-        TaskBody::Op(op) => run_op_body(task, op, target_conn, ctx, env, next_seq).await,
-        TaskBody::Assert(a) => run_assert_body(a, ctx, env),
-        TaskBody::Fail(f) => run_fail_body(f, ctx, env),
-        TaskBody::SetFact(m) => run_set_fact_body(m, ctx, env),
+        TaskBody::Op(op) => run_op_body(task, op, target_conn, ctx, env, world, next_seq).await,
+        TaskBody::Assert(a) => run_assert_body(a, ctx, env, world),
+        TaskBody::Fail(f) => run_fail_body(f, ctx, env, world),
+        TaskBody::SetFact(m) => run_set_fact_body(m, ctx, env, world),
         TaskBody::ImportTasks(p) => BodyResult::Failed {
             reason: format!(
                 "internal: import_tasks({}) reached the orchestrator; \
@@ -1059,9 +1399,10 @@ async fn run_op_body(
     target_conn: &ConnHandle,
     ctx: &mut HostCtx,
     env: &Environment<'static>,
+    world: &WorldVars,
     next_seq: &Arc<AtomicU32>,
 ) -> BodyResult {
-    let rendered = match render_op(op, ctx, env) {
+    let rendered = match render_op(op, ctx, env, world) {
         Ok(r) => r,
         Err(e) => {
             return BodyResult::Failed {
@@ -1098,20 +1439,25 @@ async fn run_op_body(
             };
         }
     };
-    let result = run_one_task_op(conn, seq, wire_op, capture).await;
+    let clock_offset_ns = conn.clock_offset_ns;
+    let result = run_one_task_op(conn, seq, wire_op, capture, clock_offset_ns).await;
     let label = conn.label.clone();
     drop(guard); // release the lock before doing CPU work / waiting on ctx
     let _ = ctx; // ctx isn't mutated here; silence unused-mut
 
     match result {
         Ok(exec) => {
+            let agent_elapsed_ns =
+                exec.done.finished_unix_ns.saturating_sub(exec.done.started_unix_ns);
+            let took_ms = (agent_elapsed_ns / 1_000_000).min(u64::MAX);
             let rv = RegisterValue::from_exec(
                 exec.done.exit_code,
                 exec.done.changed != 0,
-                exec.done.took_ms as u64,
+                took_ms,
                 &exec.stdout,
                 &exec.stderr,
             );
+            emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
                 info!(
                     host = %label,
@@ -1119,7 +1465,7 @@ async fn run_op_body(
                     seq,
                     exit = exec.done.exit_code,
                     changed = exec.done.changed != 0,
-                    took_ms = exec.done.took_ms,
+                    took_ms,
                     "ok",
                 );
                 let changed = exec.done.changed != 0;
@@ -1133,7 +1479,7 @@ async fn run_op_body(
                     task = %task.name,
                     seq,
                     exit = exec.done.exit_code,
-                    took_ms = exec.done.took_ms,
+                    took_ms,
                     "task non-zero exit",
                 );
                 BodyResult::Failed {
@@ -1161,8 +1507,13 @@ async fn run_op_body(
     }
 }
 
-fn run_assert_body(a: &AssertTask, ctx: &HostCtx, env: &Environment<'static>) -> BodyResult {
-    let view = build_template_ctx(ctx);
+fn run_assert_body(
+    a: &AssertTask,
+    ctx: &HostCtx,
+    env: &Environment<'static>,
+    world: &WorldVars,
+) -> BodyResult {
+    let view = build_template_ctx(ctx, world);
     for (i, expr) in a.that.iter().enumerate() {
         match env.compile_expression(expr) {
             Ok(compiled) => match compiled.eval(&view) {
@@ -1209,8 +1560,13 @@ fn run_assert_body(a: &AssertTask, ctx: &HostCtx, env: &Environment<'static>) ->
     }
 }
 
-fn run_fail_body(f: &FailTask, ctx: &HostCtx, env: &Environment<'static>) -> BodyResult {
-    let view = build_template_ctx(ctx);
+fn run_fail_body(
+    f: &FailTask,
+    ctx: &HostCtx,
+    env: &Environment<'static>,
+    world: &WorldVars,
+) -> BodyResult {
+    let view = build_template_ctx(ctx, world);
     let msg = match render_str(env, &f.msg, &view) {
         Ok(s) => s,
         Err(e) => {
@@ -1236,8 +1592,9 @@ fn run_set_fact_body(
     m: &SetFactMap,
     ctx: &mut HostCtx,
     env: &Environment<'static>,
+    world: &WorldVars,
 ) -> BodyResult {
-    let view = build_template_ctx(ctx);
+    let view = build_template_ctx(ctx, world);
     let mut to_set: Vec<(String, JsonValue)> = Vec::with_capacity(m.0.len());
     for (k, v) in &m.0 {
         let val = match v {
@@ -1309,8 +1666,13 @@ fn looks_jsonish(s: &str) -> bool {
 
 // ---------- template rendering ----------
 
-fn render_op(op: &TaskOp, ctx: &HostCtx, env: &Environment<'static>) -> Result<TaskOp> {
-    let view = build_template_ctx(ctx);
+fn render_op(
+    op: &TaskOp,
+    ctx: &HostCtx,
+    env: &Environment<'static>,
+    world: &WorldVars,
+) -> Result<TaskOp> {
+    let view = build_template_ctx(ctx, world);
     Ok(match op {
         TaskOp::Shell(s) => {
             let cmd = render_str(env, s.command(), &view)?;
@@ -1354,6 +1716,26 @@ fn render_op(op: &TaskOp, ctx: &HostCtx, env: &Environment<'static>) -> Result<T
                 content,
             })
         }
+        TaskOp::Template(t) => {
+            // Desugar `template:` into `OpWriteFile`. The body was loaded
+            // and stashed onto the TemplateOp during `playbook::load()`;
+            // missing-body here means the template wasn't resolved at
+            // load time, which validation should have caught.
+            let body = t.body.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "template src {:?} was not loaded — playbook::load() didn't resolve it (this is a bug; validate should have caught it)",
+                    t.src
+                )
+            })?;
+            let dest = render_str(env, &t.dest, &view)?;
+            let content = render_str(env, body, &view)?;
+            TaskOp::WriteFile(WriteFileOp {
+                path: dest,
+                mode: t.mode,
+                content,
+            })
+        }
+        TaskOp::GatherFacts => TaskOp::GatherFacts,
     })
 }
 
@@ -1375,12 +1757,13 @@ fn eval_when(
     env: &Environment<'static>,
     expr: Option<&str>,
     ctx: &HostCtx,
+    world: &WorldVars,
 ) -> Result<bool> {
     let Some(expr) = expr else { return Ok(true) };
     let compiled = env
         .compile_expression(expr)
         .map_err(|e| anyhow!("compile: {e}"))?;
-    let view = build_template_ctx(ctx);
+    let view = build_template_ctx(ctx, world);
     let val = compiled
         .eval(&view)
         .map_err(|e| anyhow!("eval: {e}"))?;
@@ -1391,6 +1774,7 @@ fn resolve_loop_items(
     env: &Environment<'static>,
     spec: Option<&LoopSpec>,
     ctx: &HostCtx,
+    world: &WorldVars,
 ) -> Result<Vec<JsonValue>> {
     let Some(spec) = spec else { return Ok(Vec::new()) };
     match spec {
@@ -1400,7 +1784,7 @@ fn resolve_loop_items(
             .map(yaml_to_json)
             .collect::<Result<Vec<_>>>(),
         LoopSpec::Expr(s) => {
-            let view = build_template_ctx(ctx);
+            let view = build_template_ctx(ctx, world);
             // Render as a template, then re-parse the resulting string
             // as JSON-ish. This handles `{{ list }}`, where minijinja
             // renders a Python-style repr; safer is to compile as an
@@ -1429,10 +1813,87 @@ fn mjvalue_to_json(v: &minijinja::Value) -> Result<JsonValue> {
 
 // ---------- wire-level task dispatch ----------
 
+/// Tracing target gating the per-task timing line. Always populated on the
+/// wire (the agent always sends start/finish nanos in TaskDone); displayed
+/// only when this target is enabled, e.g.
+/// `RUST_LOG=rsansible::timing=debug`. Fields:
+///
+/// - `host`, `task`, `seq` — identity.
+/// - `agent_started_unix_ns`, `agent_finished_unix_ns` — agent's wall-clock
+///   bracket of the module's work.
+/// - `ctl_dispatched_unix_ns`, `ctl_received_unix_ns` — controller's
+///   wall-clock observations of the wire boundary.
+/// - `agent_offset_us` — controller-minus-agent clock offset measured by a
+///   single Ping/Pong exchange right after Hello. Subtracted from
+///   `agent_started_unix_ns` / `agent_finished_unix_ns` before computing
+///   `outbound_us` / `inbound_us`, so those numbers reflect wire-time, not
+///   clock skew.
+/// - `agent_us`, `wall_us` — derived microseconds: agent-local work (skew-
+///   immune) and controller-observed end-to-end. `outbound_us` and
+///   `inbound_us` are signed (i64) because the single-sample offset still
+///   has some residual error; a slightly negative value is normal and just
+///   means the probe under-estimated skew by less than the wire delay.
+pub const TIMING_TARGET: &str = "rsansible::timing";
+
+fn emit_timing_trace(host: &str, task_name: &str, seq: u32, exec: &OpExecOutcome) {
+    let agent_ns = exec
+        .done
+        .finished_unix_ns
+        .saturating_sub(exec.done.started_unix_ns);
+    let wall_ns = exec
+        .received_unix_ns
+        .saturating_sub(exec.dispatched_unix_ns);
+    // Translate the agent's wall-clock instants into the controller's
+    // reference frame using the offset measured by the startup Ping/Pong
+    // probe (`agent_clock ≈ ctl_clock + offset`). Without correction the
+    // outbound/inbound deltas are dominated by skew on any pair of hosts
+    // whose clocks haven't been NTP-tightened recently.
+    let offset = exec.clock_offset_ns as i128;
+    let agent_started_corrected =
+        (exec.done.started_unix_ns as i128) - offset;
+    let agent_finished_corrected =
+        (exec.done.finished_unix_ns as i128) - offset;
+    // Signed: small RTTs plus a sloppy single-sample offset can still leave
+    // these mildly negative; the magnitude is the useful number.
+    let outbound_ns = agent_started_corrected - (exec.dispatched_unix_ns as i128);
+    let inbound_ns = (exec.received_unix_ns as i128) - agent_finished_corrected;
+    tracing::debug!(
+        target: TIMING_TARGET,
+        host = %host,
+        task = %task_name,
+        seq,
+        agent_started_unix_ns = exec.done.started_unix_ns,
+        agent_finished_unix_ns = exec.done.finished_unix_ns,
+        ctl_dispatched_unix_ns = exec.dispatched_unix_ns,
+        ctl_received_unix_ns = exec.received_unix_ns,
+        agent_offset_us = (exec.clock_offset_ns / 1_000),
+        agent_us = (agent_ns / 1_000) as u64,
+        wall_us = (wall_ns / 1_000) as u64,
+        outbound_us = (outbound_ns / 1_000) as i64,
+        inbound_us = (inbound_ns / 1_000) as i64,
+        "task timing"
+    );
+}
+
 struct OpExecOutcome {
     done: TaskDoneOutput,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// Controller-observed wall-clock nanos (since UNIX epoch) when the
+    /// `TaskDispatch` frame finished writing. Paired with `done.started_unix_ns`
+    /// (the agent's wall clock when it began work), this lets observers see
+    /// outbound wire delta — modulo host/controller clock skew.
+    dispatched_unix_ns: u64,
+    /// Controller-observed wall-clock nanos when the matching `TaskDone`
+    /// frame finished reading. Paired with `done.finished_unix_ns` for the
+    /// inbound delta.
+    received_unix_ns: u64,
+    /// Clock offset of the agent's wall clock vs the controller's, as
+    /// measured by the startup Ping/Pong probe (positive iff the agent
+    /// is ahead of the controller). Subtracted from the agent's two
+    /// timestamps in the timing trace to produce skew-corrected outbound
+    /// and inbound deltas.
+    clock_offset_ns: i64,
 }
 
 /// Drive one TaskDispatch / TaskDone pair on one host. When `capture` is
@@ -1443,11 +1904,13 @@ async fn run_one_task_op(
     seq: u32,
     op: Op,
     capture: bool,
+    clock_offset_ns: i64,
 ) -> Result<OpExecOutcome> {
     let dispatch = task_dispatch(seq, op);
     write_frame(&mut conn.stream, &dispatch)
         .await
         .with_context(|| format!("writing TaskDispatch to {}", conn.label))?;
+    let dispatched_unix_ns = now_unix_ns();
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
@@ -1496,6 +1959,7 @@ async fn run_one_task_op(
                 debug!(host = %conn.label, seq, stream = label, "{}", s.trim_end_matches('\n'));
             }
             Message::TaskDone(d) => {
+                let received_unix_ns = now_unix_ns();
                 if d.seq != seq {
                     return Err(anyhow!(
                         "{}: done seq mismatch: expected {seq}, got {}",
@@ -1507,6 +1971,9 @@ async fn run_one_task_op(
                     done: d,
                     stdout,
                     stderr,
+                    dispatched_unix_ns,
+                    received_unix_ns,
+                    clock_offset_ns,
                 });
             }
             Message::TaskError(e) => {
@@ -1517,7 +1984,11 @@ async fn run_one_task_op(
                     e.message
                 ));
             }
-            Message::Hello(_) | Message::TaskDispatch(_) | Message::Bye(_) => {
+            Message::Hello(_)
+            | Message::TaskDispatch(_)
+            | Message::Bye(_)
+            | Message::Ping(_)
+            | Message::Pong(_) => {
                 return Err(anyhow!(
                     "{}: unexpected frame from agent during task {seq}",
                     conn.label
@@ -1591,6 +2062,7 @@ async fn flush_handlers(
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
+    world: &Arc<WorldVars>,
 ) -> Result<bool> {
     if play.handlers.is_empty() {
         return Ok(false);
@@ -1618,7 +2090,7 @@ async fn flush_handlers(
         );
 
         let any_failed = run_task_fanout(
-            handler, &interested, conns, ctxs, report, next_seq, env, play,
+            handler, &interested, conns, ctxs, report, next_seq, env, world, play,
         )
         .await?;
 
@@ -1648,6 +2120,7 @@ async fn run_handlers_one_host(
     ctx: &mut HostCtx,
     next_seq: Arc<AtomicU32>,
     env: Arc<Environment<'static>>,
+    world: Arc<WorldVars>,
     play_name: &str,
 ) -> Option<(String, String)> {
     let mut first_failure: Option<(String, String)> = None;
@@ -1672,6 +2145,7 @@ async fn run_handlers_one_host(
             taken,
             next_seq.clone(),
             env.clone(),
+            world.clone(),
         )
         .await;
         *ctx = r.ctx;
@@ -1701,10 +2175,35 @@ fn compute_all_targeted_hosts(playbook: &Playbook, inv: &Inventory) -> BTreeSet<
 }
 
 fn resolve_play_targets(sel: &HostSelector, inv: &Inventory) -> Vec<String> {
-    match sel {
-        HostSelector::All(_) => inv.hosts.keys().cloned().collect(),
-        HostSelector::Names(names) => names.clone(),
+    // Normalize the bare-string shorthand into a slice we can iterate.
+    let single: [String; 1];
+    let names: &[String] = match sel {
+        HostSelector::All(_) => return inv.hosts.keys().cloned().collect(),
+        HostSelector::Names(names) => names.as_slice(),
+        HostSelector::Name(n) => {
+            single = [n.clone()];
+            &single
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for n in names {
+        // Group wins if both names overlap (Ansible's behavior).
+        if let Some(members) = inv.groups.get(n) {
+            for m in members {
+                if seen.insert(m.clone()) {
+                    out.push(m.clone());
+                }
+            }
+        } else if inv.hosts.contains_key(n) {
+            if seen.insert(n.clone()) {
+                out.push(n.clone());
+            }
+        }
+        // Unknown names are caught at validate time. If they slip
+        // through, we silently drop them (no panic).
     }
+    out
 }
 
 
@@ -1716,6 +2215,7 @@ mod tests {
 
     fn make_inv(names: &[&str]) -> Inventory {
         let mut hosts = BTreeMap::new();
+        let mut all_members: Vec<String> = Vec::new();
         for n in names {
             hosts.insert(
                 n.to_string(),
@@ -1724,10 +2224,20 @@ mod tests {
                     port: 22,
                     user: "u".into(),
                     key_path: None,
+                    inline_vars: BTreeMap::new(),
+                    member_of: vec!["all".to_string()],
                 },
             );
+            all_members.push(n.to_string());
         }
-        Inventory { hosts }
+        let mut groups = BTreeMap::new();
+        groups.insert("all".to_string(), all_members);
+        Inventory {
+            hosts,
+            groups,
+            all_vars: BTreeMap::new(),
+            group_inline_vars: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -1776,11 +2286,12 @@ mod tests {
     #[test]
     fn eval_when_uses_register_values() {
         let env = Arc::new(template::make_env());
+        let world = WorldVars::default();
         let mut ctx = HostCtx::new("h".into());
         let rv = RegisterValue::from_exec(0, true, 5, b"hi", b"");
         ctx.record_register("greet", rv);
-        assert!(eval_when(&env, Some("greet.rc == 0"), &ctx).unwrap());
-        assert!(!eval_when(&env, Some("greet.rc != 0"), &ctx).unwrap());
+        assert!(eval_when(&env, Some("greet.rc == 0"), &ctx, &world).unwrap());
+        assert!(!eval_when(&env, Some("greet.rc != 0"), &ctx, &world).unwrap());
     }
 
     #[test]
@@ -1788,7 +2299,7 @@ mod tests {
         let env = Arc::new(template::make_env());
         let ctx = HostCtx::new("h".into());
         // Lenient undefined → `x` is falsy; the expression is `false`.
-        assert!(!eval_when(&env, Some("x"), &ctx).unwrap());
+        assert!(!eval_when(&env, Some("x"), &ctx, &WorldVars::default()).unwrap());
     }
 
     #[test]
@@ -1799,7 +2310,7 @@ mod tests {
             serde_yaml::Value::String("a".into()),
             serde_yaml::Value::String("b".into()),
         ]);
-        let items = resolve_loop_items(&env, Some(&spec), &ctx).unwrap();
+        let items = resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).unwrap();
         assert_eq!(items, vec![JsonValue::String("a".into()), JsonValue::String("b".into())]);
     }
 
@@ -1812,7 +2323,7 @@ mod tests {
             serde_json::json!(["alice", "bob"]),
         );
         let spec = LoopSpec::Expr("names".into());
-        let items = resolve_loop_items(&env, Some(&spec), &ctx).unwrap();
+        let items = resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).unwrap();
         assert_eq!(
             items,
             vec![JsonValue::String("alice".into()), JsonValue::String("bob".into())]
@@ -1825,7 +2336,7 @@ mod tests {
         let mut ctx = HostCtx::new("h".into());
         ctx.set_facts.insert("xs".into(), serde_json::json!([1, 2, 3]));
         let spec = LoopSpec::Expr("{{ xs }}".into());
-        let items = resolve_loop_items(&env, Some(&spec), &ctx).unwrap();
+        let items = resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).unwrap();
         assert_eq!(items, vec![JsonValue::from(1), JsonValue::from(2), JsonValue::from(3)]);
     }
 
@@ -1835,7 +2346,7 @@ mod tests {
         let mut ctx = HostCtx::new("h".into());
         ctx.set_facts.insert("who".into(), serde_json::json!("alice"));
         let op = TaskOp::Shell(ShellOp::Simple("echo {{ who }}".into()));
-        let rendered = render_op(&op, &ctx, &env).unwrap();
+        let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
         match rendered {
             TaskOp::Shell(s) => assert_eq!(s.command(), "echo alice"),
             _ => panic!(),
@@ -1855,7 +2366,7 @@ mod tests {
             stdin: String::new(),
             timeout_ms: 0,
         });
-        let rendered = render_op(&op, &ctx, &env).unwrap();
+        let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
         match rendered {
             TaskOp::Exec(e) => {
                 assert_eq!(e.argv, vec!["/bin/cat", "/etc/foo"]);
@@ -1874,7 +2385,7 @@ mod tests {
             that: vec!["x > 0".into(), "x < 10".into()],
             msg: None,
         };
-        let r = run_assert_body(&a, &ctx, &env);
+        let r = run_assert_body(&a, &ctx, &env, &WorldVars::default());
         assert!(matches!(r, BodyResult::Ok { .. }));
     }
 
@@ -1887,7 +2398,7 @@ mod tests {
             that: vec!["x > 0".into()],
             msg: Some("x must be positive".into()),
         };
-        let r = run_assert_body(&a, &ctx, &env);
+        let r = run_assert_body(&a, &ctx, &env, &WorldVars::default());
         match r {
             BodyResult::Failed { reason, .. } => assert_eq!(reason, "x must be positive"),
             _ => panic!(),
@@ -1902,7 +2413,7 @@ mod tests {
         let f = FailTask {
             msg: "stop: {{ why }}".into(),
         };
-        let r = run_fail_body(&f, &ctx, &env);
+        let r = run_fail_body(&f, &ctx, &env, &WorldVars::default());
         match r {
             BodyResult::Failed { reason, .. } => assert_eq!(reason, "stop: nope"),
             _ => panic!(),
@@ -1920,7 +2431,7 @@ mod tests {
             serde_yaml::Value::String("hello {{ name }}".into()),
         );
         m.insert("count".into(), serde_yaml::from_str("3").unwrap());
-        let r = run_set_fact_body(&SetFactMap(m), &mut ctx, &env);
+        let r = run_set_fact_body(&SetFactMap(m), &mut ctx, &env, &WorldVars::default());
         assert!(matches!(r, BodyResult::Ok { .. }));
         assert_eq!(
             ctx.set_facts.get("greeting"),
@@ -1954,8 +2465,10 @@ mod tests {
             port: 22,
             user: "deploy".into(),
             key_path: None,
+            inline_vars: BTreeMap::new(),
+            member_of: vec!["all".to_string()],
         };
-        let c = make_initial_ctx("web1", &h);
+        let c = make_initial_ctx("web1", &h, &WorldVars::default());
         assert_eq!(
             c.inventory_vars.get("ansible_host"),
             Some(&serde_json::json!("1.2.3.4"))
@@ -1964,5 +2477,51 @@ mod tests {
             c.inventory_vars.get("ansible_user"),
             Some(&serde_json::json!("deploy"))
         );
+    }
+
+    #[test]
+    fn resolve_play_targets_expands_group_names() {
+        let inv = crate::inventory::parse(
+            r#"
+all:
+  vars:
+    ansible_user: u
+  children:
+    web:
+      hosts:
+        w1: { ansible_host: 1.1.1.1 }
+        w2: { ansible_host: 1.1.1.2 }
+    db:
+      hosts:
+        d1: { ansible_host: 1.1.1.3 }
+"#,
+        )
+        .unwrap();
+        let sel = HostSelector::Names(vec!["web".into()]);
+        let got = resolve_play_targets(&sel, &inv);
+        assert_eq!(got, vec!["w1".to_string(), "w2".to_string()]);
+    }
+
+    #[test]
+    fn resolve_play_targets_mixes_groups_and_hosts() {
+        let inv = crate::inventory::parse(
+            r#"
+all:
+  vars:
+    ansible_user: u
+  children:
+    web:
+      hosts:
+        w1: { ansible_host: 1.1.1.1 }
+    db:
+      hosts:
+        d1: { ansible_host: 1.1.1.3 }
+"#,
+        )
+        .unwrap();
+        let sel = HostSelector::Names(vec!["web".into(), "d1".into()]);
+        let got = resolve_play_targets(&sel, &inv);
+        assert!(got.contains(&"w1".to_string()));
+        assert!(got.contains(&"d1".to_string()));
     }
 }

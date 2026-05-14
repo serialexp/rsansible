@@ -312,10 +312,66 @@ impl From<OpWriteFileOutput> for OpWriteFileInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpGatherFactsInput {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpGatherFactsOutput {
+    pub kind: u8,
+}
+
+pub type OpGatherFacts = OpGatherFactsOutput;
+
+impl OpGatherFactsInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(3);
+        Ok(())
+    }
+
+}
+
+impl OpGatherFactsOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 3u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+        }
+        Ok(Self {
+            kind,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpGatherFactsInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpGatherFactsInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpGatherFactsOutput> for OpGatherFactsInput {
+    fn from(_o: OpGatherFactsOutput) -> Self {
+        Self {
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
     OpWriteFile(OpWriteFileOutput),
+    OpGatherFacts(OpGatherFactsOutput),
 }
 
 impl Op {
@@ -383,6 +439,9 @@ impl Op {
                     encoder.write_uint8(*item);
                 }
             }
+            Op::OpGatherFacts(v) => {
+                encoder.write_uint8(v.kind);
+            }
         }
         Ok(())
     }
@@ -401,6 +460,8 @@ impl Op {
             Ok(Op::OpShell(OpShellOutput::decode_with_decoder(decoder)?))
         } else if value == 2 {
             Ok(Op::OpWriteFile(OpWriteFileOutput::decode_with_decoder(decoder)?))
+        } else if value == 3 {
+            Ok(Op::OpGatherFacts(OpGatherFactsOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(value as u64))
         }
@@ -675,7 +736,8 @@ pub struct TaskDoneInput {
     pub seq: u32,
     pub exit_code: i32,
     pub changed: u8,
-    pub took_ms: u32,
+    pub started_unix_ns: u64,
+    pub finished_unix_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -684,7 +746,8 @@ pub struct TaskDoneOutput {
     pub seq: u32,
     pub exit_code: i32,
     pub changed: u8,
-    pub took_ms: u32,
+    pub started_unix_ns: u64,
+    pub finished_unix_ns: u64,
 }
 
 pub type TaskDone = TaskDoneOutput;
@@ -701,7 +764,8 @@ impl TaskDoneInput {
         encoder.write_u32_le(self.seq);
         encoder.write_u32_le(self.exit_code as u32);
         encoder.write_byte(self.changed);
-        encoder.write_u32_le(self.took_ms);
+        encoder.write_u64_le(self.started_unix_ns);
+        encoder.write_u64_le(self.finished_unix_ns);
         Ok(())
     }
 
@@ -721,13 +785,15 @@ impl TaskDoneOutput {
         let seq = decoder.read_u32_le()?;
         let exit_code = decoder.read_u32_le()? as i32;
         let changed = decoder.read_byte()?;
-        let took_ms = decoder.read_u32_le()?;
+        let started_unix_ns = decoder.read_u64_le()?;
+        let finished_unix_ns = decoder.read_u64_le()?;
         Ok(Self {
             kind,
             seq,
             exit_code,
             changed,
-            took_ms,
+            started_unix_ns,
+            finished_unix_ns,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -744,7 +810,8 @@ impl From<TaskDoneOutput> for TaskDoneInput {
             seq: o.seq,
             exit_code: o.exit_code,
             changed: o.changed,
-            took_ms: o.took_ms,
+            started_unix_ns: o.started_unix_ns,
+            finished_unix_ns: o.finished_unix_ns,
         }
     }
 }
@@ -877,8 +944,130 @@ impl ByeOutput {
 }
 
 impl From<ByeOutput> for ByeInput {
-    fn from(o: ByeOutput) -> Self {
+    fn from(_o: ByeOutput) -> Self {
         Self {
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PingInput {
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PingOutput {
+    pub kind: u8,
+}
+
+pub type Ping = PingOutput;
+
+impl PingInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(6);
+        Ok(())
+    }
+
+}
+
+impl PingOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 6u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+        }
+        Ok(Self {
+            kind,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        PingInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        PingInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<PingOutput> for PingInput {
+    fn from(_o: PingOutput) -> Self {
+        Self {
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PongInput {
+    pub agent_recv_unix_ns: u64,
+    pub agent_sent_unix_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PongOutput {
+    pub kind: u8,
+    pub agent_recv_unix_ns: u64,
+    pub agent_sent_unix_ns: u64,
+}
+
+pub type Pong = PongOutput;
+
+impl PongInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(7);
+        encoder.write_u64_le(self.agent_recv_unix_ns);
+        encoder.write_u64_le(self.agent_sent_unix_ns);
+        Ok(())
+    }
+
+}
+
+impl PongOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 7u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+        }
+        let agent_recv_unix_ns = decoder.read_u64_le()?;
+        let agent_sent_unix_ns = decoder.read_u64_le()?;
+        Ok(Self {
+            kind,
+            agent_recv_unix_ns,
+            agent_sent_unix_ns,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        PongInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        PongInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<PongOutput> for PongInput {
+    fn from(o: PongOutput) -> Self {
+        Self {
+            agent_recv_unix_ns: o.agent_recv_unix_ns,
+            agent_sent_unix_ns: o.agent_sent_unix_ns,
         }
     }
 }
@@ -891,6 +1080,8 @@ pub enum Message {
     TaskDone(TaskDoneOutput),
     TaskError(TaskErrorOutput),
     Bye(ByeOutput),
+    Ping(PingOutput),
+    Pong(PongOutput),
 }
 
 impl Message {
@@ -943,7 +1134,8 @@ impl Message {
                 encoder.write_uint32(v.seq, Endianness::LittleEndian);
                 encoder.write_int32(v.exit_code, Endianness::LittleEndian);
                 encoder.write_uint8(v.changed);
-                encoder.write_uint32(v.took_ms, Endianness::LittleEndian);
+                encoder.write_uint64(v.started_unix_ns, Endianness::LittleEndian);
+                encoder.write_uint64(v.finished_unix_ns, Endianness::LittleEndian);
             }
             Message::TaskError(v) => {
                 encoder.write_uint8(v.kind);
@@ -957,6 +1149,14 @@ impl Message {
             }
             Message::Bye(v) => {
                 encoder.write_uint8(v.kind);
+            }
+            Message::Ping(v) => {
+                encoder.write_uint8(v.kind);
+            }
+            Message::Pong(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint64(v.agent_recv_unix_ns, Endianness::LittleEndian);
+                encoder.write_uint64(v.agent_sent_unix_ns, Endianness::LittleEndian);
             }
         }
         Ok(())
@@ -982,6 +1182,10 @@ impl Message {
             Ok(Message::TaskError(TaskErrorOutput::decode_with_decoder(decoder)?))
         } else if value == 5 {
             Ok(Message::Bye(ByeOutput::decode_with_decoder(decoder)?))
+        } else if value == 6 {
+            Ok(Message::Ping(PingOutput::decode_with_decoder(decoder)?))
+        } else if value == 7 {
+            Ok(Message::Pong(PongOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(value as u64))
         }

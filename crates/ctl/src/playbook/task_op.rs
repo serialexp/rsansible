@@ -22,7 +22,7 @@
 
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
-    msg::{op_exec, op_shell, op_write_file},
+    msg::{op_exec, op_gather_facts, op_shell, op_write_file},
     Op,
 };
 use serde::{de::Error as _, Deserialize, Deserializer};
@@ -61,6 +61,13 @@ pub struct Task {
     /// task changes; deduped and flushed at end-of-play (or on `meta:
     /// flush_handlers`). Names are Jinja-templated at enqueue time.
     pub notify: Vec<String>,
+    /// Path of the role directory this task came from, if the task was
+    /// pulled in by the role-flatten pass. `None` for tasks declared
+    /// directly under a play. Used by `TaskOp::Template` to resolve
+    /// `src:` relative to the role's `templates/` directory.
+    ///
+    /// Not Deserialize-able — populated at load time.
+    pub role_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +103,18 @@ pub enum TaskOp {
     Shell(ShellOp),
     Exec(ExecOp),
     WriteFile(WriteFileOp),
+    /// `template:` — controller-side. The op declaration carries `src`
+    /// (a file path resolved at load time against the invoking role's
+    /// `templates/` dir, then the playbook dir) and a `dest` plus
+    /// `mode`. At execution time the orchestrator looks up the
+    /// pre-loaded template source from the playbook's `TemplateRegistry`,
+    /// renders it against the host's view, and dispatches the result
+    /// as an `OpWriteFile`. No new wire variant needed.
+    Template(TemplateOp),
+    /// Implicit op emitted by the orchestrator when `gather_facts: true`
+    /// is set on a play. Not produced by parsing user YAML — there is
+    /// no `gather_facts:` task-body key.
+    GatherFacts,
 }
 
 /// Keys that select a task body. Exactly one must appear per task.
@@ -103,6 +122,7 @@ const BODY_KEYS: &[&str] = &[
     "shell",
     "exec",
     "write_file",
+    "template",
     "assert",
     "fail",
     "set_fact",
@@ -227,6 +247,9 @@ impl<'de> Deserialize<'de> for Task {
             "write_file" => TaskBody::Op(TaskOp::WriteFile(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
+            "template" => TaskBody::Op(TaskOp::Template(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
             "assert" => TaskBody::Assert(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             ),
@@ -274,6 +297,7 @@ impl<'de> Deserialize<'de> for Task {
             delegate_to,
             run_once,
             notify,
+            role_dir: None,
         })
     }
 }
@@ -374,6 +398,39 @@ pub struct WriteFileOp {
     /// Octal in YAML (e.g. `0o644`) — serde-yaml parses that natively.
     pub mode: u32,
     pub content: String,
+}
+
+/// `template: { src: foo.j2, dest: /etc/foo, mode: 0o644 }`
+///
+/// `src:` is resolved at playbook load time. When the task came from a
+/// role (`task.role_dir.is_some()`), the lookup order is:
+///
+/// 1. absolute path (used as-is)
+/// 2. `<role_dir>/templates/<src>`
+/// 3. `<playbook_dir>/templates/<src>`
+/// 4. `<playbook_dir>/<src>`
+///
+/// The resolved file's contents are loaded into `body` during the
+/// template-resolution pass and rendered at task execution time. `src`
+/// is retained for diagnostics. `body` does not parse from YAML — it's
+/// populated by the loader, after which `body.is_some()` indicates the
+/// template was found.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateOp {
+    pub src: String,
+    pub dest: String,
+    #[serde(default = "default_template_mode")]
+    pub mode: u32,
+    /// Populated by the load-time template resolver. `None` until then.
+    #[serde(skip, default)]
+    pub body: Option<String>,
+}
+
+fn default_template_mode() -> u32 {
+    // Ansible's `template:` default; matches the surveyed gothab usage
+    // where most templated files are non-executable config files.
+    0o644
 }
 
 /// `assert: { that: ["x == 1", "y > 0"], msg: "..." }`
@@ -486,6 +543,13 @@ impl TaskOp {
                 w.mode,
                 w.content.as_bytes().to_vec(),
             )),
+            // `template:` is desugared to `OpWriteFile` by the orchestrator
+            // (after rendering the template body), so we should never see
+            // a raw `TaskOp::Template` here.
+            TaskOp::Template(_) => Err(anyhow!(
+                "internal: TaskOp::Template reached to_wire_op without being desugared to TaskOp::WriteFile"
+            )),
+            TaskOp::GatherFacts => Ok(op_gather_facts()),
         }
     }
 }

@@ -1,19 +1,17 @@
 # Example inventory. Replace the host names/users/key with your own.
-hosts:
-  web1:
-    host: 127.0.0.1
-    port: 2222
-    user: test
-    key_path: ~/.ssh/id_ed25519
-
-  web2:
-    host: 127.0.0.1
-    port: 2223
-    user: test
-    key_path: ~/.ssh/id_ed25519
-
-  web3:
-    host: 127.0.0.1
-    port: 2224
-    user: test
-    key_path: ~/.ssh/id_ed25519
+all:
+  vars:
+    ansible_user: test
+    ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+  children:
+    web:
+      hosts:
+        web1:
+          ansible_host: 127.0.0.1
+          ansible_port: 2222
+        web2:
+          ansible_host: 127.0.0.1
+          ansible_port: 2223
+        web3:
+          ansible_host: 127.0.0.1
+          ansible_port: 2224

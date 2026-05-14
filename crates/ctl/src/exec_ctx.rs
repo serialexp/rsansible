@@ -11,14 +11,30 @@
 
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// One host's state across the run.
 #[derive(Debug, Clone)]
 pub struct HostCtx {
     pub host_name: String,
-    /// Static-ish vars from the inventory entry (host:, port:, user:, …).
-    /// Lowest precedence in the template context.
+    /// Per-play role defaults — accumulated from every role in the
+    /// current play's `roles:` directive (declaration order, last-
+    /// wins). Lowest-precedence user-defined source: sits below
+    /// `inventory_vars`. Cleared and re-populated when entering each
+    /// play.
+    pub role_defaults: BTreeMap<String, JsonValue>,
+    /// Resolved view of the precedence chain steps 1..=4 (lowest →
+    /// highest): `all_vars` → group_vars (inline + on-disk, in group
+    /// order) → host_vars (on-disk) → host-inline. Stable for the run;
+    /// not mutated by tasks.
     pub inventory_vars: BTreeMap<String, JsonValue>,
+    /// Facts gathered via the implicit `OpGatherFacts` task. Persists
+    /// across plays for this host (Ansible's cached-facts behavior).
+    /// Layered above `inventory_vars` and below `play_vars`.
+    pub facts: BTreeMap<String, JsonValue>,
+    /// Per-play vars from `play.vars`. Cleared and re-populated when
+    /// entering each play.
+    pub play_vars: BTreeMap<String, JsonValue>,
     /// `set_fact:` accumulated values. Persists across plays for this
     /// host (Ansible-faithful semantics).
     pub set_facts: BTreeMap<String, JsonValue>,
@@ -42,7 +58,10 @@ impl HostCtx {
     pub fn new(host_name: String) -> Self {
         Self {
             host_name,
+            role_defaults: BTreeMap::new(),
             inventory_vars: BTreeMap::new(),
+            facts: BTreeMap::new(),
+            play_vars: BTreeMap::new(),
             set_facts: BTreeMap::new(),
             registers: BTreeMap::new(),
             failed: false,
@@ -167,14 +186,48 @@ impl RegisterValue {
     }
 }
 
+/// Shared, run-scoped view of the entire inventory's resolved variables.
+///
+/// `groups` exposes `{{ groups['postgres'] }}`-style lookups. `hostvars`
+/// exposes `{{ hostvars[h].something }}`. Both are computed once at
+/// orchestrator startup and shared via `Arc` since every host sees the
+/// same content.
+#[derive(Debug, Clone, Default)]
+pub struct WorldVars {
+    pub groups: BTreeMap<String, Vec<String>>,
+    /// Each host's resolved inventory_vars view (precedence steps 1..=4).
+    /// Does NOT include set_facts or registers (those are per-host
+    /// transient state).
+    pub hostvars: BTreeMap<String, BTreeMap<String, JsonValue>>,
+}
+
+impl WorldVars {
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
 /// Build the template context view for a host at a particular moment.
 ///
-/// Precedence (lowest → highest): inventory_vars → set_facts → registers.
-/// Loop's `item` (or renamed via loop_control.loop_var) is layered on top
-/// when present.
-pub fn build_template_ctx(ctx: &HostCtx) -> BTreeMap<String, JsonValue> {
+/// Precedence (lowest → highest): role_defaults → inventory_vars → facts →
+/// play_vars → set_facts → registers. Loop's `item` (or renamed via
+/// loop_control.loop_var) and `inventory_hostname` are layered on top.
+/// `groups` and `hostvars` are stitched in from `world`.
+pub fn build_template_ctx(
+    ctx: &HostCtx,
+    world: &WorldVars,
+) -> BTreeMap<String, JsonValue> {
     let mut out: BTreeMap<String, JsonValue> = BTreeMap::new();
+    for (k, v) in &ctx.role_defaults {
+        out.insert(k.clone(), v.clone());
+    }
     for (k, v) in &ctx.inventory_vars {
+        out.insert(k.clone(), v.clone());
+    }
+    for (k, v) in &ctx.facts {
+        out.insert(k.clone(), v.clone());
+    }
+    for (k, v) in &ctx.play_vars {
         out.insert(k.clone(), v.clone());
     }
     for (k, v) in &ctx.set_facts {
@@ -188,6 +241,34 @@ pub fn build_template_ctx(ctx: &HostCtx) -> BTreeMap<String, JsonValue> {
         "inventory_hostname".into(),
         JsonValue::String(ctx.host_name.clone()),
     );
+    // World-scoped lookups.
+    if !world.groups.is_empty() {
+        let groups_json: serde_json::Map<String, JsonValue> = world
+            .groups
+            .iter()
+            .map(|(g, hs)| {
+                (
+                    g.clone(),
+                    JsonValue::Array(hs.iter().cloned().map(JsonValue::String).collect()),
+                )
+            })
+            .collect();
+        out.insert("groups".into(), JsonValue::Object(groups_json));
+    }
+    if !world.hostvars.is_empty() {
+        let hv_json: serde_json::Map<String, JsonValue> = world
+            .hostvars
+            .iter()
+            .map(|(h, vars)| {
+                let obj: serde_json::Map<String, JsonValue> = vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                (h.clone(), JsonValue::Object(obj))
+            })
+            .collect();
+        out.insert("hostvars".into(), JsonValue::Object(hv_json));
+    }
     if let Some((name, val)) = &ctx.iter_item {
         out.insert(name.clone(), val.clone());
     }
@@ -245,10 +326,31 @@ mod tests {
     fn build_ctx_layers_precedence() {
         let mut ctx = HostCtx::new("web1".into());
         ctx.inventory_vars.insert("greeting".into(), json!("hello"));
+        ctx.play_vars.insert("greeting".into(), json!("howdy"));
         ctx.set_facts.insert("greeting".into(), json!("hola"));
-        let map = build_template_ctx(&ctx);
+        let world = WorldVars::default();
+        let map = build_template_ctx(&ctx, &world);
+        // set_facts beats play_vars beats inventory_vars.
         assert_eq!(map.get("greeting"), Some(&json!("hola")));
         assert_eq!(map.get("inventory_hostname"), Some(&json!("web1")));
+    }
+
+    #[test]
+    fn build_ctx_exposes_groups_and_hostvars() {
+        let ctx = HostCtx::new("web1".into());
+        let mut world = WorldVars::default();
+        world
+            .groups
+            .insert("web".into(), vec!["web1".into(), "web2".into()]);
+        let mut wvars = BTreeMap::new();
+        wvars.insert("region".into(), json!("us-east-1"));
+        world.hostvars.insert("web1".into(), wvars);
+        let map = build_template_ctx(&ctx, &world);
+        assert_eq!(map.get("groups").unwrap()["web"], json!(["web1", "web2"]));
+        assert_eq!(
+            map.get("hostvars").unwrap()["web1"]["region"],
+            json!("us-east-1")
+        );
     }
 
     #[test]
@@ -282,7 +384,7 @@ mod tests {
     fn iter_item_layered_on_top() {
         let mut ctx = HostCtx::new("web1".into());
         ctx.iter_item = Some(("name".into(), json!("alice")));
-        let map = build_template_ctx(&ctx);
+        let map = build_template_ctx(&ctx, &WorldVars::default());
         assert_eq!(map.get("name"), Some(&json!("alice")));
     }
 

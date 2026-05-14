@@ -177,18 +177,30 @@ async fn start_three_containers() -> Result<Vec<SshdContainer>> {
 
 fn build_inventory(containers: &[SshdContainer]) -> Inventory {
     let mut hosts = BTreeMap::new();
+    let mut all_members: Vec<String> = Vec::new();
     for (i, c) in containers.iter().enumerate() {
+        let name = format!("host{}", i + 1);
         hosts.insert(
-            format!("host{}", i + 1),
+            name.clone(),
             Host {
                 host: "127.0.0.1".into(),
                 port: c.host_port,
                 user: c.user.clone(),
                 key_path: Some(c.key_path.clone()),
+                inline_vars: BTreeMap::new(),
+                member_of: vec!["all".to_string()],
             },
         );
+        all_members.push(name);
     }
-    Inventory { hosts }
+    let mut groups = BTreeMap::new();
+    groups.insert("all".to_string(), all_members);
+    Inventory {
+        hosts,
+        groups,
+        all_vars: BTreeMap::new(),
+        group_inline_vars: BTreeMap::new(),
+    }
 }
 
 fn examples_dir() -> PathBuf {

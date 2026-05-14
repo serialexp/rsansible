@@ -42,6 +42,16 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# crypto (used by Ansible Vault decryption in the controller — pure-Rust
+# rustcrypto stack so the agent build stays FFI-free)
+aes = "0.8"
+ctr = "0.9"
+pbkdf2 = { version = "0.12", default-features = false }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+hex = "0.4"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

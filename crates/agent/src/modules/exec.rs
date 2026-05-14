@@ -3,10 +3,10 @@
 //! bounded chunks, and finishes with `TaskDone` carrying the exit code.
 
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rsansible_wire::generated::{OpExecOutput, OpShellOutput};
-use rsansible_wire::msg;
+use rsansible_wire::msg::{self, now_unix_ns};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
@@ -110,7 +110,7 @@ async fn run_command(
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
-    let started = Instant::now();
+    let started_unix_ns = now_unix_ns();
     let drain_stdout = pump(ctx, seq, stdout, msg::stream::STDOUT);
     let drain_stderr = pump(ctx, seq, stderr, msg::stream::STDERR);
 
@@ -118,7 +118,7 @@ async fn run_command(
 
     let (exit_status, _, _) = tokio::join!(wait_for_exit, drain_stdout, drain_stderr);
 
-    let took_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    let finished_unix_ns = now_unix_ns();
 
     match exit_status {
         Ok(Some(status)) => {
@@ -128,7 +128,7 @@ async fn run_command(
             // module flags any successful run as changed. Match that so
             // playbook UX feels familiar.
             let changed = code == 0;
-            ctx.emit(msg::task_done(seq, code, changed, took_ms)).await;
+            ctx.emit(msg::task_done(seq, code, changed, started_unix_ns, finished_unix_ns)).await;
         }
         Ok(None) => {
             // Timeout: child was killed by wait_with_timeout.

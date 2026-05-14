@@ -27,7 +27,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use rsansible_wire::{read_frame, Message};
+use rsansible_wire::{
+    msg::{now_unix_ns, ping},
+    read_frame, write_frame, Message,
+};
 
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
@@ -61,6 +64,18 @@ pub struct AgentConn {
     /// Reported by the agent's `Hello` frame.
     pub hello: rsansible_wire::generated::HelloOutput,
     pub stream: ChannelStream<Msg>,
+    /// Estimated offset between the agent's wall clock and the
+    /// controller's, in nanoseconds. Positive iff the agent is ahead.
+    /// Measured once with a single Ping/Pong right after Hello; stable
+    /// for the connection (NTP-style adjustments during the run are out
+    /// of scope — playbooks finish in seconds-to-minutes, drift is
+    /// negligible). 0 if the probe failed.
+    pub clock_offset_ns: i64,
+    /// Round-trip time observed by the Ping/Pong probe, in nanoseconds.
+    /// 0 if the probe failed. Useful for sanity-checking the offset
+    /// estimate: a measurement with RTT >> typical task latency is
+    /// suspicious.
+    pub clock_rtt_ns: u64,
     /// Kept alive so the session doesn't drop while we're using `stream`.
     _handle: Handle<Client>,
 }
@@ -159,13 +174,71 @@ pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Res
         "agent up",
     );
 
+    // NTP-style clock-skew probe. Single Ping/Pong, best-effort: if it
+    // fails for any reason we proceed with offset=0 rather than aborting
+    // the whole connection — task timing traces become less accurate
+    // but everything else still works.
+    let (clock_offset_ns, clock_rtt_ns) = match probe_clock_skew(&mut stream, &label).await {
+        Ok((offset, rtt)) => {
+            info!(
+                host = %label,
+                offset_us = offset / 1_000,
+                rtt_us = rtt / 1_000,
+                "clock-skew probe done",
+            );
+            (offset, rtt)
+        }
+        Err(e) => {
+            warn!(host = %label, "clock-skew probe failed (continuing with offset=0): {e:#}");
+            (0, 0)
+        }
+    };
+
     Ok(AgentConn {
         label,
         remote_path,
         hello,
         stream,
+        clock_offset_ns,
+        clock_rtt_ns,
         _handle: handle,
     })
+}
+
+/// Drive one Ping/Pong round to estimate the agent's clock offset from
+/// the controller's clock. T1 is captured right before writing Ping; T4
+/// right after reading Pong. The agent stamps T2 and T3 (Pong fields).
+///
+/// `offset = ((T2 - T1) + (T3 - T4)) / 2`  (positive iff agent ahead)
+/// `rtt    = (T4 - T1) - (T3 - T2)`        (always non-negative)
+async fn probe_clock_skew(
+    stream: &mut ChannelStream<Msg>,
+    label: &str,
+) -> Result<(i64, u64)> {
+    let t1 = now_unix_ns();
+    write_frame(stream, &ping())
+        .await
+        .with_context(|| format!("writing Ping to {label}"))?;
+    let frame = read_frame(stream)
+        .await
+        .with_context(|| format!("reading Pong from {label}"))?
+        .ok_or_else(|| anyhow!("agent on {label} closed stdout before sending Pong"))?;
+    let pong = match frame {
+        Message::Pong(p) => p,
+        other => bail!("expected Pong from {label}, got {other:?}"),
+    };
+    let t4 = now_unix_ns();
+    let t2 = pong.agent_recv_unix_ns;
+    let t3 = pong.agent_sent_unix_ns;
+    // Cast to i128 so we don't underflow on a wildly skewed clock.
+    let offset_ns =
+        (((t2 as i128) - (t1 as i128)) + ((t3 as i128) - (t4 as i128))) / 2;
+    let rtt_ns_signed =
+        ((t4 as i128) - (t1 as i128)) - ((t3 as i128) - (t2 as i128));
+    let rtt_ns = rtt_ns_signed.max(0) as u64;
+    let offset_ns =
+        offset_ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    Ok((offset_ns, rtt_ns))
 }
 
 /// Run a one-shot command on the remote, collecting stdout into a String.

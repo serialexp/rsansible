@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use rsansible_ctl::{
     inventory,
     orchestrator::{self, RunSpec},
-    playbook, template,
+    playbook, template, vault,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,6 +34,11 @@ enum Cmd {
         /// Inventory file. Optional: without it we skip host-name checks.
         #[arg(short, long)]
         inventory: Option<PathBuf>,
+        /// Path to a file containing the Ansible Vault password. Falls
+        /// back to `$ANSIBLE_VAULT_PASSWORD_FILE`. Without one, vault
+        /// files are skipped with a warning.
+        #[arg(long)]
+        vault_password_file: Option<PathBuf>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -49,6 +54,11 @@ enum Cmd {
         /// Max concurrent SSH dials during the connect phase.
         #[arg(long, default_value_t = 50)]
         concurrency: usize,
+        /// Path to a file containing the Ansible Vault password. Falls
+        /// back to `$ANSIBLE_VAULT_PASSWORD_FILE`. Without one, vault
+        /// files are skipped with a warning.
+        #[arg(long)]
+        vault_password_file: Option<PathBuf>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -68,8 +78,9 @@ async fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Validate {
             inventory,
+            vault_password_file,
             playbook,
-        } => match cmd_validate(inventory, playbook).await {
+        } => match cmd_validate(inventory, vault_password_file, playbook).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -80,8 +91,9 @@ async fn main() -> ExitCode {
             inventory,
             agent_binary,
             concurrency,
+            vault_password_file,
             playbook,
-        } => match cmd_run(inventory, agent_binary, concurrency, playbook).await {
+        } => match cmd_run(inventory, agent_binary, concurrency, vault_password_file, playbook).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -91,21 +103,27 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn cmd_validate(inv_path: Option<PathBuf>, pb_path: PathBuf) -> Result<()> {
+async fn cmd_validate(
+    inv_path: Option<PathBuf>,
+    vault_pw_path: Option<PathBuf>,
+    pb_path: PathBuf,
+) -> Result<()> {
     let pb = playbook::load(&pb_path)
         .with_context(|| format!("loading playbook {}", pb_path.display()))?;
-    let inv = inv_path
+    let vault_pw = vault::resolve_password_from(vault_pw_path.as_deref())?;
+    let inv_pair = inv_path
         .as_ref()
-        .map(|p| inventory::load(p))
+        .map(|p| inventory::load_with_vars(p, vault_pw.as_deref()))
         .transpose()
         .with_context(|| format!("loading inventory {:?}", inv_path))?;
-    playbook::validate(&pb, inv.as_ref())?;
+    let inv = inv_pair.as_ref().map(|(inv, _)| inv);
+    playbook::validate(&pb, inv)?;
     template::precompile_all(&pb)?;
     println!(
         "ok: {} plays, {} tasks total{}",
         pb.plays.len(),
         pb.plays.iter().map(|p| p.tasks.len()).sum::<usize>(),
-        match &inv {
+        match inv {
             Some(i) => format!(", {} hosts in inventory", i.hosts.len()),
             None => String::new(),
         }
@@ -117,11 +135,13 @@ async fn cmd_run(
     inv_path: PathBuf,
     agent_binary_path: PathBuf,
     concurrency: usize,
+    vault_pw_path: Option<PathBuf>,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
         .with_context(|| format!("loading playbook {}", pb_path.display()))?;
-    let inv = inventory::load(&inv_path)
+    let vault_pw = vault::resolve_password_from(vault_pw_path.as_deref())?;
+    let (inv, inv_vars) = inventory::load_with_vars(&inv_path, vault_pw.as_deref())
         .with_context(|| format!("loading inventory {}", inv_path.display()))?;
     playbook::validate(&pb, Some(&inv))?;
     template::precompile_all(&pb)?;
@@ -130,6 +150,7 @@ async fn cmd_run(
         .with_context(|| format!("reading agent binary {}", agent_binary_path.display()))?;
 
     let mut spec = RunSpec::new(inv, pb, agent_bytes);
+    spec.inventory_vars = inv_vars;
     spec.max_concurrent_hosts = concurrency.max(1);
     let report = orchestrator::run(spec)
         .await

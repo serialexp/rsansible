@@ -1,0 +1,14 @@
+# Inventory for the groups_and_vars example. Three hosts in group `web`.
+# Connection coords (ansible_host/ansible_port) are filled in by the test
+# at runtime; this file is reproduced inside the test from the live
+# container ports.
+all:
+  children:
+    web:
+      hosts:
+        host1:
+          ansible_host: 127.0.0.1
+        host2:
+          ansible_host: 127.0.0.1
+        host3:
+          ansible_host: 127.0.0.1
