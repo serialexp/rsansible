@@ -22,8 +22,8 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
-    AssertTask, CopyOp, ExecOp, FailTask, LoopControl, LoopSpec, MetaAction, SetFactMap, ShellOp,
-    Task, TaskBody, TaskOp, TemplateOp, WriteFileOp,
+    AssertTask, CopyOp, ExecOp, FailTask, IncludeRoleSpec, LoopControl, LoopSpec, MetaAction,
+    SetFactMap, ShellOp, Task, TaskBody, TaskOp, TemplateOp, WriteFileOp,
 };
 pub use validate::validate;
 
@@ -163,6 +163,8 @@ pub fn load(path: &Path) -> Result<Playbook> {
         .with_context(|| format!("resolving imports in {}", path.display()))?;
     role::flatten_playbook(&mut pb, base)
         .with_context(|| format!("resolving roles in {}", path.display()))?;
+    role::expand_include_roles(&mut pb, base)
+        .with_context(|| format!("expanding include_role in {}", path.display()))?;
     role::load_templates(&mut pb, base)
         .with_context(|| format!("loading template sources in {}", path.display()))?;
     role::load_copy_files(&mut pb, base)

@@ -207,7 +207,21 @@ a vault-encrypted `examples/group_vars/web/secrets.yml`.
   flags). All registered in `template::make_env`; precompile_all
   already exercises them whenever a template body references them.
   11 unit tests in `template::tests`. `mandatory` was already in.
-- [ ] **`include_role: tasks_from:`** — runtime include path.
+- [x] **`include_role: tasks_from:`** — parse-time expansion (despite
+  Ansible's nominally-runtime semantics, we don't need a runtime path
+  yet — no `loop:` on the include site, no register feeding through to
+  the include name). New `TaskBody::IncludeRole(IncludeRoleSpec{name,
+  tasks_from, vars})` variant; `expand_include_roles` pass in
+  `playbook::role` runs between role-flatten and template/copy resolution.
+  Splices in `roles/<name>/tasks/<tasks_from>(.yml|.yaml)`, merges
+  defaults/handlers into the play, tags spliced tasks with the role's
+  dir so `template:`/`copy:` src lookups resolve correctly, pushes the
+  include task's `when:` down onto each spliced task (AND-merged), and
+  prepends a synthetic `set_fact:` for the include's `vars:` block.
+  Recursive (16-deep cap) with (name, tasks_from) cycle detection. 14
+  unit tests in `playbook::role`/`playbook::task_op` plus an e2e
+  assertion in `tests/roles_and_facts.rs` that `/tmp/rsansible-include-role`
+  contains the vars-supplied value on every container.
 
 **Phase 2b acceptance (met):** `tests/roles_and_facts.rs`'s 3-container
 e2e exercises role flatten, role defaults precedence, the `template:`

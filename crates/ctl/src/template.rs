@@ -242,6 +242,17 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
             // skip rather than a hard failure to keep `precompile_all`
             // safe to call on partially-loaded playbooks in tests.
         }
+        TaskBody::IncludeRole(ir) => {
+            // Should already have been expanded; precompile any Jinja in
+            // the vars-block so a bad template in the include's vars
+            // surfaces here rather than at runtime.
+            for (k, v) in &ir.vars {
+                if let serde_yaml::Value::String(s) = v {
+                    env.template_from_str(s)
+                        .map_err(|e| anyhow!("include_role.vars.{k}: {e}"))?;
+                }
+            }
+        }
         TaskBody::Meta(_) => {
             // `meta: flush_handlers` has no body fields to compile.
         }

@@ -1,0 +1,9 @@
+# Alternate entry point exercised by `include_role: tasks_from: extra`.
+# The shell uses `{{ extra_msg }}` which is supplied via the include's
+# `vars:` block (synthetic set_fact) — proving the var override applies
+# to spliced tasks at runtime.
+- name: write extra marker
+  write_file:
+    path: /tmp/rsansible-include-role
+    mode: 0o644
+    content: "{{ extra_msg }}\n"

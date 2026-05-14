@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 
 use crate::exec_ctx::yaml_to_json;
 use crate::playbook::import::flatten_tasks;
-use crate::playbook::{Playbook, Task, TaskBody, TaskOp};
+use crate::playbook::{IncludeRoleSpec, Playbook, SetFactMap, Task, TaskBody, TaskOp};
+
+const MAX_INCLUDE_ROLE_DEPTH: u32 = 16;
 
 /// Resolve every `roles:` directive in the playbook. Run after
 /// `import::flatten_playbook` so the role's task files can themselves
@@ -101,6 +103,238 @@ pub fn flatten_playbook(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
         let _ = invocations;
     }
     Ok(())
+}
+
+/// Expand every `TaskBody::IncludeRole` in the playbook in place.
+///
+/// For each include site:
+///   - resolve `roles/<name>/` against `base_dir`
+///   - merge `defaults/main.yml` into `play.role_defaults`
+///     (later-wins, same as the `roles:` flatten)
+///   - append `handlers/main.yml` (if any) to `play.handlers`,
+///     tagged with the role's directory; duplicates are ignored
+///     (handlers are looked up by name — re-including a role that's
+///     already in `roles:` is a no-op for handlers)
+///   - load `tasks/<tasks_from>(.yml|.yaml)`, flatten its imports
+///     against the role's `tasks/` directory, tag the resulting tasks
+///     with the role's directory
+///   - push the include task's `when:` down onto each spliced task
+///     (AND-merge with whatever `when:` the spliced task already had)
+///   - if the include site carries `vars:`, prepend a synthetic
+///     `set_fact:` to the spliced tasks so those vars are visible
+///     to everything that follows
+///
+/// Recursive: if a tasks_from file itself contains `include_role:`,
+/// it gets expanded too, up to `MAX_INCLUDE_ROLE_DEPTH`. Cycles are
+/// caught via a (name, tasks_from) visited set per chain.
+///
+/// Runs *after* `flatten_playbook` (which handles play-level `roles:`)
+/// and *before* `load_templates` / `load_copy_files` so the spliced
+/// tasks get their src lookups resolved against the included role's
+/// directory.
+pub fn expand_include_roles(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
+    for play in &mut pb.plays {
+        let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
+        let tasks = std::mem::take(&mut play.tasks);
+        let expanded = expand_in_list(
+            tasks,
+            base_dir,
+            &mut play.role_defaults,
+            &mut play.handlers,
+            &mut visited,
+            0,
+        )
+        .with_context(|| format!("expanding include_role in play {:?}", play.name))?;
+        play.tasks = expanded;
+    }
+    Ok(())
+}
+
+fn expand_in_list(
+    tasks: Vec<Task>,
+    base_dir: &Path,
+    role_defaults: &mut std::collections::BTreeMap<String, JsonValue>,
+    play_handlers: &mut Vec<Task>,
+    visited: &mut BTreeSet<(String, String)>,
+    depth: u32,
+) -> Result<Vec<Task>> {
+    if depth > MAX_INCLUDE_ROLE_DEPTH {
+        bail!("include_role recursion depth exceeded {MAX_INCLUDE_ROLE_DEPTH}");
+    }
+    let mut out: Vec<Task> = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        match &task.body {
+            TaskBody::IncludeRole(ir) => {
+                let spliced = expand_one(
+                    &task,
+                    ir,
+                    base_dir,
+                    role_defaults,
+                    play_handlers,
+                    visited,
+                    depth,
+                )?;
+                out.extend(spliced);
+            }
+            _ => out.push(task),
+        }
+    }
+    Ok(out)
+}
+
+fn expand_one(
+    include_task: &Task,
+    ir: &IncludeRoleSpec,
+    base_dir: &Path,
+    role_defaults: &mut std::collections::BTreeMap<String, JsonValue>,
+    play_handlers: &mut Vec<Task>,
+    visited: &mut BTreeSet<(String, String)>,
+    depth: u32,
+) -> Result<Vec<Task>> {
+    let key = (ir.name.clone(), ir.tasks_from.clone());
+    if !visited.insert(key.clone()) {
+        bail!(
+            "include_role cycle detected: {:?} (tasks_from={:?})",
+            ir.name,
+            ir.tasks_from
+        );
+    }
+
+    let role_dir = resolve_role_dir(base_dir, &ir.name).with_context(|| {
+        format!(
+            "resolving include_role {:?} in task {:?}",
+            ir.name, include_task.name
+        )
+    })?;
+
+    // Merge role defaults (later-wins).
+    if let Some(defaults) = load_defaults(&role_dir)? {
+        for (k, v) in defaults {
+            role_defaults.insert(k, v);
+        }
+    }
+
+    // Append role handlers (handler names are unique within a play,
+    // and our validator already rejects duplicates; skip handlers
+    // whose names already appear so re-including is idempotent).
+    if let Some(loaded) = load_task_file(&role_dir, "handlers")? {
+        let existing: BTreeSet<String> =
+            play_handlers.iter().map(|h| h.name.clone()).collect();
+        let tagged = tag_with_role_dir(loaded, &role_dir);
+        for h in tagged {
+            if !existing.contains(&h.name) {
+                play_handlers.push(h);
+            }
+        }
+    }
+
+    // Load tasks/<tasks_from>(.yml|.yaml). Required to exist.
+    let tasks = load_tasks_from(&role_dir, &ir.tasks_from).with_context(|| {
+        format!(
+            "loading tasks_from {:?} for role {:?} (task {:?})",
+            ir.tasks_from, ir.name, include_task.name
+        )
+    })?;
+    let tagged = tag_with_role_dir(tasks, &role_dir);
+
+    // Recurse: spliced tasks themselves may carry `include_role:`.
+    let recursed = expand_in_list(
+        tagged,
+        base_dir,
+        role_defaults,
+        play_handlers,
+        visited,
+        depth + 1,
+    )?;
+
+    // Push include task's `when:` down onto every spliced task.
+    let parent_when = include_task.when.clone();
+    let mut spliced: Vec<Task> = recursed
+        .into_iter()
+        .map(|mut t| {
+            t.when = combine_when(parent_when.as_deref(), t.when.as_deref());
+            t
+        })
+        .collect();
+
+    // Prepend synthetic set_fact for the include's vars (if any).
+    if !ir.vars.is_empty() {
+        let synthetic = Task {
+            name: format!("set vars for include_role {:?}", ir.name),
+            body: TaskBody::SetFact(SetFactMap(ir.vars.clone())),
+            when: parent_when,
+            register: None,
+            loop_spec: None,
+            loop_control: None,
+            tags: Vec::new(),
+            delegate_to: None,
+            run_once: false,
+            notify: Vec::new(),
+            role_dir: Some(role_dir),
+        };
+        spliced.insert(0, synthetic);
+    }
+
+    visited.remove(&key);
+    Ok(spliced)
+}
+
+/// AND-merge two `when:` expressions. Both being `None` → `None`;
+/// either alone → that one; both → `(parent) and (child)` in Jinja
+/// syntax so precedence is unambiguous regardless of operator mix.
+fn combine_when(parent: Option<&str>, child: Option<&str>) -> Option<String> {
+    match (parent, child) {
+        (None, None) => None,
+        (Some(p), None) => Some(p.to_string()),
+        (None, Some(c)) => Some(c.to_string()),
+        (Some(p), Some(c)) => Some(format!("({p}) and ({c})")),
+    }
+}
+
+/// Resolve `tasks/<tasks_from>(.yml|.yaml)` under `role_dir` and return
+/// the parsed + import-flattened task list. Errors if no extension
+/// variant exists.
+fn load_tasks_from(role_dir: &Path, tasks_from: &str) -> Result<Vec<Task>> {
+    let dir = role_dir.join("tasks");
+    // Strip a trailing extension if the user wrote one (Ansible accepts
+    // both `tasks_from: setup` and `tasks_from: setup.yml`).
+    let stem = match tasks_from
+        .strip_suffix(".yml")
+        .or_else(|| tasks_from.strip_suffix(".yaml"))
+    {
+        Some(s) => s,
+        None => tasks_from,
+    };
+    if stem.is_empty() || stem.contains('/') || stem.contains('\\') {
+        bail!(
+            "include_role tasks_from {:?} must be a simple file stem (no slashes)",
+            tasks_from
+        );
+    }
+    let mut candidates = Vec::with_capacity(2);
+    for ext in ["yml", "yaml"] {
+        candidates.push(dir.join(format!("{stem}.{ext}")));
+    }
+    let path = candidates
+        .iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            let listed = candidates
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow!("tasks_from file not found; tried:\n{listed}")
+        })?
+        .clone();
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let tasks: Vec<Task> = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    let flattened = flatten_tasks(tasks, &dir, &mut visited, 0)
+        .with_context(|| format!("flattening {}", path.display()))?;
+    Ok(flattened)
 }
 
 /// Walk every task in the playbook; for each `TaskOp::Template`, locate
@@ -640,6 +874,417 @@ port: 80
                 assert_eq!(c.body.as_deref(), Some([0xffu8, 0x00, 0xfe, 0x7f].as_ref()));
             }
             other => panic!("expected copy body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn include_role_loads_tasks_from_alternate_file() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(
+            &role.join("tasks/main.yml"),
+            r#"
+- name: main_task
+  shell: "echo main"
+"#,
+        );
+        write(
+            &role.join("tasks/configure.yml"),
+            r#"
+- name: configured
+  shell: "echo configured"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: pull in svc.configure
+      include_role:
+        name: svc
+        tasks_from: configure
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        let names: Vec<_> = pb.plays[0].tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["configured"]);
+        // Spliced task must carry role_dir so template:/copy: resolution
+        // knows which role's templates/files to consult.
+        assert!(pb.plays[0].tasks[0].role_dir.is_some());
+    }
+
+    #[test]
+    fn include_role_accepts_explicit_extension() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(
+            &role.join("tasks/setup.yml"),
+            r#"
+- name: setup_task
+  shell: "echo setup"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: pull
+      include_role:
+        name: svc
+        tasks_from: setup.yml
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        let names: Vec<_> = pb.plays[0].tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["setup_task"]);
+    }
+
+    #[test]
+    fn include_role_vars_become_synthetic_set_fact() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(
+            &role.join("tasks/apply.yml"),
+            r#"
+- name: render
+  shell: "echo {{ override_val }}"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: include with vars
+      include_role:
+        name: svc
+        tasks_from: apply
+      vars:
+        override_val: "hello"
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        // First task should be the synthetic set_fact, then the spliced
+        // shell task.
+        assert_eq!(pb.plays[0].tasks.len(), 2);
+        match &pb.plays[0].tasks[0].body {
+            TaskBody::SetFact(SetFactMap(m)) => {
+                assert_eq!(
+                    m.get("override_val").and_then(|v| v.as_str()),
+                    Some("hello")
+                );
+            }
+            other => panic!("expected synthetic set_fact, got {other:?}"),
+        }
+        assert_eq!(pb.plays[0].tasks[1].name, "render");
+    }
+
+    #[test]
+    fn include_role_merges_defaults() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(&role.join("defaults/main.yml"), "svc_port: 8080\n");
+        write(
+            &role.join("tasks/apply.yml"),
+            r#"
+- name: t
+  shell: "echo {{ svc_port }}"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: pull
+      include_role:
+        name: svc
+        tasks_from: apply
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        assert_eq!(
+            pb.plays[0].role_defaults.get("svc_port").and_then(JsonValue::as_u64),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn include_role_when_pushes_down_onto_spliced_tasks() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(
+            &role.join("tasks/apply.yml"),
+            r#"
+- name: bare
+  shell: "echo bare"
+- name: with_when
+  when: "inner == 1"
+  shell: "echo inner"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: gated include
+      when: "outer == 2"
+      include_role:
+        name: svc
+        tasks_from: apply
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        // Parent when only on bare task.
+        assert_eq!(pb.plays[0].tasks[0].when.as_deref(), Some("outer == 2"));
+        // AND-merged on with_when.
+        assert_eq!(
+            pb.plays[0].tasks[1].when.as_deref(),
+            Some("(outer == 2) and (inner == 1)")
+        );
+    }
+
+    #[test]
+    fn include_role_handlers_are_appended() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(
+            &role.join("tasks/apply.yml"),
+            r#"
+- name: t
+  notify: bumped
+  shell: "echo t"
+"#,
+        );
+        write(
+            &role.join("handlers/main.yml"),
+            r#"
+- name: bumped
+  shell: "echo handler"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: pull
+      include_role:
+        name: svc
+        tasks_from: apply
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        let hnames: Vec<_> = pb.plays[0]
+            .handlers
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect();
+        assert_eq!(hnames, vec!["bumped"]);
+    }
+
+    #[test]
+    fn include_role_handlers_dedup_with_existing() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(
+            &role.join("tasks/apply.yml"),
+            r#"
+- name: t
+  notify: bumped
+  shell: "echo t"
+"#,
+        );
+        write(
+            &role.join("handlers/main.yml"),
+            r#"
+- name: bumped
+  shell: "echo from role"
+"#,
+        );
+        // Re-include the role both via `roles:` AND `include_role:`.
+        // The handler set must remain de-duplicated by name.
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  roles: [svc]
+  tasks:
+    - name: pull
+      include_role:
+        name: svc
+        tasks_from: apply
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        let hnames: Vec<_> = pb.plays[0]
+            .handlers
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect();
+        assert_eq!(hnames, vec!["bumped"]);
+    }
+
+    #[test]
+    fn include_role_recursive_expansion_supported() {
+        let dir = TempDir::new().unwrap();
+        // Role A's apply.yml includes role B's setup.yml.
+        write(
+            &dir.path().join("roles/a/tasks/apply.yml"),
+            r#"
+- name: pull b
+  include_role:
+    name: b
+    tasks_from: setup
+- name: a_final
+  shell: "echo a_final"
+"#,
+        );
+        write(
+            &dir.path().join("roles/b/tasks/setup.yml"),
+            r#"
+- name: b_inner
+  shell: "echo b_inner"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: kick
+      include_role:
+        name: a
+        tasks_from: apply
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        let names: Vec<_> = pb.plays[0].tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["b_inner", "a_final"]);
+    }
+
+    #[test]
+    fn include_role_cycle_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("roles/a/tasks/main.yml"),
+            r#"
+- name: kick_b
+  include_role:
+    name: b
+"#,
+        );
+        write(
+            &dir.path().join("roles/b/tasks/main.yml"),
+            r#"
+- name: kick_a
+  include_role:
+    name: a
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: kick
+      include_role:
+        name: a
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let err = playbook::load(&pb_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "got: {msg}");
+    }
+
+    #[test]
+    fn include_role_missing_tasks_from_errors() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(&role.join("tasks/main.yml"), "[]");
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: pull
+      include_role:
+        name: svc
+        tasks_from: nope
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let err = playbook::load(&pb_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nope") && msg.contains("tasks_from"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn include_role_missing_role_dir_errors() {
+        let dir = TempDir::new().unwrap();
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: pull
+      include_role:
+        name: nope
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let err = playbook::load(&pb_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope"), "got: {msg}");
+    }
+
+    #[test]
+    fn include_role_resolves_template_against_role_dir() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/web");
+        write(
+            &role.join("tasks/apply.yml"),
+            r#"
+- name: render
+  template:
+    src: cfg.j2
+    dest: /etc/cfg
+"#,
+        );
+        write(&role.join("templates/cfg.j2"), "value={{ x }}\n");
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: pull
+      include_role:
+        name: web
+        tasks_from: apply
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        match &pb.plays[0].tasks[0].body {
+            TaskBody::Op(TaskOp::Template(t)) => {
+                assert_eq!(t.body.as_deref(), Some("value={{ x }}\n"));
+            }
+            other => panic!("got {other:?}"),
         }
     }
 

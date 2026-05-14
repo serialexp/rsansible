@@ -108,6 +108,13 @@ fn validate_handler(h: &Task, where_: &str, hi: usize) -> Result<()> {
             h.name
         );
     }
+    if matches!(h.body, TaskBody::IncludeRole(_)) {
+        bail!(
+            "{}: handler[{hi}] {:?}: include_role is not supported in handlers",
+            where_,
+            h.name
+        );
+    }
     // Reuse the task-shape checks (identifiers, op shape, etc).
     validate_task(h, where_, hi)
 }
@@ -170,6 +177,19 @@ fn validate_task(task: &Task, where_: &str, ti: usize) -> Result<()> {
                 where_,
                 task.name,
                 p.display()
+            );
+        }
+        TaskBody::IncludeRole(ir) => {
+            // After load(), this shouldn't appear either — the
+            // role::expand_include_roles pass replaces it with the spliced
+            // tasks. If it survives, the caller bypassed load().
+            bail!(
+                "{}: task[{ti}] {:?}: include_role({:?}, tasks_from={:?}) was not expanded; \
+                 call playbook::load() before validating",
+                where_,
+                task.name,
+                ir.name,
+                ir.tasks_from
             );
         }
         TaskBody::Meta(_) => {

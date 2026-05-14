@@ -52,6 +52,10 @@ fn role_tasks_prepended_to_play_tasks() -> Result<()> {
             "ship static asset",
             "render web config",
             "assert facts visible",
+            // include_role: expansion: synthetic set_fact + write_file
+            // pulled in from roles/web/tasks/extra.yml.
+            "set vars for include_role \"web\"",
+            "write extra marker",
         ],
         "role tasks should be prepended (in flatten order) before play tasks",
     );
@@ -168,6 +172,14 @@ async fn three_container_roles_and_facts_run() -> Result<()> {
         assert_eq!(
             fired, "fired=rsansible-demo\n",
             "{host_name}: handler marker wrong: {fired:?}"
+        );
+        // include_role with tasks_from: + vars: produced this marker.
+        // The vars block supplies extra_msg via the synthetic set_fact,
+        // and the spliced write_file renders it.
+        let marker = read_file(c, "/tmp/rsansible-include-role")?;
+        assert_eq!(
+            marker, "rsansible-demo include_role v1\n",
+            "{host_name}: include_role marker wrong: {marker:?}"
         );
     }
     Ok(())

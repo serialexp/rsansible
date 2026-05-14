@@ -21,3 +21,13 @@
           - ansible_distribution is defined
           - ansible_hostname is defined
         msg: "expected ansible_* facts to be populated by the implicit gather"
+
+    # include_role with tasks_from: + vars: — splice in a different
+    # entry point from the same role, with a per-include var override
+    # that surfaces inside the spliced task via Jinja.
+    - name: pull in web.extra entry point
+      include_role:
+        name: web
+        tasks_from: extra
+      vars:
+        extra_msg: "rsansible-demo include_role v1"

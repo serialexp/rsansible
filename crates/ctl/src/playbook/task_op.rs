@@ -84,9 +84,36 @@ pub enum TaskBody {
     /// import-flattening pass walks the playbook, no `ImportTasks` body
     /// should remain.
     ImportTasks(PathBuf),
+    /// Parse-time directive: splice in tasks from another role's
+    /// `tasks/<tasks_from>.yml`. The role's `defaults/main.yml` is
+    /// merged into the play's role_defaults; the role's
+    /// `handlers/main.yml` (if any) is appended to the play's handler
+    /// list; the included tasks are tagged with the role's directory so
+    /// `template:` / `copy:` lookups resolve relative to that role.
+    /// `vars:` on the include site become a synthetic prepended
+    /// `set_fact:` so they're visible to the spliced tasks. After the
+    /// include-role expansion pass, no `IncludeRole` body should remain.
+    IncludeRole(IncludeRoleSpec),
     /// Control-flow marker: e.g. `meta: flush_handlers` to force the
     /// pending-handler queue to drain mid-play.
     Meta(MetaAction),
+}
+
+/// Parsed body of an `include_role:` task. The optional `vars:` sits
+/// alongside `name:` / `tasks_from:` on the task; `vars:` at the task
+/// level (sibling of `include_role:`) is folded in by the parser.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncludeRoleSpec {
+    /// Name of the role to include (simple identifier — no path
+    /// separators). Resolved to `<base_dir>/roles/<name>/` at load time.
+    pub name: String,
+    /// Which file in the role's `tasks/` directory to load. Defaults to
+    /// `"main"`. The `.yml` (or `.yaml`) extension is added if missing.
+    pub tasks_from: String,
+    /// Per-include variable overrides. Spliced in as a synthetic
+    /// `set_fact:` prepended to the included tasks. Values can be Jinja
+    /// strings and will be rendered at runtime against the host's view.
+    pub vars: BTreeMap<String, serde_yaml::Value>,
 }
 
 /// `meta:` task kinds. Currently only `flush_handlers`; the variant exists
@@ -137,6 +164,7 @@ const BODY_KEYS: &[&str] = &[
     "fail",
     "set_fact",
     "import_tasks",
+    "include_role",
     "meta",
 ];
 
@@ -197,6 +225,30 @@ impl<'de> Deserialize<'de> for Task {
                 )));
             }
         };
+        // `vars:` only has meaning on `include_role:` today. We strip it
+        // here so it doesn't trigger the unknown-key check, then enforce
+        // the include_role-only restriction once the body kind is known.
+        let task_vars: Option<BTreeMap<String, serde_yaml::Value>> = match map.remove("vars") {
+            None => None,
+            Some(serde_yaml::Value::Mapping(m)) => {
+                let mut out = BTreeMap::new();
+                for (k, v) in m {
+                    let key = k.as_str().ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "task {name:?}: vars keys must be strings, got {k:?}"
+                        ))
+                    })?;
+                    out.insert(key.to_string(), v);
+                }
+                Some(out)
+            }
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `vars` must be a mapping, got: {other:?}"
+                )));
+            }
+        };
+
         let notify = match map.remove("notify") {
             None => Vec::new(),
             Some(serde_yaml::Value::String(s)) => vec![s],
@@ -288,6 +340,55 @@ impl<'de> Deserialize<'de> for Task {
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
                 TaskBody::ImportTasks(PathBuf::from(path))
             }
+            "include_role" => {
+                // include_role body is itself a mapping: { name, tasks_from? }.
+                let mut body_map = match body_yaml {
+                    serde_yaml::Value::Mapping(m) => m,
+                    other => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role body must be a mapping, got: {other:?}"
+                        )));
+                    }
+                };
+                let role_name = match body_map.remove("name") {
+                    Some(serde_yaml::Value::String(s)) => s,
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role.name must be a string, got: {other:?}"
+                        )));
+                    }
+                    None => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role missing required `name`"
+                        )));
+                    }
+                };
+                let tasks_from = match body_map.remove("tasks_from") {
+                    None => "main".to_string(),
+                    Some(serde_yaml::Value::String(s)) => s,
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role.tasks_from must be a string, got: {other:?}"
+                        )));
+                    }
+                };
+                if !body_map.is_empty() {
+                    let unknown: Vec<String> = body_map
+                        .keys()
+                        .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                        .collect();
+                    return Err(D::Error::custom(format!(
+                        "task {name:?}: include_role: unknown field(s) {unknown:?}; \
+                         expected [name, tasks_from]"
+                    )));
+                }
+                let vars = task_vars.clone().unwrap_or_default();
+                TaskBody::IncludeRole(IncludeRoleSpec {
+                    name: role_name,
+                    tasks_from,
+                    vars,
+                })
+            }
             "meta" => {
                 let action: MetaAction = serde_yaml::from_value(body_yaml).map_err(|e| {
                     D::Error::custom(format!(
@@ -299,6 +400,15 @@ impl<'de> Deserialize<'de> for Task {
             _ => unreachable!("body key not in BODY_KEYS dispatch"),
         };
 
+        // `vars:` is consumed by the include_role arm above. If it's set
+        // on any other body kind, surface the error (rather than silently
+        // dropping the override).
+        if task_vars.is_some() && !matches!(body, TaskBody::IncludeRole(_)) {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `vars:` is only supported on `include_role:` tasks; \
+                 use set_fact or play-level vars for general task variables"
+            )));
+        }
         Ok(Task {
             name,
             body,
@@ -797,6 +907,103 @@ import_tasks: tasks/common.yml
             TaskBody::ImportTasks(p) => assert_eq!(p, PathBuf::from("tasks/common.yml")),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn parses_include_role_minimal() {
+        let t = parse_task(
+            r#"
+name: include role
+include_role:
+  name: web
+"#,
+        );
+        match t.body {
+            TaskBody::IncludeRole(ir) => {
+                assert_eq!(ir.name, "web");
+                assert_eq!(ir.tasks_from, "main");
+                assert!(ir.vars.is_empty());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_include_role_with_tasks_from_and_vars() {
+        let t = parse_task(
+            r#"
+name: flip archive_command
+include_role:
+  name: postgres-node
+  tasks_from: apply-cluster-config
+vars:
+  pg_archive_command: "/usr/bin/wrapper %p"
+  retries: 3
+"#,
+        );
+        match t.body {
+            TaskBody::IncludeRole(ir) => {
+                assert_eq!(ir.name, "postgres-node");
+                assert_eq!(ir.tasks_from, "apply-cluster-config");
+                assert_eq!(ir.vars.len(), 2);
+                assert_eq!(
+                    ir.vars.get("pg_archive_command").and_then(|v| v.as_str()),
+                    Some("/usr/bin/wrapper %p")
+                );
+                assert_eq!(
+                    ir.vars.get("retries").and_then(|v| v.as_u64()),
+                    Some(3)
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn include_role_rejects_missing_name() {
+        let err = try_parse_task(
+            r#"
+name: t
+include_role:
+  tasks_from: setup
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("name"), "got: {msg}");
+    }
+
+    #[test]
+    fn include_role_rejects_unknown_field() {
+        let err = try_parse_task(
+            r#"
+name: t
+include_role:
+  name: web
+  apply: { tags: [setup] }
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("apply"), "got: {msg}");
+    }
+
+    #[test]
+    fn vars_on_non_include_role_task_is_rejected() {
+        let err = try_parse_task(
+            r#"
+name: t
+shell: echo hi
+vars:
+  x: 1
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("include_role") && msg.contains("vars"),
+            "got: {msg}"
+        );
     }
 
     #[test]

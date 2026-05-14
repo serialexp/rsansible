@@ -1396,6 +1396,15 @@ async fn run_body_once(
             register: None,
             conn_alive: true,
         },
+        TaskBody::IncludeRole(ir) => BodyResult::Failed {
+            reason: format!(
+                "internal: include_role({:?}, tasks_from={:?}) reached the orchestrator; \
+                 expansion pass should have removed it",
+                ir.name, ir.tasks_from
+            ),
+            register: None,
+            conn_alive: true,
+        },
         TaskBody::Meta(_) => {
             // Meta bodies are handled at the loop level, not per-host body
             // dispatch. Reaching here means a bug in the orchestrator.
