@@ -194,8 +194,13 @@ a vault-encrypted `examples/group_vars/web/secrets.yml`.
   through `WriteFileOp.content: String`). 3-container e2e in
   `tests/roles_and_facts.rs` plus 9 unit tests across parse, resolver,
   and binary-bytes paths.
-- [ ] **Custom Jinja filters** — `b64encode`/`b64decode`, `from_json`,
-  `to_json`, `regex_replace`, `mandatory` (`mandatory` is already in).
+- [x] **Custom Jinja filters** — `b64encode` / `b64decode` (base64
+  crate), `from_json` (serde_json), `to_json` (Ansible alias for
+  minijinja's built-in `tojson`, compact output), `regex_replace`
+  (regex crate, supports `$N` backrefs and inline `(?i)`/`(?m)`
+  flags). All registered in `template::make_env`; precompile_all
+  already exercises them whenever a template body references them.
+  11 unit tests in `template::tests`. `mandatory` was already in.
 - [ ] **`include_role: tasks_from:`** — runtime include path.
 
 **Phase 2b acceptance (met):** `tests/roles_and_facts.rs`'s 3-container

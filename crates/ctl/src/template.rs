@@ -35,6 +35,15 @@ pub fn make_env<'a>() -> Environment<'a> {
     env.set_keep_trailing_newline(true);
     env.add_filter("mandatory", mandatory_filter);
     env.add_filter("subelements", subelements_filter);
+    // Ansible-style filters; gothab uses these in role templates.
+    env.add_filter("b64encode", b64encode_filter);
+    env.add_filter("b64decode", b64decode_filter);
+    env.add_filter("from_json", from_json_filter);
+    // Ansible spells the JSON encoder `to_json`; minijinja calls its
+    // built-in `tojson`. Register both — the built-in is already there
+    // under `tojson`, this adds the Ansible alias.
+    env.add_filter("to_json", to_json_filter);
+    env.add_filter("regex_replace", regex_replace_filter);
     env
 }
 
@@ -71,6 +80,101 @@ fn subelements_filter(value: MjValue, field: String) -> Result<MjValue, MjError>
         }
     }
     Ok(MjValue::from(out))
+}
+
+/// `value | b64encode` — base64-encode a string. Ansible accepts strings
+/// only (its docs note "for binary use the `base64` shell filter"); we
+/// match that. Bytes-by-bytes round-trip with `b64decode`.
+fn b64encode_filter(value: MjValue) -> Result<MjValue, MjError> {
+    use base64::Engine as _;
+    let s = value.as_str().ok_or_else(|| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("b64encode: expected a string, got {:?}", value.kind()),
+        )
+    })?;
+    Ok(MjValue::from(
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes()),
+    ))
+}
+
+/// `value | b64decode` — base64-decode a string and return the result as
+/// a UTF-8 string. Non-UTF-8 output errors out (matches Ansible — for
+/// raw bytes, gothab pipes through `copy:` with a pre-encoded file).
+fn b64decode_filter(value: MjValue) -> Result<MjValue, MjError> {
+    use base64::Engine as _;
+    let s = value.as_str().ok_or_else(|| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("b64decode: expected a string, got {:?}", value.kind()),
+        )
+    })?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(|e| {
+            MjError::new(MjKind::InvalidOperation, format!("b64decode: {e}"))
+        })?;
+    let text = String::from_utf8(bytes).map_err(|e| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("b64decode: result is not valid UTF-8: {e}"),
+        )
+    })?;
+    Ok(MjValue::from(text))
+}
+
+/// `value | from_json` — parse a string as JSON. Ansible's filter; lets
+/// templates consume registered command stdout that emitted JSON.
+fn from_json_filter(value: MjValue) -> Result<MjValue, MjError> {
+    let s = value.as_str().ok_or_else(|| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("from_json: expected a string, got {:?}", value.kind()),
+        )
+    })?;
+    let json: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+        MjError::new(MjKind::InvalidOperation, format!("from_json: {e}"))
+    })?;
+    Ok(MjValue::from_serialize(&json))
+}
+
+/// `value | to_json` — Ansible alias for minijinja's built-in `tojson`.
+/// Returns the value as a compact JSON string. We deliberately do not
+/// accept an `indent` arg (the built-in `tojson` does); gothab doesn't
+/// use it. Add if needed.
+fn to_json_filter(value: MjValue) -> Result<MjValue, MjError> {
+    let s = serde_json::to_string(&value).map_err(|e| {
+        MjError::new(MjKind::InvalidOperation, format!("to_json: {e}"))
+    })?;
+    Ok(MjValue::from(s))
+}
+
+/// `value | regex_replace(pattern, replacement)` — `regex::Regex::replace_all`
+/// applied to a string. Pattern is Rust regex syntax (close to PCRE for
+/// the cases gothab uses); replacement supports `$1` / `${name}`
+/// backrefs.
+///
+/// Ansible's filter also accepts an optional `multiline` / `ignorecase`
+/// flag; we don't yet (gothab doesn't use them). Easy to add via the
+/// `(?i)` / `(?m)` inline flags in the meantime.
+fn regex_replace_filter(
+    value: MjValue,
+    pattern: String,
+    replacement: String,
+) -> Result<MjValue, MjError> {
+    let s = value.as_str().ok_or_else(|| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("regex_replace: expected a string, got {:?}", value.kind()),
+        )
+    })?;
+    let re = regex::Regex::new(&pattern).map_err(|e| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("regex_replace: invalid pattern {pattern:?}: {e}"),
+        )
+    })?;
+    Ok(MjValue::from(re.replace_all(s, replacement.as_str()).into_owned()))
 }
 
 /// Compile every Jinja string in the playbook so syntax errors surface
@@ -255,6 +359,125 @@ mod tests {
         ]);
         let out = tmpl.render(context! { users => users }).unwrap();
         assert_eq!(out, "alice:a1;alice:a2;bob:b1;");
+    }
+
+    #[test]
+    fn b64encode_round_trip_through_b64decode() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str("{{ s | b64encode | b64decode }}")
+            .unwrap();
+        let out = tmpl
+            .render(context! { s => "hello world" })
+            .unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn b64encode_known_value() {
+        let env = make_env();
+        let tmpl = env.template_from_str("{{ s | b64encode }}").unwrap();
+        let out = tmpl.render(context! { s => "rsansible" }).unwrap();
+        // base64(rsansible) = cnNhbnNpYmxl
+        assert_eq!(out, "cnNhbnNpYmxl");
+    }
+
+    #[test]
+    fn b64decode_rejects_garbage() {
+        let env = make_env();
+        let tmpl = env.template_from_str("{{ s | b64decode }}").unwrap();
+        let err = tmpl
+            .render(context! { s => "not-actually-base64!" })
+            .unwrap_err();
+        assert!(format!("{err}").contains("b64decode"), "got: {err}");
+    }
+
+    #[test]
+    fn from_json_returns_structured_value() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str("{{ (s | from_json).a }}-{{ (s | from_json).b }}")
+            .unwrap();
+        let out = tmpl
+            .render(context! { s => r#"{"a": "x", "b": 42}"# })
+            .unwrap();
+        assert_eq!(out, "x-42");
+    }
+
+    #[test]
+    fn from_json_propagates_parse_errors() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str("{{ s | from_json }}")
+            .unwrap();
+        let err = tmpl
+            .render(context! { s => "not json" })
+            .unwrap_err();
+        assert!(format!("{err}").contains("from_json"), "got: {err}");
+    }
+
+    #[test]
+    fn to_json_compact_output() {
+        let env = make_env();
+        let tmpl = env.template_from_str("{{ v | to_json }}").unwrap();
+        let v = serde_json::json!({"a": 1, "b": [true, null]});
+        let out = tmpl.render(context! { v => v }).unwrap();
+        // serde_json's default key ordering is whatever the input has;
+        // since we feed an ordered JSON literal, "a" comes first.
+        assert_eq!(out, r#"{"a":1,"b":[true,null]}"#);
+    }
+
+    #[test]
+    fn to_json_roundtrips_through_from_json() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str("{{ (v | to_json | from_json).a }}")
+            .unwrap();
+        let v = serde_json::json!({"a": "round"});
+        let out = tmpl.render(context! { v => v }).unwrap();
+        assert_eq!(out, "round");
+    }
+
+    #[test]
+    fn regex_replace_basic_substitution() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ s | regex_replace('foo', 'bar') }}"#)
+            .unwrap();
+        let out = tmpl.render(context! { s => "foo and foo" }).unwrap();
+        assert_eq!(out, "bar and bar");
+    }
+
+    #[test]
+    fn regex_replace_with_capture_group_backref() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ s | regex_replace('(\d+)-(\d+)', '$2/$1') }}"#)
+            .unwrap();
+        let out = tmpl.render(context! { s => "12-34" }).unwrap();
+        assert_eq!(out, "34/12");
+    }
+
+    #[test]
+    fn regex_replace_invalid_pattern_errors() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ s | regex_replace('[unclosed', 'x') }}"#)
+            .unwrap();
+        let err = tmpl.render(context! { s => "anything" }).unwrap_err();
+        assert!(format!("{err}").contains("regex_replace"), "got: {err}");
+    }
+
+    #[test]
+    fn regex_replace_inline_flags_for_case_insensitive() {
+        let env = make_env();
+        // Ansible's `ignorecase=True` arg isn't supported; in the meantime
+        // the inline `(?i)` flag does the same thing.
+        let tmpl = env
+            .template_from_str(r#"{{ s | regex_replace('(?i)foo', 'bar') }}"#)
+            .unwrap();
+        let out = tmpl.render(context! { s => "FOO Foo foo" }).unwrap();
+        assert_eq!(out, "bar bar bar");
     }
 
     #[test]

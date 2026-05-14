@@ -31,6 +31,12 @@ russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "
 
 # templates
 minijinja = { version = "2", default-features = false, features = ["builtins", "loader", "serde"] }
+# base64 — controller-side Jinja filter (`b64encode` / `b64decode`).
+# rustcrypto-free, std-only.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+# regex — controller-side Jinja `regex_replace` filter. Default
+# features are fine; controller-only, agent stays FFI-free.
+regex = "1"
 
 # cli + config
 clap = { version = "4", features = ["derive"] }
