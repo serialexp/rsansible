@@ -131,7 +131,7 @@ fn resolve_template_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
     let TaskBody::Op(TaskOp::Template(t)) = &mut task.body else {
         return Ok(());
     };
-    let candidates = template_search_paths(&t.src, task.role_dir.as_deref(), base_dir);
+    let candidates = file_search_paths(&t.src, task.role_dir.as_deref(), base_dir, "templates");
     for path in &candidates {
         if path.is_file() {
             let bytes = std::fs::read(path)
@@ -155,10 +155,55 @@ fn resolve_template_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
     ))
 }
 
-fn template_search_paths(
+/// Walk every task; for each `TaskOp::Copy`, locate `src:` and load its
+/// raw bytes into `body`. Resolution order mirrors `load_templates`,
+/// but looks in `files/` rather than `templates/`. Bytes are shipped
+/// verbatim — no UTF-8 requirement, no Jinja rendering.
+pub fn load_copy_files(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
+    for play in &mut pb.plays {
+        for task in play
+            .tasks
+            .iter_mut()
+            .chain(play.handlers.iter_mut())
+        {
+            resolve_copy_for_task(task, base_dir)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_copy_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
+    let TaskBody::Op(TaskOp::Copy(c)) = &mut task.body else {
+        return Ok(());
+    };
+    let candidates = file_search_paths(&c.src, task.role_dir.as_deref(), base_dir, "files");
+    for path in &candidates {
+        if path.is_file() {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading copy src {}", path.display()))?;
+            c.body = Some(bytes);
+            return Ok(());
+        }
+    }
+    let candidate_list = candidates
+        .iter()
+        .map(|p| format!("  {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(anyhow!(
+        "task {:?}: couldn't locate copy src {:?}; tried:\n{candidate_list}",
+        task.name,
+        c.src
+    ))
+}
+
+/// Build the candidate path list for a role-relative file lookup.
+/// `subdir` is `"templates"` for `template:` or `"files"` for `copy:`.
+fn file_search_paths(
     src: &str,
     role_dir: Option<&Path>,
     base_dir: &Path,
+    subdir: &str,
 ) -> Vec<PathBuf> {
     let p = PathBuf::from(src);
     if p.is_absolute() {
@@ -166,9 +211,9 @@ fn template_search_paths(
     }
     let mut out = Vec::with_capacity(3);
     if let Some(rd) = role_dir {
-        out.push(rd.join("templates").join(&p));
+        out.push(rd.join(subdir).join(&p));
     }
-    out.push(base_dir.join("templates").join(&p));
+    out.push(base_dir.join(subdir).join(&p));
     out.push(base_dir.join(&p));
     out
 }
@@ -528,5 +573,101 @@ port: 80
         assert!(pb.plays[0].tasks.is_empty());
         // unused
         let _ = BTreeMap::<String, JsonValue>::new();
+    }
+
+    #[test]
+    fn copy_src_resolved_from_role_files_dir() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/web");
+        // Need at least one of tasks/handlers/defaults to satisfy the
+        // "empty role" check, so the tasks/main.yml below is mandatory.
+        write(
+            &role.join("tasks/main.yml"),
+            r#"
+- name: stage asset
+  copy:
+    src: asset.txt
+    dest: /etc/asset
+    mode: 0o644
+"#,
+        );
+        write(&role.join("files/asset.txt"), "static content\n");
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  roles: [web]
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        match &pb.plays[0].tasks[0].body {
+            TaskBody::Op(TaskOp::Copy(c)) => {
+                assert_eq!(c.body.as_deref(), Some(b"static content\n".as_ref()));
+            }
+            other => panic!("expected copy body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_src_supports_binary_bytes() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/web");
+        write(
+            &role.join("tasks/main.yml"),
+            r#"
+- name: blob
+  copy:
+    src: blob.bin
+    dest: /etc/blob
+"#,
+        );
+        // Non-UTF-8 bytes — template: would reject these, copy: should
+        // load them verbatim.
+        std::fs::create_dir_all(role.join("files")).unwrap();
+        std::fs::write(role.join("files/blob.bin"), [0xffu8, 0x00, 0xfe, 0x7f]).unwrap();
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  roles: [web]
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        match &pb.plays[0].tasks[0].body {
+            TaskBody::Op(TaskOp::Copy(c)) => {
+                assert_eq!(c.body.as_deref(), Some([0xffu8, 0x00, 0xfe, 0x7f].as_ref()));
+            }
+            other => panic!("expected copy body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_copy_src_fails_load() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/web");
+        write(&role.join("defaults/main.yml"), "x: 1");
+        write(
+            &role.join("tasks/main.yml"),
+            r#"
+- name: blob
+  copy:
+    src: missing.bin
+    dest: /etc/blob
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  roles: [web]
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let err = playbook::load(&pb_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing.bin"), "got: {msg}");
+        assert!(msg.contains("files/missing.bin"), "search paths should be in error: {msg}");
     }
 }

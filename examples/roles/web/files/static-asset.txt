@@ -1,0 +1,1 @@
+rsansible-demo: static asset shipped by copy:

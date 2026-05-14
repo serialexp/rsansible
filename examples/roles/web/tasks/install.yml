@@ -1,2 +1,8 @@
 - name: simulate package install
   shell: "echo installed {{ service_name }}"
+
+- name: ship static asset
+  copy:
+    src: static-asset.txt
+    dest: /tmp/rsansible-role-static
+    mode: 0o644

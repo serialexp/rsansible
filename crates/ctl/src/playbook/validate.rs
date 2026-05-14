@@ -263,6 +263,32 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::Copy(c) => {
+            if c.src.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: copy.src is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if c.dest.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: copy.dest is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if c.body.is_none() {
+                bail!(
+                    "{}: task[{ti}] {:?}: copy src {:?} was not resolved at load time; \
+                     call playbook::load() or ensure the file exists",
+                    where_,
+                    task.name,
+                    c.src
+                );
+            }
+            Ok(())
+        }
         TaskOp::GatherFacts => {
             // Implicit op — only the orchestrator constructs it. If we see
             // one here it means user YAML somehow produced one, which

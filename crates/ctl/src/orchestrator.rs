@@ -40,8 +40,8 @@ use tracing::{debug, info, warn};
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, ExecOp, FailTask, HostSelector, LoopSpec, MetaAction, OnFailure, Play, Playbook,
-    SetFactMap, ShellOp, Strategy, Task, TaskBody, TaskOp, WriteFileOp,
+    AssertTask, CopyOp, ExecOp, FailTask, HostSelector, LoopSpec, MetaAction, OnFailure, Play,
+    Playbook, SetFactMap, ShellOp, Strategy, Task, TaskBody, TaskOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1733,6 +1733,26 @@ fn render_op(
                 path: dest,
                 mode: t.mode,
                 content,
+            })
+        }
+        TaskOp::Copy(c) => {
+            // Resolved bytes live on `c.body`; we just render `dest`
+            // and keep the variant intact through dispatch. `to_wire_op`
+            // emits the actual `OpWriteFile` with the bytes shipped
+            // verbatim — going through `TaskOp::WriteFile` here would
+            // force a lossy String roundtrip for binary content.
+            if c.body.is_none() {
+                return Err(anyhow!(
+                    "copy src {:?} was not loaded — playbook::load() didn't resolve it (validate should have caught this)",
+                    c.src
+                ));
+            }
+            let dest = render_str(env, &c.dest, &view)?;
+            TaskOp::Copy(CopyOp {
+                src: c.src.clone(),
+                dest,
+                mode: c.mode,
+                body: c.body.clone(),
             })
         }
         TaskOp::GatherFacts => TaskOp::GatherFacts,

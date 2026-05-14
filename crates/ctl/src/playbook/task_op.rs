@@ -111,6 +111,15 @@ pub enum TaskOp {
     /// renders it against the host's view, and dispatches the result
     /// as an `OpWriteFile`. No new wire variant needed.
     Template(TemplateOp),
+    /// `copy:` — controller-side. The op declaration carries `src` (a
+    /// file path resolved at load time against the invoking role's
+    /// `files/` dir, then the playbook dir) and a `dest` plus `mode`.
+    /// At execution time the orchestrator looks up the pre-loaded raw
+    /// bytes from the `CopyOp.body`, renders `dest` against the host's
+    /// view, and dispatches the result as an `OpWriteFile`. No new wire
+    /// variant needed. Unlike `template:`, the body is **not** Jinja-
+    /// rendered — `copy:` ships bytes verbatim, including binary.
+    Copy(CopyOp),
     /// Implicit op emitted by the orchestrator when `gather_facts: true`
     /// is set on a play. Not produced by parsing user YAML — there is
     /// no `gather_facts:` task-body key.
@@ -123,6 +132,7 @@ const BODY_KEYS: &[&str] = &[
     "exec",
     "write_file",
     "template",
+    "copy",
     "assert",
     "fail",
     "set_fact",
@@ -248,6 +258,9 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "template" => TaskBody::Op(TaskOp::Template(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "copy" => TaskBody::Op(TaskOp::Copy(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "assert" => TaskBody::Assert(
@@ -433,6 +446,32 @@ fn default_template_mode() -> u32 {
     0o644
 }
 
+/// `copy: { src: foo.bin, dest: /etc/foo, mode: 0o644 }`
+///
+/// Resolution mirrors `template:` but looks in `files/` rather than
+/// `templates/`:
+///
+/// 1. absolute path (used as-is)
+/// 2. `<role_dir>/files/<src>`
+/// 3. `<playbook_dir>/files/<src>`
+/// 4. `<playbook_dir>/<src>`
+///
+/// The resolved file is loaded as raw bytes into `body` during the
+/// copy-resolution pass; `body` does not parse from YAML. Unlike
+/// `template:`, the bytes are shipped verbatim — no Jinja rendering of
+/// the content, so `copy:` supports binary blobs.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CopyOp {
+    pub src: String,
+    pub dest: String,
+    #[serde(default = "default_template_mode")]
+    pub mode: u32,
+    /// Populated by the load-time copy resolver. `None` until then.
+    #[serde(skip, default)]
+    pub body: Option<Vec<u8>>,
+}
+
 /// `assert: { that: ["x == 1", "y > 0"], msg: "..." }`
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -549,6 +588,19 @@ impl TaskOp {
             TaskOp::Template(_) => Err(anyhow!(
                 "internal: TaskOp::Template reached to_wire_op without being desugared to TaskOp::WriteFile"
             )),
+            TaskOp::Copy(c) => {
+                // `copy:` keeps its variant through render_op (rather
+                // than desugaring to WriteFile) so we can ship bytes
+                // verbatim — WriteFileOp.content is String, which would
+                // lossy-convert binary blobs.
+                let body = c.body.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "internal: TaskOp::Copy src {:?} body not resolved at to_wire_op time",
+                        c.src
+                    )
+                })?;
+                Ok(op_write_file(c.dest.clone(), c.mode, body.clone()))
+            }
             TaskOp::GatherFacts => Ok(op_gather_facts()),
         }
     }
@@ -986,6 +1038,101 @@ shell: echo
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("when"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_copy_body() {
+        let t = parse_task(
+            r#"
+name: stage
+copy:
+  src: foo.bin
+  dest: /etc/foo
+  mode: 0o600
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Copy(c)) => {
+                assert_eq!(c.src, "foo.bin");
+                assert_eq!(c.dest, "/etc/foo");
+                assert_eq!(c.mode, 0o600);
+                assert!(c.body.is_none(), "body is populated by the loader, not parse");
+            }
+            other => panic!("expected copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_mode_defaults_to_0644() {
+        let t = parse_task(
+            r#"
+name: stage
+copy:
+  src: foo.bin
+  dest: /etc/foo
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Copy(c)) => assert_eq!(c.mode, 0o644),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn copy_rejects_missing_src() {
+        let err = try_parse_task(
+            r#"
+name: stage
+copy:
+  dest: /etc/foo
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("src"), "got: {err}");
+    }
+
+    #[test]
+    fn copy_rejects_unknown_field() {
+        let err = try_parse_task(
+            r#"
+name: stage
+copy:
+  src: a
+  dest: /b
+  rogue: 1
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("rogue"), "got: {err}");
+    }
+
+    #[test]
+    fn copy_to_wire_with_binary_body_ships_bytes_verbatim() {
+        let t = TaskOp::Copy(CopyOp {
+            src: "blob.bin".into(),
+            dest: "/etc/blob".into(),
+            mode: 0o600,
+            // Non-UTF-8 bytes — would corrupt through a String roundtrip.
+            body: Some(vec![0xff, 0x00, 0xfe, 0xfd, 0x7f]),
+        });
+        let WireOp::OpWriteFile(w) = t.to_wire_op().unwrap() else {
+            panic!()
+        };
+        assert_eq!(w.path, "/etc/blob");
+        assert_eq!(w.mode, 0o600);
+        assert_eq!(w.content, vec![0xff, 0x00, 0xfe, 0xfd, 0x7f]);
+    }
+
+    #[test]
+    fn copy_to_wire_errors_when_body_missing() {
+        let t = TaskOp::Copy(CopyOp {
+            src: "blob.bin".into(),
+            dest: "/etc/blob".into(),
+            mode: 0o644,
+            body: None,
+        });
+        let err = t.to_wire_op().unwrap_err();
+        assert!(format!("{err}").contains("not resolved"), "got: {err}");
     }
 
     #[test]

@@ -183,6 +183,21 @@ a vault-encrypted `examples/group_vars/web/secrets.yml`.
   use either. Add if/when something needs them.
 - [ ] **CLI `--extra-vars`** — top-of-stack precedence layer.
 
+### Phase 2c — in flight
+
+- [x] **`copy:` task module** — controller-side desugar to `OpWriteFile`,
+  parallel to `template:`. `src:` resolved at load time against
+  `<role_dir>/files/`, `<playbook_dir>/files/`, then `<playbook_dir>/`;
+  raw bytes inlined onto the parsed `CopyOp` and shipped verbatim
+  (binary-safe — keeps the `TaskOp::Copy` variant through dispatch so
+  `to_wire_op` emits `OpWriteFile` directly rather than round-tripping
+  through `WriteFileOp.content: String`). 3-container e2e in
+  `tests/roles_and_facts.rs` plus 9 unit tests across parse, resolver,
+  and binary-bytes paths.
+- [ ] **Custom Jinja filters** — `b64encode`/`b64decode`, `from_json`,
+  `to_json`, `regex_replace`, `mandatory` (`mandatory` is already in).
+- [ ] **`include_role: tasks_from:`** — runtime include path.
+
 **Phase 2b acceptance (met):** `tests/roles_and_facts.rs`'s 3-container
 e2e exercises role flatten, role defaults precedence, the `template:`
 op resolving against the role's `templates/` dir, the implicit

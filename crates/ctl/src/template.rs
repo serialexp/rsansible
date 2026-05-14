@@ -186,6 +186,13 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(&t.dest)
                 .map_err(|e| anyhow!("template.dest: {e}"))?;
         }
+        TaskOp::Copy(c) => {
+            // `src:` is resolved at load time; `body` is raw bytes that
+            // ship verbatim and need no Jinja compilation. Only `dest:`
+            // is templatable.
+            env.template_from_str(&c.dest)
+                .map_err(|e| anyhow!("copy.dest: {e}"))?;
+        }
         TaskOp::GatherFacts => {
             // Implicit op — no user-supplied fields to compile.
         }

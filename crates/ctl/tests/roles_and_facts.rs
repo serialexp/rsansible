@@ -47,12 +47,32 @@ fn role_tasks_prepended_to_play_tasks() -> Result<()> {
     let names: Vec<&str> = play.tasks.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["simulate package install", "render web config", "assert facts visible"],
+        vec![
+            "simulate package install",
+            "ship static asset",
+            "render web config",
+            "assert facts visible",
+        ],
         "role tasks should be prepended (in flatten order) before play tasks",
+    );
+    // The copy task's body should have been resolved from the role's
+    // files/ dir.
+    let copy_task = &play.tasks[1];
+    let TaskBody::Op(TaskOp::Copy(c)) = &copy_task.body else {
+        return Err(anyhow!(
+            "expected Copy body, got {:?}",
+            copy_task.body
+        ));
+    };
+    let body = c.body.as_deref().ok_or_else(|| anyhow!("copy body not loaded"))?;
+    assert_eq!(
+        std::str::from_utf8(body).unwrap(),
+        "rsansible-demo: static asset shipped by copy:\n",
+        "copy src should have been read from roles/web/files/static-asset.txt",
     );
     // The template task's body should have been resolved from the role's
     // templates/ dir.
-    let render_task = &play.tasks[1];
+    let render_task = &play.tasks[2];
     let TaskBody::Op(TaskOp::Template(t)) = &render_task.body else {
         return Err(anyhow!(
             "expected Template body, got {:?}",
@@ -136,6 +156,12 @@ async fn three_container_roles_and_facts_run() -> Result<()> {
         assert!(
             body.contains(&format!("host={host_name}")),
             "{host_name}: template host line wrong: {body:?}"
+        );
+        // The static asset shipped via `copy:` lands verbatim.
+        let asset = read_file(c, "/tmp/rsansible-role-static")?;
+        assert_eq!(
+            asset, "rsansible-demo: static asset shipped by copy:\n",
+            "{host_name}: copy: didn't deliver bytes verbatim: {asset:?}"
         );
         // Handler fired at end-of-play because the template changed.
         let fired = read_file(c, "/tmp/rsansible-handler-fired")?;
