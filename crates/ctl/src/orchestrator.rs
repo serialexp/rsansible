@@ -97,6 +97,10 @@ pub struct RunSpec {
     pub agent_binary: Arc<Vec<u8>>,
     /// Cap on concurrent SSH dials during the initial connect phase.
     pub max_concurrent_hosts: usize,
+    /// CLI `--extra-vars` (`-e`) overrides. Highest-precedence variable
+    /// source — seeded into every `HostCtx.extra_vars` at run start.
+    /// Empty by default.
+    pub extra_vars: BTreeMap<String, JsonValue>,
 }
 
 impl RunSpec {
@@ -107,6 +111,7 @@ impl RunSpec {
             playbook,
             agent_binary: Arc::new(agent_binary),
             max_concurrent_hosts: DEFAULT_MAX_CONCURRENT_HOSTS,
+            extra_vars: BTreeMap::new(),
         }
     }
 }
@@ -132,6 +137,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         playbook,
         agent_binary,
         max_concurrent_hosts,
+        extra_vars,
     } = spec;
 
     // Build the per-host inventory_vars views + the shared WorldVars
@@ -211,7 +217,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         let host = inventory.hosts.get(name).expect("conn host in inventory");
         ctxs.insert(
             name.clone(),
-            make_initial_ctx(name, host, &world),
+            make_initial_ctx(name, host, &world, &extra_vars),
         );
     }
 
@@ -326,7 +332,12 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     Ok(report)
 }
 
-fn make_initial_ctx(name: &str, host: &Host, world: &WorldVars) -> HostCtx {
+fn make_initial_ctx(
+    name: &str,
+    host: &Host,
+    world: &WorldVars,
+    extra_vars: &BTreeMap<String, JsonValue>,
+) -> HostCtx {
     let mut ctx = HostCtx::new(name.to_string());
     // Seed inventory_vars from the world-scoped per-host map (precedence
     // steps 1..=4 already resolved by build_world_vars).
@@ -335,6 +346,9 @@ fn make_initial_ctx(name: &str, host: &Host, world: &WorldVars) -> HostCtx {
             ctx.inventory_vars.insert(k.clone(), v.clone());
         }
     }
+    // CLI `-e` / `--extra-vars` — same value across every host, highest
+    // precedence at render time.
+    ctx.extra_vars = extra_vars.clone();
     // Always make sure the four canonical connection coords are present
     // (build_world_vars normally seeds them too, but this protects against
     // an empty world e.g. in unit tests).
@@ -480,6 +494,9 @@ fn apply_play_vars(
         scratch.role_defaults = ctx.role_defaults.clone();
         scratch.inventory_vars = ctx.inventory_vars.clone();
         scratch.facts = ctx.facts.clone();
+        // extra_vars is run-start state, visible everywhere including
+        // play.vars rendering (Ansible's behavior).
+        scratch.extra_vars = ctx.extra_vars.clone();
         let view = build_template_ctx(&scratch, world);
         for (k, v) in &play.vars {
             let val = match v {
@@ -2488,7 +2505,7 @@ mod tests {
             inline_vars: BTreeMap::new(),
             member_of: vec!["all".to_string()],
         };
-        let c = make_initial_ctx("web1", &h, &WorldVars::default());
+        let c = make_initial_ctx("web1", &h, &WorldVars::default(), &BTreeMap::new());
         assert_eq!(
             c.inventory_vars.get("ansible_host"),
             Some(&serde_json::json!("1.2.3.4"))

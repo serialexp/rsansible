@@ -40,6 +40,11 @@ pub struct HostCtx {
     pub set_facts: BTreeMap<String, JsonValue>,
     /// Bound by tasks with `register:`. Keyed by the register name.
     pub registers: BTreeMap<String, RegisterValue>,
+    /// Highest-precedence layer — wins over every other source. Populated
+    /// from CLI `-e` / `--extra-vars` at run start and never mutated
+    /// after. Same reference shared across all hosts (cloned for now;
+    /// could `Arc` if it grows).
+    pub extra_vars: BTreeMap<String, JsonValue>,
     /// True once a task on this host has failed in a way that should
     /// keep it from receiving further work (mark_host_failed policy, or
     /// a failed `assert:`/`fail:` under `on_failure: stop`).
@@ -64,6 +69,7 @@ impl HostCtx {
             play_vars: BTreeMap::new(),
             set_facts: BTreeMap::new(),
             registers: BTreeMap::new(),
+            extra_vars: BTreeMap::new(),
             failed: false,
             iter_item: None,
             pending_handlers: BTreeSet::new(),
@@ -210,9 +216,11 @@ impl WorldVars {
 /// Build the template context view for a host at a particular moment.
 ///
 /// Precedence (lowest → highest): role_defaults → inventory_vars → facts →
-/// play_vars → set_facts → registers. Loop's `item` (or renamed via
-/// loop_control.loop_var) and `inventory_hostname` are layered on top.
-/// `groups` and `hostvars` are stitched in from `world`.
+/// play_vars → set_facts → registers → extra_vars. Loop's `item` (or
+/// renamed via loop_control.loop_var) and `inventory_hostname` are
+/// layered on top. `groups` and `hostvars` are stitched in from `world`.
+/// `extra_vars` is highest precedence and matches Ansible's `-e` flag
+/// (cannot be overridden by anything inside the playbook).
 pub fn build_template_ctx(
     ctx: &HostCtx,
     world: &WorldVars,
@@ -235,6 +243,12 @@ pub fn build_template_ctx(
     }
     for (k, v) in &ctx.registers {
         out.insert(k.clone(), v.to_json());
+    }
+    // `--extra-vars` — Ansible's highest-precedence source. Layered last
+    // so it cannot be shadowed by registers, set_facts, play_vars,
+    // facts, inventory_vars, or role_defaults.
+    for (k, v) in &ctx.extra_vars {
+        out.insert(k.clone(), v.clone());
     }
     // Stable host identity, mirroring the most-asked Ansible vars.
     out.insert(
@@ -333,6 +347,37 @@ mod tests {
         // set_facts beats play_vars beats inventory_vars.
         assert_eq!(map.get("greeting"), Some(&json!("hola")));
         assert_eq!(map.get("inventory_hostname"), Some(&json!("web1")));
+    }
+
+    #[test]
+    fn build_ctx_extra_vars_beats_everything_else() {
+        let mut ctx = HostCtx::new("web1".into());
+        ctx.role_defaults.insert("svc".into(), json!("from_default"));
+        ctx.inventory_vars.insert("svc".into(), json!("from_inv"));
+        ctx.facts.insert("svc".into(), json!("from_fact"));
+        ctx.play_vars.insert("svc".into(), json!("from_play"));
+        ctx.set_facts.insert("svc".into(), json!("from_setfact"));
+        // Registers go through a structured form, but a plain key
+        // collision should also be overridden by extra_vars.
+        ctx.registers.insert(
+            "svc".into(),
+            RegisterValue::from_exec(0, false, 1, b"", b""),
+        );
+        ctx.extra_vars.insert("svc".into(), json!("from_cli"));
+        let map = build_template_ctx(&ctx, &WorldVars::default());
+        assert_eq!(
+            map.get("svc"),
+            Some(&json!("from_cli")),
+            "extra_vars must win over every other layer"
+        );
+    }
+
+    #[test]
+    fn build_ctx_extra_vars_seeds_a_new_key() {
+        let mut ctx = HostCtx::new("web1".into());
+        ctx.extra_vars.insert("only_in_cli".into(), json!(42));
+        let map = build_template_ctx(&ctx, &WorldVars::default());
+        assert_eq!(map.get("only_in_cli"), Some(&json!(42)));
     }
 
     #[test]

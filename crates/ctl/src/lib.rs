@@ -4,6 +4,7 @@
 //! so integration tests can drive them directly.
 
 pub mod exec_ctx;
+pub mod extra_vars;
 pub mod inventory;
 pub mod orchestrator;
 pub mod playbook;

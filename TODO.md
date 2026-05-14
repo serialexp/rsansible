@@ -181,7 +181,13 @@ a vault-encrypted `examples/group_vars/web/secrets.yml`.
   are best-effort — logged, don't halt the play.
 - [ ] **Nested groups / boolean selectors** — defer; gothab doesn't
   use either. Add if/when something needs them.
-- [ ] **CLI `--extra-vars`** — top-of-stack precedence layer.
+- [x] **CLI `--extra-vars`** — top-of-stack precedence layer, ahead of
+  registers. `rsansible run -e key=value` (always stringified, Ansible-
+  faithful), `-e @file.yml` (top-level YAML map), `-e {json_literal}`
+  (object literal). Repeatable; later occurrences override earlier on
+  key collision. Parsed via `crates/ctl/src/extra_vars.rs` and threaded
+  through `RunSpec.extra_vars` → `HostCtx.extra_vars`. Layered last in
+  `build_template_ctx`; visible to `play.vars` rendering too.
 
 ### Phase 2c — in flight
 

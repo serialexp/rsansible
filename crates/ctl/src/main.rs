@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rsansible_ctl::{
-    inventory,
+    extra_vars, inventory,
     orchestrator::{self, RunSpec},
     playbook, template, vault,
 };
@@ -59,6 +59,13 @@ enum Cmd {
         /// files are skipped with a warning.
         #[arg(long)]
         vault_password_file: Option<PathBuf>,
+        /// Variable overrides — repeatable. Accepts `key=value` (always
+        /// stringified), `@path/to/file.yml` (loads a YAML map), or
+        /// `{"json": "object"}` (JSON/YAML object literal). Highest-
+        /// precedence variable source — wins over inventory, facts,
+        /// play vars, set_facts, and registers.
+        #[arg(short = 'e', long = "extra-vars", value_name = "key=value|@file|{json}")]
+        extra_vars: Vec<String>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -92,8 +99,18 @@ async fn main() -> ExitCode {
             agent_binary,
             concurrency,
             vault_password_file,
+            extra_vars,
             playbook,
-        } => match cmd_run(inventory, agent_binary, concurrency, vault_password_file, playbook).await {
+        } => match cmd_run(
+            inventory,
+            agent_binary,
+            concurrency,
+            vault_password_file,
+            extra_vars,
+            playbook,
+        )
+        .await
+        {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -136,6 +153,7 @@ async fn cmd_run(
     agent_binary_path: PathBuf,
     concurrency: usize,
     vault_pw_path: Option<PathBuf>,
+    extra_vars_args: Vec<String>,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -146,12 +164,16 @@ async fn cmd_run(
     playbook::validate(&pb, Some(&inv))?;
     template::precompile_all(&pb)?;
 
+    let extra = extra_vars::parse_all(&extra_vars_args)
+        .context("parsing --extra-vars")?;
+
     let agent_bytes = std::fs::read(&agent_binary_path)
         .with_context(|| format!("reading agent binary {}", agent_binary_path.display()))?;
 
     let mut spec = RunSpec::new(inv, pb, agent_bytes);
     spec.inventory_vars = inv_vars;
     spec.max_concurrent_hosts = concurrency.max(1);
+    spec.extra_vars = extra;
     let report = orchestrator::run(spec)
         .await
         .context("orchestrator failed")?;
