@@ -1,0 +1,27 @@
+[package]
+name = "rsansible-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rsansible agent — pushed to a host, executes ops, deletes itself."
+
+[[bin]]
+name = "rsansible-agent"
+path = "src/main.rs"
+
+[dependencies]
+rsansible-wire.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# rustix for getuid/getgid/uname without dropping `forbid(unsafe_code)` and
+# without dragging in libc-link headaches on musl.
+rustix = { version = "0.38", default-features = false, features = ["process", "system", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "process", "io-util", "fs"] }

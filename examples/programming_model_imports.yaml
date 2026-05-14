@@ -1,0 +1,12 @@
+# Shared tasks brought in via `import_tasks` from
+# programming_model.yaml. Each task runs on every host the parent play
+# targets, in the order listed here, just as if it were spliced in.
+
+- name: greet via shell
+  register: greet_result
+  shell: "printf 'hello from %s\\n' \"$(hostname)\""
+
+- name: derive set_fact from register
+  set_fact:
+    seen_hostname: "{{ greet_result.stdout_lines[0] }}"
+    happy: true

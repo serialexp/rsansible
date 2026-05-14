@@ -1,0 +1,46 @@
+# End-to-end exercise of every Phase 1a feature:
+#   - import_tasks (greet + set_fact live in programming_model_imports.yaml)
+#   - register (greet_result)
+#   - when (gate the follow-up shell on the previous register)
+#   - set_fact (capture a value derived from the register)
+#   - loop (create N marker files, one per item)
+#   - assert (sanity check the set_fact we built)
+#
+# Runs against the same 3-container fixture as the other e2e tests. Drops
+# files under /tmp/ that the test reads back to confirm everything fired.
+
+- name: phase1a exercise
+  hosts: all
+  strategy: per_task
+  on_failure: stop
+  tasks:
+    - name: include shared
+      import_tasks: programming_model_imports.yaml
+
+    - name: only-when-greet-succeeded
+      when: "greet_result.rc == 0"
+      write_file:
+        path: /tmp/rsansible-when-fired
+        mode: 0o644
+        content: "{{ seen_hostname }}\n"
+
+    - name: never-when-false
+      when: "1 == 2"
+      write_file:
+        path: /tmp/rsansible-should-not-exist
+        mode: 0o644
+        content: "ghost\n"
+
+    - name: loop over names
+      loop: [alpha, beta, gamma]
+      write_file:
+        path: "/tmp/rsansible-loop-{{ item }}"
+        mode: 0o644
+        content: "name={{ item }} host={{ inventory_hostname }}\n"
+
+    - name: sanity check
+      assert:
+        that:
+          - "happy"
+          - "seen_hostname | length > 0"
+        msg: "post-import facts should be set"

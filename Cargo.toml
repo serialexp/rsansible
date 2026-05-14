@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wire",
+    "crates/wire-runtime",
+    "crates/agent",
+    "crates/ctl",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/serialexp/rsansible"
+
+[workspace.dependencies]
+# wire
+rsansible-wire = { path = "crates/wire" }
+
+# error handling
+anyhow = "1"
+thiserror = "1"
+
+# async
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "process", "fs", "net", "time", "sync", "signal"] }
+futures = "0.3"
+
+# ssh (pure-rust crypto). russh 0.60+ folded the old russh-keys crate in.
+russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "rsa"] }
+
+# templates
+minijinja = { version = "2", default-features = false, features = ["builtins", "loader", "serde"] }
+
+# cli + config
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Aggressive size profile for the agent — pushed-and-deleted, every KB shows on the wire.
+[profile.agent]
+inherits = "release"
+opt-level = "z"
+lto = "fat"

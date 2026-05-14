@@ -1,0 +1,60 @@
+# End-to-end exercise of every Phase 1b feature:
+#   - handlers + notify (with dedup: two notifies for the same handler
+#     fire it exactly once)
+#   - meta: flush_handlers (mid-play drain)
+#   - delegate_to + run_once (one host generates a token; the result is
+#     broadcast to every other host's register)
+#   - end-of-play implicit flush (a final notify that flushes when the
+#     play's task list ends)
+#
+# Files written:
+#   /tmp/rsansible-state            (touched by every host; notifies restart_marker twice)
+#   /tmp/rsansible-restart-marker   (written by the restart_marker handler — exactly once)
+#   /tmp/rsansible-flush-marker     (written by mid-play meta: flush_handlers)
+#   /tmp/rsansible-token            (broadcast token from host1 — same content everywhere)
+#   /tmp/rsansible-eop-marker       (written by end-of-play implicit flush)
+
+- name: phase1b exercise
+  hosts: all
+  strategy: per_task
+  on_failure: stop
+  tasks:
+    - name: write state file (notify A)
+      notify: restart_marker
+      shell: "echo state > /tmp/rsansible-state"
+
+    - name: write state file again (notify A again — should NOT fire twice)
+      notify: restart_marker
+      shell: "echo state-take-two >> /tmp/rsansible-state"
+
+    - name: notify mid-play flusher (notify B)
+      notify: flush_log
+      shell: "echo flush > /tmp/rsansible-state"
+
+    - name: drain handlers mid-play
+      meta: flush_handlers
+
+    - name: run_once on first host, register token
+      run_once: true
+      register: token_result
+      shell: "echo phase1b-token-$(date +%s%N)"
+
+    - name: write token from broadcast register on every host
+      write_file:
+        path: /tmp/rsansible-token
+        mode: 0o644
+        content: "{{ token_result.stdout }}\n"
+
+    - name: change something to fire end-of-play handler
+      notify: eop_log
+      shell: "echo done > /tmp/rsansible-state"
+
+  handlers:
+    - name: restart_marker
+      shell: "echo restarted > /tmp/rsansible-restart-marker"
+
+    - name: flush_log
+      shell: "echo flushed > /tmp/rsansible-flush-marker"
+
+    - name: eop_log
+      shell: "echo eop > /tmp/rsansible-eop-marker"

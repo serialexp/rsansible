@@ -1,0 +1,19 @@
+# Example inventory. Replace the host names/users/key with your own.
+hosts:
+  web1:
+    host: 127.0.0.1
+    port: 2222
+    user: test
+    key_path: ~/.ssh/id_ed25519
+
+  web2:
+    host: 127.0.0.1
+    port: 2223
+    user: test
+    key_path: ~/.ssh/id_ed25519
+
+  web3:
+    host: 127.0.0.1
+    port: 2224
+    user: test
+    key_path: ~/.ssh/id_ed25519

@@ -1,0 +1,28 @@
+# Minimal three-task playbook covering each of v0's ops.
+#
+# Run against a matching inventory:
+#   rsansible run -i examples/hello.inventory.yaml \
+#     -a target/x86_64-unknown-linux-musl/agent/rsansible-agent \
+#     examples/hello.yaml
+
+- name: greet
+  hosts: all
+  strategy: per_task
+  on_failure: stop
+  tasks:
+    - name: say hi via shell
+      shell: "printf 'hello from %s\\n' \"$(hostname)\""
+
+    - name: drop a marker file
+      write_file:
+        path: /tmp/rsansible-hello
+        mode: 0o644
+        content: |
+          hello from rsansible
+
+    - name: prove the file is there
+      exec:
+        argv: [/bin/cat, /tmp/rsansible-hello]
+        env:
+          LC_ALL: C
+        timeout_ms: 5000
