@@ -28,7 +28,49 @@ pub struct SshdContainer {
 }
 
 impl SshdContainer {
+    /// Variant of `start()` that enables `sudo` for `CONTAINER_USER`
+    /// with NOPASSWD. Used by `become:` e2e tests. Requires the test
+    /// user to also exist as a real Linux account inside the container
+    /// (linuxserver/openssh-server creates it from `USER_NAME`).
+    ///
+    /// Also creates an extra unprivileged account `becometest` so the
+    /// container can demonstrate `become_user: becometest` flipping
+    /// `whoami` output. We deliberately keep this separate from the
+    /// SSH login user so the test can distinguish "the wrap actually
+    /// changed user" from "task ran as the SSH user, sudo or no sudo".
+    #[allow(dead_code)]
+    pub async fn start_with_sudo() -> Result<Self> {
+        let c = Self::start_inner(true).await?;
+        // Add a passwordless sudoers entry for the test user, plus an
+        // additional account we can `become_user:` into.
+        let install = c.docker_exec_root(&[
+            "sh",
+            "-c",
+            // alpine ships sudo via SUDO_ACCESS=true; ensure NOPASSWD,
+            // create becometest, and make sudo's secure_path includes
+            // /bin so plain commands work after the wrap.
+            "set -eu; \
+             apk add --no-cache sudo >/dev/null 2>&1 || true; \
+             adduser -D -H becometest >/dev/null 2>&1 || true; \
+             echo 'test ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/test; \
+             chmod 440 /etc/sudoers.d/test",
+        ])?;
+        if !install.status.success() {
+            bail!(
+                "post-start sudoers setup failed: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&install.stdout),
+                String::from_utf8_lossy(&install.stderr)
+            );
+        }
+        Ok(c)
+    }
+
+    #[allow(dead_code)]
     pub async fn start() -> Result<Self> {
+        Self::start_inner(false).await
+    }
+
+    async fn start_inner(sudo_access: bool) -> Result<Self> {
         let tmpdir = tempfile::tempdir().context("creating tmpdir for keys")?;
         let key_path = tmpdir.path().join("id_ed25519");
         gen_ed25519_keypair(&key_path)?;
@@ -61,7 +103,7 @@ impl SshdContainer {
                 "-e",
                 &format!("PUBLIC_KEY={pubkey}"),
                 "-e",
-                "SUDO_ACCESS=false",
+                if sudo_access { "SUDO_ACCESS=true" } else { "SUDO_ACCESS=false" },
                 "-e",
                 "PASSWORD_ACCESS=false",
                 IMAGE,
@@ -102,6 +144,20 @@ impl SshdContainer {
     pub fn docker_exec(&self, argv: &[&str]) -> Result<std::process::Output> {
         let mut cmd = Command::new("docker");
         cmd.arg("exec").arg(&self.container_id);
+        for arg in argv {
+            cmd.arg(arg);
+        }
+        cmd.output().context("docker exec failed")
+    }
+
+    /// Run a command in the container as UID 0 (root) regardless of
+    /// the container's default user. Used by `start_with_sudo` to
+    /// install packages and write sudoers entries before the test
+    /// connects over SSH.
+    #[allow(dead_code)]
+    pub fn docker_exec_root(&self, argv: &[&str]) -> Result<std::process::Output> {
+        let mut cmd = Command::new("docker");
+        cmd.arg("exec").arg("-u").arg("0").arg(&self.container_id);
         for arg in argv {
             cmd.arg(arg);
         }

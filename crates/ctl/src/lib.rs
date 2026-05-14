@@ -3,6 +3,8 @@
 //! The CLI binary in `src/main.rs` is a thin wrapper over the modules here
 //! so integration tests can drive them directly.
 
+#[path = "become_.rs"]
+pub mod become_;
 pub mod exec_ctx;
 pub mod extra_vars;
 pub mod inventory;

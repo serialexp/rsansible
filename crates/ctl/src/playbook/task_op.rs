@@ -68,6 +68,20 @@ pub struct Task {
     ///
     /// Not Deserialize-able — populated at load time.
     pub role_dir: Option<PathBuf>,
+    /// `become: true|false` — run this task with elevated privileges
+    /// via `sudo`. `None` means "inherit from the play's become
+    /// keyword" — a play-level default push-down pass at load time
+    /// fills it in. `Some(false)` explicitly opts out of an inherited
+    /// `become: true`. The orchestrator wraps `shell:` / `exec:` argv
+    /// with `sudo -n -u <become_user> --` when this is true; non-argv
+    /// ops (`write_file:` / `template:` / `copy:` / `gather_facts`)
+    /// run with the agent's own privileges and rely on the agent
+    /// having been pushed as a sufficiently privileged user.
+    pub become_: Option<bool>,
+    /// `become_user: <name>` — target user for `become: true`. None
+    /// means "inherit from play, then default to root". Only meaningful
+    /// when `become_` resolves to true at runtime.
+    pub become_user: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +193,8 @@ const METADATA_KEYS: &[&str] = &[
     "delegate_to",
     "run_once",
     "notify",
+    "become",
+    "become_user",
 ];
 
 impl<'de> Deserialize<'de> for Task {
@@ -216,6 +232,16 @@ impl<'de> Deserialize<'de> for Task {
                 .map_err(|e| D::Error::custom(format!("task {name:?}: tags: {e}")))?,
         };
         let delegate_to = take_optional_string(&mut map, "delegate_to", &name)?;
+        let become_ = match map.remove("become") {
+            None => None,
+            Some(serde_yaml::Value::Bool(b)) => Some(b),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `become` must be a bool, got: {other:?}"
+                )));
+            }
+        };
+        let become_user = take_optional_string(&mut map, "become_user", &name)?;
         let run_once = match map.remove("run_once") {
             None => false,
             Some(serde_yaml::Value::Bool(b)) => b,
@@ -421,6 +447,8 @@ impl<'de> Deserialize<'de> for Task {
             run_once,
             notify,
             role_dir: None,
+            become_,
+            become_user,
         })
     }
 }
@@ -907,6 +935,62 @@ import_tasks: tasks/common.yml
             TaskBody::ImportTasks(p) => assert_eq!(p, PathBuf::from("tasks/common.yml")),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn parses_become_metadata() {
+        let t = parse_task(
+            r#"
+name: install pg
+become: true
+become_user: postgres
+shell: "apt install -y postgresql"
+"#,
+        );
+        assert_eq!(t.become_, Some(true));
+        assert_eq!(t.become_user.as_deref(), Some("postgres"));
+    }
+
+    #[test]
+    fn become_defaults_to_none_for_inheritance() {
+        let t = parse_task(
+            r#"
+name: t
+shell: hi
+"#,
+        );
+        assert_eq!(t.become_, None, "None signals 'inherit from play'");
+        assert_eq!(t.become_user, None);
+    }
+
+    #[test]
+    fn become_false_distinguishes_from_unset() {
+        let t = parse_task(
+            r#"
+name: t
+become: false
+shell: hi
+"#,
+        );
+        assert_eq!(
+            t.become_,
+            Some(false),
+            "Some(false) signals 'opt out of inherited become: true'"
+        );
+    }
+
+    #[test]
+    fn become_non_bool_rejected() {
+        let err = try_parse_task(
+            r#"
+name: t
+become: "yes"
+shell: hi
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("become") && msg.contains("bool"), "got: {msg}");
     }
 
     #[test]

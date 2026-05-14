@@ -238,13 +238,26 @@ new wire framing roundtrip for `OpGatherFacts`.
 
 **Estimated:** ~1200 LoC, mostly agent-side.
 
-- [ ] **`become:` / `become_user:` on every op**
-  - either: add to `Task` metadata (controller wraps argv in
-    `sudo -n -u <user> --`), or: add a `become` field to every op in the
-    schema (agent wraps). Pick controller-side wrapping for simplicity;
-    only requires changes to argv/command construction.
-  - 45 explicit sites in gothab plus play-level default; ansible.cfg
-    already requires sudo.
+- [x] **`become:` / `become_user:` on every op** — controller-side
+  argv wrapping. New `crates/ctl/src/become_.rs` module computes
+  effective become per (task, ctx) and mutates the rendered `TaskOp`
+  before `to_wire_op`: `Shell` gets `sudo -n -u <user> -- ` prepended
+  to the command string, `Exec` gets the same as a structural argv
+  prefix. Non-argv ops (`write_file:` / `template:` / `copy:` /
+  `gather_facts`) pass through — the agent's own privilege level
+  dictates whether they succeed; agent-side `become_user`-for-writes
+  is deferred. Both `Task` and `Play` carry `become_: Option<bool>` +
+  `become_user: Option<String>`; `playbook::inherit_become_defaults`
+  push-down pass at load time folds play defaults into tasks that left
+  the fields as `None` (an explicit `Some(false)` opts out of inherited
+  `true`). Inventory `ansible_become` / `ansible_become_user` are
+  consulted at runtime when task+play both leave `become_` as `None`.
+  `become_user` is validated as a POSIX username — `[A-Za-z_][A-Za-z0-9_-]*`
+  up to 32 chars — so shell metacharacters can't escape the wrap. 14
+  unit tests in `become_` + 4 parser + 4 validator + 2 inheritance +
+  one 1-container e2e (`tests/become_e2e.rs`) that proves play default
+  → root, per-task `become_user: becometest` → flipped uid, per-task
+  `become: false` → opted-out (ran as the SSH login user).
 - [ ] **`OpStat`** — returns existence, type, mode, owner/group, size,
   mtime, sha256. 10 stat sites in gothab.
 - [ ] **`OpFile`** — proper file module: ensure absent/file/directory/link

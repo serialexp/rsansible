@@ -1,0 +1,30 @@
+# End-to-end exercise of `become:` argv-wrapping.
+#
+# The test container has:
+#   - login user `test` (UID 1000) with NOPASSWD sudo
+#   - service user `becometest` (no shell, no sudo)
+#
+# Each task writes its `whoami` output to a different path. The test
+# then verifies the file contents match the expected user — proving
+# that the controller is wrapping argv with `sudo -n -u <user> --`
+# and that the wrap actually changes the running uid.
+
+- name: become demo
+  hosts: all
+  gather_facts: false
+  # Play-level default: opt every task into become: true. Individual
+  # tasks opt out or override the user.
+  become: true
+  become_user: root
+  tasks:
+    - name: shell as root (play default)
+      shell: "whoami > /tmp/rsansible-become-shell-root"
+
+    - name: exec as becometest (per-task override)
+      become_user: becometest
+      exec:
+        argv: ["/bin/sh", "-c", "whoami > /tmp/rsansible-become-exec-becometest"]
+
+    - name: shell as test (opt out of become)
+      become: false
+      shell: "whoami > /tmp/rsansible-become-noop"

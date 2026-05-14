@@ -73,6 +73,18 @@ pub struct Play {
     /// below `inventory_vars` in the precedence chain.
     #[serde(skip)]
     pub role_defaults: BTreeMap<String, JsonValue>,
+    /// Play-level `become:` default. Pushed down onto every task in
+    /// this play that doesn't explicitly set its own `become:` (the
+    /// `inherit_become_defaults` pass in `playbook::load` does the
+    /// push). At task scope, `Some(false)` opts out of an inherited
+    /// `true`.
+    #[serde(rename = "become", default)]
+    pub become_: Option<bool>,
+    /// Play-level `become_user:` default. Same inheritance model as
+    /// `become_`. Only meaningful when become resolves to true at
+    /// run time; defaults to `"root"` when unset.
+    #[serde(default)]
+    pub become_user: Option<String>,
 }
 
 fn default_gather_facts() -> bool {
@@ -169,7 +181,29 @@ pub fn load(path: &Path) -> Result<Playbook> {
         .with_context(|| format!("loading template sources in {}", path.display()))?;
     role::load_copy_files(&mut pb, base)
         .with_context(|| format!("loading copy sources in {}", path.display()))?;
+    inherit_become_defaults(&mut pb);
     Ok(pb)
+}
+
+/// Push play-level `become:` / `become_user:` defaults down onto every
+/// task (including handlers) that doesn't set its own. Runs after all
+/// flatten/expand passes so role-pulled and include_role-pulled tasks
+/// see the play's become defaults too. Tasks that explicitly set
+/// `become: false` are left alone — the parser distinguishes
+/// `Some(false)` from `None` for exactly this reason.
+fn inherit_become_defaults(pb: &mut Playbook) {
+    for play in &mut pb.plays {
+        let play_become = play.become_;
+        let play_become_user = play.become_user.clone();
+        for task in play.tasks.iter_mut().chain(play.handlers.iter_mut()) {
+            if task.become_.is_none() {
+                task.become_ = play_become;
+            }
+            if task.become_user.is_none() {
+                task.become_user = play_become_user.clone();
+            }
+        }
+    }
 }
 
 /// Parse a playbook from a YAML string. Does *not* resolve `import_tasks:` —
@@ -413,6 +447,8 @@ all:
                 tasks: vec![],
                 handlers: vec![],
                 role_defaults: BTreeMap::new(),
+                become_: None,
+                become_user: None,
             }],
         };
         let err = validate(&pb, None).unwrap_err();
@@ -466,5 +502,65 @@ all:
         }
         // shut up unused-import warning when BTreeMap is needed downstream
         let _ = BTreeMap::<String, String>::new();
+    }
+
+    #[test]
+    fn play_become_inherited_by_tasks_with_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pb_path = dir.path().join("pb.yml");
+        std::fs::write(
+            &pb_path,
+            r#"
+- name: p
+  become: true
+  become_user: postgres
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: inherit_both
+      shell: echo hi
+    - name: opt_out
+      become: false
+      shell: echo hi
+    - name: override_user_only
+      become_user: www-data
+      shell: echo hi
+"#,
+        )
+        .unwrap();
+        let pb = load(&pb_path).unwrap();
+        let tasks = &pb.plays[0].tasks;
+        // First task: both inherited.
+        assert_eq!(tasks[0].become_, Some(true));
+        assert_eq!(tasks[0].become_user.as_deref(), Some("postgres"));
+        // Second: explicit false stays false; user still inherited.
+        assert_eq!(tasks[1].become_, Some(false));
+        assert_eq!(tasks[1].become_user.as_deref(), Some("postgres"));
+        // Third: become inherited, user overridden.
+        assert_eq!(tasks[2].become_, Some(true));
+        assert_eq!(tasks[2].become_user.as_deref(), Some("www-data"));
+    }
+
+    #[test]
+    fn play_without_become_leaves_tasks_at_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pb_path = dir.path().join("pb.yml");
+        std::fs::write(
+            &pb_path,
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+        )
+        .unwrap();
+        let pb = load(&pb_path).unwrap();
+        // None preserved → orchestrator falls back to inventory
+        // `ansible_become` at run time.
+        assert_eq!(pb.plays[0].tasks[0].become_, None);
+        assert_eq!(pb.plays[0].tasks[0].become_user, None);
     }
 }

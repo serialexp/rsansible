@@ -37,6 +37,7 @@ use tokio::sync::{Mutex as TokioMutex, OnceCell, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
@@ -549,6 +550,12 @@ fn make_gather_facts_task() -> Task {
         run_once: false,
         notify: Vec::new(),
         role_dir: None,
+        // Fact-gathering must always run as whoever the agent was
+        // launched as — never sudo-wrapped (the agent runs the helper
+        // in-process). Explicit `Some(false)` so a play-level
+        // `become: true` doesn't accidentally wrap it.
+        become_: Some(false),
+        become_user: None,
     }
 }
 
@@ -1428,7 +1435,7 @@ async fn run_op_body(
     world: &WorldVars,
     next_seq: &Arc<AtomicU32>,
 ) -> BodyResult {
-    let rendered = match render_op(op, ctx, env, world) {
+    let mut rendered = match render_op(op, ctx, env, world) {
         Ok(r) => r,
         Err(e) => {
             return BodyResult::Failed {
@@ -1438,6 +1445,12 @@ async fn run_op_body(
             };
         }
     };
+    // Apply `become:` argv wrapping after render (so the wrapping is
+    // never templated) and before `to_wire_op` (so the wire op carries
+    // the wrapped argv verbatim, with no further string surgery agent-
+    // side).
+    let eff = become_::effective(task, ctx);
+    become_::apply(&mut rendered, &eff);
     let wire_op = match rendered.to_wire_op() {
         Ok(w) => w,
         Err(e) => {

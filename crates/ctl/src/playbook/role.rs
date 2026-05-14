@@ -271,6 +271,9 @@ fn expand_one(
             run_once: false,
             notify: Vec::new(),
             role_dir: Some(role_dir),
+            // Synthetic set_fact runs controller-side; no privilege escalation.
+            become_: Some(false),
+            become_user: None,
         };
         spliced.insert(0, synthetic);
     }
