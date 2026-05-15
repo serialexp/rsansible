@@ -54,9 +54,11 @@ aes = "0.8"
 ctr = "0.9"
 pbkdf2 = { version = "0.12", default-features = false }
 hmac = "0.12"
-sha2 = "0.10"
 subtle = "2"
 hex = "0.4"
+
+# sha2 used by both the controller (vault HMAC) and the agent (stat checksum).
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"

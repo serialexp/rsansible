@@ -42,7 +42,7 @@ use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, 
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, CopyOp, ExecOp, FailTask, HostSelector, LoopSpec, MetaAction, OnFailure, Play,
-    Playbook, SetFactMap, ShellOp, Strategy, Task, TaskBody, TaskOp, WriteFileOp,
+    Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task, TaskBody, TaskOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1489,13 +1489,23 @@ async fn run_op_body(
             let agent_elapsed_ns =
                 exec.done.finished_unix_ns.saturating_sub(exec.done.started_unix_ns);
             let took_ms = (agent_elapsed_ns / 1_000_000).min(u64::MAX);
-            let rv = RegisterValue::from_exec(
+            let mut rv = RegisterValue::from_exec(
                 exec.done.exit_code,
                 exec.done.changed != 0,
                 took_ms,
                 &exec.stdout,
                 &exec.stderr,
             );
+            // Module-specific result lifting. `stat:` ships its result as a
+            // JSON object on stdout; we expose it as `register.stat.<field>`
+            // to match Ansible's contract. Failure to parse here is silent —
+            // the user can still see the raw stdout and `register.json`.
+            if let TaskOp::Stat(_) = op {
+                if let Some(JsonValue::Object(_)) = rv.json.as_ref() {
+                    let parsed = rv.json.clone().unwrap();
+                    rv.extra.insert("stat".into(), parsed);
+                }
+            }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
                 info!(
@@ -1795,6 +1805,13 @@ fn render_op(
             })
         }
         TaskOp::GatherFacts => TaskOp::GatherFacts,
+        TaskOp::Stat(s) => {
+            let path = render_str(env, &s.path, &view)?;
+            TaskOp::Stat(StatOp {
+                path,
+                follow: s.follow,
+            })
+        }
     })
 }
 

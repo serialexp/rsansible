@@ -1,0 +1,56 @@
+# End-to-end exercise of `stat:` (Phase 3, read-only filesystem probe).
+#
+# The agent's stat module returns a JSON object that the orchestrator
+# lifts to `register.stat.<field>` so user code can write the standard
+# Ansible idiom `foo_stat.stat.exists`.
+#
+# We probe three things:
+#   1. a regular file we just created — exists, isreg, has a sha256
+#   2. a directory — exists, isdir, no sha256
+#   3. a path that doesn't exist — exists=false, nothing else lifted
+#
+# Each task records a one-line summary into a temp file so the test
+# harness can read it back via `docker exec cat`.
+
+- name: stat demo
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: seed a regular file
+      shell: "printf 'hello\\n' > /tmp/rsansible-stat-input"
+
+    # 1. Regular file.
+    - name: stat the seeded file
+      stat:
+        path: /tmp/rsansible-stat-input
+      register: file_stat
+
+    - name: record regular-file findings
+      shell: "printf '%s\\n%s\\n%s\\n%s\\n' '{{ file_stat.stat.exists }}' '{{ file_stat.stat.isreg }}' '{{ file_stat.stat.size }}' '{{ file_stat.stat.checksum }}' > /tmp/rsansible-stat-file"
+
+    # 2. Directory.
+    - name: stat /tmp
+      stat:
+        path: /tmp
+      register: dir_stat
+
+    - name: record directory findings
+      shell: "printf '%s\\n%s\\n%s\\n' '{{ dir_stat.stat.exists }}' '{{ dir_stat.stat.isdir }}' '{{ dir_stat.stat.isreg }}' > /tmp/rsansible-stat-dir"
+
+    # 3. Missing path.
+    - name: stat a path that doesn't exist
+      stat:
+        path: /tmp/rsansible-stat-nope
+      register: missing_stat
+
+    - name: record missing-path findings
+      shell: "printf '%s\\n' '{{ missing_stat.stat.exists }}' > /tmp/rsansible-stat-missing"
+
+    # 4. Use stat result in a when: clause — only this fires.
+    - name: conditional that should run
+      when: file_stat.stat.exists
+      shell: "echo ran > /tmp/rsansible-stat-when-yes"
+
+    - name: conditional that should NOT run
+      when: missing_stat.stat.exists
+      shell: "echo ran > /tmp/rsansible-stat-when-no"

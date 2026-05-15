@@ -52,6 +52,14 @@ pub fn op_gather_facts() -> Op {
     Op::OpGatherFacts(OpGatherFactsOutput { kind: 3 })
 }
 
+pub fn op_stat(path: String, follow: bool) -> Op {
+    Op::OpStat(OpStatOutput {
+        kind: 4,
+        path,
+        follow: if follow { 1 } else { 0 },
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

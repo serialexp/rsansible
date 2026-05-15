@@ -311,6 +311,10 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
         TaskOp::GatherFacts => {
             // Implicit op — no user-supplied fields to compile.
         }
+        TaskOp::Stat(s) => {
+            env.template_from_str(&s.path)
+                .map_err(|e| anyhow!("stat.path: {e}"))?;
+        }
     }
     Ok(())
 }

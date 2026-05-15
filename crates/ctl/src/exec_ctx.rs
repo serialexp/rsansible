@@ -100,6 +100,13 @@ pub struct RegisterValue {
     /// For tasks under `loop:`, the per-iteration results land here so
     /// `register: x` exposes `x.results = [...]`.
     pub results: Option<Vec<RegisterValue>>,
+    /// Module-specific result fields that the orchestrator lifts to
+    /// top-level keys on the register dict (matching Ansible's per-module
+    /// result shape — e.g. `stat:` exposes `register.stat.exists`). Each
+    /// entry is keyed by the field name (e.g. `"stat"`) and the value is
+    /// whatever JSON shape the module emits. Empty by default; populated
+    /// from parsed stdout JSON for modules that opt in.
+    pub extra: BTreeMap<String, JsonValue>,
 }
 
 impl RegisterValue {
@@ -130,6 +137,9 @@ impl RegisterValue {
                 "results".into(),
                 JsonValue::Array(results.iter().map(|r| r.to_json()).collect()),
             );
+        }
+        for (k, v) in &self.extra {
+            m.insert(k.clone(), v.clone());
         }
         JsonValue::Object(m)
     }
@@ -171,6 +181,7 @@ impl RegisterValue {
             skipped: false,
             failed: exit_code != 0,
             results: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -415,6 +426,20 @@ mod tests {
         assert_eq!(rv.json, Some(json!({"a": 1})));
         let j = rv.to_json();
         assert_eq!(j["json"], json!({"a": 1}));
+    }
+
+    #[test]
+    fn register_extra_lifts_module_specific_keys() {
+        // Mirrors what the orchestrator does after a `stat:` op: the
+        // parsed JSON object lands under `register.stat`.
+        let mut rv = RegisterValue::from_exec(0, false, 1, b"{\"exists\":true,\"isreg\":true}", b"");
+        rv.extra.insert("stat".into(), rv.json.clone().unwrap());
+        let j = rv.to_json();
+        assert_eq!(j["stat"]["exists"], json!(true));
+        assert_eq!(j["stat"]["isreg"], json!(true));
+        // Standard fields still present.
+        assert_eq!(j["rc"], 0);
+        assert_eq!(j["failed"], false);
     }
 
     #[test]

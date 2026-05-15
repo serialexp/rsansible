@@ -344,6 +344,16 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
                 task.name
             )
         }
+        TaskOp::Stat(s) => {
+            if s.path.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: stat.path is empty",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -610,6 +620,39 @@ mod tests {
         assert!(!is_valid_username("a b"), "embedded space");
         assert!(!is_valid_username("a;b"), "shell metachar");
         assert!(!is_valid_username(&"a".repeat(33)), "too long");
+    }
+
+    #[test]
+    fn rejects_stat_empty_path() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: probe
+      stat:
+        path: ""
+"#,
+        )
+        .unwrap();
+        let err = validate(&pb, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stat.path") && msg.contains("empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_stat_with_path() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: probe
+      stat:
+        path: /etc/hostname
+      register: probe_out
+"#,
+        )
+        .unwrap();
+        validate(&pb, None).expect("valid stat task");
     }
 
     #[test]

@@ -103,7 +103,8 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         TaskOp::WriteFile(_)
         | TaskOp::Template(_)
         | TaskOp::Copy(_)
-        | TaskOp::GatherFacts => {}
+        | TaskOp::GatherFacts
+        | TaskOp::Stat(_) => {}
     }
 }
 

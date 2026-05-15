@@ -23,7 +23,7 @@ use std::path::Path;
 #[allow(unused_imports)]
 pub use task_op::{
     AssertTask, CopyOp, ExecOp, FailTask, IncludeRoleSpec, LoopControl, LoopSpec, MetaAction,
-    SetFactMap, ShellOp, Task, TaskBody, TaskOp, TemplateOp, WriteFileOp,
+    SetFactMap, ShellOp, StatOp, Task, TaskBody, TaskOp, TemplateOp, WriteFileOp,
 };
 pub use validate::validate;
 

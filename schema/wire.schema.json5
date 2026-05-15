@@ -90,6 +90,15 @@
       ],
     },
 
+    OpStat: {
+      description: "Stat a single filesystem path. The agent emits a UTF-8 JSON object on stdout describing the path (exists / type bits / mode / uid+gid / size / mtime / atime / ctime / sha256 / link target) and finishes with TaskDone(exit_code=0). Missing path is *not* an error: the JSON simply reports {\"exists\": false}. Hard failures (permission denied on the parent dir, etc.) surface as TaskError. `follow` selects stat() vs lstat(): 0 = lstat (don't follow final symlink), 1 = stat (follow). Matches Ansible's `follow` default of true.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 4 },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "follow", type: "uint8" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -101,6 +110,7 @@
         { type: "OpShell", when: "value === 1" },
         { type: "OpWriteFile", when: "value === 2" },
         { type: "OpGatherFacts", when: "value === 3" },
+        { type: "OpStat", when: "value === 4" },
       ],
     },
 

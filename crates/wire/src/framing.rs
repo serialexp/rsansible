@@ -154,6 +154,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_stat() {
+        roundtrip(msg::task_dispatch(
+            102,
+            msg::op_stat("/etc/hostname".into(), true),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            103,
+            msg::op_stat("/nope".into(), false),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_progress() {
         roundtrip(msg::task_progress(42, 0, b"line of output\n".to_vec())).await;
     }

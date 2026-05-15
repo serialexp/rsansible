@@ -22,7 +22,7 @@
 
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
-    msg::{op_exec, op_gather_facts, op_shell, op_write_file},
+    msg::{op_exec, op_gather_facts, op_shell, op_stat, op_write_file},
     Op,
 };
 use serde::{de::Error as _, Deserialize, Deserializer};
@@ -165,6 +165,52 @@ pub enum TaskOp {
     /// is set on a play. Not produced by parsing user YAML — there is
     /// no `gather_facts:` task-body key.
     GatherFacts,
+    /// `stat:` — read-only filesystem inspection. The agent emits a JSON
+    /// object on stdout describing the path; the orchestrator lifts it
+    /// into `register.stat` (matching Ansible's `foo.stat.exists` shape).
+    Stat(StatOp),
+}
+
+/// `stat: { path: /etc/foo, follow: yes }`. `follow` selects stat() vs
+/// lstat() — defaults to true (Ansible's default). Currently always
+/// computes a sha256 for regular files (agent-side); a `get_checksum:
+/// no` knob can be added if the size becomes a problem.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StatOp {
+    pub path: String,
+    /// Defaults to true (Ansible's default). Accepts `yes`/`no`/`true`/
+    /// `false` in YAML — Ansible playbooks commonly spell booleans as
+    /// `yes`/`no`, which serde_yaml otherwise refuses.
+    #[serde(default = "default_stat_follow", deserialize_with = "deserialize_ansible_bool")]
+    pub follow: bool,
+}
+
+fn default_stat_follow() -> bool {
+    true
+}
+
+/// Accept Ansible-flavored booleans: `true`, `false`, `yes`, `no`, `on`,
+/// `off` (case-insensitive). YAML 1.2 only accepts `true`/`false`, but
+/// every gothab playbook uses `yes`/`no` so we widen.
+fn deserialize_ansible_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_yaml::Value::deserialize(d)?;
+    match v {
+        serde_yaml::Value::Bool(b) => Ok(b),
+        serde_yaml::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "yes" | "true" | "on" => Ok(true),
+            "no" | "false" | "off" => Ok(false),
+            other => Err(D::Error::custom(format!(
+                "expected bool (true/false/yes/no/on/off), got: {other:?}"
+            ))),
+        },
+        other => Err(D::Error::custom(format!(
+            "expected bool, got: {other:?}"
+        ))),
+    }
 }
 
 /// Keys that select a task body. Exactly one must appear per task.
@@ -174,6 +220,7 @@ const BODY_KEYS: &[&str] = &[
     "write_file",
     "template",
     "copy",
+    "stat",
     "assert",
     "fail",
     "set_fact",
@@ -339,6 +386,9 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "copy" => TaskBody::Op(TaskOp::Copy(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "stat" => TaskBody::Op(TaskOp::Stat(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "assert" => TaskBody::Assert(
@@ -740,6 +790,7 @@ impl TaskOp {
                 Ok(op_write_file(c.dest.clone(), c.mode, body.clone()))
             }
             TaskOp::GatherFacts => Ok(op_gather_facts()),
+            TaskOp::Stat(s) => Ok(op_stat(s.path.clone(), s.follow)),
         }
     }
 }
@@ -806,6 +857,29 @@ mod tests {
             timeout_ms: 0,
         });
         assert!(t.to_wire_op().is_err());
+    }
+
+    #[test]
+    fn stat_to_wire_carries_path_and_follow() {
+        let t = TaskOp::Stat(StatOp {
+            path: "/etc/foo".into(),
+            follow: true,
+        });
+        let WireOp::OpStat(s) = t.to_wire_op().unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.kind, 4);
+        assert_eq!(s.path, "/etc/foo");
+        assert_eq!(s.follow, 1);
+
+        let t = TaskOp::Stat(StatOp {
+            path: "/etc/foo".into(),
+            follow: false,
+        });
+        let WireOp::OpStat(s) = t.to_wire_op().unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.follow, 0);
     }
 
     #[test]
@@ -1041,6 +1115,77 @@ vars:
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_stat_minimal() {
+        let t = parse_task(
+            r#"
+name: probe
+stat:
+  path: /etc/hostname
+register: probe_stat
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Stat(s)) => {
+                assert_eq!(s.path, "/etc/hostname");
+                assert!(s.follow, "follow defaults to true (Ansible default)");
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert_eq!(t.register.as_deref(), Some("probe_stat"));
+    }
+
+    #[test]
+    fn parses_stat_with_follow_false() {
+        let t = parse_task(
+            r#"
+name: probe
+stat:
+  path: /var/log/foo.log
+  follow: no
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Stat(s)) => {
+                assert_eq!(s.path, "/var/log/foo.log");
+                assert!(!s.follow);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stat_rejects_unknown_field() {
+        let err = try_parse_task(
+            r#"
+name: t
+stat:
+  path: /x
+  bogus: 1
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown") || err.contains("bogus"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn stat_rejects_missing_path() {
+        let err = try_parse_task(
+            r#"
+name: t
+stat:
+  follow: yes
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("path"), "got: {err}");
     }
 
     #[test]

@@ -258,8 +258,25 @@ new wire framing roundtrip for `OpGatherFacts`.
   one 1-container e2e (`tests/become_e2e.rs`) that proves play default
   → root, per-task `become_user: becometest` → flipped uid, per-task
   `become: false` → opted-out (ran as the SSH login user).
-- [ ] **`OpStat`** — returns existence, type, mode, owner/group, size,
-  mtime, sha256. 10 stat sites in gothab.
+- [x] **`OpStat`** — read-only filesystem probe. New wire op kind=4
+  (`{path, follow}`); agent emits a JSON object on stdout with
+  `exists` / type bits (`isreg`/`isdir`/`islnk`/`isblk`/`ischr`/
+  `isfifo`/`issock`) / 4-digit octal `mode` / `size` / `uid`+`gid` /
+  `mtime`+`atime`+`ctime` (fractional seconds) / `checksum` (sha256
+  hex for regular files) / `lnk_source` (when `follow: no` and the
+  path is a symlink). Controller-side `TaskOp::Stat(StatOp)` with
+  `follow:` defaulting to true and accepting Ansible booleans
+  (`yes`/`no`/`on`/`off` plus `true`/`false`). After the op finishes,
+  the orchestrator lifts the parsed stdout JSON into
+  `register.stat.<field>`, matching Ansible's
+  `foo_stat.stat.exists` contract — implemented via a generic
+  `RegisterValue.extra: BTreeMap<String, JsonValue>` so other modules
+  can opt in later without further core changes. `path` is Jinja-
+  rendered at task time. 6 stat unit tests in the agent + 6
+  parser/validator tests + 1 register-lifting unit test + a
+  single-container e2e (`tests/stat_e2e.rs`) covering regular file
+  (incl. exact sha256 of `"hello\n"`), directory, missing path, and
+  `when: foo.stat.exists` gating both positive and negative paths.
 - [ ] **`OpFile`** — proper file module: ensure absent/file/directory/link
   with mode/owner/group, atomic. Subsumes some uses of write_file's mode
   param plus chmod via shell. 26 file sites.

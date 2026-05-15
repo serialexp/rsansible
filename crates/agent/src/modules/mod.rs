@@ -8,6 +8,7 @@ use crate::writer::Sender;
 
 mod exec;
 mod gather_facts;
+mod stat;
 mod write_file;
 
 /// Shared state passed to every handler. Currently just the writer; future
@@ -37,6 +38,7 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
         Op::OpShell(o) => exec::run_shell(ctx, seq, o).await,
         Op::OpWriteFile(o) => write_file::run(ctx, seq, o).await,
         Op::OpGatherFacts(_) => gather_facts::run(ctx, seq).await,
+        Op::OpStat(o) => stat::run(ctx, seq, o).await,
     }
 }
 
