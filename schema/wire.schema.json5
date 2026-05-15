@@ -198,6 +198,25 @@
       ],
     },
 
+    OpUfw: {
+      description: "`ufw` (Uncomplicated Firewall) wrapper. Maps Ansible's `community.general.ufw` (subset). `op` is a uint8: 0=rule (apply allow/deny/limit/reject), 1=enable, 2=disable, 3=reset, 4=default (set default policy), 5=reload, 6=logging. For op=rule, `rule` is one of allow/deny/limit/reject; `direction` is in/out/routed; `proto` is any/tcp/udp; `from_ip`/`to_ip` are empty for `any`; `from_port`/`to_port` are empty for any (range syntax like `5000:5010` allowed); `interface` is optional; `comment` is optional. For op=default, `rule` carries the policy (allow/deny/reject) and `direction` selects in/out/routed (empty = `incoming`). For op=logging, `rule` carries the level (on/off/low/medium/high/full). Idempotency: `ufw status verbose` is parsed once, then the requested rule is checked against the rule list (canonicalized) before any mutation. `delete=1` deletes a matching rule instead of adding it. `insert` (0 = append) inserts at the given position (1-based). Wire kind=11.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 11 },
+        { name: "op", type: "uint8" },
+        { name: "rule", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "direction", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "proto", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "from_ip", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "from_port", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "to_ip", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "to_port", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "interface", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "comment", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "delete", type: "uint8" },
+        { name: "insert", type: "uint32" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -216,6 +235,7 @@
         { type: "OpBlockInFile", when: "value === 8" },
         { type: "OpSystemd", when: "value === 9" },
         { type: "OpApt", when: "value === 10" },
+        { type: "OpUfw", when: "value === 11" },
       ],
     },
 

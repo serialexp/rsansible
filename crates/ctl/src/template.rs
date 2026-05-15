@@ -371,6 +371,24 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("apt.default_release: {e}"))?;
             }
         }
+        TaskOp::Ufw(u) => {
+            // Most ufw fields are rendered as raw strings (proto, direction
+            // are gated by parse-time allowlists; rule/state are tokens).
+            // The fields that *could* carry Jinja are ip/port/comment/iface.
+            for (label, val) in [
+                ("ufw.from_ip", &u.from_ip),
+                ("ufw.from_port", &u.from_port),
+                ("ufw.to_ip", &u.to_ip),
+                ("ufw.to_port", &u.to_port),
+                ("ufw.interface", &u.interface),
+                ("ufw.comment", &u.comment),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(val)
+                        .map_err(|e| anyhow!("{label}: {e}"))?;
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -110,7 +110,8 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         | TaskOp::LineInFile(_)
         | TaskOp::BlockInFile(_)
         | TaskOp::Systemd(_)
-        | TaskOp::Apt(_) => {}
+        | TaskOp::Apt(_)
+        | TaskOp::Ufw(_) => {}
     }
 }
 

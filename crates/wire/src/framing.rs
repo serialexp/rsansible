@@ -315,6 +315,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_ufw() {
+        roundtrip(msg::task_dispatch(
+            116,
+            msg::op_ufw(
+                msg::ufw_op::RULE,
+                "allow".into(),
+                "in".into(),
+                "tcp".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "22".into(),
+                String::new(),
+                "ssh".into(),
+                false,
+                0,
+            ),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            117,
+            msg::op_ufw(
+                msg::ufw_op::ENABLE,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+                0,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_apt() {
         roundtrip(msg::task_dispatch(
             114,

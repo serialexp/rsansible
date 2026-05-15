@@ -1203,6 +1203,187 @@ impl From<OpSystemdOutput> for OpSystemdInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpUfwInput {
+    pub op: u8,
+    pub rule: std::string::String,
+    pub direction: std::string::String,
+    pub proto: std::string::String,
+    pub from_ip: std::string::String,
+    pub from_port: std::string::String,
+    pub to_ip: std::string::String,
+    pub to_port: std::string::String,
+    pub interface: std::string::String,
+    pub comment: std::string::String,
+    pub delete: u8,
+    pub insert: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpUfwOutput {
+    pub kind: u8,
+    pub op: u8,
+    pub rule: std::string::String,
+    pub direction: std::string::String,
+    pub proto: std::string::String,
+    pub from_ip: std::string::String,
+    pub from_port: std::string::String,
+    pub to_ip: std::string::String,
+    pub to_port: std::string::String,
+    pub interface: std::string::String,
+    pub comment: std::string::String,
+    pub delete: u8,
+    pub insert: u32,
+}
+
+pub type OpUfw = OpUfwOutput;
+
+impl OpUfwInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(11);
+        encoder.write_byte(self.op);
+        encoder.write_u16_le(self.rule.len() as u16);
+        let string_bytes: &[u8] = self.rule.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.direction.len() as u16);
+        let string_bytes: &[u8] = self.direction.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.proto.len() as u16);
+        let string_bytes: &[u8] = self.proto.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.from_ip.len() as u16);
+        let string_bytes: &[u8] = self.from_ip.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.from_port.len() as u16);
+        let string_bytes: &[u8] = self.from_port.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.to_ip.len() as u16);
+        let string_bytes: &[u8] = self.to_ip.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.to_port.len() as u16);
+        let string_bytes: &[u8] = self.to_port.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.interface.len() as u16);
+        let string_bytes: &[u8] = self.interface.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.comment.len() as u16);
+        let string_bytes: &[u8] = self.comment.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.delete);
+        encoder.write_u32_le(self.insert);
+        Ok(())
+    }
+
+}
+
+impl OpUfwOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 11u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+        }
+        let op = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let rule = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let direction = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let proto = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let from_ip = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let from_port = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let to_ip = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let to_port = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let interface = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let comment = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let delete = decoder.read_byte()?;
+        let insert = decoder.read_u32_le()?;
+        Ok(Self {
+            kind,
+            op,
+            rule,
+            direction,
+            proto,
+            from_ip,
+            from_port,
+            to_ip,
+            to_port,
+            interface,
+            comment,
+            delete,
+            insert,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpUfwInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpUfwInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpUfwOutput> for OpUfwInput {
+    fn from(o: OpUfwOutput) -> Self {
+        Self {
+            op: o.op,
+            rule: o.rule,
+            direction: o.direction,
+            proto: o.proto,
+            from_ip: o.from_ip,
+            from_port: o.from_port,
+            to_ip: o.to_ip,
+            to_port: o.to_port,
+            interface: o.interface,
+            comment: o.comment,
+            delete: o.delete,
+            insert: o.insert,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
@@ -1215,6 +1396,7 @@ pub enum Op {
     OpBlockInFile(OpBlockInFileOutput),
     OpSystemd(OpSystemdOutput),
     OpApt(OpAptOutput),
+    OpUfw(OpUfwOutput),
 }
 
 impl Op {
@@ -1445,6 +1627,57 @@ impl Op {
                 }
                 encoder.write_uint8(v.allow_unauthenticated);
             }
+            Op::OpUfw(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint8(v.op);
+                encoder.write_uint16(v.rule.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.rule.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.direction.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.direction.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.proto.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.proto.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.from_ip.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.from_ip.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.from_port.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.from_port.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.to_ip.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.to_ip.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.to_port.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.to_port.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.interface.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.interface.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.comment.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.comment.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.delete);
+                encoder.write_uint32(v.insert, Endianness::LittleEndian);
+            }
         }
         Ok(())
     }
@@ -1479,6 +1712,8 @@ impl Op {
             Ok(Op::OpSystemd(OpSystemdOutput::decode_with_decoder(decoder)?))
         } else if value == 10 {
             Ok(Op::OpApt(OpAptOutput::decode_with_decoder(decoder)?))
+        } else if value == 11 {
+            Ok(Op::OpUfw(OpUfwOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(value as u64))
         }

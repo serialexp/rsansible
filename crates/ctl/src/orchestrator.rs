@@ -43,7 +43,7 @@ use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AptOp, AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp,
-    Strategy, SystemdOp, Task, TaskBody, TaskOp, WaitForOp, WriteFileOp,
+    Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, WaitForOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1912,6 +1912,29 @@ fn render_op(
                 autoremove: a.autoremove,
                 default_release,
                 allow_unauthenticated: a.allow_unauthenticated,
+            })
+        }
+        TaskOp::Ufw(u) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            TaskOp::Ufw(UfwOp {
+                op: u.op,
+                rule: u.rule.clone(),
+                direction: u.direction.clone(),
+                proto: u.proto.clone(),
+                from_ip: render_if(&u.from_ip)?,
+                from_port: render_if(&u.from_port)?,
+                to_ip: render_if(&u.to_ip)?,
+                to_port: render_if(&u.to_port)?,
+                interface: render_if(&u.interface)?,
+                comment: render_if(&u.comment)?,
+                delete: u.delete,
+                insert: u.insert,
             })
         }
     })

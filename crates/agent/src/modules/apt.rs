@@ -28,7 +28,7 @@ use std::time::SystemTime;
 use rsansible_wire::generated::OpAptOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
 
-use super::{emit_error, Context};
+use super::{emit_error, spawn_with_etxtbsy_retry, Context};
 
 const STATE_PRESENT: u8 = 0;
 const STATE_ABSENT: u8 = 1;
@@ -219,10 +219,7 @@ fn cache_update_needed(valid_seconds: u32) -> bool {
 /// Run `apt-get <args>` with `DEBIAN_FRONTEND=noninteractive`. Errors
 /// on non-zero exit with the captured stderr.
 fn run_apt(bin: &str, _op: &OpAptOutput, args: &[&str]) -> Result<(), AptError> {
-    let out = Command::new(bin)
-        .args(args)
-        .env("DEBIAN_FRONTEND", "noninteractive")
-        .output()
+    let out = spawn_apt_with_retry(bin, args)
         .map_err(|e| AptError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
         return Err(AptError::Io(format!(
@@ -236,10 +233,7 @@ fn run_apt(bin: &str, _op: &OpAptOutput, args: &[&str]) -> Result<(), AptError> 
 
 /// Same as `run_apt` but returns the captured stdout for parsing.
 fn run_apt_capture(bin: &str, _op: &OpAptOutput, args: &[&str]) -> Result<String, AptError> {
-    let out = Command::new(bin)
-        .args(args)
-        .env("DEBIAN_FRONTEND", "noninteractive")
-        .output()
+    let out = spawn_apt_with_retry(bin, args)
         .map_err(|e| AptError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
         return Err(AptError::Io(format!(
@@ -249,6 +243,33 @@ fn run_apt_capture(bin: &str, _op: &OpAptOutput, args: &[&str]) -> Result<String
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Apt's variant of the ETXTBSY retry: same idea as the shared helper
+/// in modules::mod, but we need `DEBIAN_FRONTEND=noninteractive` on
+/// every attempt, so we can't reuse the shared spawn function directly.
+fn spawn_apt_with_retry(bin: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+    let mut delay_ms = 5u64;
+    let mut last_err = None;
+    for _ in 0..6 {
+        match Command::new(bin)
+            .args(args)
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .output()
+        {
+            Ok(out) => return Ok(out),
+            Err(e) if e.raw_os_error() == Some(26) || e.kind() == ErrorKind::ResourceBusy => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(80);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("ETXTBSY retries exhausted")))
 }
 
 /// `dpkg-query -W -f '${binary:Package} ${db:Status-Status} ${Version}\n' <pkgs...>`
@@ -268,9 +289,8 @@ fn probe_installed(dpkg: &str, names: &[String]) -> Result<BTreeMap<String, Stri
     ];
     args.extend(names.iter().cloned());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new(dpkg)
-        .args(&argv)
-        .output()
+    let argv_slice: Vec<&str> = argv.iter().copied().collect();
+    let out = spawn_with_etxtbsy_retry(dpkg, &argv_slice)
         .map_err(|e| AptError::Spawn(format!("spawn {dpkg} {argv:?}: {e}")))?;
     // dpkg-query exits non-zero when any requested package is unknown,
     // but the lines it could resolve are still printed. Don't error.

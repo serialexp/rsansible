@@ -366,8 +366,20 @@ new wire framing roundtrip for `OpGatherFacts`.
   (no-op) → batch install (only-missing) → remove (changed) → second
   remove (no-op) → latest with version bump (changed) → latest stable
   (no-op) → update_cache + install (update precedes install).
-- [ ] **`OpUfw`** — allow/deny/limit + from/to/port/proto + reset/enable.
-  14 sites. Wraps `ufw`.
+- [x] **`OpUfw`** — Uncomplicated Firewall control. Wire op kind=11
+  with op (rule/enable/disable/reset/default/reload/logging) +
+  rule/direction/proto/from_ip/from_port/to_ip/to_port/interface/
+  comment/delete/insert. YAML dispatches op kind by inspecting `state:`
+  (enabled/disabled/reloaded/reset) first, then `default:`, then
+  `logging:`, then `rule:`; common aliases (`from`/`src`,
+  `to`/`dest`, `if`/`interface`) accepted. Idempotency probes `ufw
+  status verbose` and matches the requested rule against the
+  normalized rule list (loose match on verb + port/proto + direction)
+  before any mutation. enable/disable/reset use `--force`. e2e plants
+  a stub ufw in /usr/local/bin on an Alpine container and exercises
+  enable (changed) → enable (no-op) → allow ssh (no-op since stub
+  status reports it) → allow https (changed) → default deny (no-op
+  since current matches) → logging high (changed).
 - [x] **`OpWaitFor`** — port-ready (host + port + timeout) or path-exists.
   Wire op kind=6 with host/port/path/state/timeout_ms/delay_ms/sleep_ms.
   Two modes: TCP probe (`host`+`port`) or path probe (`path`); mutual

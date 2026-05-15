@@ -1,0 +1,133 @@
+# End-to-end exercise of `ufw:` (Phase 3, firewall).
+#
+# Alpine sshd containers don't have ufw, so the playbook stages a stub
+# `ufw` in /usr/local/bin that logs invocations and reads its
+# canned "status verbose" output from /tmp/rsansible-ufw-stub/STATUS.
+#
+# Scenarios:
+#   1. enable when inactive → changed, `--force enable` logged
+#   2. enable again (status now active) → no-op
+#   3. allow 22/tcp when missing → changed
+#   4. allow 22/tcp again (now in status) → no-op
+#   5. default deny incoming (different from current) → changed
+#   6. logging high (current is "low") → changed
+
+- name: ufw demo (against stub)
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: stage stub directory
+      file:
+        path: /tmp/rsansible-ufw-stub
+        state: directory
+        mode: '0755'
+
+    - name: seed STATUS (inactive)
+      shell: "echo 'Status: inactive' > /tmp/rsansible-ufw-stub/STATUS"
+
+    - name: clear stub log
+      shell: ": > /tmp/rsansible-ufw-stub/log"
+
+    - name: stage ufw stub under /tmp
+      write_file:
+        path: /tmp/rsansible-ufw-stub/ufw.in
+        mode: 0o755
+        content: |
+          #!/bin/sh
+          STATUS=/tmp/rsansible-ufw-stub/STATUS
+          LOG=/tmp/rsansible-ufw-stub/log
+          echo "$@" >> "$LOG"
+          if [ "$1" = "status" ]; then
+            cat "$STATUS"
+            exit 0
+          fi
+          exit 0
+
+    - name: install ufw stub into /usr/local/bin
+      become: true
+      shell: "install -m 0755 /tmp/rsansible-ufw-stub/ufw.in /usr/local/bin/ufw"
+
+    # --- 1. enable when inactive → changed. ---
+    - name: enable ufw
+      ufw:
+        state: enabled
+      register: r1
+
+    - name: assert enable reported changed
+      assert:
+        that: [r1.changed]
+
+    # Flip STATUS to "active with 22/tcp + low logging + deny incoming"
+    # for the remaining idempotency probes.
+    - name: install active STATUS
+      shell: |
+        cat > /tmp/rsansible-ufw-stub/STATUS <<'EOF'
+        Status: active
+        Logging: on (low)
+        Default: deny (incoming), allow (outgoing), disabled (routed)
+
+        To                         Action      From
+        --                         ------      ----
+        22/tcp                     ALLOW IN    Anywhere
+        EOF
+
+    # --- 2. enable again → no-op. ---
+    - name: enable again
+      ufw:
+        state: enabled
+      register: r2
+
+    - name: assert enable second time is no-op
+      assert:
+        that: [not r2.changed]
+
+    # --- 3. allow 22/tcp (already in STATUS) → no-op. ---
+    - name: allow ssh
+      ufw:
+        rule: allow
+        port: 22
+        proto: tcp
+      register: r3
+
+    - name: assert allow ssh is no-op (already present)
+      assert:
+        that: [not r3.changed]
+
+    # --- 4. allow 443/tcp (NOT in STATUS) → changed. ---
+    - name: clear log to isolate next call
+      shell: ": > /tmp/rsansible-ufw-stub/log"
+
+    - name: allow https
+      ufw:
+        rule: allow
+        port: 443
+        proto: tcp
+      register: r4
+
+    - name: assert allow https reported changed
+      assert:
+        that: [r4.changed]
+
+    # --- 5. default deny incoming (already current) → no-op. ---
+    - name: default deny incoming
+      ufw:
+        default: deny
+        direction: in
+      register: r5
+
+    - name: assert default no-op
+      assert:
+        that: [not r5.changed]
+
+    # --- 6. logging high (current is low) → changed. ---
+    - name: logging high
+      ufw:
+        logging: high
+      register: r6
+
+    - name: assert logging change reported
+      assert:
+        that: [r6.changed]
+
+    - name: final log snapshot
+      shell: cp /tmp/rsansible-ufw-stub/log /tmp/rsansible-ufw-stub/log.final

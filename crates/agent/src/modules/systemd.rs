@@ -27,12 +27,10 @@
 //! can drop a stub in PATH without depending on a systemd-on-container
 //! environment; production deployments leave it unset.
 
-use std::process::Command;
-
 use rsansible_wire::generated::OpSystemdOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
 
-use super::{emit_error, Context};
+use super::{emit_error, spawn_with_etxtbsy_retry, Context};
 
 const STATE_NONE: u8 = 0;
 const STATE_STARTED: u8 = 1;
@@ -181,9 +179,7 @@ fn apply(bin: &str, op: &OpSystemdOutput) -> Result<bool, SystemdError> {
 /// Run `systemctl <args>`, returning the captured stdout on success or
 /// SystemdError::Io on non-zero exit / stderr.
 fn run_systemctl(bin: &str, args: &[&str]) -> Result<String, SystemdError> {
-    let out = Command::new(bin)
-        .args(args)
-        .output()
+    let out = spawn_with_etxtbsy_retry(bin, args)
         .map_err(|e| SystemdError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -199,9 +195,7 @@ fn run_systemctl(bin: &str, args: &[&str]) -> Result<String, SystemdError> {
 /// `systemctl is-active <unit>` — exits 0 + prints "active" when up.
 /// Anything else (inactive, failed, activating) returns Ok(false).
 fn probe_is_active(bin: &str, name: &str) -> Result<bool, SystemdError> {
-    let out = Command::new(bin)
-        .args(["is-active", name])
-        .output()
+    let out = spawn_with_etxtbsy_retry(bin, &["is-active", name])
         .map_err(|e| SystemdError::Spawn(format!("spawn {bin} is-active {name}: {e}")))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     Ok(stdout.trim() == "active")
@@ -212,9 +206,7 @@ fn probe_is_active(bin: &str, name: &str) -> Result<bool, SystemdError> {
 /// code carries the same info but the stdout string is more
 /// informative; we use it.
 fn probe_is_enabled(bin: &str, name: &str) -> Result<String, SystemdError> {
-    let out = Command::new(bin)
-        .args(["is-enabled", name])
-        .output()
+    let out = spawn_with_etxtbsy_retry(bin, &["is-enabled", name])
         .map_err(|e| SystemdError::Spawn(format!("spawn {bin} is-enabled {name}: {e}")))?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

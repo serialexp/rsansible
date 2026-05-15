@@ -25,7 +25,7 @@ pub use task_op::{
     AptOp, AptState, AssertTask, BlockInFileOp, BlockInFileState, CopyOp, ExecOp, FailTask, FileOp,
     FileState, IncludeRoleSpec, LineInFileOp, LineInFileState, LoopControl, LoopSpec, MetaAction,
     SetFactMap, ShellOp, StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp,
-    WaitForOp, WaitForState, WriteFileOp,
+    UfwOp, UfwOpKind, WaitForOp, WaitForState, WriteFileOp,
 };
 pub use validate::validate;
 

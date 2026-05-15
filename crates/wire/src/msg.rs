@@ -270,6 +270,49 @@ pub fn op_apt(
     })
 }
 
+/// `op:` byte values for `OpUfw`.
+pub mod ufw_op {
+    pub const RULE: u8 = 0;
+    pub const ENABLE: u8 = 1;
+    pub const DISABLE: u8 = 2;
+    pub const RESET: u8 = 3;
+    pub const DEFAULT: u8 = 4;
+    pub const RELOAD: u8 = 5;
+    pub const LOGGING: u8 = 6;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_ufw(
+    op: u8,
+    rule: String,
+    direction: String,
+    proto: String,
+    from_ip: String,
+    from_port: String,
+    to_ip: String,
+    to_port: String,
+    interface: String,
+    comment: String,
+    delete: bool,
+    insert: u32,
+) -> Op {
+    Op::OpUfw(OpUfwOutput {
+        kind: 11,
+        op,
+        rule,
+        direction,
+        proto,
+        from_ip,
+        from_port,
+        to_ip,
+        to_port,
+        interface,
+        comment,
+        delete: if delete { 1 } else { 0 },
+        insert,
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

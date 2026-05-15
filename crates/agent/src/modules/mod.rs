@@ -14,6 +14,7 @@ mod gather_facts;
 mod lineinfile;
 mod stat;
 mod systemd;
+mod ufw;
 mod wait_for;
 mod write_file;
 
@@ -51,6 +52,7 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
         Op::OpBlockInFile(o) => blockinfile::run(ctx, seq, o).await,
         Op::OpSystemd(o) => systemd::run(ctx, seq, o).await,
         Op::OpApt(o) => apt::run(ctx, seq, o).await,
+        Op::OpUfw(o) => ufw::run(ctx, seq, o).await,
     }
 }
 
@@ -58,4 +60,40 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
 /// handlers when something goes wrong before they can produce TaskDone.
 pub async fn emit_error(ctx: &Context, seq: u32, code: u8, message: impl Into<String>) {
     ctx.emit(msg::task_error(seq, code, message.into())).await;
+}
+
+/// Spawn `bin args` with bounded retries on ETXTBSY. ETXTBSY ("Text
+/// file busy", `errno == 26`) fires when the kernel still sees an open
+/// writable fd on the executable's inode at the moment of exec.
+///
+/// In production this should never happen — `/usr/bin/systemctl`,
+/// `/usr/bin/apt-get`, `/usr/sbin/ufw` are all system binaries we never
+/// write to ourselves. The retry exists for tests that fork+exec stub
+/// scripts they've just laid down on disk: under parallel-cargo-test
+/// pressure the kernel occasionally refuses the first exec, but a
+/// rewrite+rename ordering + a 5-80ms backoff is sufficient to clear
+/// it. Always doing the retry is harmless: the slow path is gated on a
+/// specific errno that production never hits.
+pub(crate) fn spawn_with_etxtbsy_retry(
+    bin: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    use std::io::ErrorKind;
+    use std::process::Command;
+    use std::time::Duration;
+    let mut delay_ms = 5u64;
+    let mut last_err = None;
+    for _ in 0..6 {
+        match Command::new(bin).args(args).output() {
+            Ok(out) => return Ok(out),
+            Err(e) if e.raw_os_error() == Some(26) || e.kind() == ErrorKind::ResourceBusy => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(80);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("ETXTBSY retries exhausted")))
 }

@@ -485,6 +485,11 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::Ufw(_) => {
+            // Cross-field constraints already enforced at parse time;
+            // nothing else to check.
+            Ok(())
+        }
         TaskOp::BlockInFile(b) => {
             if b.path.is_empty() {
                 bail!(
