@@ -17,3 +17,4 @@ pub mod tags;
 pub mod template;
 pub mod vault;
 pub mod wire_cost;
+pub mod x509;

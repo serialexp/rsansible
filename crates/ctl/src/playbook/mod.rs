@@ -24,9 +24,9 @@ use std::path::Path;
 pub use task_op::{
     AssertTask, BlockInFileOp, BlockInFileState, CopyOp, ExecOp, FailTask, FileOp, FileState,
     IncludeRoleSpec, LineInFileOp, LineInFileState, LoopControl, LoopSpec, MetaAction,
-    PackageManager, PackageOp, PackageState, SetFactMap, ShellOp, StatOp, SystemdOp, SystemdState,
-    Task, TaskBody, TaskOp, TemplateOp, UfwOp, UfwOpKind, UriOp, WaitForOp, WaitForState,
-    WriteFileOp,
+    OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageManager, PackageOp, PackageState, SetFactMap,
+    ShellOp, StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp, UfwOp,
+    UfwOpKind, UriOp, WaitForOp, WaitForState, WriteFileOp, X509CertificatePipeOp,
 };
 pub use validate::validate;
 

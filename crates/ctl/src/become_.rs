@@ -112,7 +112,13 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         | TaskOp::Systemd(_)
         | TaskOp::Package(_)
         | TaskOp::Ufw(_)
-        | TaskOp::Uri(_) => {}
+        | TaskOp::Uri(_)
+        // x509 family is controller-side: privkey desugars to
+        // OpWriteFile (no argv); the *_pipe variants don't even
+        // dispatch a wire op. become: is meaningless for all three.
+        | TaskOp::OpenSslPrivkey(_)
+        | TaskOp::OpenSslCsrPipe(_)
+        | TaskOp::X509CertificatePipe(_) => {}
     }
 }
 

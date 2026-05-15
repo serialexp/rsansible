@@ -95,11 +95,43 @@ fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()>
         }
         validate_handler(h, &where_(), hi)?;
     }
+    // Track privkey-path → task-index for the play-scoped chain
+    // constraint: an `openssl_csr_pipe` referencing a `privatekey_path`
+    // must be preceded (in the same play) by an `openssl_privatekey`
+    // task writing to that exact path. v1 doesn't support cross-run
+    // chains via OpReadFile — flag this loudly so playbook errors
+    // surface at validate time rather than as a confusing runtime
+    // "no cached private key" failure.
+    //
+    // Paths containing Jinja (`{{ ... }}`) are unrendered at this
+    // stage and can't be statically reasoned about — those skip the
+    // check and rely on the runtime error.
+    let mut privkey_paths: BTreeSet<String> = BTreeSet::new();
     for (ti, task) in play.tasks.iter().enumerate() {
         if task.name.is_empty() {
             bail!("{}: task[{ti}] has empty name", where_());
         }
         validate_task(task, &where_(), ti)?;
+        if let TaskBody::Op(TaskOp::OpenSslPrivkey(p)) = &task.body {
+            if !p.path.contains("{{") {
+                privkey_paths.insert(p.path.clone());
+            }
+        }
+        if let TaskBody::Op(TaskOp::OpenSslCsrPipe(c)) = &task.body {
+            if !c.privatekey_path.contains("{{")
+                && !privkey_paths.contains(&c.privatekey_path)
+            {
+                bail!(
+                    "{}: task[{ti}] {:?}: openssl_csr_pipe.privatekey_path {:?} doesn't \
+                     match any preceding openssl_privatekey task in this play. v1 requires \
+                     the privkey and csr_pipe to chain within the same play (no cross-run \
+                     OpReadFile fetch yet).",
+                    where_(),
+                    task.name,
+                    c.privatekey_path
+                );
+            }
+        }
         // Notify references: literal (no `{{`) names must match a handler.
         for n in &task.notify {
             if !n.contains("{{") && !handler_names.contains(n) {
@@ -582,6 +614,71 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::OpenSslPrivkey(p) => {
+            if p.path.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: openssl_privatekey.path is empty",
+                    where_,
+                    task.name
+                );
+            }
+            // size only meaningful for RSA; reject 0 / nonsense for RSA.
+            if matches!(p.kind, crate::x509::PrivkeyType::Rsa)
+                && !matches!(p.size, 2048 | 3072 | 4096)
+            {
+                bail!(
+                    "{}: task[{ti}] {:?}: openssl_privatekey.size must be 2048, 3072, or 4096 \
+                     for RSA; got {}",
+                    where_,
+                    task.name,
+                    p.size
+                );
+            }
+            Ok(())
+        }
+        TaskOp::OpenSslCsrPipe(c) => {
+            if c.privatekey_path.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: openssl_csr_pipe.privatekey_path is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if c.common_name.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: openssl_csr_pipe.common_name is empty",
+                    where_,
+                    task.name
+                );
+            }
+            // The `must run in same play as the privkey it derives from`
+            // constraint is play-scoped, not task-scoped — checked in
+            // `validate_play`. Per-task we just sanity-check the inputs.
+            Ok(())
+        }
+        TaskOp::X509CertificatePipe(c) => {
+            if c.provider != "selfsigned" {
+                bail!(
+                    "{}: task[{ti}] {:?}: x509_certificate_pipe.provider only supports \
+                     \"selfsigned\" in v1; got {:?}",
+                    where_,
+                    task.name,
+                    c.provider
+                );
+            }
+            if c.valid_for_days == 0 {
+                bail!(
+                    "{}: task[{ti}] {:?}: x509_certificate_pipe.valid_for_days must be > 0",
+                    where_,
+                    task.name
+                );
+            }
+            // csr_content / privatekey_content are almost always Jinja
+            // expressions referencing prior registers; empty literals
+            // are nonsense but valid expressions are opaque here.
+            // Render-time evaluation catches empty cases.
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -937,6 +1034,85 @@ mod tests {
         )
         .unwrap();
         validate(&pb, None).expect("valid file task");
+    }
+
+    #[test]
+    fn rejects_csr_pipe_without_preceding_privkey() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: csr
+      openssl_csr_pipe:
+        privatekey_path: /etc/etcd/server.key
+        common_name: cn
+"#,
+        )
+        .unwrap();
+        let err = validate(&pb, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("openssl_csr_pipe") && msg.contains("preceding"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_csr_pipe_after_privkey() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: key
+      openssl_privatekey:
+        path: /etc/etcd/server.key
+    - name: csr
+      openssl_csr_pipe:
+        privatekey_path: /etc/etcd/server.key
+        common_name: cn
+"#,
+        )
+        .unwrap();
+        validate(&pb, None).expect("chained ok");
+    }
+
+    #[test]
+    fn rejects_x509_pipe_provider_other_than_selfsigned() {
+        // The provider check is enforced at Deserialize time (more
+        // immediate UX than waiting for validate). Confirm parsing
+        // rejects the bad value before validate even runs.
+        let err = serde_yaml::from_str::<Playbook>(
+            r#"
+- name: p
+  tasks:
+    - name: cert
+      x509_certificate_pipe:
+        csr_content: x
+        privatekey_content: y
+        provider: ownca
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("provider") || msg.contains("selfsigned"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_privkey_invalid_rsa_size() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: t
+      openssl_privatekey:
+        path: /etc/k
+        size: 1024
+"#,
+        )
+        .unwrap();
+        let err = validate(&pb, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("size") || msg.contains("2048"), "got: {msg}");
     }
 
     #[test]

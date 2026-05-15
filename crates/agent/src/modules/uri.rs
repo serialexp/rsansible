@@ -790,4 +790,225 @@ mod tests {
     fn _silence(_: AxumPath<()>, _: Query<HashMap<String, String>>, _: AxumHeaderMap, _: AxumMethod, _: Bytes, _: SocketAddr) -> Response<axum::body::Body> {
         ().into_response()
     }
+
+    // ---------- mTLS integration tests ----------
+    //
+    // These exercise the full mTLS code path in `build_client`:
+    // CA-bundle import, client identity (cert + key concatenated),
+    // and rustls' handshake on both sides. Cert chain is generated
+    // in-test via rcgen so the test is hermetic.
+
+    struct TestChain {
+        ca_cert_pem: Vec<u8>,
+        server_cert_pem: Vec<u8>,
+        server_key_pem: Vec<u8>,
+        client_cert_pem: Vec<u8>,
+        client_key_pem: Vec<u8>,
+    }
+
+    /// Build a CA, sign a server cert (SAN=127.0.0.1), and sign a
+    /// client cert. All Ed25519 — fastest to generate, smallest PEMs,
+    /// and the rustls/ring/aws_lc trio all accept it without extra
+    /// feature gates.
+    fn gen_chain() -> TestChain {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+            KeyPair, KeyUsagePurpose, SanType, PKCS_ED25519,
+        };
+        // CA.
+        let ca_kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.distinguished_name.push(DnType::CommonName, "rsansible-test-CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        ca_params.key_usages.push(KeyUsagePurpose::CrlSign);
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+
+        // Server cert: SAN=127.0.0.1.
+        let srv_kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut srv_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        srv_params.distinguished_name.push(DnType::CommonName, "rsansible-test-server");
+        srv_params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
+        srv_params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
+        let srv_cert = srv_params.signed_by(&srv_kp, &ca_cert, &ca_kp).unwrap();
+
+        // Client cert.
+        let cli_kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut cli_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        cli_params.distinguished_name.push(DnType::CommonName, "rsansible-test-client");
+        cli_params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
+        let cli_cert = cli_params.signed_by(&cli_kp, &ca_cert, &ca_kp).unwrap();
+
+        TestChain {
+            ca_cert_pem: ca_cert.pem().into_bytes(),
+            server_cert_pem: srv_cert.pem().into_bytes(),
+            server_key_pem: srv_kp.serialize_pem().into_bytes(),
+            client_cert_pem: cli_cert.pem().into_bytes(),
+            client_key_pem: cli_kp.serialize_pem().into_bytes(),
+        }
+    }
+
+    /// Spin up a rustls-backed axum server bound to 127.0.0.1:0 that
+    /// requires a client cert signed by `ca_pem`. Returns the bound
+    /// port. The server runs on a tokio task that lives for the
+    /// duration of the test.
+    async fn boot_tls(router: Router, chain: &TestChain) -> u16 {
+        use axum_server::tls_rustls::RustlsConfig;
+        use rustls::server::WebPkiClientVerifier;
+        use rustls::RootCertStore;
+        use std::sync::Arc;
+
+        // CA root store — the verifier uses this to validate incoming
+        // client certs.
+        let mut roots = RootCertStore::empty();
+        for der in rustls_pemfile_certs(&chain.ca_cert_pem) {
+            roots.add(der).unwrap();
+        }
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        // Server identity.
+        let server_certs = rustls_pemfile_certs(&chain.server_cert_pem);
+        let server_key = rustls_pemfile_private_key(&chain.server_key_pem);
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(server_certs, server_key)
+            .unwrap();
+        let cfg = RustlsConfig::from_config(Arc::new(server_cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        tokio::spawn(async move {
+            axum_server::from_tcp_rustls(std_listener, cfg)
+                .serve(router.into_make_service())
+                .await
+                .unwrap();
+        });
+        // Tiny yield so the acceptor is ready before clients connect.
+        tokio::task::yield_now().await;
+        port
+    }
+
+    // Parse a PEM blob into rustls 0.23 CertificateDer values without
+    // pulling in the `rustls-pemfile` crate — we already have rcgen
+    // and want to keep the dev-deps lean. PEM grammar here is
+    // permissive (rcgen always emits canonical PEMs).
+    fn rustls_pemfile_certs(pem: &[u8]) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+        let s = std::str::from_utf8(pem).expect("PEM is UTF-8");
+        let mut out = Vec::new();
+        for block in s.split("-----BEGIN CERTIFICATE-----") {
+            if let Some(end) = block.find("-----END CERTIFICATE-----") {
+                let b64 = block[..end].replace(['\n', '\r', ' '], "");
+                if b64.is_empty() {
+                    continue;
+                }
+                use base64::Engine;
+                let der = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .unwrap();
+                out.push(rustls::pki_types::CertificateDer::from(der));
+            }
+        }
+        out
+    }
+
+    fn rustls_pemfile_private_key(pem: &[u8]) -> rustls::pki_types::PrivateKeyDer<'static> {
+        let s = std::str::from_utf8(pem).expect("PEM is UTF-8");
+        // rcgen emits Ed25519 keys as PKCS#8.
+        let begin = "-----BEGIN PRIVATE KEY-----";
+        let end = "-----END PRIVATE KEY-----";
+        let start = s.find(begin).expect("PKCS8 PEM") + begin.len();
+        let tail = &s[start..];
+        let stop = tail.find(end).expect("PKCS8 PEM end");
+        let b64 = tail[..stop].replace(['\n', '\r', ' '], "");
+        use base64::Engine;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(der),
+        )
+    }
+
+    /// Install a default rustls crypto provider for the test process if
+    /// one hasn't been set yet. rustls 0.23 demands an explicit choice;
+    /// reqwest installs its own internally, but axum-server's server
+    /// side requires it at process scope. Using `ring` to match
+    /// reqwest's rustls feature.
+    fn ensure_crypto_provider() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    #[tokio::test]
+    async fn mtls_round_trip_succeeds_with_client_cert() {
+        ensure_crypto_provider();
+        let chain = gen_chain();
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let port = boot_tls(app, &chain).await;
+
+        let mut op = op_for(&format!("https://127.0.0.1:{port}/ping"));
+        op.return_content = 1;
+        op.client_cert_pem = chain.client_cert_pem.clone();
+        op.client_key_pem = chain.client_key_pem.clone();
+        op.ca_bundle_pem = chain.ca_cert_pem.clone();
+        let r = run_op(op).await;
+        assert_eq!(r.exit_code, 0, "envelope: {:?}", r.envelope);
+        let env = r.envelope.expect("envelope present");
+        assert_eq!(env["status"], 200, "envelope: {env}");
+        assert_eq!(env["content"], "pong");
+    }
+
+    #[tokio::test]
+    async fn mtls_fails_when_client_cert_missing() {
+        ensure_crypto_provider();
+        let chain = gen_chain();
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let port = boot_tls(app, &chain).await;
+
+        // Provide the CA bundle so the server's cert validates, but
+        // omit the client identity. The server rejects the handshake;
+        // OpUri should surface this as a TaskError (network-level
+        // failure, not an HTTP-level non-200). drain() captures that
+        // in `error`.
+        let mut op = op_for(&format!("https://127.0.0.1:{port}/ping"));
+        op.ca_bundle_pem = chain.ca_cert_pem.clone();
+        let r = run_op(op).await;
+        assert!(
+            r.error.is_some() || r.exit_code != 0,
+            "expected failure, exit={} envelope={:?} error={:?}",
+            r.exit_code,
+            r.envelope,
+            r.error
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_fails_with_missing_ca_bundle() {
+        ensure_crypto_provider();
+        let chain = gen_chain();
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let port = boot_tls(app, &chain).await;
+
+        // No CA bundle: the test server cert is self-issued by our
+        // private CA which isn't in the system trust store. Without
+        // ca_bundle_pem and without `validate_certs: 0`, reqwest's
+        // verifier should reject the cert chain.
+        let mut op = op_for(&format!("https://127.0.0.1:{port}/ping"));
+        op.client_cert_pem = chain.client_cert_pem.clone();
+        op.client_key_pem = chain.client_key_pem.clone();
+        let r = run_op(op).await;
+        assert!(
+            r.error.is_some() || r.exit_code != 0,
+            "expected failure, exit={} envelope={:?} error={:?}",
+            r.exit_code,
+            r.envelope,
+            r.error
+        );
+    }
 }

@@ -9,7 +9,7 @@
 //! `loop:` expressions, `assert.that:` expressions) all evaluate against
 //! the merged view returned by `build_template_ctx`.
 
-use crate::wire_cost::WireCost;
+use crate::wire_cost::{WireCost, WireStrategy};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -64,6 +64,25 @@ pub struct HostCtx {
     /// by `wire_cost::should_probe_first` to decide ship-blind vs
     /// probe-first for module-generated content (privkey, …).
     pub wire_cost: WireCost,
+    /// Run-scoped override for the ship-blind / probe heuristic. Same
+    /// value for every host (copied in from `RunSpec.wire_strategy` at
+    /// initial-context time). Stored per-host because `HostCtx` is the
+    /// only thing threaded through the per-task dispatch path. `Auto`
+    /// defers to `wire_cost::should_probe_first`.
+    pub wire_strategy: WireStrategy,
+    /// In-memory cache of private-key PEM bytes generated this run,
+    /// keyed by the remote dest path. Populated by the
+    /// `OpenSslPrivkey` composite-dispatch path when it actually
+    /// generates a key; consumed by subsequent `OpenSslCsrPipe`
+    /// tasks that reference the same `privatekey_path`. Lets the
+    /// CSR step sign with the key bytes without a wire round-trip
+    /// to fetch them back from the remote.
+    ///
+    /// Not persisted across runs. If the key already exists on the
+    /// remote (privkey task was a no-op) and no entry is cached,
+    /// the CSR task fails loudly — v1 contract is "csr_pipe must
+    /// run in the same play as the privkey it derives from."
+    pub privkey_pem_cache: BTreeMap<String, Vec<u8>>,
 }
 
 impl HostCtx {
@@ -81,6 +100,8 @@ impl HostCtx {
             iter_item: None,
             pending_handlers: BTreeSet::new(),
             wire_cost: WireCost::default(),
+            wire_strategy: WireStrategy::default(),
+            privkey_pem_cache: BTreeMap::new(),
         }
     }
 

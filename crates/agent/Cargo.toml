@@ -41,3 +41,15 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "proc
 axum = "0.7"
 hyper = "1"
 tower = "0.5"
+# mTLS integration test: axum-server provides a rustls-backed TCP
+# acceptor that can demand client certs; rcgen generates the CA +
+# server + client cert chain in-test; rustls is the server-side TLS
+# implementation. These are dev-deps only — they never ship with the
+# pushed agent binary.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+# Test-only PEM → DER decoding for handing certs to rustls 0.23.
+# rcgen emits canonical PEM so a tiny grep-then-base64 helper is plenty;
+# avoids dragging in `rustls-pemfile` just for the dev path.
+base64 = "0.22"

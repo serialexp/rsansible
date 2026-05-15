@@ -410,6 +410,43 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 env.template_from_str(&u.body)
                     .map_err(|e| anyhow!("uri.body: {e}"))?;
             }
+            for label in ["client_cert", "client_key", "ca_path"] {
+                let val = match label {
+                    "client_cert" => &u.client_cert,
+                    "client_key" => &u.client_key,
+                    "ca_path" => &u.ca_path,
+                    _ => unreachable!(),
+                };
+                if !val.is_empty() {
+                    env.template_from_str(val)
+                        .map_err(|e| anyhow!("uri.{label}: {e}"))?;
+                }
+            }
+        }
+        TaskOp::OpenSslPrivkey(p) => {
+            env.template_from_str(&p.path)
+                .map_err(|e| anyhow!("openssl_privatekey.path: {e}"))?;
+        }
+        TaskOp::OpenSslCsrPipe(c) => {
+            env.template_from_str(&c.privatekey_path)
+                .map_err(|e| anyhow!("openssl_csr_pipe.privatekey_path: {e}"))?;
+            env.template_from_str(&c.common_name)
+                .map_err(|e| anyhow!("openssl_csr_pipe.common_name: {e}"))?;
+            for (i, s) in c.subject_alt_name.iter().enumerate() {
+                env.template_from_str(s)
+                    .map_err(|e| anyhow!("openssl_csr_pipe.subject_alt_name[{i}]: {e}"))?;
+            }
+            // key_usage / extended_key_usage are validated against
+            // closed enums (parse_key_usage / parse_extended_key_usage);
+            // Jinja inside those strings would only confuse the matcher.
+        }
+        TaskOp::X509CertificatePipe(c) => {
+            // csr_content / privatekey_content come from previous-task
+            // registers via Jinja in real playbooks.
+            env.template_from_str(&c.csr_content)
+                .map_err(|e| anyhow!("x509_certificate_pipe.csr_content: {e}"))?;
+            env.template_from_str(&c.privatekey_content)
+                .map_err(|e| anyhow!("x509_certificate_pipe.privatekey_content: {e}"))?;
         }
     }
     Ok(())

@@ -38,6 +38,24 @@ subtle.workspace = true
 hex.workspace = true
 base64.workspace = true
 regex.workspace = true
+# Controller-side x509: generates private keys, CSRs, and self-signed
+# certificates locally so the bytes can ship via OpWriteFile (or via
+# `register: .content` for the *_pipe variants). Pulled in on the
+# controller only — keeps the pushed agent binary small.
+# aws_lc_rs (not ring) is required for RSA keygen — ring intentionally
+# doesn't ship an RSA generator (briansmith/ring#219), and
+# `openssl_privatekey` defaults to RSA-4096 in Ansible-land. aws-lc-sys
+# links a copy of AWS's libcrypto; this is fine on the controller (it
+# only ships to operator workstations), and never touches the agent.
+# x509-parser is needed by `CertificateSigningRequestParams::from_pem`
+# so cert_pipe can lift the CSR's subject/SANs/extensions into the
+# signed cert.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "aws_lc_rs", "x509-parser"] }
+# rcgen's CertificateParams takes `OffsetDateTime` for cert validity
+# windows. `time` is already in our dep graph (transitive via rcgen
+# and hyper); pinning explicitly keeps the API visible without
+# version-skew surprises.
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
