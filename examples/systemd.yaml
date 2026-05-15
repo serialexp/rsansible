@@ -1,0 +1,147 @@
+# End-to-end exercise of `systemd:` (Phase 3, service management).
+#
+# Alpine sshd containers don't have systemd, so this playbook stages a
+# *stub* systemctl in /usr/local/bin that logs invocations and reports
+# probe state via marker files. The agent's `systemd:` op invokes the
+# stub via the agent's inherited PATH.
+#
+# The stub honours two state files written by the playbook:
+#   /tmp/rsansible-systemd-stub/ACTIVE  → contents of `is-active`
+#   /tmp/rsansible-systemd-stub/ENABLED → contents of `is-enabled`
+#
+# Scenarios:
+#   1. start an inactive service → changed, `start` logged
+#   2. re-run with service "active" → no-op, no `start`
+#   3. restart → always changed, `restart` logged
+#   4. enable when disabled → changed, `enable` logged
+#   5. daemon_reload + start → daemon-reload first, then start
+#   6. mask when not masked → changed, `mask` logged
+
+- name: systemd demo (against stub)
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: stage stub directory
+      file:
+        path: /tmp/rsansible-systemd-stub
+        state: directory
+        mode: '0755'
+
+    - name: clear stub log
+      shell: ": > /tmp/rsansible-systemd-stub/log"
+
+    # The stub is a sh script; we plant it on PATH at /usr/local/bin.
+    # That path is writable only by root, so we stage the file in /tmp
+    # first and then `sudo install` it. (Doing the install via become +
+    # `cat > /usr/local/bin/systemctl` would redirect in the outer
+    # shell's context, before sudo takes effect — the redirection has
+    # to happen via `tee`/`install` running as root, not via outer sh.)
+    - name: stage stub script under /tmp
+      write_file:
+        path: /tmp/rsansible-systemd-stub/systemctl.in
+        mode: 0o755
+        content: |
+          #!/bin/sh
+          LOG=/tmp/rsansible-systemd-stub/log
+          A=/tmp/rsansible-systemd-stub/ACTIVE
+          E=/tmp/rsansible-systemd-stub/ENABLED
+          echo "$@" >> "$LOG"
+          case "$1" in
+            is-active)  if [ -f "$A" ]; then cat "$A"; else echo inactive; fi ;;
+            is-enabled) if [ -f "$E" ]; then cat "$E"; else echo disabled; fi ;;
+          esac
+
+    - name: install stub systemctl into /usr/local/bin
+      become: true
+      shell: "install -m 0755 /tmp/rsansible-systemd-stub/systemctl.in /usr/local/bin/systemctl"
+
+    # --- 1. start when inactive (no ACTIVE file → "inactive"). ---
+    - name: ensure ACTIVE/ENABLED markers absent
+      shell: "rm -f /tmp/rsansible-systemd-stub/ACTIVE /tmp/rsansible-systemd-stub/ENABLED"
+
+    - name: start foo.service (should be changed)
+      systemd:
+        name: foo.service
+        state: started
+      register: r_start
+
+    - name: assert start reported changed
+      assert:
+        that: [r_start.changed]
+
+    # --- 2. start when already active → no-op. ---
+    - name: flip ACTIVE to active
+      shell: "echo active > /tmp/rsansible-systemd-stub/ACTIVE"
+
+    - name: start foo.service again (should be no-op)
+      systemd:
+        name: foo.service
+        state: started
+      register: r_start_noop
+
+    - name: assert start no-op
+      assert:
+        that: [not r_start_noop.changed]
+
+    # --- 3. restart → always changed. ---
+    - name: restart foo.service
+      systemd:
+        name: foo.service
+        state: restarted
+      register: r_restart
+
+    - name: assert restart reported changed
+      assert:
+        that: [r_restart.changed]
+
+    # --- 4. enable when disabled. ---
+    - name: ensure ENABLED absent (probe returns "disabled")
+      shell: "rm -f /tmp/rsansible-systemd-stub/ENABLED"
+
+    - name: enable foo.service
+      systemd:
+        name: foo.service
+        enabled: yes
+      register: r_enable
+
+    - name: assert enable reported changed
+      assert:
+        that: [r_enable.changed]
+
+    # --- 5. daemon_reload + start (clear ACTIVE so start actually runs). ---
+    - name: clear ACTIVE so start will fire
+      shell: "rm -f /tmp/rsansible-systemd-stub/ACTIVE"
+
+    - name: clear log to isolate next call
+      shell: ": > /tmp/rsansible-systemd-stub/log"
+
+    - name: daemon_reload + start
+      systemd:
+        name: foo.service
+        state: started
+        daemon_reload: yes
+      register: r_dr
+
+    - name: assert daemon-reload reported changed
+      assert:
+        that: [r_dr.changed]
+
+    - name: snapshot log for ordering check
+      shell: "cp /tmp/rsansible-systemd-stub/log /tmp/rsansible-systemd-stub/log.dr"
+
+    # --- 6. mask when not masked. ---
+    - name: clear ENABLED so probe is "disabled" (i.e. not masked)
+      shell: "rm -f /tmp/rsansible-systemd-stub/ENABLED"
+
+    - name: mask foo.service
+      systemd:
+        name: foo.service
+        masked: yes
+      register: r_mask
+
+    - name: assert mask reported changed
+      assert:
+        that: [r_mask.changed]
+
+    - name: final log snapshot
+      shell: "cp /tmp/rsansible-systemd-stub/log /tmp/rsansible-systemd-stub/log.final"

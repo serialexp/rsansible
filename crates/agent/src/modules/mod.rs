@@ -12,6 +12,7 @@ mod file;
 mod gather_facts;
 mod lineinfile;
 mod stat;
+mod systemd;
 mod wait_for;
 mod write_file;
 
@@ -47,6 +48,7 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
         Op::OpWaitFor(o) => wait_for::run(ctx, seq, o).await,
         Op::OpLineInFile(o) => lineinfile::run(ctx, seq, o).await,
         Op::OpBlockInFile(o) => blockinfile::run(ctx, seq, o).await,
+        Op::OpSystemd(o) => systemd::run(ctx, seq, o).await,
     }
 }
 

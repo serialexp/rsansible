@@ -333,9 +333,22 @@ new wire framing roundtrip for `OpGatherFacts`.
   `changed=1` iff bytes actually moved on disk. e2e covers seed →
   no-op → body update → custom-marker block placement → state=absent
   with the custom block surviving.
-- [ ] **`OpSystemd`** — start / stop / restart / reload / enable /
+- [x] **`OpSystemd`** — start / stop / restart / reload / enable /
   disable / mask / unmask with proper "did this actually change anything"
-  reporting. 39 sites. Wraps `systemctl`.
+  reporting. Wire op kind=9 with name/state/enabled/masked/daemon_reload/
+  no_block. Action order matches Ansible: `daemon-reload` (if requested)
+  → mask/unmask transition → enable/disable transition → state transition
+  (started/stopped/restarted/reloaded). Probes via `systemctl is-active`
+  and `systemctl is-enabled` for idempotency: `started`/`stopped` only
+  fire when current state disagrees; `restarted`/`reloaded` always
+  report changed (Ansible contract). `--no-block` is inserted before
+  the subcommand when set. `systemctl` binary path is overridable via
+  `RSANSIBLE_SYSTEMCTL` env (used by tests with a stub). e2e plants a
+  stub systemctl in /usr/local/bin (via `write_file:` + `become: true
+  install`) on an Alpine sshd container and exercises start (changed)
+  → re-start (no-op) → restart (changed) → enable (changed) →
+  daemon_reload + start (daemon-reload precedes start in log) → mask
+  (changed).
 - [ ] **`OpApt`** — name(s), state (present/absent/latest), update_cache.
   Wraps apt-get with DEBIAN_FRONTEND=noninteractive. 13 sites.
 - [ ] **`OpUfw`** — allow/deny/limit + from/to/port/proto + reset/enable.

@@ -357,6 +357,10 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             // itself (not Jinja). insertbefore/insertafter are regex
             // patterns — same rationale as lineinfile.
         }
+        TaskOp::Systemd(s) => {
+            env.template_from_str(&s.name)
+                .map_err(|e| anyhow!("systemd.name: {e}"))?;
+        }
     }
     Ok(())
 }

@@ -287,6 +287,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_systemd() {
+        roundtrip(msg::task_dispatch(
+            112,
+            msg::op_systemd(
+                "nginx.service".into(),
+                msg::systemd_state::RESTARTED,
+                Some(true),
+                None,
+                true,
+                false,
+            ),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            113,
+            msg::op_systemd(
+                "foo.service".into(),
+                msg::systemd_state::NONE,
+                None,
+                Some(false),
+                false,
+                true,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,

@@ -24,7 +24,8 @@ use std::path::Path;
 pub use task_op::{
     AssertTask, BlockInFileOp, BlockInFileState, CopyOp, ExecOp, FailTask, FileOp, FileState,
     IncludeRoleSpec, LineInFileOp, LineInFileState, LoopControl, LoopSpec, MetaAction, SetFactMap,
-    ShellOp, StatOp, Task, TaskBody, TaskOp, TemplateOp, WaitForOp, WaitForState, WriteFileOp,
+    ShellOp, StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp, WaitForOp,
+    WaitForState, WriteFileOp,
 };
 pub use validate::validate;
 

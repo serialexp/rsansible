@@ -199,6 +199,46 @@ pub fn op_blockinfile(
     })
 }
 
+/// `state:` byte values for `OpSystemd`.
+pub mod systemd_state {
+    /// Don't touch run-state — only manage enable/mask.
+    pub const NONE: u8 = 0;
+    pub const STARTED: u8 = 1;
+    pub const STOPPED: u8 = 2;
+    pub const RESTARTED: u8 = 3;
+    pub const RELOADED: u8 = 4;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_systemd(
+    name: String,
+    state: u8,
+    enabled: Option<bool>,
+    masked: Option<bool>,
+    daemon_reload: bool,
+    no_block: bool,
+) -> Op {
+    let (has_enabled, enabled_val) = match enabled {
+        Some(b) => (1u8, if b { 1u8 } else { 0u8 }),
+        None => (0u8, 0u8),
+    };
+    let (has_masked, masked_val) = match masked {
+        Some(b) => (1u8, if b { 1u8 } else { 0u8 }),
+        None => (0u8, 0u8),
+    };
+    Op::OpSystemd(OpSystemdOutput {
+        kind: 9,
+        name,
+        state,
+        has_enabled,
+        enabled: enabled_val,
+        has_masked,
+        masked: masked_val,
+        daemon_reload: if daemon_reload { 1 } else { 0 },
+        no_block: if no_block { 1 } else { 0 },
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

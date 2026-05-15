@@ -456,6 +456,16 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::Systemd(s) => {
+            if s.name.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: systemd.name is empty",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
         TaskOp::BlockInFile(b) => {
             if b.path.is_empty() {
                 bail!(

@@ -42,8 +42,8 @@ use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, 
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp,
-    LoopSpec, MetaAction, OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task,
-    TaskBody, TaskOp, WaitForOp, WriteFileOp,
+    LoopSpec, MetaAction, OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy,
+    SystemdOp, Task, TaskBody, TaskOp, WaitForOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1880,6 +1880,17 @@ fn render_op(
                 create: b.create,
                 insertbefore: b.insertbefore.clone(),
                 insertafter: b.insertafter.clone(),
+            })
+        }
+        TaskOp::Systemd(s) => {
+            let name = render_str(env, &s.name, &view)?;
+            TaskOp::Systemd(SystemdOp {
+                name,
+                state: s.state,
+                enabled: s.enabled,
+                masked: s.masked,
+                daemon_reload: s.daemon_reload,
+                no_block: s.no_block,
             })
         }
     })
