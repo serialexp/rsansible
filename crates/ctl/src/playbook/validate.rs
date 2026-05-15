@@ -41,7 +41,7 @@ fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()>
             );
         }
     }
-    let names_to_check: Vec<&str> = match &play.hosts {
+    let entries: Vec<&str> = match &play.hosts {
         HostSelector::All(_) => Vec::new(),
         HostSelector::Names(names) => {
             if names.is_empty() {
@@ -51,11 +51,25 @@ fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()>
         }
         HostSelector::Name(n) => vec![n.as_str()],
     };
+    // Validate the full hosts: expression against the pattern grammar.
+    // Catches malformed regex, unbalanced brackets, leading `!`/`&`, etc.
+    if !entries.is_empty() {
+        let joined = entries.join(",");
+        crate::host_pattern::HostPattern::parse(&joined).map_err(|e| {
+            anyhow!("{}: invalid hosts pattern {:?}: {}", where_(), joined, e)
+        })?;
+    }
     if let Some(inv) = inv {
-        for n in &names_to_check {
-            // A `hosts:` entry resolves to either a known host name or
-            // a known group name. Group wins if both exist (Ansible's
-            // behavior). Anything else is a typo and fails validation.
+        for n in &entries {
+            // For *plain-name* terms (no glob/regex metacharacters) we
+            // can keep the pre-pattern-grammar typo-catching: if the
+            // operator wrote a bare name that isn't in the inventory,
+            // it's almost certainly a typo and silent-empty is bad UX.
+            // Glob/regex terms are allowed to match nothing — same as
+            // Ansible.
+            if !crate::host_pattern::is_plain_name(n) {
+                continue;
+            }
             if !inv.hosts.contains_key(*n) && !inv.groups.contains_key(*n) {
                 return Err(anyhow!(
                     "{}: {:?} is not a known host or group in the inventory",

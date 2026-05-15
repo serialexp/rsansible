@@ -527,8 +527,25 @@ These don't fit neatly into a phase but should happen alongside the work:
   5-scenario 1-container e2e (`tests/tags_e2e.rs`) covering no-flags
   / `--tags setup` / `--skip-tags teardown` / `--tags never` /
   `--skip-tags always`.
-- [ ] **`--limit` flag** — restrict the run to a host pattern. Ansible
-  convention; gothab's bin/ scripts call ansible-playbook with this.
+- [x] **`--limit` flag** — restricts the run to a host pattern.
+  Shipped in `crates/ctl/src/host_pattern.rs` (full Ansible-grammar
+  engine: globs, regex `~prefix`, intersection `:&pat`, exclusion
+  `:!pat` / `!pat`, group index/slice `web[0]` / `web[1:3]` /
+  `web[-1]`) and `crates/ctl/src/limit.rs` (CLI wrapper). The
+  orchestrator preflights the pattern against the full inventory and
+  bails with a clear error if it matches zero hosts (Ansible's
+  behavior); on the per-play hot path it intersects each play's
+  resolved host set with the limit before dispatch, and it filters
+  the SSH connect phase so excluded hosts aren't dialed. The new
+  engine *also* upgrades the playbook `hosts:` field — `hosts:
+  'web*:!web03'` now works in playbooks too, since `resolve_play_targets`
+  now delegates to `HostPattern`. Validate-time syntax check catches
+  malformed patterns at `rsansible validate`. Bare-name typos still
+  fail validation (kept the pre-pattern-grammar typo-catching for
+  plain names). 30 `host_pattern` unit tests + 6 `LimitFilter` tests
+  + 5-scenario 3-container e2e (`tests/limit_e2e.rs`) covering
+  no-limit / exact name / glob+exclude / group index / zero-match
+  bail.
 - [ ] **`--check` mode** — dry-run; every op reports what it *would* do
   without changing state. Each new module needs a check-mode codepath.
 - [ ] **Better progress output** — current `info!` stream is fine but a

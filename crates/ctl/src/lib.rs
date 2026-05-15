@@ -7,7 +7,9 @@
 pub mod become_;
 pub mod exec_ctx;
 pub mod extra_vars;
+pub mod host_pattern;
 pub mod inventory;
+pub mod limit;
 pub mod orchestrator;
 pub mod playbook;
 pub mod ssh;

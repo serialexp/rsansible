@@ -108,6 +108,11 @@ pub struct RunSpec {
     pub tags: Vec<String>,
     /// CLI `--skip-tags` selectors. Empty = no filter.
     pub skip_tags: Vec<String>,
+    /// CLI `--limit` host-pattern terms. Empty = no host filter.
+    /// Each entry is a pattern in the same grammar as `hosts:` —
+    /// globs, regex, intersection (`:&`), exclusion (`:!` / `!`),
+    /// index/slice (`web[0]`). Repetitions are union-joined.
+    pub limit: Vec<String>,
 }
 
 impl RunSpec {
@@ -121,6 +126,7 @@ impl RunSpec {
             extra_vars: BTreeMap::new(),
             tags: Vec::new(),
             skip_tags: Vec::new(),
+            limit: Vec::new(),
         }
     }
 }
@@ -149,6 +155,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         extra_vars,
         tags,
         skip_tags,
+        limit,
     } = spec;
 
     // `--tags` / `--skip-tags` resolve to a filter consulted at task
@@ -160,11 +167,37 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
             .map_err(|e| anyhow::anyhow!("{e}"))?,
     );
 
+    // `--limit` resolves to a host-pattern filter applied at two
+    // points: a one-shot preflight against the full inventory (zero
+    // matches → typo, bail before any SSH dial) and a per-play
+    // intersection right before dispatch. When the user didn't pass
+    // `--limit`, the filter is the identity and both calls are no-ops.
+    let limit_filter = crate::limit::LimitFilter::from_cli(&limit)
+        .map_err(|e| anyhow::anyhow!("--limit: {e}"))?;
+    if limit_filter.is_active() {
+        let matched = limit_filter.preflight(&inventory);
+        if matched.is_empty() {
+            anyhow::bail!("--limit pattern matches no hosts in the inventory");
+        }
+    }
+
     // Build the per-host inventory_vars views + the shared WorldVars
     // once at startup. Both are stable for the run.
     let world = Arc::new(build_world_vars(&inventory, &inventory_vars));
 
-    let target_hosts = compute_all_targeted_hosts(&playbook, &inventory);
+    // Connect phase host set: union of every play's host set,
+    // intersected with --limit. We don't dial hosts that `--limit` is
+    // filtering out — the connect phase is the expensive bit.
+    let target_hosts: BTreeSet<String> = if limit_filter.is_active() {
+        let allowed: BTreeSet<String> =
+            limit_filter.preflight(&inventory).into_iter().collect();
+        compute_all_targeted_hosts(&playbook, &inventory)
+            .intersection(&allowed)
+            .cloned()
+            .collect()
+    } else {
+        compute_all_targeted_hosts(&playbook, &inventory)
+    };
 
     let mut outcomes: BTreeMap<String, HostOutcome> = inventory
         .hosts
@@ -252,7 +285,8 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     'plays: for play in &playbook.plays {
         // Live-host filter: hosts that connected AND haven't been marked
         // failed under a prior play's mark_host_failed/stop policy.
-        let play_targets: Vec<String> = resolve_play_targets(&play.hosts, &inventory)
+        let play_targets: Vec<String> = limit_filter
+            .apply(&inventory, &resolve_play_targets(&play.hosts, &inventory))
             .into_iter()
             .filter(|n| {
                 conns.contains_key(n)
@@ -2443,35 +2477,22 @@ fn compute_all_targeted_hosts(playbook: &Playbook, inv: &Inventory) -> BTreeSet<
 }
 
 fn resolve_play_targets(sel: &HostSelector, inv: &Inventory) -> Vec<String> {
-    // Normalize the bare-string shorthand into a slice we can iterate.
-    let single: [String; 1];
-    let names: &[String] = match sel {
+    // The pattern engine accepts the same grammar Ansible does — globs,
+    // regex, intersection, exclusion, index/slice. The current schema's
+    // `Names(Vec<String>)` form is joined with `,` so each list entry
+    // becomes a union term. `All` short-circuits.
+    let raw = match sel {
         HostSelector::All(_) => return inv.hosts.keys().cloned().collect(),
-        HostSelector::Names(names) => names.as_slice(),
-        HostSelector::Name(n) => {
-            single = [n.clone()];
-            &single
-        }
+        HostSelector::Name(n) => n.clone(),
+        HostSelector::Names(names) => names.join(","),
     };
-    let mut out: Vec<String> = Vec::new();
-    let mut seen = BTreeSet::new();
-    for n in names {
-        // Group wins if both names overlap (Ansible's behavior).
-        if let Some(members) = inv.groups.get(n) {
-            for m in members {
-                if seen.insert(m.clone()) {
-                    out.push(m.clone());
-                }
-            }
-        } else if inv.hosts.contains_key(n) {
-            if seen.insert(n.clone()) {
-                out.push(n.clone());
-            }
-        }
-        // Unknown names are caught at validate time. If they slip
-        // through, we silently drop them (no panic).
+    match crate::host_pattern::HostPattern::parse(&raw) {
+        Ok(p) => p.resolve(inv),
+        // Validate catches parse errors earlier; if one slips through
+        // (e.g. a programmatic caller skipping validate) we silently
+        // resolve to nothing rather than panicking mid-run.
+        Err(_) => Vec::new(),
     }
-    out
 }
 
 

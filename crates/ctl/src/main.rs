@@ -77,6 +77,13 @@ enum Cmd {
         /// `--tags`.
         #[arg(long = "skip-tags", value_delimiter = ',', value_name = "tag")]
         skip_tags: Vec<String>,
+        /// Only run on hosts matching this pattern (Ansible-style).
+        /// Repeatable; values are also comma-split. Supports exact
+        /// names, globs (`web*`), regex (`~^web\d$`), intersection
+        /// (`:&pat`), exclusion (`:!pat` or `!pat`), and group
+        /// index/slice (`web[0]`, `web[1:3]`, `web[-1]`).
+        #[arg(long = "limit", value_delimiter = ',', value_name = "pattern")]
+        limit: Vec<String>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -113,6 +120,7 @@ async fn main() -> ExitCode {
             extra_vars,
             tags,
             skip_tags,
+            limit,
             playbook,
         } => match cmd_run(
             inventory,
@@ -122,6 +130,7 @@ async fn main() -> ExitCode {
             extra_vars,
             tags,
             skip_tags,
+            limit,
             playbook,
         )
         .await
@@ -171,6 +180,7 @@ async fn cmd_run(
     extra_vars_args: Vec<String>,
     tags: Vec<String>,
     skip_tags: Vec<String>,
+    limit: Vec<String>,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -193,6 +203,7 @@ async fn cmd_run(
     spec.extra_vars = extra;
     spec.tags = tags;
     spec.skip_tags = skip_tags;
+    spec.limit = limit;
     let report = orchestrator::run(spec)
         .await
         .context("orchestrator failed")?;

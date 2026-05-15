@@ -220,12 +220,32 @@ fn resolve_published_port(container_id: &str, container_port: u16) -> Result<u16
 }
 
 async fn wait_for_sshd(host: &str, port: u16) -> Result<()> {
+    // Why we read the banner instead of just checking TCP-accept:
+    // with `docker run -d -P`, Docker's userland proxy starts accepting
+    // on the published port immediately, but if sshd inside the
+    // container hasn't bound its listener yet the proxy can't forward
+    // the connection and sends RST. A bare TCP-connect probe then
+    // returns Ok, the next `ssh::connect_and_push` lands on a RST, and
+    // the test fails with "Connection reset by peer". sshd emits the
+    // `SSH-2.0-...\r\n` banner immediately after a real accept, so
+    // reading those 4 bytes proves the end-to-end path is live, not
+    // just the proxy half.
+    use tokio::io::AsyncReadExt;
     let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline {
-        if let Ok(stream) = tokio::net::TcpStream::connect((host, port)).await {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect((host, port)).await {
+            let mut buf = [0u8; 4];
+            let read = tokio::time::timeout(
+                Duration::from_secs(2),
+                stream.read_exact(&mut buf),
+            )
+            .await;
+            if matches!(read, Ok(Ok(_))) && &buf == b"SSH-" {
+                drop(stream);
+                return Ok(());
+            }
+            // Either timed out or read failed (RST from proxy) — retry.
             drop(stream);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
