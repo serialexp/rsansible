@@ -41,9 +41,9 @@ use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp, LoopSpec, MetaAction,
-    OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task, TaskBody, TaskOp,
-    WaitForOp, WriteFileOp,
+    AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp,
+    LoopSpec, MetaAction, OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task,
+    TaskBody, TaskOp, WaitForOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1864,6 +1864,22 @@ fn render_op(
                 insertbefore: l.insertbefore.clone(),
                 insertafter: l.insertafter.clone(),
                 backrefs: l.backrefs,
+            })
+        }
+        TaskOp::BlockInFile(b) => {
+            let path = render_str(env, &b.path, &view)?;
+            let block = render_str(env, &b.block, &view)?;
+            TaskOp::BlockInFile(BlockInFileOp {
+                path,
+                block,
+                marker: b.marker.clone(),
+                marker_begin: b.marker_begin.clone(),
+                marker_end: b.marker_end.clone(),
+                state: b.state,
+                mode: b.mode,
+                create: b.create,
+                insertbefore: b.insertbefore.clone(),
+                insertafter: b.insertafter.clone(),
             })
         }
     })

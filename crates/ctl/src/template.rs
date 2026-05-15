@@ -347,6 +347,16 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             // inside regex patterns, and `{{...}}` would be ambiguous
             // with regex syntax). If we ever need it, add it here.
         }
+        TaskOp::BlockInFile(b) => {
+            env.template_from_str(&b.path)
+                .map_err(|e| anyhow!("blockinfile.path: {e}"))?;
+            env.template_from_str(&b.block)
+                .map_err(|e| anyhow!("blockinfile.block: {e}"))?;
+            // marker/marker_begin/marker_end pass through as raw
+            // strings; the agent does the literal `{mark}` substitution
+            // itself (not Jinja). insertbefore/insertafter are regex
+            // patterns — same rationale as lineinfile.
+        }
     }
     Ok(())
 }

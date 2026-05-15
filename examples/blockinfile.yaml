@@ -1,0 +1,97 @@
+# End-to-end exercise of `blockinfile:` (Phase 3, idempotent block edit).
+#
+# Scenarios with internal asserts:
+#   1. create=yes seeds a file with a new block.
+#   2. Re-running the same task is a no-op.
+#   3. Updating the block body replaces in place (markers untouched).
+#   4. Custom marker template + insertafter.
+#   5. state=absent removes the block (and its markers).
+
+- name: blockinfile demo
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: remove any pre-existing target
+      file:
+        path: /tmp/rsansible-bi.conf
+        state: absent
+
+    # 1. create=yes seeds with a fresh block (default markers).
+    - name: seed file with a block
+      blockinfile:
+        path: /tmp/rsansible-bi.conf
+        block: |
+          alpha=1
+          beta=2
+        create: yes
+        mode: '0644'
+      register: bi_create
+
+    - name: assert create reported changed
+      assert:
+        that:
+          - bi_create.changed
+
+    # 2. Idempotent re-run.
+    - name: re-run with same block (no-op)
+      blockinfile:
+        path: /tmp/rsansible-bi.conf
+        block: |
+          alpha=1
+          beta=2
+        create: yes
+        mode: '0644'
+      register: bi_noop
+
+    - name: assert idempotent no-op
+      assert:
+        that:
+          - not bi_noop.changed
+
+    # 3. Body update — markers stay, content changes.
+    - name: update block body
+      blockinfile:
+        path: /tmp/rsansible-bi.conf
+        block: |
+          alpha=10
+          gamma=3
+      register: bi_update
+
+    - name: assert update reported changed
+      assert:
+        that:
+          - bi_update.changed
+
+    # 4. Different block under a custom marker template + insertafter anchor.
+    - name: append separator anchor
+      lineinfile:
+        path: /tmp/rsansible-bi.conf
+        line: "# section: app"
+
+    - name: add app block under custom markers, after anchor
+      blockinfile:
+        path: /tmp/rsansible-bi.conf
+        marker: "## ---- {mark} APP ----"
+        block: |
+          app_port=8080
+        insertafter: "^# section: app$"
+
+    # Snapshot the file before we remove the default block.
+    - name: snapshot before absent
+      shell: "cp /tmp/rsansible-bi.conf /tmp/rsansible-bi-before-absent"
+
+    # 5. Remove the *default-marker* block; the custom-marker block stays.
+    - name: remove default block
+      blockinfile:
+        path: /tmp/rsansible-bi.conf
+        block: ""
+        state: absent
+      register: bi_remove
+
+    - name: assert remove reported changed
+      assert:
+        that:
+          - bi_remove.changed
+
+    - name: final snapshot
+      shell: "cp /tmp/rsansible-bi.conf /tmp/rsansible-bi-final"

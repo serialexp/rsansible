@@ -159,6 +159,46 @@ pub fn op_lineinfile(
     })
 }
 
+/// `state:` byte values for `OpBlockInFile`. Same byte assignments as
+/// `OpLineInFile` but kept separate so renames stay independent.
+pub mod blockinfile_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_blockinfile(
+    path: String,
+    block: String,
+    marker: String,
+    marker_begin: String,
+    marker_end: String,
+    state: u8,
+    mode: Option<u32>,
+    create: bool,
+    insertbefore: String,
+    insertafter: String,
+) -> Op {
+    let (has_mode, mode_val) = match mode {
+        Some(m) => (1u8, m),
+        None => (0u8, 0u32),
+    };
+    Op::OpBlockInFile(OpBlockInFileOutput {
+        kind: 8,
+        path,
+        block,
+        marker,
+        marker_begin,
+        marker_end,
+        state,
+        has_mode,
+        mode: mode_val,
+        create: if create { 1 } else { 0 },
+        insertbefore,
+        insertafter,
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

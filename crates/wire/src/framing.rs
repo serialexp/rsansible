@@ -251,6 +251,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_blockinfile() {
+        roundtrip(msg::task_dispatch(
+            110,
+            msg::op_blockinfile(
+                "/etc/foo".into(),
+                "alpha\nbeta\n".into(),
+                "# {mark} ANSIBLE MANAGED BLOCK".into(),
+                "BEGIN".into(),
+                "END".into(),
+                msg::blockinfile_state::PRESENT,
+                Some(0o644),
+                true,
+                String::new(),
+                "EOF".into(),
+            ),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            111,
+            msg::op_blockinfile(
+                "/etc/foo".into(),
+                String::new(),
+                "// {mark} app".into(),
+                "begin".into(),
+                "end".into(),
+                msg::blockinfile_state::ABSENT,
+                None,
+                false,
+                "^EXIT".into(),
+                String::new(),
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,

@@ -319,8 +319,20 @@ new wire framing roundtrip for `OpGatherFacts`.
   iff bytes actually moved on disk. e2e covers create / idempotent
   no-op / regex-replace / insertafter / backrefs / state=absent in
   one playbook.
-- [ ] **`OpBlockInFile`** — idempotent multi-line block edit with
-  customizable marker comments. 6 sites split with `OpLineInFile`.
+- [x] **`OpBlockInFile`** — idempotent multi-line block edit. Wire op
+  kind=8 with path/block/marker/marker_begin/marker_end/state/
+  has_mode+mode/create/insertbefore/insertafter. The block body is
+  delimited by two marker lines built from `marker` with the literal
+  `{mark}` token substituted for `marker_begin` (top) and `marker_end`
+  (bottom). Defaults follow Ansible: marker = "# {mark} ANSIBLE
+  MANAGED BLOCK", begin/end = BEGIN/END. Replace-in-place when a
+  block already exists; otherwise place via `insertbefore`/
+  `insertafter` (last-match for after, like Ansible) or append. Empty
+  `block` + state=present means "remove the block if it exists" —
+  also matches Ansible. Atomic write via sibling-tempfile + rename;
+  `changed=1` iff bytes actually moved on disk. e2e covers seed →
+  no-op → body update → custom-marker block placement → state=absent
+  with the custom block surviving.
 - [ ] **`OpSystemd`** — start / stop / restart / reload / enable /
   disable / mask / unmask with proper "did this actually change anything"
   reporting. 39 sites. Wraps `systemctl`.

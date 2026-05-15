@@ -456,6 +456,50 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::BlockInFile(b) => {
+            if b.path.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: blockinfile.path is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if !b.insertbefore.is_empty() && !b.insertafter.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: blockinfile: insertbefore and insertafter are mutually exclusive",
+                    where_,
+                    task.name
+                );
+            }
+            if !b.marker.contains("{mark}") {
+                bail!(
+                    "{}: task[{ti}] {:?}: blockinfile.marker must contain the literal token `{{mark}}`",
+                    where_,
+                    task.name
+                );
+            }
+            if !b.insertbefore.is_empty() {
+                regex::Regex::new(&b.insertbefore).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: task[{ti}] {:?}: blockinfile.insertbefore: invalid pattern {:?}: {e}",
+                        where_,
+                        task.name,
+                        b.insertbefore
+                    )
+                })?;
+            }
+            if !b.insertafter.is_empty() && b.insertafter != "EOF" {
+                regex::Regex::new(&b.insertafter).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: task[{ti}] {:?}: blockinfile.insertafter: invalid pattern {:?}: {e}",
+                        where_,
+                        task.name,
+                        b.insertafter
+                    )
+                })?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

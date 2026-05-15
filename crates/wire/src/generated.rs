@@ -809,6 +809,169 @@ impl From<OpLineInFileOutput> for OpLineInFileInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpBlockInFileInput {
+    pub path: std::string::String,
+    pub block: std::string::String,
+    pub marker: std::string::String,
+    pub marker_begin: std::string::String,
+    pub marker_end: std::string::String,
+    pub state: u8,
+    pub has_mode: u8,
+    pub mode: u32,
+    pub create: u8,
+    pub insertbefore: std::string::String,
+    pub insertafter: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpBlockInFileOutput {
+    pub kind: u8,
+    pub path: std::string::String,
+    pub block: std::string::String,
+    pub marker: std::string::String,
+    pub marker_begin: std::string::String,
+    pub marker_end: std::string::String,
+    pub state: u8,
+    pub has_mode: u8,
+    pub mode: u32,
+    pub create: u8,
+    pub insertbefore: std::string::String,
+    pub insertafter: std::string::String,
+}
+
+pub type OpBlockInFile = OpBlockInFileOutput;
+
+impl OpBlockInFileInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(8);
+        encoder.write_u16_le(self.path.len() as u16);
+        let string_bytes: &[u8] = self.path.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u32_le(self.block.len() as u32);
+        let string_bytes: &[u8] = self.block.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.marker.len() as u16);
+        let string_bytes: &[u8] = self.marker.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.marker_begin.len() as u16);
+        let string_bytes: &[u8] = self.marker_begin.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.marker_end.len() as u16);
+        let string_bytes: &[u8] = self.marker_end.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.state);
+        encoder.write_byte(self.has_mode);
+        encoder.write_u32_le(self.mode);
+        encoder.write_byte(self.create);
+        encoder.write_u16_le(self.insertbefore.len() as u16);
+        let string_bytes: &[u8] = self.insertbefore.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.insertafter.len() as u16);
+        let string_bytes: &[u8] = self.insertafter.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+}
+
+impl OpBlockInFileOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 8u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let path = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u32_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let block = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let marker = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let marker_begin = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let marker_end = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let state = decoder.read_byte()?;
+        let has_mode = decoder.read_byte()?;
+        let mode = decoder.read_u32_le()?;
+        let create = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let insertbefore = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let insertafter = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            kind,
+            path,
+            block,
+            marker,
+            marker_begin,
+            marker_end,
+            state,
+            has_mode,
+            mode,
+            create,
+            insertbefore,
+            insertafter,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpBlockInFileInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpBlockInFileInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpBlockInFileOutput> for OpBlockInFileInput {
+    fn from(o: OpBlockInFileOutput) -> Self {
+        Self {
+            path: o.path,
+            block: o.block,
+            marker: o.marker,
+            marker_begin: o.marker_begin,
+            marker_end: o.marker_end,
+            state: o.state,
+            has_mode: o.has_mode,
+            mode: o.mode,
+            create: o.create,
+            insertbefore: o.insertbefore,
+            insertafter: o.insertafter,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
@@ -818,6 +981,7 @@ pub enum Op {
     OpFile(OpFileOutput),
     OpWaitFor(OpWaitForOutput),
     OpLineInFile(OpLineInFileOutput),
+    OpBlockInFile(OpBlockInFileOutput),
 }
 
 impl Op {
@@ -970,6 +1134,48 @@ impl Op {
                 }
                 encoder.write_uint8(v.backrefs);
             }
+            Op::OpBlockInFile(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.path.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.path.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint32(v.block.len() as u32, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.block.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.marker.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.marker.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.marker_begin.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.marker_begin.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.marker_end.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.marker_end.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint8(v.has_mode);
+                encoder.write_uint32(v.mode, Endianness::LittleEndian);
+                encoder.write_uint8(v.create);
+                encoder.write_uint16(v.insertbefore.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.insertbefore.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.insertafter.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.insertafter.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
         }
         Ok(())
     }
@@ -998,6 +1204,8 @@ impl Op {
             Ok(Op::OpWaitFor(OpWaitForOutput::decode_with_decoder(decoder)?))
         } else if value == 7 {
             Ok(Op::OpLineInFile(OpLineInFileOutput::decode_with_decoder(decoder)?))
+        } else if value == 8 {
+            Ok(Op::OpBlockInFile(OpBlockInFileOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(value as u64))
         }

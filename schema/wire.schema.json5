@@ -144,6 +144,24 @@
       ],
     },
 
+    OpBlockInFile: {
+      description: "Idempotent multi-line block edit in a text file. Maps Ansible's `ansible.builtin.blockinfile`. A block is delimited by two marker comment lines whose text is built from `marker` with the literal token `{mark}` substituted for `marker_begin` (top marker) or `marker_end` (bottom marker). On state=present, the block body (the `block` field — possibly multi-line) is placed between fresh markers; if a previous block with the same markers exists it is replaced; otherwise placement follows `insertbefore`/`insertafter` (with the literal `EOF` for insertafter meaning append; default is append when both are empty). On state=absent the block and its markers are removed. `block` empty + state=present means \"remove the block if it exists.\" `create=1` creates the file (with `mode` if `has_mode=1`) when missing + state=present; create=0 + missing file is a no-op for absent and an error for present. `changed=1` iff bytes actually moved on disk.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 8 },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "block", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "marker", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "marker_begin", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "marker_end", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "state", type: "uint8" },
+        { name: "has_mode", type: "uint8" },
+        { name: "mode", type: "uint32" },
+        { name: "create", type: "uint8" },
+        { name: "insertbefore", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "insertafter", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -159,6 +177,7 @@
         { type: "OpFile", when: "value === 5" },
         { type: "OpWaitFor", when: "value === 6" },
         { type: "OpLineInFile", when: "value === 7" },
+        { type: "OpBlockInFile", when: "value === 8" },
       ],
     },
 
