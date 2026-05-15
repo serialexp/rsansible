@@ -70,6 +70,33 @@ pub mod file_state {
     pub const FILE: u8 = 3;
 }
 
+pub mod wait_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_wait_for(
+    host: String,
+    port: u32,
+    path: String,
+    state: u8,
+    timeout_ms: u32,
+    delay_ms: u32,
+    sleep_ms: u32,
+) -> Op {
+    Op::OpWaitFor(OpWaitForOutput {
+        kind: 6,
+        host,
+        port,
+        path,
+        state,
+        timeout_ms,
+        delay_ms,
+        sleep_ms,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn op_file(
     path: String,

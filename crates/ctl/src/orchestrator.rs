@@ -42,7 +42,8 @@ use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, 
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LoopSpec, MetaAction, OnFailure,
-    Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task, TaskBody, TaskOp, WriteFileOp,
+    Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task, TaskBody, TaskOp, WaitForOp,
+    WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1810,6 +1811,25 @@ fn render_op(
             TaskOp::Stat(StatOp {
                 path,
                 follow: s.follow,
+            })
+        }
+        TaskOp::WaitFor(w) => {
+            let host = match &w.host {
+                Some(h) => Some(render_str(env, h, &view)?),
+                None => None,
+            };
+            let path = match &w.path {
+                Some(p) => Some(render_str(env, p, &view)?),
+                None => None,
+            };
+            TaskOp::WaitFor(WaitForOp {
+                host,
+                port: w.port,
+                path,
+                state: w.state,
+                timeout_ms: w.timeout_ms,
+                delay_ms: w.delay_ms,
+                sleep_ms: w.sleep_ms,
             })
         }
         TaskOp::File(f) => {

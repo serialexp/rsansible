@@ -99,6 +99,20 @@
       ],
     },
 
+    OpWaitFor: {
+      description: "Wait for a TCP port to be reachable OR a filesystem path to appear/disappear. Mutually exclusive modes: `port > 0` selects TCP probing on (host, port); `port == 0` selects path-existence probing on `path` (the other field is sent as an empty string). `state` is a uint8: 0=present (wait for it to come up / file to exist), 1=absent (wait for it to disappear). The agent loops every `sleep_ms` (after an optional `delay_ms` initial wait) up to `timeout_ms` total. On success: TaskDone(exit_code=0, changed=0). On timeout: TaskError(code=TIMEOUT). Bad mode (both port>0 and path set, or neither) → TaskError(BAD_REQUEST).",
+      sequence: [
+        { name: "kind", type: "uint8", const: 6 },
+        { name: "host", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "port", type: "uint32" },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "state", type: "uint8" },
+        { name: "timeout_ms", type: "uint32" },
+        { name: "delay_ms", type: "uint32" },
+        { name: "sleep_ms", type: "uint32" },
+      ],
+    },
+
     OpFile: {
       description: "Ensure a filesystem path is in the requested state. Maps Ansible's `ansible.builtin.file` module. The agent applies the state and reports TaskDone with `changed=1` iff anything actually changed (creation, removal, mode bits flipped, owner/group changed, touch updated mtime). `state` is a uint8 enum: 0=directory (mkdir -p semantics; recurse chmod/chown if `recurse=1`), 1=absent (rm -rf if dir, unlink if file/symlink), 2=touch (create empty file if missing; always bumps mtime/atime — Ansible reports touch as always-changed), 3=file (ensure regular file exists; errors if path is missing or wrong type; still applies mode/owner/group). `has_mode` is 0/1: when 1, the low 12 bits of `mode` are applied via chmod; when 0, no chmod runs. Empty `owner`/`group` strings mean \"don't change\"; non-empty values are resolved via /etc/passwd and /etc/group (no NSS) and applied via chown. `recurse` (0/1) only applies to state=directory.",
       sequence: [
@@ -126,6 +140,7 @@
         { type: "OpGatherFacts", when: "value === 3" },
         { type: "OpStat", when: "value === 4" },
         { type: "OpFile", when: "value === 5" },
+        { type: "OpWaitFor", when: "value === 6" },
       ],
     },
 

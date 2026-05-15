@@ -315,8 +315,17 @@ new wire framing roundtrip for `OpGatherFacts`.
   Wraps apt-get with DEBIAN_FRONTEND=noninteractive. 13 sites.
 - [ ] **`OpUfw`** — allow/deny/limit + from/to/port/proto + reset/enable.
   14 sites. Wraps `ufw`.
-- [ ] **`OpWaitFor`** — port-ready (host + port + timeout) or path-exists.
-  5 sites. Tiny.
+- [x] **`OpWaitFor`** — port-ready (host + port + timeout) or path-exists.
+  Wire op kind=6 with host/port/path/state/timeout_ms/delay_ms/sleep_ms.
+  Two modes: TCP probe (`host`+`port`) or path probe (`path`); mutual
+  exclusion enforced at parse, validate, and agent. `state: present`
+  (default; aliases `started`) waits for it to come up; `state: absent`
+  (alias `stopped`) waits for it to go away. `timeout`/`delay`/`sleep`
+  accept seconds (Ansible-style) and convert to ms. TCP probe uses
+  `TcpStream::connect_timeout` with a 1s per-attempt deadline; the
+  agent parks the sync wait loop on `spawn_blocking`. e2e via
+  `examples/wait_for.yaml` covers path-appears, path-disappears, and
+  TCP-already-listening.
 - [ ] Idempotency reporting: every module sets `TaskDone.changed`
   correctly so handlers fire only when state actually changed. This is
   the contract handlers depend on.

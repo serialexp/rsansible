@@ -327,6 +327,16 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("file.group: {e}"))?;
             }
         }
+        TaskOp::WaitFor(w) => {
+            if let Some(h) = &w.host {
+                env.template_from_str(h)
+                    .map_err(|e| anyhow!("wait_for.host: {e}"))?;
+            }
+            if let Some(p) = &w.path {
+                env.template_from_str(p)
+                    .map_err(|e| anyhow!("wait_for.path: {e}"))?;
+            }
+        }
     }
     Ok(())
 }

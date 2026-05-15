@@ -154,6 +154,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_wait_for() {
+        // TCP-mode
+        roundtrip(msg::task_dispatch(
+            106,
+            msg::op_wait_for(
+                "10.0.0.5".into(),
+                8080,
+                String::new(),
+                msg::wait_state::PRESENT,
+                30_000,
+                0,
+                1_000,
+            ),
+        ))
+        .await;
+        // path-mode (port=0)
+        roundtrip(msg::task_dispatch(
+            107,
+            msg::op_wait_for(
+                String::new(),
+                0,
+                "/var/run/foo.pid".into(),
+                msg::wait_state::ABSENT,
+                10_000,
+                500,
+                250,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_file() {
         roundtrip(msg::task_dispatch(
             104,

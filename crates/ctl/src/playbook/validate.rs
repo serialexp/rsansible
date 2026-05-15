@@ -354,6 +354,38 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::WaitFor(w) => {
+            // The Deserialize impl enforces mode mutual-exclusion, but
+            // an in-code constructor could bypass it. Re-check here.
+            let has_tcp = w.port.is_some();
+            let has_path = w.path.is_some();
+            if has_tcp && has_path {
+                bail!(
+                    "{}: task[{ti}] {:?}: wait_for: host+port and path are mutually exclusive",
+                    where_,
+                    task.name
+                );
+            }
+            if !has_tcp && !has_path {
+                bail!(
+                    "{}: task[{ti}] {:?}: wait_for: must specify host+port OR path",
+                    where_,
+                    task.name
+                );
+            }
+            if has_tcp {
+                // Empty host with port set is meaningless — the agent
+                // doesn't default to 127.0.0.1; require an explicit value.
+                if w.host.as_deref().map(str::is_empty).unwrap_or(true) {
+                    bail!(
+                        "{}: task[{ti}] {:?}: wait_for: TCP mode requires a non-empty host",
+                        where_,
+                        task.name
+                    );
+                }
+            }
+            Ok(())
+        }
         TaskOp::File(f) => {
             if f.path.is_empty() {
                 bail!("{}: task[{ti}] {:?}: file.path is empty", where_, task.name);

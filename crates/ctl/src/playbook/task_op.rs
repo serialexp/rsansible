@@ -22,7 +22,7 @@
 
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
-    msg::{op_exec, op_file, op_gather_facts, op_shell, op_stat, op_write_file},
+    msg::{op_exec, op_file, op_gather_facts, op_shell, op_stat, op_wait_for, op_write_file},
     Op,
 };
 use serde::{de::Error as _, Deserialize, Deserializer};
@@ -174,6 +174,185 @@ pub enum TaskOp {
     /// (directory/absent/touch/file) with optional mode/owner/group +
     /// recurse for directories.
     File(FileOp),
+    /// `wait_for:` — block until a TCP port is reachable OR a path
+    /// appears/disappears. No state change; `changed` is always 0.
+    WaitFor(WaitForOp),
+}
+
+/// `wait_for:` parsed form. Either (host + port) OR path must be set;
+/// validated at parse + validate time. Timing fields are in
+/// **seconds** in YAML (Ansible's spec) but stored as millis here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitForOp {
+    pub host: Option<String>,
+    pub port: Option<u32>,
+    pub path: Option<String>,
+    pub state: WaitForState,
+    pub timeout_ms: u32,
+    pub delay_ms: u32,
+    pub sleep_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitForState {
+    Present,
+    Absent,
+}
+
+impl WaitForState {
+    pub fn wire_byte(self) -> u8 {
+        match self {
+            WaitForState::Present => 0,
+            WaitForState::Absent => 1,
+        }
+    }
+}
+
+/// Hand-written deserializer so we can:
+///   - reject host+port mixed with path
+///   - accept Ansible's aliases for `state` (`started`/`present` →
+///     Present; `stopped`/`absent` → Absent)
+///   - parse seconds (int or string) → millis for the wire
+///   - default timeout=300s, sleep=1s, delay=0s
+impl<'de> Deserialize<'de> for WaitForOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        let host = match map.remove("host") {
+            None => None,
+            Some(serde_yaml::Value::String(s)) => Some(s),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "wait_for.host must be a string, got: {other:?}"
+                )))
+            }
+        };
+        let port = match map.remove("port") {
+            None => None,
+            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
+                D::Error::custom(format!("wait_for.port must be a non-negative int, got: {n}"))
+            })? as u32),
+            Some(serde_yaml::Value::String(s)) => Some(s.parse::<u32>().map_err(|e| {
+                D::Error::custom(format!("wait_for.port: invalid int {s:?}: {e}"))
+            })?),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "wait_for.port must be an int or numeric string, got: {other:?}"
+                )))
+            }
+        };
+        let path = match map.remove("path") {
+            None => None,
+            Some(serde_yaml::Value::String(s)) => Some(s),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "wait_for.path must be a string, got: {other:?}"
+                )))
+            }
+        };
+
+        let state = match map.remove("state") {
+            None => WaitForState::Present,
+            Some(serde_yaml::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "present" | "started" => WaitForState::Present,
+                "absent" | "stopped" => WaitForState::Absent,
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "wait_for.state: expected one of [present, started, absent, stopped], got: {other:?}"
+                    )))
+                }
+            },
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "wait_for.state must be a string, got: {other:?}"
+                )))
+            }
+        };
+
+        let timeout_ms = take_seconds_ms(&mut map, "timeout", 300_000)?;
+        let delay_ms = take_seconds_ms(&mut map, "delay", 0)?;
+        let sleep_ms = take_seconds_ms(&mut map, "sleep", 1_000)?;
+        // `msg:` is the Ansible-style custom message on timeout. We
+        // accept and discard it for now — gothab sets it but the
+        // agent-side error already names the resource. Drop it from
+        // the map so the unknown-field check doesn't trip.
+        let _ = map.remove("msg");
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "wait_for: unknown field(s): {unknown:?}; \
+                 expected one of [host, port, path, state, timeout, delay, sleep, msg]"
+            )));
+        }
+
+        // Mode mutual exclusion (defensive; agent re-checks).
+        let has_tcp = port.is_some();
+        let has_path = path.is_some();
+        if has_tcp && has_path {
+            return Err(D::Error::custom(
+                "wait_for: host+port and path are mutually exclusive",
+            ));
+        }
+        if !has_tcp && !has_path {
+            return Err(D::Error::custom(
+                "wait_for: must specify either host+port (TCP probe) or path (file probe)",
+            ));
+        }
+        if has_tcp && port == Some(0) {
+            return Err(D::Error::custom("wait_for: port must be non-zero"));
+        }
+
+        Ok(WaitForOp {
+            host,
+            port,
+            path,
+            state,
+            timeout_ms,
+            delay_ms,
+            sleep_ms,
+        })
+    }
+}
+
+/// Accept `<key>: <seconds>` as int or numeric string; convert to ms.
+/// Returns `default_ms` if absent.
+fn take_seconds_ms<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    key: &str,
+    default_ms: u32,
+) -> Result<u32, E> {
+    match map.remove(key) {
+        None => Ok(default_ms),
+        Some(serde_yaml::Value::Number(n)) => {
+            let s = n.as_f64().ok_or_else(|| {
+                E::custom(format!("wait_for.{key}: invalid number {n}"))
+            })?;
+            if !s.is_finite() || s < 0.0 {
+                return Err(E::custom(format!(
+                    "wait_for.{key}: expected non-negative seconds, got {s}"
+                )));
+            }
+            Ok((s * 1000.0) as u32)
+        }
+        Some(serde_yaml::Value::String(s)) => {
+            let f = s.parse::<f64>().map_err(|e| {
+                E::custom(format!("wait_for.{key}: invalid number {s:?}: {e}"))
+            })?;
+            if !f.is_finite() || f < 0.0 {
+                return Err(E::custom(format!(
+                    "wait_for.{key}: expected non-negative seconds, got {f}"
+                )));
+            }
+            Ok((f * 1000.0) as u32)
+        }
+        Some(other) => Err(E::custom(format!(
+            "wait_for.{key} must be a number or numeric string, got: {other:?}"
+        ))),
+    }
 }
 
 /// `file: { path: …, state: directory, mode: "0755", owner: root,
@@ -326,6 +505,7 @@ const BODY_KEYS: &[&str] = &[
     "copy",
     "stat",
     "file",
+    "wait_for",
     "assert",
     "fail",
     "set_fact",
@@ -497,6 +677,9 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "file" => TaskBody::Op(TaskOp::File(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "wait_for" => TaskBody::Op(TaskOp::WaitFor(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "assert" => TaskBody::Assert(
@@ -899,6 +1082,15 @@ impl TaskOp {
             }
             TaskOp::GatherFacts => Ok(op_gather_facts()),
             TaskOp::Stat(s) => Ok(op_stat(s.path.clone(), s.follow)),
+            TaskOp::WaitFor(w) => Ok(op_wait_for(
+                w.host.clone().unwrap_or_default(),
+                w.port.unwrap_or(0),
+                w.path.clone().unwrap_or_default(),
+                w.state.wire_byte(),
+                w.timeout_ms,
+                w.delay_ms,
+                w.sleep_ms,
+            )),
             TaskOp::File(f) => Ok(op_file(
                 f.path.clone(),
                 f.state.wire_byte(),
@@ -1868,6 +2060,133 @@ copy:
         });
         let err = t.to_wire_op().unwrap_err();
         assert!(format!("{err}").contains("not resolved"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_wait_for_tcp_basic() {
+        let t = parse_task(
+            r#"
+name: wait
+wait_for:
+  host: 127.0.0.1
+  port: 5432
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::WaitFor(w)) => {
+                assert_eq!(w.host.as_deref(), Some("127.0.0.1"));
+                assert_eq!(w.port, Some(5432));
+                assert!(w.path.is_none());
+                assert_eq!(w.state, WaitForState::Present);
+            }
+            _ => panic!("expected WaitFor body"),
+        }
+    }
+
+    #[test]
+    fn parses_wait_for_path_with_absent() {
+        let t = parse_task(
+            r#"
+name: wait
+wait_for:
+  path: /var/run/foo.pid
+  state: absent
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::WaitFor(w)) => {
+                assert_eq!(w.path.as_deref(), Some("/var/run/foo.pid"));
+                assert_eq!(w.state, WaitForState::Absent);
+            }
+            _ => panic!("expected WaitFor body"),
+        }
+    }
+
+    #[test]
+    fn parses_wait_for_state_aliases() {
+        for s in ["started", "stopped", "present", "absent"] {
+            let yaml = format!(
+                "name: t\nwait_for:\n  path: /x\n  state: {s}\n",
+            );
+            let _ = parse_task(&yaml);
+        }
+    }
+
+    #[test]
+    fn wait_for_rejects_both_modes() {
+        let yaml = r#"
+name: t
+wait_for:
+  host: localhost
+  port: 22
+  path: /x
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        assert!(
+            format!("{err}").contains("mutually exclusive"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_rejects_neither_mode() {
+        let yaml = r#"
+name: t
+wait_for:
+  timeout: 10
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        assert!(
+            format!("{err}").contains("either host+port"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn wait_for_seconds_convert_to_ms() {
+        let t = parse_task(
+            r#"
+name: t
+wait_for:
+  host: 127.0.0.1
+  port: 1
+  timeout: 3
+  delay: 1
+  sleep: 2
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::WaitFor(w)) => {
+                assert_eq!(w.timeout_ms, 3_000);
+                assert_eq!(w.delay_ms, 1_000);
+                assert_eq!(w.sleep_ms, 2_000);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn wait_for_to_wire_carries_fields() {
+        let t = TaskOp::WaitFor(WaitForOp {
+                host: Some("h".into()),
+                port: Some(80),
+                path: None,
+                state: WaitForState::Present,
+                timeout_ms: 5000,
+                delay_ms: 100,
+                sleep_ms: 250,
+        });
+        let wire = t.to_wire_op().unwrap();
+        let rsansible_wire::generated::Op::OpWaitFor(w) = wire else {
+            panic!("expected OpWaitFor")
+        };
+        assert_eq!(w.host, "h");
+        assert_eq!(w.port, 80);
+        assert_eq!(w.path, "");
+        assert_eq!(w.state, 0);
+        assert_eq!(w.timeout_ms, 5000);
+        assert_eq!(w.delay_ms, 100);
+        assert_eq!(w.sleep_ms, 250);
     }
 
     #[test]

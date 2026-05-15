@@ -1,0 +1,59 @@
+# End-to-end exercise of `wait_for:` (Phase 3, readiness probe).
+#
+# Three scenarios:
+#   1. Path mode (present) — file appears mid-playbook, wait_for unblocks.
+#   2. Path mode (absent)  — file removed mid-playbook, wait_for unblocks.
+#   3. TCP mode (present)  — the agent's own sshd port (22) is already
+#      listening from the container's perspective.
+#
+# Each success path writes a marker so the harness can verify the task
+# actually ran. The TCP probe targets `localhost:22` from inside the
+# container — that's reachable because the container *is* the sshd.
+
+- name: wait_for demo
+  hosts: all
+  gather_facts: false
+  tasks:
+    # 1. Path appears.
+    - name: spawn a sleeper that creates a marker in 0.3s
+      shell: "(sleep 0.3 && touch /tmp/rsansible-wait-appears) >/dev/null 2>&1 &"
+
+    - name: wait for the marker to appear
+      wait_for:
+        path: /tmp/rsansible-wait-appears
+        state: present
+        timeout: 5
+        sleep: 1
+
+    - name: record path-present success
+      shell: "echo ok > /tmp/rsansible-wait-path-present-done"
+
+    # 2. Path disappears.
+    - name: seed a doomed marker
+      shell: "touch /tmp/rsansible-wait-doomed"
+
+    - name: spawn a sleeper that deletes the marker in 0.3s
+      shell: "(sleep 0.3 && rm -f /tmp/rsansible-wait-doomed) >/dev/null 2>&1 &"
+
+    - name: wait for the marker to disappear
+      wait_for:
+        path: /tmp/rsansible-wait-doomed
+        state: absent
+        timeout: 5
+        sleep: 1
+
+    - name: record path-absent success
+      shell: "echo ok > /tmp/rsansible-wait-path-absent-done"
+
+    # 3. TCP port already reachable (sshd inside the container listens
+    #    on 2222).
+    - name: wait for sshd to be reachable
+      wait_for:
+        host: 127.0.0.1
+        port: 2222
+        state: present
+        timeout: 5
+        sleep: 1
+
+    - name: record tcp-present success
+      shell: "echo ok > /tmp/rsansible-wait-tcp-present-done"
