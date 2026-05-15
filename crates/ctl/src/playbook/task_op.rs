@@ -1539,7 +1539,7 @@ impl<'de> Deserialize<'de> for Task {
         };
         let tags = match map.remove("tags") {
             None => Vec::new(),
-            Some(v) => serde_yaml::from_value::<Vec<String>>(v)
+            Some(v) => parse_tags_value::<D::Error>(v)
                 .map_err(|e| D::Error::custom(format!("task {name:?}: tags: {e}")))?,
         };
         let delegate_to = take_optional_string(&mut map, "delegate_to", &name)?;
@@ -1808,6 +1808,49 @@ impl<'de> Deserialize<'de> for Task {
             become_user,
         })
     }
+}
+
+/// Deserialize a `tags:` value into `Vec<String>`. Ansible accepts both
+/// `tags: foo` and `tags: [foo, bar]`; we accept both shapes here. Empty
+/// or whitespace-only tag strings are rejected — they almost always
+/// indicate a typo (a trailing comma, an unquoted YAML null, etc.) and
+/// silently dropping them would mask the bug.
+pub(crate) fn parse_tags_value<E: serde::de::Error>(
+    v: serde_yaml::Value,
+) -> Result<Vec<String>, E> {
+    let raw: Vec<String> = match v {
+        serde_yaml::Value::String(s) => vec![s],
+        serde_yaml::Value::Sequence(_) => serde_yaml::from_value::<Vec<String>>(v)
+            .map_err(|e| E::custom(format!("expected a list of strings: {e}")))?,
+        serde_yaml::Value::Null => Vec::new(),
+        other => {
+            return Err(E::custom(format!(
+                "expected a string or list of strings, got: {other:?}"
+            )))
+        }
+    };
+    for s in &raw {
+        if s.trim().is_empty() {
+            return Err(E::custom(
+                "tag entries must be non-empty (check for stray commas \
+                 or unquoted YAML nulls)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(raw)
+}
+
+/// `serde::Deserialize` adapter for the standalone `tags:` field on
+/// `RoleSpec`. The task-level parser does its own field-by-field
+/// extraction (so it doesn't use this directly) but the role-spec
+/// derive flow does.
+pub(crate) fn deserialize_tags<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_yaml::Value::deserialize(d)?;
+    parse_tags_value(v)
 }
 
 fn take_optional_string<E: serde::de::Error>(
@@ -2302,6 +2345,53 @@ shell: "echo hi"
         assert_eq!(t.register.as_deref(), Some("greet_out"));
         assert_eq!(t.tags, vec!["smoke", "hello"]);
         assert!(matches!(t.body, TaskBody::Op(TaskOp::Shell(_))));
+    }
+
+    #[test]
+    fn parses_bare_string_tag() {
+        // Ansible-style shorthand: `tags: foo` (no brackets).
+        let t = parse_task(
+            r#"
+name: t
+tags: smoke
+shell: "echo hi"
+"#,
+        );
+        assert_eq!(t.tags, vec!["smoke"]);
+    }
+
+    #[test]
+    fn rejects_non_string_tag_scalar() {
+        let err = serde_yaml::from_str::<Task>(
+            r#"
+name: t
+tags: 42
+shell: "echo hi"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("tags"),
+            "expected a tags-related error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_tag_in_list() {
+        let err = serde_yaml::from_str::<Task>(
+            r#"
+name: t
+tags: [smoke, ""]
+shell: "echo hi"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("non-empty"),
+            "expected non-empty error, got: {err}"
+        );
     }
 
     #[test]

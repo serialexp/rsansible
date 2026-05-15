@@ -111,13 +111,26 @@ impl RoleInvocation {
             RoleInvocation::Full(s) => &s.role,
         }
     }
+
+    /// Tags declared on this role invocation (always empty for the bare
+    /// shorthand form). Propagated onto every materialized task at
+    /// role-flatten time.
+    pub fn tags(&self) -> &[String] {
+        match self {
+            RoleInvocation::Bare(_) => &[],
+            RoleInvocation::Full(s) => &s.tags,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RoleSpec {
     pub role: String,
-    #[serde(default)]
+    /// `tags:` on a role invocation are propagated onto every task and
+    /// handler pulled in from that role at flatten time. Accepts either
+    /// a bare string (Ansible-style shorthand) or a YAML sequence.
+    #[serde(default, deserialize_with = "crate::playbook::task_op::deserialize_tags")]
     pub tags: Vec<String>,
 }
 

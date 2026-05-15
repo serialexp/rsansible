@@ -66,6 +66,17 @@ enum Cmd {
         /// play vars, set_facts, and registers.
         #[arg(short = 'e', long = "extra-vars", value_name = "key=value|@file|{json}")]
         extra_vars: Vec<String>,
+        /// Run only tasks tagged with one of these (Ansible-style).
+        /// Repeatable; values are also comma-split. Magic tag `always`
+        /// is honored on tasks (keeps them running through `--tags`),
+        /// and the special selectors `all` / `untagged` work too.
+        #[arg(long = "tags", value_delimiter = ',', value_name = "tag")]
+        tags: Vec<String>,
+        /// Skip tasks tagged with one of these. Repeatable;
+        /// comma-splitting and the `all` / `untagged` selectors mirror
+        /// `--tags`.
+        #[arg(long = "skip-tags", value_delimiter = ',', value_name = "tag")]
+        skip_tags: Vec<String>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -100,6 +111,8 @@ async fn main() -> ExitCode {
             concurrency,
             vault_password_file,
             extra_vars,
+            tags,
+            skip_tags,
             playbook,
         } => match cmd_run(
             inventory,
@@ -107,6 +120,8 @@ async fn main() -> ExitCode {
             concurrency,
             vault_password_file,
             extra_vars,
+            tags,
+            skip_tags,
             playbook,
         )
         .await
@@ -154,6 +169,8 @@ async fn cmd_run(
     concurrency: usize,
     vault_pw_path: Option<PathBuf>,
     extra_vars_args: Vec<String>,
+    tags: Vec<String>,
+    skip_tags: Vec<String>,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -174,6 +191,8 @@ async fn cmd_run(
     spec.inventory_vars = inv_vars;
     spec.max_concurrent_hosts = concurrency.max(1);
     spec.extra_vars = extra;
+    spec.tags = tags;
+    spec.skip_tags = skip_tags;
     let report = orchestrator::run(spec)
         .await
         .context("orchestrator failed")?;

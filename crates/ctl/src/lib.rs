@@ -11,5 +11,6 @@ pub mod inventory;
 pub mod orchestrator;
 pub mod playbook;
 pub mod ssh;
+pub mod tags;
 pub mod template;
 pub mod vault;

@@ -53,6 +53,7 @@ pub fn flatten_playbook(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
         let mut role_handlers: Vec<Task> = Vec::new();
         for inv in &invocations {
             let name = inv.name();
+            let spec_tags = inv.tags();
             let role_dir = resolve_role_dir(base_dir, name).with_context(|| {
                 format!("resolving role {name:?} in play {:?}", play.name)
             })?;
@@ -70,14 +71,20 @@ pub fn flatten_playbook(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
             // tasks/main.yml
             if let Some(loaded) = load_task_file(&role_dir, "tasks")? {
                 had_content = true;
-                let tagged = tag_with_role_dir(loaded, &role_dir);
+                let mut tagged = tag_with_role_dir(loaded, &role_dir);
+                propagate_tags(&mut tagged, spec_tags);
                 role_tasks.extend(tagged);
             }
 
             // handlers/main.yml
             if let Some(loaded) = load_task_file(&role_dir, "handlers")? {
                 had_content = true;
-                let tagged = tag_with_role_dir(loaded, &role_dir);
+                let mut tagged = tag_with_role_dir(loaded, &role_dir);
+                // Handlers aren't filtered by --tags in v1 (matches the
+                // simpler Ansible variant), but propagating the
+                // role-invocation's tags keeps the data structure honest
+                // so a future handler-tag policy has the right inputs.
+                propagate_tags(&mut tagged, spec_tags);
                 role_handlers.extend(tagged);
             }
 
@@ -256,6 +263,10 @@ fn expand_one(
             t
         })
         .collect();
+
+    // Push include task's `tags:` down onto every spliced task. Matches
+    // the role-invocation tag-inheritance path above.
+    propagate_tags(&mut spliced, &include_task.tags);
 
     // Prepend synthetic set_fact for the include's vars (if any).
     if !ir.vars.is_empty() {
@@ -464,6 +475,20 @@ fn tag_with_role_dir(mut tasks: Vec<Task>, role_dir: &Path) -> Vec<Task> {
         }
     }
     tasks
+}
+
+/// Union `extra` into every task's `tags` list, sorted and deduped.
+/// Used by the role-flatten and `include_role:` paths to propagate
+/// the invocation site's tags down onto each materialized task.
+fn propagate_tags(tasks: &mut [Task], extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    for t in tasks {
+        t.tags.extend(extra.iter().cloned());
+        t.tags.sort();
+        t.tags.dedup();
+    }
 }
 
 fn resolve_role_dir(base_dir: &Path, name: &str) -> Result<PathBuf> {
@@ -793,6 +818,141 @@ port: 80
             pb.plays[0].role_defaults.get("x").and_then(JsonValue::as_u64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn role_invocation_tags_propagate_onto_role_tasks() {
+        let dir = make_role_tree(
+            "web",
+            "x: 1",
+            r#"
+- name: r1
+  shell: "echo r1"
+- name: r2
+  tags: [existing]
+  shell: "echo r2"
+"#,
+            r#"
+- name: h
+  shell: "echo h"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  roles:
+    - role: web
+      tags: [setup, common]
+  tasks:
+    - name: play_own
+      shell: "echo own"
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+
+        // Role tasks pick up the invocation tags.
+        assert_eq!(pb.plays[0].tasks[0].name, "r1");
+        assert_eq!(pb.plays[0].tasks[0].tags, vec!["common", "setup"]);
+
+        // A task that already had tags merges with the role tags (deduped + sorted).
+        assert_eq!(pb.plays[0].tasks[1].name, "r2");
+        assert_eq!(pb.plays[0].tasks[1].tags, vec!["common", "existing", "setup"]);
+
+        // Play-direct task is untouched.
+        assert_eq!(pb.plays[0].tasks[2].name, "play_own");
+        assert!(pb.plays[0].tasks[2].tags.is_empty());
+
+        // Role handlers also pick up the tags (no filtering for now, but
+        // the data structure stays consistent).
+        assert_eq!(pb.plays[0].handlers[0].name, "h");
+        assert_eq!(pb.plays[0].handlers[0].tags, vec!["common", "setup"]);
+    }
+
+    #[test]
+    fn bare_role_invocation_does_not_inject_tags() {
+        let dir = make_role_tree(
+            "web",
+            "x: 1",
+            r#"
+- name: r1
+  tags: [keep]
+  shell: "echo r1"
+"#,
+            "",
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  roles:
+    - web
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        assert_eq!(pb.plays[0].tasks[0].tags, vec!["keep"]);
+    }
+
+    #[test]
+    fn include_role_tags_propagate_onto_spliced_tasks() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/svc");
+        write(
+            &role.join("tasks/apply.yml"),
+            r#"
+- name: bare
+  shell: "echo bare"
+- name: own
+  tags: [existing]
+  shell: "echo own"
+"#,
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: include
+      tags: [outer]
+      include_role:
+        name: svc
+        tasks_from: apply
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        assert_eq!(pb.plays[0].tasks[0].name, "bare");
+        assert_eq!(pb.plays[0].tasks[0].tags, vec!["outer"]);
+        assert_eq!(pb.plays[0].tasks[1].name, "own");
+        assert_eq!(pb.plays[0].tasks[1].tags, vec!["existing", "outer"]);
+    }
+
+    #[test]
+    fn role_spec_accepts_bare_string_tag() {
+        // `tags: setup` (no list).
+        let dir = make_role_tree(
+            "web",
+            "x: 1",
+            r#"
+- name: r1
+  shell: "echo r1"
+"#,
+            "",
+        );
+        let pb_text = r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  roles:
+    - role: web
+      tags: setup
+"#;
+        let pb_path = dir.path().join("playbook.yml");
+        write(&pb_path, pb_text);
+        let pb = playbook::load(&pb_path).unwrap();
+        assert_eq!(pb.plays[0].tasks[0].tags, vec!["setup"]);
     }
 
     #[test]

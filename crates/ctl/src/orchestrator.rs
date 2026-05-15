@@ -103,6 +103,11 @@ pub struct RunSpec {
     /// source — seeded into every `HostCtx.extra_vars` at run start.
     /// Empty by default.
     pub extra_vars: BTreeMap<String, JsonValue>,
+    /// CLI `--tags` selectors. Empty = run everything except
+    /// `never`-only tasks. See [`crate::tags::TagFilter`].
+    pub tags: Vec<String>,
+    /// CLI `--skip-tags` selectors. Empty = no filter.
+    pub skip_tags: Vec<String>,
 }
 
 impl RunSpec {
@@ -114,6 +119,8 @@ impl RunSpec {
             agent_binary: Arc::new(agent_binary),
             max_concurrent_hosts: DEFAULT_MAX_CONCURRENT_HOSTS,
             extra_vars: BTreeMap::new(),
+            tags: Vec::new(),
+            skip_tags: Vec::new(),
         }
     }
 }
@@ -140,7 +147,18 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         agent_binary,
         max_concurrent_hosts,
         extra_vars,
+        tags,
+        skip_tags,
     } = spec;
+
+    // `--tags` / `--skip-tags` resolve to a filter consulted at task
+    // dispatch time. Empty + empty = identity (the common case);
+    // building it once and Arc-cloning it into per-host futures keeps
+    // the per-task hot path branch-free.
+    let tag_filter = Arc::new(
+        crate::tags::TagFilter::from_cli(&tags, &skip_tags)
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
 
     // Build the per-host inventory_vars views + the shared WorldVars
     // once at startup. Both are stable for the run.
@@ -264,6 +282,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
             &next_seq,
             &env,
             &world_for_play,
+            &tag_filter,
         )
         .await?;
 
@@ -293,6 +312,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                     &next_seq,
                     &env,
                     &world_for_play,
+                    &tag_filter,
                 )
                 .await?
             }
@@ -306,6 +326,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                     &next_seq,
                     &env,
                     &world_for_play,
+                    &tag_filter,
                 )
                 .await?
             }
@@ -546,7 +567,10 @@ fn make_gather_facts_task() -> Task {
         register: Some(GATHER_FACTS_REGISTER.to_string()),
         loop_spec: None,
         loop_control: None,
-        tags: Vec::new(),
+        // Tag with `always` so `--tags foo` doesn't accidentally drop
+        // the implicit fact-gather (matches Ansible). Users who really
+        // want to skip it can pass `--skip-tags always`.
+        tags: vec!["always".to_string()],
         delegate_to: None,
         run_once: false,
         notify: Vec::new(),
@@ -574,8 +598,17 @@ async fn gather_facts_for_play(
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
     world: &Arc<WorldVars>,
+    tag_filter: &Arc<crate::tags::TagFilter>,
 ) -> Result<()> {
     if !play.gather_facts {
+        return Ok(());
+    }
+    let task = make_gather_facts_task();
+    // The synthetic gather task carries `tags: ["always"]`. Under
+    // `--skip-tags always` (the documented Ansible escape hatch) the
+    // filter rejects it; respect that.
+    if !tag_filter.should_run(&task.tags) {
+        info!(play = %play.name, "skipping implicit gather_facts (tag filter)");
         return Ok(());
     }
     let live: Vec<String> = targets
@@ -587,7 +620,6 @@ async fn gather_facts_for_play(
         return Ok(());
     }
     info!(play = %play.name, hosts = live.len(), "gathering facts");
-    let task = make_gather_facts_task();
     let mut set: JoinSet<PerHostTaskResult> = JoinSet::new();
     for name in &live {
         let own_conn = conns.get(name).expect("live host has handle").clone();
@@ -656,6 +688,7 @@ async fn run_play_per_task(
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
     world: &Arc<WorldVars>,
+    tag_filter: &Arc<crate::tags::TagFilter>,
 ) -> Result<bool> {
     for task in &play.tasks {
         // `meta: flush_handlers` is not dispatched to hosts — it's a
@@ -666,6 +699,19 @@ async fn run_play_per_task(
             if stop {
                 return Ok(true);
             }
+            continue;
+        }
+
+        // `--tags` / `--skip-tags` filter. Tag-skipped tasks are dropped
+        // entirely — no per-host dispatch, no register binding, no
+        // notify side-effects.
+        if !tag_filter.should_run(&task.tags) {
+            info!(
+                play = %play.name,
+                task = %task.name,
+                tags = ?task.tags,
+                "skipped (tag filter)",
+            );
             continue;
         }
 
@@ -833,6 +879,7 @@ async fn run_play_per_play(
     next_seq: &Arc<AtomicU32>,
     env: &Arc<Environment<'static>>,
     world: &Arc<WorldVars>,
+    tag_filter: &Arc<crate::tags::TagFilter>,
 ) -> Result<bool> {
     // Snapshot the live target set; per-host futures don't see each other.
     let live: Vec<String> = targets
@@ -874,6 +921,7 @@ async fn run_play_per_play(
         let name_owned = name.clone();
         let handlers = handlers.clone();
         let live_names = live.clone();
+        let tag_filter = tag_filter.clone();
         set.spawn(async move {
             let mut ctx = ctx;
             let mut first_failure: Option<(String, String)> = None;
@@ -898,6 +946,24 @@ async fn run_play_per_play(
                         if matches!(on_failure, OnFailure::Stop | OnFailure::MarkHostFailed) {
                             break;
                         }
+                    }
+                    continue;
+                }
+
+                // `--tags` / `--skip-tags` filter. Tag-skipped tasks are
+                // dropped entirely; the matching `OnceCell` slot stays
+                // unused (a tag-skipped run_once task simply doesn't run
+                // on any host).
+                if !tag_filter.should_run(&task.tags) {
+                    if name_owned == live_names[0] {
+                        // Log once per filtered task — only the first
+                        // host emits; others would be redundant noise.
+                        info!(
+                            play = %play_name,
+                            task = %task.name,
+                            tags = ?task.tags,
+                            "skipped (tag filter)",
+                        );
                     }
                     continue;
                 }

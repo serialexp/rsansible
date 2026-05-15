@@ -405,9 +405,41 @@ new wire framing roundtrip for `OpGatherFacts`.
   agent parks the sync wait loop on `spawn_blocking`. e2e via
   `examples/wait_for.yaml` covers path-appears, path-disappears, and
   TCP-already-listening.
-- [ ] Idempotency reporting: every module sets `TaskDone.changed`
-  correctly so handlers fire only when state actually changed. This is
-  the contract handlers depend on.
+- [x] **Idempotency reporting sweep** — audited every agent module
+  against the `TaskDone.changed` contract handlers depend on. Findings
+  per module:
+  - `write_file`: bytes+mode diff against on-disk; `changed=1` iff
+    bytes or mode bits actually moved. ✓ (smoke.rs validates both
+    branches).
+  - `file`: per-state (`directory`/`file`/`touch`/`absent`) returns
+    accurate `changed` from `apply_*` helpers; `touch` is
+    Ansible-faithfully always-changed. ✓
+  - `lineinfile` / `blockinfile`: render new bytes, compare against
+    existing, `changed=1` iff different. Mode-only delta on an
+    otherwise-unchanged file is reported as `changed=1`. ✓
+  - `stat` / `gather_facts` / `wait_for`: read-only modules, always
+    `changed=0`. ✓
+  - `systemd`: per-action flag accumulation; `started`/`stopped`/
+    `enabled`/`masked` gated by `is-active`/`is-enabled` probes;
+    `restarted`/`reloaded`/`daemon_reload` always-changed (matches
+    Ansible). ✓
+  - `ufw`: per-op `status verbose` probe; rules/defaults/logging only
+    flip changed when state moves; `reset`/`reload` always-changed
+    (matches Ansible). ✓
+  - `package/apt`: pre/post `dpkg-query` version compare; `present`
+    skips when installed, `latest` only reports changed on version
+    move, `absent` skips when not installed. ✓
+  - `exec` / `shell`: `changed = (exit_code == 0)`. Diverges in
+    spirit from Ansible's "always-changed for command/shell" only on
+    the failure branch — but the controller treats `exit_code != 0`
+    as task failure (BodyResult::Failed) and `ignore_errors:` isn't
+    supported yet, so the failure-branch `changed` value isn't
+    observable. Comment in `modules/exec.rs:126` already documents
+    the intent. Revisit when `ignore_errors:` ships.
+  Controller side: `RegisterValue::from_exec` lifts `done.changed`
+  into `register.changed`; `enqueue_notifies` gates on
+  `!skipped && changed && !task.notify.is_empty()`. ✓ No drift; no
+  source changes required.
 
 **Acceptance:** `common` role applies end-to-end (users, packages, ssh
 config, ufw rules, netplan, sshd handlers fire on change).
@@ -472,8 +504,29 @@ run against an existing cluster.
 
 These don't fit neatly into a phase but should happen alongside the work:
 
-- [ ] **Tags** (`tags:` + `--tags` / `--skip-tags`). 36 sites. Skippable
-  for v1 but obvious quality-of-life.
+- [x] **Tags** (`tags:` + `--tags` / `--skip-tags`) — controller-side
+  task-dispatch gate, no wire change. `tags:` accepted on tasks and on
+  `roles:` invocations as either a bare string or a YAML list; empty
+  entries rejected at parse. Role-flatten propagates `RoleSpec.tags`
+  onto every task and handler pulled from that invocation (deduped +
+  sorted); `include_role:` propagates the include task's own `tags:`
+  onto the spliced tasks the same way. CLI exposes `--tags` and
+  `--skip-tags` (both repeatable, comma-splitting via
+  `value_delimiter`); they resolve to an `Arc<TagFilter>` consulted at
+  dispatch time in both `run_play_per_task` and `run_play_per_play`
+  (gated right after the `meta: flush_handlers` check). Magic tags
+  honored: `always` (task runs unless `--skip-tags always`), `never`
+  (task only runs when explicitly opted in via `--tags`), plus the
+  `all` and `untagged` CLI selectors. The implicit `Gathering Facts`
+  task ships with `tags: ["always"]` so `--tags foo` doesn't
+  accidentally drop fact-gathering. Handlers aren't filtered in v1 —
+  a notified handler fires if its trigger task fired, regardless of
+  `--tags`. Tag-skipped tasks are dropped entirely (no register
+  binding, no notify), matching Ansible. 22 `TagFilter` rule-table
+  unit tests + 3 task-parse tests + 4 role-flatten tests + a
+  5-scenario 1-container e2e (`tests/tags_e2e.rs`) covering no-flags
+  / `--tags setup` / `--skip-tags teardown` / `--tags never` /
+  `--skip-tags always`.
 - [ ] **`--limit` flag** — restrict the run to a host pattern. Ansible
   convention; gothab's bin/ scripts call ansible-playbook with this.
 - [ ] **`--check` mode** — dry-run; every op reports what it *would* do
