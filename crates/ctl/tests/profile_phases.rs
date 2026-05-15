@@ -123,6 +123,7 @@ async fn profile_three_host_run() -> Result<()> {
             op_write_file(
                 "/tmp/rsansible-hello".into(),
                 0o644,
+                false,
                 b"hello from rsansible\n".to_vec(),
             ),
         ),

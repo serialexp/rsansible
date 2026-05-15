@@ -1,0 +1,73 @@
+# End-to-end exercise of `uri:` (Phase 4 HTTP client).
+#
+# The agent's uri module returns a JSON envelope describing the response;
+# the orchestrator lifts the envelope keys to the top level of `register`
+# (`register.status`, `register.json.<body-field>`, `register.content`,
+# `register.headers`, …) matching Ansible's contract.
+#
+# Setup: we stand up a tiny `busybox httpd` server inside the container,
+# serving a static directory at port 18080. The test playbook then hits
+# `http://127.0.0.1:18080/...` from the same container (the agent runs
+# in-container), exercising:
+#   1. GET 200 with a JSON body → register.json.foo == "bar"
+#   2. GET 200 with return_content → register.content includes the body
+#   3. GET against status_code=[418] + ignore_errors → register.failed
+#      and register.status==200 (envelope is lifted even on failure)
+#   4. HEAD against the same endpoint → register.status==200, no body
+
+- name: uri demo
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: prepare the static webroot
+      shell: |
+        mkdir -p /tmp/rsansible-uri-www &&
+        printf '{"foo":"bar","n":42}' > /tmp/rsansible-uri-www/data.json
+
+    - name: start busybox httpd in the background
+      # -f keeps it foreground (so nohup can background it cleanly);
+      # we keep the PID for explicit teardown at end of play.
+      shell: |
+        (busybox httpd -f -p 18080 -h /tmp/rsansible-uri-www >/tmp/rsansible-uri-httpd.log 2>&1 &
+         echo $! > /tmp/rsansible-uri-httpd.pid)
+
+    - name: wait for httpd to start accepting
+      wait_for:
+        host: 127.0.0.1
+        port: 18080
+        timeout: 5
+
+    # 1. GET 200 with a JSON body.
+    - name: GET the json blob
+      uri:
+        url: http://127.0.0.1:18080/data.json
+        return_content: yes
+      register: r_get
+
+    - name: record GET findings
+      shell: "printf '%s\\n%s\\n%s\\n%s\\n' '{{ r_get.status }}' '{{ r_get.json.foo }}' '{{ r_get.json.n }}' '{{ r_get.content }}' > /tmp/rsansible-uri-get"
+
+    # 2. status_code mismatch + ignore_errors → register.failed populated,
+    # envelope still lifted.
+    - name: GET expecting an impossible status code
+      uri:
+        url: http://127.0.0.1:18080/data.json
+        status_code: [418]
+      register: r_bad
+      ignore_errors: true
+
+    - name: record status-mismatch findings
+      shell: "printf '%s\\n%s\\n' '{{ r_bad.failed }}' '{{ r_bad.status }}' > /tmp/rsansible-uri-bad"
+
+    # 3. HEAD — no body returned by the server, but envelope still shows status.
+    - name: HEAD the json blob
+      uri:
+        url: http://127.0.0.1:18080/data.json
+        method: HEAD
+      register: r_head
+
+    - name: record HEAD findings
+      shell: "printf '%s\\n%s\\n' '{{ r_head.status }}' '{{ r_head.changed }}' > /tmp/rsansible-uri-head"
+
+    - name: tear down httpd
+      shell: "kill $(cat /tmp/rsansible-uri-httpd.pid) 2>/dev/null || true"

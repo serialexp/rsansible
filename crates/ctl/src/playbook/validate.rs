@@ -505,6 +505,39 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             // nothing else to check.
             Ok(())
         }
+        TaskOp::Uri(u) => {
+            // url empty pre-render is a sure error — the rest of the
+            // fields were already validated structurally at parse time
+            // (status_codes range, body_format / method / follow_redirects
+            // enum membership). Header-injection guard: forbid CR/LF in
+            // header keys.
+            if u.url.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: uri.url is empty",
+                    where_,
+                    task.name
+                );
+            }
+            for k in u.headers.keys() {
+                if k.is_empty() || k.contains('\r') || k.contains('\n') || k.contains(':') {
+                    bail!(
+                        "{}: task[{ti}] {:?}: uri.headers: invalid header name {:?} \
+                         (must be non-empty and contain no CR/LF/colon)",
+                        where_,
+                        task.name,
+                        k
+                    );
+                }
+            }
+            if u.status_codes.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: uri.status_code: must be a non-empty list",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
         TaskOp::BlockInFile(b) => {
             if b.path.is_empty() {
                 bail!(

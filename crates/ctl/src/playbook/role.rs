@@ -285,6 +285,7 @@ fn expand_one(
             // Synthetic set_fact runs controller-side; no privilege escalation.
             become_: Some(false),
             become_user: None,
+            ignore_errors: None,
         };
         spliced.insert(0, synthetic);
     }

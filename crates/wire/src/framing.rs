@@ -143,7 +143,7 @@ mod tests {
     async fn roundtrip_task_dispatch_write_file() {
         roundtrip(msg::task_dispatch(
             99,
-            msg::op_write_file("/etc/motd".into(), 0o644, b"hello world\n".to_vec()),
+            msg::op_write_file("/etc/motd".into(), 0o644, false, b"hello world\n".to_vec()),
         ))
         .await;
     }
@@ -414,6 +414,43 @@ mod tests {
         roundtrip(msg::task_dispatch(
             103,
             msg::op_stat("/nope".into(), false),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_write_file_only_if_missing() {
+        // only_if_missing=true variant must roundtrip with the byte set
+        // — otherwise the agent's skip-if-exists branch never fires.
+        roundtrip(msg::task_dispatch(
+            42,
+            msg::op_write_file("/etc/ssl/key.pem".into(), 0o600, true, b"PEM".to_vec()),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_uri_with_mtls() {
+        // Exercise the three PEM-bytes fields on OpUri so a schema-vs-
+        // wire-vs-runtime mismatch surfaces here, not in production.
+        roundtrip(msg::task_dispatch(
+            77,
+            msg::op_uri(
+                msg::uri_method::GET,
+                "https://etcd.example/v2".into(),
+                vec![],
+                vec![],
+                Vec::new(),
+                msg::uri_body_format::RAW,
+                vec![200],
+                5_000,
+                false,
+                true,
+                msg::uri_follow::SAFE,
+                b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n".to_vec(),
+                b"-----BEGIN PRIVATE KEY-----\nxyz\n-----END PRIVATE KEY-----\n".to_vec(),
+                b"-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n".to_vec(),
+            ),
         ))
         .await;
     }

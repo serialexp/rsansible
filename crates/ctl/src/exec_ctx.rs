@@ -9,6 +9,7 @@
 //! `loop:` expressions, `assert.that:` expressions) all evaluate against
 //! the merged view returned by `build_template_ctx`.
 
+use crate::wire_cost::WireCost;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -57,6 +58,12 @@ pub struct HostCtx {
     /// Deduped naturally (BTreeSet). Drained at end-of-play or on
     /// `meta: flush_handlers`.
     pub pending_handlers: BTreeSet<String>,
+    /// Wire-cost estimate for this host's SSH transport. Populated at
+    /// connection-open time with the measured RTT from Ping/Pong, and
+    /// an inventory-overridable bandwidth (default 100 KB/s). Consumed
+    /// by `wire_cost::should_probe_first` to decide ship-blind vs
+    /// probe-first for module-generated content (privkey, …).
+    pub wire_cost: WireCost,
 }
 
 impl HostCtx {
@@ -73,6 +80,7 @@ impl HostCtx {
             failed: false,
             iter_item: None,
             pending_handlers: BTreeSet::new(),
+            wire_cost: WireCost::default(),
         }
     }
 

@@ -295,11 +295,17 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 .map_err(|e| anyhow!("write_file.content: {e}"))?;
         }
         TaskOp::Template(t) => {
-            // `src:` was resolved at load time; only `dest:` is Jinja-able
-            // at task time. The template body itself is compiled via the
-            // playbook's `TemplateRegistry` rather than here.
+            // `src:` was resolved at load time; `dest:` is Jinja-able
+            // at task time, and the loaded `.j2` body itself is also
+            // compiled here so a syntax error in the template surfaces
+            // at validate-time rather than at first task dispatch.
             env.template_from_str(&t.dest)
                 .map_err(|e| anyhow!("template.dest: {e}"))?;
+            if let Some(body) = t.body.as_deref() {
+                env.template_from_str(body).map_err(|e| {
+                    anyhow!("template src {:?}: {e}", t.src)
+                })?;
+            }
         }
         TaskOp::Copy(c) => {
             // `src:` is resolved at load time; `body` is raw bytes that
@@ -388,6 +394,21 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     env.template_from_str(val)
                         .map_err(|e| anyhow!("{label}: {e}"))?;
                 }
+            }
+        }
+        TaskOp::Uri(u) => {
+            // url, header values, and body are Jinja-rendered at task
+            // time. Header keys are not (header names aren't useful Jinja
+            // targets and `:` in a name would be ambiguous anyway).
+            env.template_from_str(&u.url)
+                .map_err(|e| anyhow!("uri.url: {e}"))?;
+            for (k, v) in &u.headers {
+                env.template_from_str(v)
+                    .map_err(|e| anyhow!("uri.headers.{k}: {e}"))?;
+            }
+            if !u.body.is_empty() {
+                env.template_from_str(&u.body)
+                    .map_err(|e| anyhow!("uri.body: {e}"))?;
             }
         }
     }
@@ -601,6 +622,60 @@ mod tests {
         let err = precompile_all(&pb).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("shell"), "got: {msg}");
+    }
+
+    #[test]
+    fn precompile_catches_bad_template_body() {
+        // `template:` deserializes with body=None (the body is normally
+        // populated by the loader after locating the .j2 file). For
+        // this test we inject a bad body by hand.
+        let mut pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: t
+      template:
+        src: foo.j2
+        dest: /tmp/out
+"#,
+        )
+        .unwrap();
+        // Reach into the parsed structure and stash a malformed Jinja
+        // template body. `precompile_all` should surface it with the
+        // src in the error message.
+        if let TaskBody::Op(TaskOp::Template(t)) =
+            &mut pb.plays[0].tasks[0].body
+        {
+            t.body = Some("hi {{ unclosed".into());
+        } else {
+            panic!("expected TaskOp::Template");
+        }
+        let err = precompile_all(&pb).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("foo.j2"), "got: {msg}");
+    }
+
+    #[test]
+    fn precompile_accepts_clean_template_body() {
+        let mut pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: t
+      template:
+        src: foo.j2
+        dest: /tmp/out
+"#,
+        )
+        .unwrap();
+        if let TaskBody::Op(TaskOp::Template(t)) =
+            &mut pb.plays[0].tasks[0].body
+        {
+            t.body = Some("hi {{ name | default('world') }}\n".into());
+        } else {
+            panic!("expected TaskOp::Template");
+        }
+        precompile_all(&pb).unwrap();
     }
 
     #[test]

@@ -39,11 +39,12 @@ pub fn op_shell(command: String, timeout_ms: u32) -> Op {
     })
 }
 
-pub fn op_write_file(path: String, mode: u32, content: Vec<u8>) -> Op {
+pub fn op_write_file(path: String, mode: u32, only_if_missing: bool, content: Vec<u8>) -> Op {
     Op::OpWriteFile(OpWriteFileOutput {
         kind: 2,
         path,
         mode,
+        only_if_missing: if only_if_missing { 1 } else { 0 },
         content,
     })
 }
@@ -334,6 +335,75 @@ pub fn op_ufw(
         comment,
         delete: if delete { 1 } else { 0 },
         insert,
+    })
+}
+
+/// HTTP `method:` byte values for `OpUri`.
+pub mod uri_method {
+    pub const GET: u8 = 0;
+    pub const POST: u8 = 1;
+    pub const PUT: u8 = 2;
+    pub const PATCH: u8 = 3;
+    pub const DELETE: u8 = 4;
+    pub const HEAD: u8 = 5;
+}
+
+/// `body_format:` byte values for `OpUri`.
+pub mod uri_body_format {
+    /// Ship the body bytes verbatim; no Content-Type adjustment.
+    pub const RAW: u8 = 0;
+    /// Body is already JSON-encoded; agent sets `Content-Type:
+    /// application/json` if the caller didn't already.
+    pub const JSON: u8 = 1;
+    /// Body is form-encoded (`k=v&k=v`); agent sets `Content-Type:
+    /// application/x-www-form-urlencoded` if the caller didn't already.
+    pub const FORM: u8 = 2;
+}
+
+/// `follow_redirects:` byte values for `OpUri`.
+pub mod uri_follow {
+    /// Never follow 3xx; the response surfaces as-is.
+    pub const NONE: u8 = 0;
+    /// Follow 3xx only when the original method was GET or HEAD,
+    /// matching Ansible's default. Capped at 10 hops.
+    pub const SAFE: u8 = 1;
+    /// Follow 3xx regardless of method. Capped at 10 hops.
+    pub const ALL: u8 = 2;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_uri(
+    method: u8,
+    url: String,
+    header_keys: Vec<String>,
+    header_values: Vec<String>,
+    body: Vec<u8>,
+    body_format: u8,
+    status_codes: Vec<u16>,
+    timeout_ms: u32,
+    return_content: bool,
+    validate_certs: bool,
+    follow_redirects: u8,
+    client_cert_pem: Vec<u8>,
+    client_key_pem: Vec<u8>,
+    ca_bundle_pem: Vec<u8>,
+) -> Op {
+    Op::OpUri(OpUriOutput {
+        kind: 12,
+        method,
+        url,
+        header_keys,
+        header_values,
+        body,
+        body_format,
+        status_codes,
+        timeout_ms,
+        return_content: if return_content { 1 } else { 0 },
+        validate_certs: if validate_certs { 1 } else { 0 },
+        follow_redirects,
+        client_cert_pem,
+        client_key_pem,
+        ca_bundle_pem,
     })
 }
 

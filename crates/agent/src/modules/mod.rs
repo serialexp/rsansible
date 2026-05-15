@@ -15,6 +15,7 @@ mod package;
 mod stat;
 mod systemd;
 mod ufw;
+mod uri;
 mod wait_for;
 mod write_file;
 
@@ -53,6 +54,7 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
         Op::OpSystemd(o) => systemd::run(ctx, seq, o).await,
         Op::OpPackage(o) => package::run(ctx, seq, o).await,
         Op::OpUfw(o) => ufw::run(ctx, seq, o).await,
+        Op::OpUri(o) => uri::run(ctx, seq, o).await,
     }
 }
 

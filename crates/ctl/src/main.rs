@@ -84,9 +84,33 @@ enum Cmd {
         /// index/slice (`web[0]`, `web[1:3]`, `web[-1]`).
         #[arg(long = "limit", value_delimiter = ',', value_name = "pattern")]
         limit: Vec<String>,
+        /// Override the ship-blind / probe-first heuristic that
+        /// modules generating file content (e.g. `openssl_privatekey`)
+        /// use to choose between sending bytes directly vs. statting
+        /// first. `auto` (default) consults per-host RTT × bandwidth.
+        /// `blind` skips the stat probe; `probe` always probes.
+        #[arg(long = "wire-strategy", value_enum, default_value = "auto")]
+        wire_strategy: WireStrategyArg,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum WireStrategyArg {
+    Auto,
+    Blind,
+    Probe,
+}
+
+impl From<WireStrategyArg> for rsansible_ctl::wire_cost::WireStrategy {
+    fn from(a: WireStrategyArg) -> Self {
+        match a {
+            WireStrategyArg::Auto => rsansible_ctl::wire_cost::WireStrategy::Auto,
+            WireStrategyArg::Blind => rsansible_ctl::wire_cost::WireStrategy::Blind,
+            WireStrategyArg::Probe => rsansible_ctl::wire_cost::WireStrategy::Probe,
+        }
+    }
 }
 
 #[tokio::main]
@@ -121,6 +145,7 @@ async fn main() -> ExitCode {
             tags,
             skip_tags,
             limit,
+            wire_strategy,
             playbook,
         } => match cmd_run(
             inventory,
@@ -131,6 +156,7 @@ async fn main() -> ExitCode {
             tags,
             skip_tags,
             limit,
+            wire_strategy,
             playbook,
         )
         .await
@@ -181,6 +207,7 @@ async fn cmd_run(
     tags: Vec<String>,
     skip_tags: Vec<String>,
     limit: Vec<String>,
+    wire_strategy: WireStrategyArg,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -204,6 +231,7 @@ async fn cmd_run(
     spec.tags = tags;
     spec.skip_tags = skip_tags;
     spec.limit = limit;
+    spec.wire_strategy = wire_strategy.into();
     let report = orchestrator::run(spec)
         .await
         .context("orchestrator failed")?;

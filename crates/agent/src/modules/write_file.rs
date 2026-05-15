@@ -19,6 +19,38 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput) -> anyhow::Resu
     let path = PathBuf::from(&op.path);
     let mode = op.mode;
 
+    // `only_if_missing=1` short-circuits without reading or writing: if the
+    // file exists, we report changed=false and bail. Used by the controller's
+    // ship-blind privkey path so a generated PEM doesn't clobber a key the
+    // operator already has on disk. A bare `symlink_metadata` is enough — we
+    // don't care whether the target is a regular file, only whether the path
+    // is occupied.
+    if op.only_if_missing != 0 {
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(_) => {
+                let finished_unix_ns = now_unix_ns();
+                ctx.emit(msg::task_done(seq, 0, false, started_unix_ns, finished_unix_ns))
+                    .await;
+                return Ok(());
+            }
+            // Path doesn't exist → fall through to the normal write path.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Any other lstat error is a real failure (e.g. EACCES on the
+            // parent dir) and should surface — same shape as a read failure
+            // on the regular path.
+            Err(e) => {
+                emit_error(
+                    ctx,
+                    seq,
+                    map_io_err(&e),
+                    format!("stat {}: {e}", op.path),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
+
     // Determine prior state for the `changed` flag.
     let prior = match tokio::fs::read(&path).await {
         Ok(b) => Some(b),

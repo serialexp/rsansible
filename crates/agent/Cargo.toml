@@ -29,5 +29,15 @@ regex = { workspace = true }
 # without dragging in libc-link headaches on musl.
 rustix = { version = "0.38", default-features = false, features = ["process", "system", "std"] }
 
+# reqwest with rustls (no OpenSSL) powers OpUri. `json` exposes the
+# response-body parser; `gzip` is needed because Patroni's REST API
+# returns gzipped responses. Default features stripped so we don't drag
+# in OpenSSL via the default `native-tls` feature.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "process", "io-util", "fs"] }
+# Pin axum/hyper/tower for the OpUri unit-test HTTP server.
+axum = "0.7"
+hyper = "1"
+tower = "0.5"

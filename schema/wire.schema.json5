@@ -72,13 +72,17 @@
     },
 
     OpWriteFile: {
-      description: "Atomic write: tmp + fsync + rename. `changed` in TaskDone is set iff content or mode differed.",
+      description: "Atomic write: tmp + fsync + rename. `changed` in TaskDone is set iff content or mode differed. `only_if_missing=1` makes the write a no-op when `path` already exists (agent reports changed=0 without reading or writing); used for ship-blind idempotent paths like generated private keys where a stat-then-write round trip is more expensive than just shipping the bytes.",
       sequence: [
         { name: "kind", type: "uint8", const: 2 },
         { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
         // Permission bits (octal in YAML, decoded to u32 here). Only the low 12
         // bits are meaningful but uint32 keeps room for setuid/sticky etc.
         { name: "mode", type: "uint32" },
+        // 0 = always write (overwrite if present), 1 = skip if dest exists.
+        // The fixed-size byte goes before the variable-length `content` tail
+        // so the framing stays simple.
+        { name: "only_if_missing", type: "uint8" },
         { name: "content", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
       ],
     },
@@ -218,6 +222,51 @@
       ],
     },
 
+    OpUri: {
+      description: "HTTP client. Maps Ansible's `ansible.builtin.uri` (subset). `method` is a uint8: 0=GET, 1=POST, 2=PUT, 3=PATCH, 4=DELETE, 5=HEAD. `header_keys` / `header_values` are parallel arrays carrying the request headers (case preserved on the wire; reqwest canonicalises at send time). `body_format` is a uint8: 0=raw (body shipped verbatim, no Content-Type touched), 1=json (body shipped as-is — controller pre-serialises any YAML map at parse time; Content-Type set to application/json when not already in headers), 2=form (body shipped verbatim; Content-Type set to application/x-www-form-urlencoded when not already in headers — caller does the k=v&k=v encoding). `status_codes` is the list of accepted HTTP statuses; the agent emits TaskDone with exit_code=0 when the response status is in this list, exit_code=1 otherwise. The envelope is shipped on stdout in both cases for diagnostics. `follow_redirects` is a uint8: 0=none, 1=safe (follow up to 10 hops iff the original method was GET/HEAD), 2=all (follow up to 10 hops regardless of method). `validate_certs=0` disables TLS cert/hostname verification. `return_content=1` includes the response body as a UTF-8 string in the envelope's `content` field. Envelope shape: {status: uint16, url: string, headers: map<string,string> (response headers, keys lowercased), content?: string (only if return_content), content_length: uint, content_type: string, json?: <parsed body if Content-Type indicates JSON>, elapsed_ms: uint, redirected: bool}. `changed` is 1 for any successful non-GET/HEAD request (Ansible's contract: mutating verbs report changed even if the server didn't actually change), 0 for GET/HEAD or for any failed status. Pre-status errors (connect refused, DNS, TLS handshake, timeout) surface as TaskError BAD_HOST/BAD_REQUEST without an envelope. Wire kind=12.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 12 },
+        { name: "method", type: "uint8" },
+        { name: "url", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        {
+          name: "header_keys",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+        {
+          name: "header_values",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+        { name: "body", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "body_format", type: "uint8" },
+        {
+          name: "status_codes",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "uint16" },
+        },
+        { name: "timeout_ms", type: "uint32" },
+        { name: "return_content", type: "uint8" },
+        { name: "validate_certs", type: "uint8" },
+        { name: "follow_redirects", type: "uint8" },
+        // mTLS PEM material. Empty bytes = absent. `client_cert_pem` +
+        // `client_key_pem` together build a reqwest Identity (concatenated PEM
+        // bundle). `ca_bundle_pem` is added as a custom root for verification.
+        // Controller reads these from local files (Ansible's `client_cert` /
+        // `client_key` / `ca_path`) at playbook load time and embeds the bytes
+        // here, so the agent never touches the controller's filesystem.
+        { name: "client_cert_pem", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "client_key_pem", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "ca_bundle_pem", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -237,6 +286,7 @@
         { type: "OpSystemd", when: "value === 9" },
         { type: "OpPackage", when: "value === 10" },
         { type: "OpUfw", when: "value === 11" },
+        { type: "OpUri", when: "value === 12" },
       ],
     },
 

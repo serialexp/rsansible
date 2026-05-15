@@ -164,6 +164,7 @@ async fn op_write_file_atomic() {
             msg::op_write_file(
                 target.to_string_lossy().into_owned(),
                 0o644,
+                false,
                 b"hello\n".to_vec(),
             ),
         ),
@@ -184,6 +185,7 @@ async fn op_write_file_atomic() {
             msg::op_write_file(
                 target.to_string_lossy().into_owned(),
                 0o644,
+                false,
                 b"hello\n".to_vec(),
             ),
         ),
@@ -193,6 +195,83 @@ async fn op_write_file_atomic() {
     let (_p, done) = read_until_done(&mut stdout, 2).await;
     let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
     assert_eq!(td.changed, 0, "rewriting same content should report unchanged");
+
+    write_frame(&mut stdin, &msg::bye()).await.unwrap();
+    drop(stdin);
+    child.wait().await.ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn op_write_file_only_if_missing() {
+    // `only_if_missing=1` must be a no-op (changed=0) when the dest
+    // already exists, and a normal write (changed=1) when it doesn't.
+    // This is the ship-blind idempotency contract the controller's
+    // privkey path depends on.
+    let dir = tempdir_path("rsansible-only-if-missing");
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("key.pem");
+
+    let mut child = Command::new(agent_path())
+        .env("RSANSIBLE_AGENT_LOG", "warn")
+        .env("RSANSIBLE_AGENT_KEEP_BINARY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn agent");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let _ = read_frame(&mut stdout).await.unwrap();
+
+    // Target does not exist → only_if_missing should still write.
+    write_frame(
+        &mut stdin,
+        &msg::task_dispatch(
+            1,
+            msg::op_write_file(
+                target.to_string_lossy().into_owned(),
+                0o600,
+                true,
+                b"first-content\n".to_vec(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    let (_p, done) = read_until_done(&mut stdout, 1).await;
+    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    assert_eq!(td.exit_code, 0);
+    assert_eq!(td.changed, 1, "missing → should write and report changed");
+    assert_eq!(std::fs::read(&target).unwrap(), b"first-content\n");
+
+    // Now the file exists. only_if_missing must skip — even if the
+    // would-be content is different, the agent must NOT overwrite.
+    write_frame(
+        &mut stdin,
+        &msg::task_dispatch(
+            2,
+            msg::op_write_file(
+                target.to_string_lossy().into_owned(),
+                0o600,
+                true,
+                b"DIFFERENT-content\n".to_vec(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    let (_p, done) = read_until_done(&mut stdout, 2).await;
+    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    assert_eq!(td.exit_code, 0);
+    assert_eq!(td.changed, 0, "existing dest → only_if_missing must skip");
+    // Crucially, the original bytes must still be on disk — the differ
+    // payload above must not have clobbered them.
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"first-content\n",
+        "only_if_missing must not overwrite existing content"
+    );
 
     write_frame(&mut stdin, &msg::bye()).await.unwrap();
     drop(stdin);

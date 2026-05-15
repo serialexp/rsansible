@@ -43,7 +43,7 @@ use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp,
     LoopSpec, MetaAction, OnFailure, PackageOp, Play, Playbook, SetFactMap, ShellOp, StatOp,
-    Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, WaitForOp, WriteFileOp,
+    Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, UriOp, WaitForOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -113,6 +113,12 @@ pub struct RunSpec {
     /// globs, regex, intersection (`:&`), exclusion (`:!` / `!`),
     /// index/slice (`web[0]`). Repetitions are union-joined.
     pub limit: Vec<String>,
+    /// Override for the ship-blind vs probe-first heuristic used by
+    /// modules that generate file content (e.g. `openssl_privatekey`).
+    /// `Auto` (default) consults the per-host RTT × bandwidth model;
+    /// `Blind` / `Probe` force one branch globally — useful for
+    /// debugging and benchmarks.
+    pub wire_strategy: crate::wire_cost::WireStrategy,
 }
 
 impl RunSpec {
@@ -127,6 +133,7 @@ impl RunSpec {
             tags: Vec::new(),
             skip_tags: Vec::new(),
             limit: Vec::new(),
+            wire_strategy: crate::wire_cost::WireStrategy::default(),
         }
     }
 }
@@ -156,7 +163,12 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         tags,
         skip_tags,
         limit,
+        wire_strategy,
     } = spec;
+    // Plumbed through to per-task dispatch so privkey (and any future
+    // composite-dispatch op) can override the auto heuristic. Cheap to
+    // clone — a 3-variant enum.
+    let _wire_strategy = wire_strategy;
 
     // `--tags` / `--skip-tags` resolve to a filter consulted at task
     // dispatch time. Empty + empty = identity (the common case);
@@ -266,12 +278,29 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // Build per-host execution contexts. Lives across the whole run so
     // set_facts and registers persist across plays (Ansible-faithful).
     let mut ctxs: BTreeMap<String, HostCtx> = BTreeMap::new();
-    for name in conns.keys() {
+    for (name, conn_handle) in conns.iter() {
         let host = inventory.hosts.get(name).expect("conn host in inventory");
-        ctxs.insert(
-            name.clone(),
-            make_initial_ctx(name, host, &world, &extra_vars),
-        );
+        let mut ctx = make_initial_ctx(name, host, &world, &extra_vars);
+        // Seed wire-cost from the measured Ping/Pong RTT on this host's
+        // SSH channel, capped to u32::MAX ms (60s+ would already be
+        // disastrous). Bandwidth comes from an optional inventory var
+        // `wire_bandwidth_bytes_per_s`; missing/invalid → keep the
+        // conservative default seeded by HostCtx::new.
+        {
+            let guard = conn_handle.lock().await;
+            if let Some(conn) = guard.as_ref() {
+                let rtt_ms = (conn.clock_rtt_ns / 1_000_000).min(u32::MAX as u64) as u32;
+                ctx.wire_cost.rtt_ms = rtt_ms;
+            }
+        }
+        if let Some(JsonValue::Number(n)) =
+            ctx.inventory_vars.get("wire_bandwidth_bytes_per_s")
+        {
+            if let Some(bw) = n.as_u64() {
+                ctx.wire_cost.bw_bytes_per_s = bw.min(u32::MAX as u64) as u32;
+            }
+        }
+        ctxs.insert(name.clone(), ctx);
     }
 
     let mut report = RunReport {
@@ -615,6 +644,7 @@ fn make_gather_facts_task() -> Task {
         // `become: true` doesn't accidentally wrap it.
         become_: Some(false),
         become_user: None,
+        ignore_errors: None,
     }
 }
 
@@ -1348,6 +1378,7 @@ async fn run_task_on_one_host(
                 HostTaskOutcome::Failed { reason }
             }
         };
+        let outcome = maybe_ignore_failure(task, outcome, &name);
         return PerHostTaskResult {
             name,
             ctx,
@@ -1426,11 +1457,40 @@ async fn run_task_on_one_host(
             HostTaskOutcome::Failed { reason }
         }
     };
+    let outcome = maybe_ignore_failure(task, outcome, &name);
     PerHostTaskResult {
         name,
         ctx,
         outcome,
         conn_alive: own_conn_alive,
+    }
+}
+
+/// Apply `ignore_errors: true` semantics by converting a Failed outcome
+/// to Ok at the per-host result boundary. The register (recorded
+/// earlier with `.failed=true`) is untouched, and `enqueue_notifies`
+/// was already skipped on the Failed arm — so handlers don't fire for
+/// an ignored failure. Effect on the surrounding orchestrator: the
+/// host's `HostOutcome` stays `Ok`, the connection is not dropped, and
+/// `on_failure: stop` is not tripped. Matches Ansible's behavior:
+/// task-level opt-out from play-halting, register still reflects the
+/// truth so a downstream `when: prev.failed` can react to it.
+fn maybe_ignore_failure(
+    task: &Task,
+    outcome: HostTaskOutcome,
+    host: &str,
+) -> HostTaskOutcome {
+    match (&task.ignore_errors, &outcome) {
+        (Some(true), HostTaskOutcome::Failed { reason }) => {
+            info!(
+                host = %host,
+                task = %task.name,
+                reason = %reason,
+                "task failed but ignored (ignore_errors: true)"
+            );
+            HostTaskOutcome::Ok
+        }
+        _ => outcome,
     }
 }
 
@@ -1606,6 +1666,16 @@ async fn run_op_body(
                     let parsed = rv.json.clone().unwrap();
                     rv.extra.insert("stat".into(), parsed);
                 }
+            }
+            // `uri:` ships a JSON envelope on stdout. Unlike stat, Ansible's
+            // contract exposes the envelope keys at the **top level** of the
+            // register (`register.status`, `register.content`, …), not under
+            // `register.uri.*`. Lift each key into `rv.extra`, and swap the
+            // envelope's parsed `json` body into `rv.json` so
+            // `register.json.<body-field>` resolves to the response body
+            // rather than the envelope itself.
+            if let TaskOp::Uri(_) = op {
+                lift_uri_envelope(&mut rv);
             }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
@@ -1812,6 +1882,44 @@ fn looks_jsonish(s: &str) -> bool {
         || s == "true"
         || s == "false"
         || s == "null"
+}
+
+// ---------- module result lifting ----------
+
+/// Lift the `uri:` envelope JSON object into the canonical RegisterValue
+/// shape Ansible exposes: top-level keys (`register.status`,
+/// `register.content`, `register.url`, …) instead of nested
+/// `register.uri.<field>`, with the response body's parsed JSON swapped
+/// into `rv.json` so `register.json.<field>` resolves to the body.
+///
+/// No-op when `rv.json` isn't a JSON object (the agent failed to ship a
+/// well-formed envelope, e.g. on a TaskError path — but in that case the
+/// orchestrator runs the error branch, not this one). The set of
+/// shadow-protected keys is the public RegisterValue field set so a
+/// pathological response body can't override `changed`, `rc`, etc.
+fn lift_uri_envelope(rv: &mut RegisterValue) {
+    let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
+        return;
+    };
+    let mut envelope = obj.clone();
+    rv.json = envelope.remove("json");
+    for (k, v) in envelope {
+        if matches!(
+            k.as_str(),
+            "changed"
+                | "rc"
+                | "stdout"
+                | "stderr"
+                | "stdout_lines"
+                | "took_ms"
+                | "skipped"
+                | "failed"
+                | "results"
+        ) {
+            continue;
+        }
+        rv.extra.insert(k, v);
+    }
 }
 
 // ---------- template rendering ----------
@@ -2036,6 +2144,42 @@ fn render_op(
                 comment: render_if(&u.comment)?,
                 delete: u.delete,
                 insert: u.insert,
+            })
+        }
+        TaskOp::Uri(u) => {
+            // url, header values, and body all support Jinja. Header
+            // keys are not rendered (header names aren't useful Jinja
+            // targets and `:` would be ambiguous with regex syntax).
+            let url = render_str(env, &u.url, &view)?;
+            let mut headers = BTreeMap::new();
+            for (k, v) in &u.headers {
+                headers.insert(k.clone(), render_str(env, v, &view)?);
+            }
+            let body = if u.body.is_empty() {
+                String::new()
+            } else {
+                render_str(env, &u.body, &view)?
+            };
+            // mTLS / CA paths are Jinja-templatable so a per-host
+            // path (e.g. `/etc/pki/{{ inventory_hostname }}.crt`)
+            // works. Bytes are read at to_wire_op time, not here.
+            let client_cert = render_str(env, &u.client_cert, &view)?;
+            let client_key = render_str(env, &u.client_key, &view)?;
+            let ca_path = render_str(env, &u.ca_path, &view)?;
+            TaskOp::Uri(UriOp {
+                url,
+                method: u.method,
+                headers,
+                body,
+                body_format: u.body_format,
+                status_codes: u.status_codes.clone(),
+                timeout_ms: u.timeout_ms,
+                return_content: u.return_content,
+                validate_certs: u.validate_certs,
+                follow_redirects: u.follow_redirects,
+                client_cert,
+                client_key,
+                ca_path,
             })
         }
     })
@@ -2592,6 +2736,61 @@ mod tests {
     }
 
     #[test]
+    fn lift_uri_envelope_pulls_keys_to_top_level() {
+        // Build a register value with the agent's envelope sitting in
+        // rv.json (simulating from_exec parsing of `{...}` on stdout).
+        let envelope = serde_json::json!({
+            "status": 200,
+            "url": "https://api/x",
+            "headers": {"content-type": "application/json"},
+            "content_length": 9,
+            "content_type": "application/json",
+            "elapsed_ms": 12,
+            "redirected": false,
+            "json": {"a": 1, "b": "two"},
+            // Shadow-protection: must NOT clobber rv.rc/rv.changed.
+            "rc": 999,
+            "changed": true
+        });
+        let stdout = serde_json::to_vec(&envelope).unwrap();
+        let mut rv = RegisterValue::from_exec(0, false, 5, &stdout, b"");
+        // Sanity: from_exec parses stdout as JSON into rv.json when it
+        // looks like a JSON object.
+        assert!(matches!(rv.json, Some(JsonValue::Object(_))));
+        lift_uri_envelope(&mut rv);
+        // Top-level lifts.
+        assert_eq!(rv.extra.get("status").unwrap(), &serde_json::json!(200));
+        assert_eq!(
+            rv.extra.get("url").unwrap(),
+            &serde_json::json!("https://api/x")
+        );
+        assert_eq!(
+            rv.extra.get("content_type").unwrap(),
+            &serde_json::json!("application/json")
+        );
+        assert_eq!(rv.extra.get("elapsed_ms").unwrap(), &serde_json::json!(12));
+        assert_eq!(
+            rv.extra.get("redirected").unwrap(),
+            &serde_json::json!(false)
+        );
+        // rv.json now holds the response body, not the envelope.
+        assert_eq!(rv.json, Some(serde_json::json!({"a": 1, "b": "two"})));
+        // Canonical fields were NOT shadowed by the envelope.
+        assert_eq!(rv.rc, 0);
+        assert!(!rv.changed);
+        assert!(!rv.extra.contains_key("rc"));
+        assert!(!rv.extra.contains_key("changed"));
+    }
+
+    #[test]
+    fn lift_uri_envelope_noop_when_no_json() {
+        let mut rv = RegisterValue::from_exec(0, false, 5, b"not json", b"");
+        // rv.json is None — should pass through with no panics.
+        lift_uri_envelope(&mut rv);
+        assert!(rv.extra.is_empty());
+    }
+
+    #[test]
     fn resolve_loop_items_literal_list() {
         let env = template::make_env();
         let ctx = HostCtx::new("h".into());
@@ -2812,5 +3011,74 @@ all:
         let got = resolve_play_targets(&sel, &inv);
         assert!(got.contains(&"w1".to_string()));
         assert!(got.contains(&"d1".to_string()));
+    }
+
+    // ---- ignore_errors gate ----
+
+    fn shell_task_with_ignore(ignore: Option<bool>) -> Task {
+        Task {
+            name: "t".into(),
+            body: TaskBody::Op(TaskOp::Shell(ShellOp::Simple("false".into()))),
+            when: None,
+            register: None,
+            loop_spec: None,
+            loop_control: None,
+            tags: Vec::new(),
+            delegate_to: None,
+            run_once: false,
+            notify: Vec::new(),
+            role_dir: None,
+            become_: None,
+            become_user: None,
+            ignore_errors: ignore,
+        }
+    }
+
+    #[test]
+    fn maybe_ignore_failure_converts_failed_to_ok_when_set() {
+        let task = shell_task_with_ignore(Some(true));
+        let outcome = HostTaskOutcome::Failed {
+            reason: "exit 1".into(),
+        };
+        let got = maybe_ignore_failure(&task, outcome, "h1");
+        assert!(matches!(got, HostTaskOutcome::Ok));
+    }
+
+    #[test]
+    fn maybe_ignore_failure_passes_through_failed_when_unset() {
+        // None → don't ignore.
+        let task = shell_task_with_ignore(None);
+        let outcome = HostTaskOutcome::Failed {
+            reason: "exit 1".into(),
+        };
+        let got = maybe_ignore_failure(&task, outcome, "h1");
+        assert!(matches!(got, HostTaskOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn maybe_ignore_failure_passes_through_failed_when_false() {
+        // Explicit `ignore_errors: false` also doesn't ignore.
+        let task = shell_task_with_ignore(Some(false));
+        let outcome = HostTaskOutcome::Failed {
+            reason: "exit 1".into(),
+        };
+        let got = maybe_ignore_failure(&task, outcome, "h1");
+        assert!(matches!(got, HostTaskOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn maybe_ignore_failure_leaves_ok_alone() {
+        let task = shell_task_with_ignore(Some(true));
+        let got = maybe_ignore_failure(&task, HostTaskOutcome::Ok, "h1");
+        assert!(matches!(got, HostTaskOutcome::Ok));
+    }
+
+    #[test]
+    fn maybe_ignore_failure_leaves_skipped_alone() {
+        // Skipped tasks shouldn't be affected — ignore_errors only
+        // covers actual failures.
+        let task = shell_task_with_ignore(Some(true));
+        let got = maybe_ignore_failure(&task, HostTaskOutcome::Skipped, "h1");
+        assert!(matches!(got, HostTaskOutcome::Skipped));
     }
 }

@@ -111,7 +111,8 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         | TaskOp::BlockInFile(_)
         | TaskOp::Systemd(_)
         | TaskOp::Package(_)
-        | TaskOp::Ufw(_) => {}
+        | TaskOp::Ufw(_)
+        | TaskOp::Uri(_) => {}
     }
 }
 
@@ -171,6 +172,7 @@ mod tests {
             role_dir: None,
             become_: b,
             become_user: u.map(String::from),
+            ignore_errors: None,
         }
     }
 

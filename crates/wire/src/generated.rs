@@ -84,7 +84,7 @@ impl OpExecOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 0u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 0, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let mut argv = Vec::with_capacity(length);
@@ -195,7 +195,7 @@ impl OpShellOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 1u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -228,6 +228,7 @@ impl From<OpShellOutput> for OpShellInput {
 pub struct OpWriteFileInput {
     pub path: std::string::String,
     pub mode: u32,
+    pub only_if_missing: u8,
     pub content: Vec<u8>,
 }
 
@@ -236,6 +237,7 @@ pub struct OpWriteFileOutput {
     pub kind: u8,
     pub path: std::string::String,
     pub mode: u32,
+    pub only_if_missing: u8,
     pub content: Vec<u8>,
 }
 
@@ -256,6 +258,7 @@ impl OpWriteFileInput {
             encoder.write_byte(b);
         }
         encoder.write_u32_le(self.mode);
+        encoder.write_byte(self.only_if_missing);
         encoder.write_u32_le(self.content.len() as u32);
         for item in &self.content {
             encoder.write_byte(*item);
@@ -274,12 +277,13 @@ impl OpWriteFileOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 2u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let path = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let mode = decoder.read_u32_le()?;
+        let only_if_missing = decoder.read_byte()?;
         let length = decoder.read_u32_le()? as usize;
         let mut content = Vec::with_capacity(length);
         for _ in 0..length {
@@ -290,6 +294,7 @@ impl OpWriteFileOutput {
             kind,
             path,
             mode,
+            only_if_missing,
             content,
         })
     }
@@ -306,6 +311,7 @@ impl From<OpWriteFileOutput> for OpWriteFileInput {
         Self {
             path: o.path,
             mode: o.mode,
+            only_if_missing: o.only_if_missing,
             content: o.content,
         }
     }
@@ -345,7 +351,7 @@ impl OpGatherFactsOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 3u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3, got {}", kind)));
         }
         Ok(Self {
             kind,
@@ -410,7 +416,7 @@ impl OpStatOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 4u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 4, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -502,7 +508,7 @@ impl OpWaitForOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 6u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 6, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -615,7 +621,7 @@ impl OpFileOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 5u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 5, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -747,7 +753,7 @@ impl OpLineInFileOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 7u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 7, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -903,7 +909,7 @@ impl OpBlockInFileOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 8u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 8, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -1042,7 +1048,7 @@ impl OpPackageOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 10u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 10, got {}", kind)));
         }
         let manager = decoder.read_byte()?;
         let length = decoder.read_u16_le()? as usize;
@@ -1161,7 +1167,7 @@ impl OpSystemdOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 9u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 9, got {}", kind)));
         }
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
@@ -1314,7 +1320,7 @@ impl OpUfwOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 11u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 11, got {}", kind)));
         }
         let op = decoder.read_byte()?;
         let length = decoder.read_u16_le()? as usize;
@@ -1390,6 +1396,217 @@ impl From<OpUfwOutput> for OpUfwInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpUriInput {
+    pub method: u8,
+    pub url: std::string::String,
+    pub header_keys: Vec<std::string::String>,
+    pub header_values: Vec<std::string::String>,
+    pub body: Vec<u8>,
+    pub body_format: u8,
+    pub status_codes: Vec<u16>,
+    pub timeout_ms: u32,
+    pub return_content: u8,
+    pub validate_certs: u8,
+    pub follow_redirects: u8,
+    pub client_cert_pem: Vec<u8>,
+    pub client_key_pem: Vec<u8>,
+    pub ca_bundle_pem: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpUriOutput {
+    pub kind: u8,
+    pub method: u8,
+    pub url: std::string::String,
+    pub header_keys: Vec<std::string::String>,
+    pub header_values: Vec<std::string::String>,
+    pub body: Vec<u8>,
+    pub body_format: u8,
+    pub status_codes: Vec<u16>,
+    pub timeout_ms: u32,
+    pub return_content: u8,
+    pub validate_certs: u8,
+    pub follow_redirects: u8,
+    pub client_cert_pem: Vec<u8>,
+    pub client_key_pem: Vec<u8>,
+    pub ca_bundle_pem: Vec<u8>,
+}
+
+pub type OpUri = OpUriOutput;
+
+impl OpUriInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(12);
+        encoder.write_byte(self.method);
+        encoder.write_u16_le(self.url.len() as u16);
+        let string_bytes: &[u8] = self.url.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.header_keys.len() as u16);
+        for item in &self.header_keys {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_u16_le(self.header_values.len() as u16);
+        for item in &self.header_values {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_u32_le(self.body.len() as u32);
+        for item in &self.body {
+            encoder.write_byte(*item);
+        }
+        encoder.write_byte(self.body_format);
+        encoder.write_u16_le(self.status_codes.len() as u16);
+        for item in &self.status_codes {
+            encoder.write_u16_le(*item);
+        }
+        encoder.write_u32_le(self.timeout_ms);
+        encoder.write_byte(self.return_content);
+        encoder.write_byte(self.validate_certs);
+        encoder.write_byte(self.follow_redirects);
+        encoder.write_u32_le(self.client_cert_pem.len() as u32);
+        for item in &self.client_cert_pem {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_le(self.client_key_pem.len() as u32);
+        for item in &self.client_key_pem {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_le(self.ca_bundle_pem.len() as u32);
+        for item in &self.ca_bundle_pem {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+
+}
+
+impl OpUriOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 12u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 12, got {}", kind)));
+        }
+        let method = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let url = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let mut header_keys = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            header_keys.push(item);
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let mut header_values = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            header_values.push(item);
+        }
+        let length = decoder.read_u32_le()? as usize;
+        let mut body = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            body.push(item);
+        }
+        let body_format = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let mut status_codes = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_u16_le()?;
+            status_codes.push(item);
+        }
+        let timeout_ms = decoder.read_u32_le()?;
+        let return_content = decoder.read_byte()?;
+        let validate_certs = decoder.read_byte()?;
+        let follow_redirects = decoder.read_byte()?;
+        let length = decoder.read_u32_le()? as usize;
+        let mut client_cert_pem = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            client_cert_pem.push(item);
+        }
+        let length = decoder.read_u32_le()? as usize;
+        let mut client_key_pem = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            client_key_pem.push(item);
+        }
+        let length = decoder.read_u32_le()? as usize;
+        let mut ca_bundle_pem = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            ca_bundle_pem.push(item);
+        }
+        Ok(Self {
+            kind,
+            method,
+            url,
+            header_keys,
+            header_values,
+            body,
+            body_format,
+            status_codes,
+            timeout_ms,
+            return_content,
+            validate_certs,
+            follow_redirects,
+            client_cert_pem,
+            client_key_pem,
+            ca_bundle_pem,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpUriInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpUriInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpUriOutput> for OpUriInput {
+    fn from(o: OpUriOutput) -> Self {
+        Self {
+            method: o.method,
+            url: o.url,
+            header_keys: o.header_keys,
+            header_values: o.header_values,
+            body: o.body,
+            body_format: o.body_format,
+            status_codes: o.status_codes,
+            timeout_ms: o.timeout_ms,
+            return_content: o.return_content,
+            validate_certs: o.validate_certs,
+            follow_redirects: o.follow_redirects,
+            client_cert_pem: o.client_cert_pem,
+            client_key_pem: o.client_key_pem,
+            ca_bundle_pem: o.ca_bundle_pem,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
@@ -1403,6 +1620,7 @@ pub enum Op {
     OpSystemd(OpSystemdOutput),
     OpPackage(OpPackageOutput),
     OpUfw(OpUfwOutput),
+    OpUri(OpUriOutput),
 }
 
 impl Op {
@@ -1465,6 +1683,7 @@ impl Op {
                     encoder.write_uint8(b);
                 }
                 encoder.write_uint32(v.mode, Endianness::LittleEndian);
+                encoder.write_uint8(v.only_if_missing);
                 encoder.write_uint32(v.content.len() as u32, Endianness::LittleEndian);
                 for item in &v.content {
                     encoder.write_uint8(*item);
@@ -1685,6 +1904,54 @@ impl Op {
                 encoder.write_uint8(v.delete);
                 encoder.write_uint32(v.insert, Endianness::LittleEndian);
             }
+            Op::OpUri(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint8(v.method);
+                encoder.write_uint16(v.url.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.url.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.header_keys.len() as u16, Endianness::LittleEndian);
+                for item in &v.header_keys {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint16(v.header_values.len() as u16, Endianness::LittleEndian);
+                for item in &v.header_values {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint32(v.body.len() as u32, Endianness::LittleEndian);
+                for item in &v.body {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint8(v.body_format);
+                encoder.write_uint16(v.status_codes.len() as u16, Endianness::LittleEndian);
+                for item in &v.status_codes {
+                    encoder.write_uint16(*item, Endianness::LittleEndian);
+                }
+                encoder.write_uint32(v.timeout_ms, Endianness::LittleEndian);
+                encoder.write_uint8(v.return_content);
+                encoder.write_uint8(v.validate_certs);
+                encoder.write_uint8(v.follow_redirects);
+                encoder.write_uint32(v.client_cert_pem.len() as u32, Endianness::LittleEndian);
+                for item in &v.client_cert_pem {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint32(v.client_key_pem.len() as u32, Endianness::LittleEndian);
+                for item in &v.client_key_pem {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint32(v.ca_bundle_pem.len() as u32, Endianness::LittleEndian);
+                for item in &v.ca_bundle_pem {
+                    encoder.write_uint8(*item);
+                }
+            }
         }
         Ok(())
     }
@@ -1721,8 +1988,10 @@ impl Op {
             Ok(Op::OpPackage(OpPackageOutput::decode_with_decoder(decoder)?))
         } else if value == 11 {
             Ok(Op::OpUfw(OpUfwOutput::decode_with_decoder(decoder)?))
+        } else if value == 12 {
+            Ok(Op::OpUri(OpUriOutput::decode_with_decoder(decoder)?))
         } else {
-            Err(binschema_runtime::BinSchemaError::InvalidVariant(value as u64))
+            Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }
     }
 }
@@ -1794,7 +2063,7 @@ impl HelloOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 0u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 0, got {}", kind)));
         }
         let arch = decoder.read_byte()?;
         let os = decoder.read_byte()?;
@@ -1882,7 +2151,7 @@ impl TaskDispatchOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 1u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", kind)));
         }
         let seq = decoder.read_u32_le()?;
         let op = Op::decode_with_decoder(decoder)?;
@@ -1955,7 +2224,7 @@ impl TaskProgressOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 2u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 2, got {}", kind)));
         }
         let seq = decoder.read_u32_le()?;
         let stream = decoder.read_byte()?;
@@ -2039,7 +2308,7 @@ impl TaskDoneOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 3u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 3, got {}", kind)));
         }
         let seq = decoder.read_u32_le()?;
         let exit_code = decoder.read_u32_le()? as i32;
@@ -2122,7 +2391,7 @@ impl TaskErrorOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 4u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 4, got {}", kind)));
         }
         let seq = decoder.read_u32_le()?;
         let code = decoder.read_byte()?;
@@ -2188,7 +2457,7 @@ impl ByeOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 5u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 5, got {}", kind)));
         }
         Ok(Self {
             kind,
@@ -2243,7 +2512,7 @@ impl PingOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 6u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 6, got {}", kind)));
         }
         Ok(Self {
             kind,
@@ -2304,7 +2573,7 @@ impl PongOutput {
     pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
         let kind = decoder.read_byte()?;
         if kind != 7u8 {
-            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 7, got {}", kind)));
         }
         let agent_recv_unix_ns = decoder.read_u64_le()?;
         let agent_sent_unix_ns = decoder.read_u64_le()?;
@@ -2446,7 +2715,7 @@ impl Message {
         } else if value == 7 {
             Ok(Message::Pong(PongOutput::decode_with_decoder(decoder)?))
         } else {
-            Err(binschema_runtime::BinSchemaError::InvalidVariant(value as u64))
+            Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }
     }
 }
