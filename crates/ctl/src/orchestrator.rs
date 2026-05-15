@@ -1865,8 +1865,19 @@ async fn run_privkey_composite(
         if exists {
             // No-op path: the key is already on the remote. Don't ship
             // a single byte. Surfaces as `changed: false`.
+            //
+            // We still expose the *just-generated* PEM via
+            // `register.content` so a downstream `openssl_csr_pipe` /
+            // `x509_certificate_pipe` in the same play can chain. v1
+            // contract: those _pipe tasks always sign with the PEM
+            // produced by this task's invocation, not whatever's on
+            // disk. Cross-run "sign with the existing on-disk key"
+            // chains need OpReadFile (deferred).
+            let pem_str = String::from_utf8_lossy(&pem).into_owned();
             let mut rv = RegisterValue::default();
             rv.took_ms = 0;
+            rv.extra
+                .insert("content".into(), JsonValue::String(pem_str));
             return BodyResult::Ok {
                 register: rv,
                 changed: false,
@@ -1911,13 +1922,19 @@ async fn run_privkey_composite(
             let agent_elapsed_ns =
                 exec.done.finished_unix_ns.saturating_sub(exec.done.started_unix_ns);
             let took_ms = (agent_elapsed_ns / 1_000_000).min(u64::MAX);
-            let rv = RegisterValue::from_exec(
+            let mut rv = RegisterValue::from_exec(
                 exec.done.exit_code,
                 exec.done.changed != 0,
                 took_ms,
                 &exec.stdout,
                 &exec.stderr,
             );
+            // Lift the generated PEM into `register.content` so a
+            // downstream csr_pipe / cert_pipe can chain via Jinja.
+            // Mirrors the no-op branch above for a consistent contract.
+            let pem_str = String::from_utf8_lossy(&pem).into_owned();
+            rv.extra
+                .insert("content".into(), JsonValue::String(pem_str));
             if exec.done.exit_code == 0 {
                 BodyResult::Ok {
                     register: rv,
