@@ -337,6 +337,16 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("wait_for.path: {e}"))?;
             }
         }
+        TaskOp::LineInFile(l) => {
+            env.template_from_str(&l.path)
+                .map_err(|e| anyhow!("lineinfile.path: {e}"))?;
+            env.template_from_str(&l.line)
+                .map_err(|e| anyhow!("lineinfile.line: {e}"))?;
+            // regexp / insertbefore / insertafter are regex patterns —
+            // we don't Jinja-render those (gothab doesn't use Jinja
+            // inside regex patterns, and `{{...}}` would be ambiguous
+            // with regex syntax). If we ever need it, add it here.
+        }
     }
     Ok(())
 }

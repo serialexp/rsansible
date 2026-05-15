@@ -127,6 +127,23 @@
       ],
     },
 
+    OpLineInFile: {
+      description: "Idempotent single-line edit in a text file. Maps Ansible's `ansible.builtin.lineinfile`. Semantics: `state=0 (present)` ensures a line matching `regexp` (or, when regexp is empty, matching `line` literally) is present in the file; when the match isn't found the line is appended unless `insertbefore`/`insertafter` redirects placement. `state=1 (absent)` removes every line matching `regexp` (or `line` literal). `create=1` creates the file (with `mode` if `has_mode=1`) when missing and state=present; create=0 + missing file is a no-op for absent and an error for present. `backrefs=1` substitutes regex backrefs from the match into `line` when replacing. Empty `insertbefore`/`insertafter` mean unused; the literal `EOF` for insertafter means append (Ansible convention). `changed=1` iff the on-disk bytes actually changed.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 7 },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "regexp", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "line", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "state", type: "uint8" },
+        { name: "has_mode", type: "uint8" },
+        { name: "mode", type: "uint32" },
+        { name: "create", type: "uint8" },
+        { name: "insertbefore", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "insertafter", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "backrefs", type: "uint8" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -141,6 +158,7 @@
         { type: "OpStat", when: "value === 4" },
         { type: "OpFile", when: "value === 5" },
         { type: "OpWaitFor", when: "value === 6" },
+        { type: "OpLineInFile", when: "value === 7" },
       ],
     },
 

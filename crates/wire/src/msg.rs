@@ -122,6 +122,43 @@ pub fn op_file(
     })
 }
 
+/// `state:` byte values for `OpLineInFile`.
+pub mod lineinfile_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_lineinfile(
+    path: String,
+    regexp: String,
+    line: String,
+    state: u8,
+    mode: Option<u32>,
+    create: bool,
+    insertbefore: String,
+    insertafter: String,
+    backrefs: bool,
+) -> Op {
+    let (has_mode, mode_val) = match mode {
+        Some(m) => (1u8, m),
+        None => (0u8, 0u32),
+    };
+    Op::OpLineInFile(OpLineInFileOutput {
+        kind: 7,
+        path,
+        regexp,
+        line,
+        state,
+        has_mode,
+        mode: mode_val,
+        create: if create { 1 } else { 0 },
+        insertbefore,
+        insertafter,
+        backrefs: if backrefs { 1 } else { 0 },
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

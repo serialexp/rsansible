@@ -215,6 +215,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_lineinfile() {
+        // state=present with regexp + insertafter.
+        roundtrip(msg::task_dispatch(
+            108,
+            msg::op_lineinfile(
+                "/etc/foo.conf".into(),
+                "^foo=".into(),
+                "foo=42".into(),
+                msg::lineinfile_state::PRESENT,
+                Some(0o644),
+                true,
+                String::new(),
+                "^# foo section".into(),
+                false,
+            ),
+        ))
+        .await;
+        // state=absent with empty regexp + create=false + mode=None.
+        roundtrip(msg::task_dispatch(
+            109,
+            msg::op_lineinfile(
+                "/etc/bar".into(),
+                String::new(),
+                "obsolete".into(),
+                msg::lineinfile_state::ABSENT,
+                None,
+                false,
+                String::new(),
+                String::new(),
+                false,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,

@@ -1,0 +1,104 @@
+# End-to-end exercise of `lineinfile:` (Phase 3, idempotent line edit).
+#
+# Scenarios (with internal asserts):
+#   1. create=yes seeds a file with one line.
+#   2. Re-running the same task is a no-op (changed=0 expectation
+#      validated via register).
+#   3. Regex replacement updates a key's value.
+#   4. Insertafter places a new line after a matching anchor.
+#   5. state=absent removes lines matching a regex.
+#   6. backrefs substitutes capture groups.
+
+- name: lineinfile demo
+  hosts: all
+  gather_facts: false
+  tasks:
+    # Clean slate.
+    - name: remove any pre-existing target
+      file:
+        path: /tmp/rsansible-li.conf
+        state: absent
+
+    # 1. Create the file with one line.
+    - name: seed with single line (create=yes)
+      lineinfile:
+        path: /tmp/rsansible-li.conf
+        line: foo=1
+        create: yes
+        mode: '0644'
+      register: li_create
+
+    - name: assert create reported changed
+      assert:
+        that:
+          - li_create.changed
+
+    # 2. Idempotency — same task, no change.
+    - name: re-run create (should be a no-op)
+      lineinfile:
+        path: /tmp/rsansible-li.conf
+        line: foo=1
+        create: yes
+        mode: '0644'
+      register: li_noop
+
+    - name: assert idempotent no-op
+      assert:
+        that:
+          - not li_noop.changed
+
+    # 3. Regex replacement: update the value.
+    - name: replace foo's value via regex
+      lineinfile:
+        path: /tmp/rsansible-li.conf
+        regexp: '^foo='
+        line: foo=42
+      register: li_replace
+
+    - name: assert replace reported changed
+      assert:
+        that:
+          - li_replace.changed
+
+    # 4. Insertafter — place a new line after foo.
+    - name: insert bar after foo
+      lineinfile:
+        path: /tmp/rsansible-li.conf
+        regexp: '^bar='
+        line: bar=hi
+        insertafter: '^foo='
+
+    # 5. Append plain marker that we'll later remove.
+    - name: append marker line
+      lineinfile:
+        path: /tmp/rsansible-li.conf
+        line: marker
+
+    # 6. backrefs — uppercase the bar value.
+    - name: rewrite bar=hi via backrefs to BAR=HI
+      lineinfile:
+        path: /tmp/rsansible-li.conf
+        regexp: '^(bar)=(.*)$'
+        line: 'BAR=HI'
+        backrefs: yes
+
+    # Snapshot for the test harness to read.
+    - name: snapshot current file
+      shell: "cp /tmp/rsansible-li.conf /tmp/rsansible-li-before-absent"
+
+    # 7. Absent: remove the marker.
+    - name: remove the marker
+      lineinfile:
+        path: /tmp/rsansible-li.conf
+        regexp: '^marker$'
+        state: absent
+      register: li_absent
+
+    - name: assert remove reported changed
+      assert:
+        that:
+          - li_absent.changed
+
+    # Final snapshot.
+    - name: final snapshot
+      shell: "cp /tmp/rsansible-li.conf /tmp/rsansible-li-final"

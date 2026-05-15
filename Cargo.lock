@@ -1761,6 +1761,7 @@ name = "rsansible-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "regex",
  "rsansible-wire",
  "rustix 0.38.44",
  "serde_json",

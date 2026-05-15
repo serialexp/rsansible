@@ -106,7 +106,8 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         | TaskOp::GatherFacts
         | TaskOp::Stat(_)
         | TaskOp::File(_)
-        | TaskOp::WaitFor(_) => {}
+        | TaskOp::WaitFor(_)
+        | TaskOp::LineInFile(_) => {}
     }
 }
 

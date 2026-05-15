@@ -41,9 +41,9 @@ use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LoopSpec, MetaAction, OnFailure,
-    Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task, TaskBody, TaskOp, WaitForOp,
-    WriteFileOp,
+    AssertTask, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp, LoopSpec, MetaAction,
+    OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy, Task, TaskBody, TaskOp,
+    WaitForOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1849,6 +1849,21 @@ fn render_op(
                 owner,
                 group,
                 recurse: f.recurse,
+            })
+        }
+        TaskOp::LineInFile(l) => {
+            let path = render_str(env, &l.path, &view)?;
+            let line = render_str(env, &l.line, &view)?;
+            TaskOp::LineInFile(LineInFileOp {
+                path,
+                regexp: l.regexp.clone(),
+                line,
+                state: l.state,
+                mode: l.mode,
+                create: l.create,
+                insertbefore: l.insertbefore.clone(),
+                insertafter: l.insertafter.clone(),
+                backrefs: l.backrefs,
             })
         }
     })

@@ -306,8 +306,21 @@ new wire framing roundtrip for `OpGatherFacts`.
   playbook whose internal `assert:` chain validates every
   changed/no-op claim along the directory → idempotent → touch →
   chmod-changed → chmod-noop → recurse → absent → absent-noop path.
-- [ ] **`OpLineInFile` / `OpBlockInFile`** — idempotent line/block edits
-  using anchored regex; preserves file mode/ownership. 6 sites.
+- [x] **`OpLineInFile`** — idempotent single-line text edit. Wire op
+  kind=7 with path/regexp/line/state/has_mode+mode/create/insertbefore/
+  insertafter/backrefs. `state=present` ensures the line is there
+  (replace by regexp match, or by literal `line` equality); `state=absent`
+  removes every matching line. `insertbefore`/`insertafter` (regex
+  anchors) and the literal `EOF` for append-place new lines. `backrefs`
+  substitutes regex captures into `line`; with no match the file is
+  left untouched (Ansible's documented rule). `create=yes` seeds the
+  file (with `mode`) when missing. Atomic write via sibling-tempfile +
+  rename; preserves original mode unless `mode` is given. `changed=1`
+  iff bytes actually moved on disk. e2e covers create / idempotent
+  no-op / regex-replace / insertafter / backrefs / state=absent in
+  one playbook.
+- [ ] **`OpBlockInFile`** — idempotent multi-line block edit with
+  customizable marker comments. 6 sites split with `OpLineInFile`.
 - [ ] **`OpSystemd`** — start / stop / restart / reload / enable /
   disable / mask / unmask with proper "did this actually change anything"
   reporting. 39 sites. Wraps `systemctl`.

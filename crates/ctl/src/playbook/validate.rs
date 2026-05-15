@@ -401,6 +401,61 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::LineInFile(l) => {
+            if l.path.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: lineinfile.path is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if !l.insertbefore.is_empty() && !l.insertafter.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: lineinfile: insertbefore and insertafter are mutually exclusive",
+                    where_,
+                    task.name
+                );
+            }
+            if l.backrefs && l.regexp.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: lineinfile.backrefs requires regexp",
+                    where_,
+                    task.name
+                );
+            }
+            // Compile regexes to surface bad patterns at validate.
+            if !l.regexp.is_empty() {
+                regex::Regex::new(&l.regexp).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: task[{ti}] {:?}: lineinfile.regexp: invalid pattern {:?}: {e}",
+                        where_,
+                        task.name,
+                        l.regexp
+                    )
+                })?;
+            }
+            if !l.insertbefore.is_empty() {
+                regex::Regex::new(&l.insertbefore).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: task[{ti}] {:?}: lineinfile.insertbefore: invalid pattern {:?}: {e}",
+                        where_,
+                        task.name,
+                        l.insertbefore
+                    )
+                })?;
+            }
+            if !l.insertafter.is_empty() && l.insertafter != "EOF" {
+                regex::Regex::new(&l.insertafter).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: task[{ti}] {:?}: lineinfile.insertafter: invalid pattern {:?}: {e}",
+                        where_,
+                        task.name,
+                        l.insertafter
+                    )
+                })?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
