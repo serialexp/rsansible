@@ -355,12 +355,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn roundtrip_task_dispatch_apt() {
+    async fn roundtrip_task_dispatch_package() {
         roundtrip(msg::task_dispatch(
             114,
-            msg::op_apt(
+            msg::op_package(
+                msg::package_manager::APT,
                 vec!["nginx".into(), "curl".into()],
-                msg::apt_state::PRESENT,
+                msg::package_state::PRESENT,
                 true,
                 3600,
                 false,
@@ -372,15 +373,32 @@ mod tests {
         .await;
         roundtrip(msg::task_dispatch(
             115,
-            msg::op_apt(
+            msg::op_package(
+                msg::package_manager::APT,
                 vec!["openssh-server".into()],
-                msg::apt_state::LATEST,
+                msg::package_state::LATEST,
                 false,
                 0,
                 false,
                 false,
                 "bookworm-backports".into(),
                 true,
+            ),
+        ))
+        .await;
+        // Auto-manager (no specific backend pinned).
+        roundtrip(msg::task_dispatch(
+            116,
+            msg::op_package(
+                msg::package_manager::AUTO,
+                vec!["curl".into()],
+                msg::package_state::PRESENT,
+                false,
+                0,
+                false,
+                false,
+                String::new(),
+                false,
             ),
         ))
         .await;

@@ -466,18 +466,19 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
-        TaskOp::Apt(a) => {
-            if a.names.is_empty() {
+        TaskOp::Package(p) => {
+            let label = p.manager.label();
+            if p.names.is_empty() {
                 bail!(
-                    "{}: task[{ti}] {:?}: apt.name is empty",
+                    "{}: task[{ti}] {:?}: {label}.name is empty",
                     where_,
                     task.name
                 );
             }
-            for n in &a.names {
+            for n in &p.names {
                 if n.trim().is_empty() {
                     bail!(
-                        "{}: task[{ti}] {:?}: apt.name contains an empty entry",
+                        "{}: task[{ti}] {:?}: {label}.name contains an empty entry",
                         where_,
                         task.name
                     );

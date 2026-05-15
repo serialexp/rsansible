@@ -1,4 +1,4 @@
-//! `OpApt` — Ansible's `apt` module (subset).
+//! Apt backend for `OpPackage`.
 //!
 //! Wraps `apt-get` with `DEBIAN_FRONTEND=noninteractive`.
 //!
@@ -20,75 +20,47 @@
 //!
 //! `autoremove=1` runs `apt-get autoremove -y` after the main op
 //! regardless of state.
+//!
+//! Fields that aren't apt-specific (`manager`) are read by the
+//! dispatcher; fields that *are* meaningful only for apt
+//! (`default_release`, `allow_unauthenticated`, `purge`,
+//! `cache_valid_time`) are honored here. The `OpPackage` wire shape
+//! carries the union of all backends' knobs; we ignore what we don't
+//! consume.
 
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::SystemTime;
 
-use rsansible_wire::generated::OpAptOutput;
-use rsansible_wire::msg::{self, err, now_unix_ns};
+use rsansible_wire::generated::OpPackageOutput;
 
-use super::{emit_error, spawn_with_etxtbsy_retry, Context};
+use super::super::spawn_with_etxtbsy_retry;
+use super::PackageError;
 
 const STATE_PRESENT: u8 = 0;
 const STATE_ABSENT: u8 = 1;
 const STATE_LATEST: u8 = 2;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpAptOutput) -> anyhow::Result<()> {
-    let started_unix_ns = now_unix_ns();
-
-    if op.names.is_empty() && op.update_cache == 0 && op.autoremove == 0 {
-        emit_error(
-            ctx,
-            seq,
-            err::BAD_REQUEST,
-            "apt: need at least one of [name(s), update_cache, autoremove]",
-        )
-        .await;
-        return Ok(());
-    }
-
+/// Apt backend entry point. Reads env-var overrides for the apt-get and
+/// dpkg-query binary paths (used by tests with stubs) and does the work.
+pub(crate) fn apply(op: &OpPackageOutput) -> Result<bool, PackageError> {
     let bin = std::env::var("RSANSIBLE_APT_GET").unwrap_or_else(|_| "apt-get".to_string());
     let dpkg = std::env::var("RSANSIBLE_DPKG_QUERY").unwrap_or_else(|_| "dpkg-query".to_string());
-    let result = tokio::task::spawn_blocking(move || apply(&bin, &dpkg, &op))
-        .await
-        .map_err(|e| anyhow::anyhow!("apt join: {e}"))?;
-
-    let changed = match result {
-        Ok(c) => c,
-        Err(AptError::Io(m)) => {
-            emit_error(ctx, seq, err::IO, m).await;
-            return Ok(());
-        }
-        Err(AptError::Spawn(m)) => {
-            emit_error(ctx, seq, err::SPAWN_FAILED, m).await;
-            return Ok(());
-        }
-        Err(AptError::BadRequest(m)) => {
-            emit_error(ctx, seq, err::BAD_REQUEST, m).await;
-            return Ok(());
-        }
-    };
-
-    let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, started_unix_ns, finished))
-        .await;
-    Ok(())
+    apply_with_bins(&bin, &dpkg, op)
 }
 
-#[derive(Debug)]
-enum AptError {
-    Io(String),
-    Spawn(String),
-    BadRequest(String),
-}
-
-fn apply(bin: &str, dpkg: &str, op: &OpAptOutput) -> Result<bool, AptError> {
+/// Test-visible apply: caller passes explicit binary paths so unit
+/// tests can plant stubs without env-var contamination.
+pub(crate) fn apply_with_bins(
+    bin: &str,
+    dpkg: &str,
+    op: &OpPackageOutput,
+) -> Result<bool, PackageError> {
     let mut changed = false;
 
     // 1. update_cache (with cache_valid_time gate).
     if op.update_cache != 0 && cache_update_needed(op.cache_valid_time) {
-        run_apt(bin, &op, &["update"])?;
+        run_apt(bin, &["update"])?;
         // Per Ansible, cache_updated is reported separately and doesn't
         // by itself set `changed`. We follow that here — only package
         // movement counts.
@@ -109,7 +81,7 @@ fn apply(bin: &str, dpkg: &str, op: &OpAptOutput) -> Result<bool, AptError> {
                 push_install_flags(&mut args, op);
                 args.extend(missing.iter().map(|s| s.to_string()));
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                run_apt(bin, &op, &argv)?;
+                run_apt(bin, &argv)?;
                 changed = true;
             }
         }
@@ -126,7 +98,7 @@ fn apply(bin: &str, dpkg: &str, op: &OpAptOutput) -> Result<bool, AptError> {
                 let mut args: Vec<String> = vec![verb.into(), "-y".into()];
                 args.extend(present.iter().map(|s| s.to_string()));
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                run_apt(bin, &op, &argv)?;
+                run_apt(bin, &argv)?;
                 changed = true;
             }
         }
@@ -138,7 +110,7 @@ fn apply(bin: &str, dpkg: &str, op: &OpAptOutput) -> Result<bool, AptError> {
             push_install_flags(&mut args, op);
             args.extend(op.names.iter().cloned());
             let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_apt(bin, &op, &argv)?;
+            run_apt(bin, &argv)?;
             let post = probe_installed(dpkg, &op.names)?;
             for n in &op.names {
                 let pre_v = pre.get(n.as_str()).cloned().unwrap_or_default();
@@ -150,8 +122,8 @@ fn apply(bin: &str, dpkg: &str, op: &OpAptOutput) -> Result<bool, AptError> {
             }
         }
         other => {
-            return Err(AptError::BadRequest(format!(
-                "apt: unknown state byte {other}"
+            return Err(PackageError::BadRequest(format!(
+                "package(apt): unknown state byte {other}"
             )))
         }
     }
@@ -162,7 +134,7 @@ fn apply(bin: &str, dpkg: &str, op: &OpAptOutput) -> Result<bool, AptError> {
         // parsing apt output. Mark changed conservatively only if it
         // actually removed something — we approximate by capturing the
         // stdout and looking for "0 to remove" / "0 removed".
-        let out = run_apt_capture(bin, &op, &["autoremove", "-y"])?;
+        let out = run_apt_capture(bin, &["autoremove", "-y"])?;
         // apt-get prints a summary line like "0 upgraded, 0 newly
         // installed, 0 to remove and N not upgraded." We treat absence
         // of "0 to remove" as "something was removed".
@@ -183,7 +155,7 @@ fn apply(bin: &str, dpkg: &str, op: &OpAptOutput) -> Result<bool, AptError> {
 /// Ansible's default keeps recommends ON (we follow that); the only
 /// extra flags we surface are `-t <release>` and
 /// `--allow-unauthenticated`.
-fn push_install_flags(args: &mut Vec<String>, op: &OpAptOutput) {
+fn push_install_flags(args: &mut Vec<String>, op: &OpPackageOutput) {
     if !op.default_release.is_empty() {
         args.push("-t".into());
         args.push(op.default_release.clone());
@@ -218,11 +190,11 @@ fn cache_update_needed(valid_seconds: u32) -> bool {
 
 /// Run `apt-get <args>` with `DEBIAN_FRONTEND=noninteractive`. Errors
 /// on non-zero exit with the captured stderr.
-fn run_apt(bin: &str, _op: &OpAptOutput, args: &[&str]) -> Result<(), AptError> {
+fn run_apt(bin: &str, args: &[&str]) -> Result<(), PackageError> {
     let out = spawn_apt_with_retry(bin, args)
-        .map_err(|e| AptError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
+        .map_err(|e| PackageError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
-        return Err(AptError::Io(format!(
+        return Err(PackageError::Io(format!(
             "{bin} {args:?} failed ({:?}): stderr={:?}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
@@ -232,11 +204,11 @@ fn run_apt(bin: &str, _op: &OpAptOutput, args: &[&str]) -> Result<(), AptError> 
 }
 
 /// Same as `run_apt` but returns the captured stdout for parsing.
-fn run_apt_capture(bin: &str, _op: &OpAptOutput, args: &[&str]) -> Result<String, AptError> {
+fn run_apt_capture(bin: &str, args: &[&str]) -> Result<String, PackageError> {
     let out = spawn_apt_with_retry(bin, args)
-        .map_err(|e| AptError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
+        .map_err(|e| PackageError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
-        return Err(AptError::Io(format!(
+        return Err(PackageError::Io(format!(
             "{bin} {args:?} failed ({:?}): stderr={:?}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
@@ -276,7 +248,7 @@ fn spawn_apt_with_retry(bin: &str, args: &[&str]) -> std::io::Result<std::proces
 /// returns one line per *known* package (installed or otherwise known to
 /// dpkg). Unknown packages exit non-zero and don't appear on stdout — we
 /// tolerate that. Output map: pkg → version string (empty if not installed).
-fn probe_installed(dpkg: &str, names: &[String]) -> Result<BTreeMap<String, String>, AptError> {
+fn probe_installed(dpkg: &str, names: &[String]) -> Result<BTreeMap<String, String>, PackageError> {
     if names.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -291,7 +263,7 @@ fn probe_installed(dpkg: &str, names: &[String]) -> Result<BTreeMap<String, Stri
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let argv_slice: Vec<&str> = argv.iter().copied().collect();
     let out = spawn_with_etxtbsy_retry(dpkg, &argv_slice)
-        .map_err(|e| AptError::Spawn(format!("spawn {dpkg} {argv:?}: {e}")))?;
+        .map_err(|e| PackageError::Spawn(format!("spawn {dpkg} {argv:?}: {e}")))?;
     // dpkg-query exits non-zero when any requested package is unknown,
     // but the lines it could resolve are still printed. Don't error.
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -314,6 +286,7 @@ fn probe_installed(dpkg: &str, names: &[String]) -> Result<BTreeMap<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsansible_wire::msg::now_unix_ns;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -349,7 +322,7 @@ mod tests {
             let dpkg = dir.join("dpkg-query");
 
             // apt-get stub: log argv, on `install <pkgs...>` add each
-            // pkg to DB at version `installed-1`. On `remove`/`purge`
+            // pkg to DB at version `installed-2`. On `remove`/`purge`
             // delete matching pkgs from DB. `update` and `autoremove`
             // are no-ops.
             let apt_script = format!(
@@ -449,9 +422,10 @@ done
         }
     }
 
-    fn op(names: &[&str], state: u8) -> OpAptOutput {
-        OpAptOutput {
+    fn op(names: &[&str], state: u8) -> OpPackageOutput {
+        OpPackageOutput {
             kind: 10,
+            manager: 1, // apt
             names: names.iter().map(|s| s.to_string()).collect(),
             state,
             update_cache: 0,
@@ -463,15 +437,18 @@ done
         }
     }
 
+    fn run(stub: &Stub, op: &OpPackageOutput) -> Result<bool, PackageError> {
+        apply_with_bins(
+            stub.apt_path().to_str().unwrap(),
+            stub.dpkg_path().to_str().unwrap(),
+            op,
+        )
+    }
+
     #[test]
     fn present_installs_missing() {
         let stub = Stub::new("present-install", &[]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["nginx"], STATE_PRESENT),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["nginx"], STATE_PRESENT)).unwrap();
         assert!(changed);
         assert!(stub.log().contains("install -y"), "log={:?}", stub.log());
         assert!(stub.db().contains("nginx installed-2"));
@@ -480,12 +457,7 @@ done
     #[test]
     fn present_skips_when_installed() {
         let stub = Stub::new("present-noop", &[("nginx", "1.18.0-6")]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["nginx"], STATE_PRESENT),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["nginx"], STATE_PRESENT)).unwrap();
         assert!(!changed);
         assert!(!stub.log().contains("install"), "log={:?}", stub.log());
     }
@@ -493,12 +465,7 @@ done
     #[test]
     fn present_installs_only_missing_in_batch() {
         let stub = Stub::new("present-batch", &[("curl", "7.85.0-1")]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["curl", "nginx"], STATE_PRESENT),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["curl", "nginx"], STATE_PRESENT)).unwrap();
         assert!(changed);
         let log = stub.log();
         // Only nginx should be installed; curl should NOT appear.
@@ -509,12 +476,7 @@ done
     #[test]
     fn absent_removes_installed() {
         let stub = Stub::new("absent-go", &[("nginx", "1.18.0-6")]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["nginx"], STATE_ABSENT),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["nginx"], STATE_ABSENT)).unwrap();
         assert!(changed);
         assert!(stub.log().contains("remove -y nginx"), "log={:?}", stub.log());
         assert!(!stub.db().contains("nginx"));
@@ -523,12 +485,7 @@ done
     #[test]
     fn absent_skips_when_not_installed() {
         let stub = Stub::new("absent-noop", &[]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["nginx"], STATE_ABSENT),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["nginx"], STATE_ABSENT)).unwrap();
         assert!(!changed);
         assert!(!stub.log().contains("remove"), "log={:?}", stub.log());
     }
@@ -538,12 +495,7 @@ done
         let stub = Stub::new("absent-purge", &[("nginx", "1.18.0-6")]);
         let mut o = op(&["nginx"], STATE_ABSENT);
         o.purge = 1;
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &o,
-        )
-        .unwrap();
+        let changed = run(&stub, &o).unwrap();
         assert!(changed);
         assert!(stub.log().contains("purge -y nginx"), "log={:?}", stub.log());
     }
@@ -551,12 +503,7 @@ done
     #[test]
     fn latest_install_when_missing_reports_changed() {
         let stub = Stub::new("latest-install", &[]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["nginx"], STATE_LATEST),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["nginx"], STATE_LATEST)).unwrap();
         assert!(changed);
         assert!(stub.log().contains("install -y"));
     }
@@ -566,24 +513,14 @@ done
         // Our apt stub always sets version to "installed-2" on install.
         // Pre-version is also "installed-2" → no change.
         let stub = Stub::new("latest-noop", &[("nginx", "installed-2")]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["nginx"], STATE_LATEST),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["nginx"], STATE_LATEST)).unwrap();
         assert!(!changed);
     }
 
     #[test]
     fn latest_when_version_changes_reports_changed() {
         let stub = Stub::new("latest-go", &[("nginx", "installed-1")]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&["nginx"], STATE_LATEST),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&["nginx"], STATE_LATEST)).unwrap();
         assert!(changed);
     }
 
@@ -593,12 +530,7 @@ done
         let mut o = op(&["nginx"], STATE_PRESENT);
         o.update_cache = 1;
         o.cache_valid_time = 0;
-        let _ = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &o,
-        )
-        .unwrap();
+        let _ = run(&stub, &o).unwrap();
         let log = stub.log();
         let update_pos = log.find("update").unwrap();
         let install_pos = log.find("install").unwrap();
@@ -610,25 +542,17 @@ done
         let stub = Stub::new("default-release", &[]);
         let mut o = op(&["nginx"], STATE_PRESENT);
         o.default_release = "bookworm-backports".into();
-        let _ = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &o,
-        )
-        .unwrap();
+        let _ = run(&stub, &o).unwrap();
         assert!(stub.log().contains("-t bookworm-backports"), "log={:?}", stub.log());
     }
 
     #[test]
-    fn empty_names_with_no_other_action_rejected() {
-        // run() validates this; apply() doesn't crash but does nothing.
+    fn empty_names_with_no_other_action_is_noop_in_apply() {
+        // The dispatcher in package/mod.rs validates "need at least one
+        // of [names, update_cache, autoremove]" before reaching the
+        // backend. apply_with_bins itself doesn't crash but does nothing.
         let stub = Stub::new("empty", &[]);
-        let changed = apply(
-            stub.apt_path().to_str().unwrap(),
-            stub.dpkg_path().to_str().unwrap(),
-            &op(&[], STATE_PRESENT),
-        )
-        .unwrap();
+        let changed = run(&stub, &op(&[], STATE_PRESENT)).unwrap();
         assert!(!changed);
     }
 }

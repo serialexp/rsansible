@@ -79,6 +79,16 @@ async fn apt_drives_install_remove_latest() -> Result<()> {
         "update must precede install in: {final_log:?}"
     );
 
+    // Scenario #9: `package:` (auto) routes through the apt backend
+    // because the planted /usr/local/bin/apt-get satisfies the
+    // PATH probe. The auto-detect log must show an `install -y htop`
+    // invocation matching the per-manager `apt:` form.
+    let auto_log = read_file(&container, "/tmp/rsansible-apt-stub/log.auto")?;
+    assert!(
+        auto_log.contains("install -y htop"),
+        "expected `install -y htop` from auto-detected package: in: {auto_log:?}"
+    );
+
     Ok(())
 }
 

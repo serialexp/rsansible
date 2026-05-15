@@ -162,10 +162,11 @@
       ],
     },
 
-    OpApt: {
-      description: "`apt-get` wrapper. Maps Ansible's `ansible.builtin.apt` (subset). `names` is the list of package names to manage (one wire op handles a batch). `state` is a uint8: 0=present (install if missing), 1=absent (remove if installed), 2=latest (install + upgrade to latest available). `update_cache=1` runs `apt-get update` first; `cache_valid_time` (seconds) suppresses the update if `/var/cache/apt/pkgcache.bin` mtime is fresher than that (0 = always update when update_cache=1). `purge=1` switches absent's `remove` for `purge`. `autoremove=1` runs `apt-get autoremove -y` after the main op. `default_release` (empty = unused) maps to `-t <release>`. `allow_unauthenticated=1` adds `--allow-unauthenticated`. The agent runs apt-get with `DEBIAN_FRONTEND=noninteractive`. Idempotency: state=present skips packages already installed (`dpkg-query -W`); state=absent skips packages already absent; state=latest probes pre/post versions and reports changed iff anything moved.",
+    OpPackage: {
+      description: "Generic package-manager wrapper. Maps Ansible's `ansible.builtin.package` plus all the per-manager modules (`apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, …). `manager` selects the backend: 0=auto (agent picks based on what's on PATH / facts), 1=apt, 2=dnf, 3=yum, 4=apk, 5=pacman, 6=zypper. Unimplemented backends return BAD_REQUEST. `names` is the list of package names to manage (one wire op handles a batch). `state` is a uint8: 0=present (install if missing), 1=absent (remove if installed), 2=latest (install + upgrade to latest available). `update_cache=1` runs the manager's index refresh first; `cache_valid_time` (seconds) suppresses the update if the cache mtime is fresher than that (0 = always update when update_cache=1) — apt-only, ignored by other managers. `purge=1` switches absent's `remove` for `purge` (apt-only). `autoremove=1` runs an autoremove pass after the main op (apt/dnf). `default_release` maps to apt's `-t <release>` (apt-only). `allow_unauthenticated=1` adds apt's `--allow-unauthenticated` (apt-only). Apt backend runs apt-get with `DEBIAN_FRONTEND=noninteractive`. Idempotency: state=present skips packages already installed; state=absent skips packages already absent; state=latest probes pre/post versions and reports changed iff anything moved.",
       sequence: [
         { name: "kind", type: "uint8", const: 10 },
+        { name: "manager", type: "uint8" },
         {
           name: "names",
           type: "array",
@@ -234,7 +235,7 @@
         { type: "OpLineInFile", when: "value === 7" },
         { type: "OpBlockInFile", when: "value === 8" },
         { type: "OpSystemd", when: "value === 9" },
-        { type: "OpApt", when: "value === 10" },
+        { type: "OpPackage", when: "value === 10" },
         { type: "OpUfw", when: "value === 11" },
       ],
     },

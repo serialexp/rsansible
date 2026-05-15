@@ -239,15 +239,38 @@ pub fn op_systemd(
     })
 }
 
-/// `state:` byte values for `OpApt`.
-pub mod apt_state {
+/// `state:` byte values for `OpPackage` (shared across all package
+/// managers — present/absent/latest mean the same thing everywhere).
+pub mod package_state {
     pub const PRESENT: u8 = 0;
     pub const ABSENT: u8 = 1;
     pub const LATEST: u8 = 2;
 }
 
+/// `manager:` byte values for `OpPackage`. 0 = auto (agent picks based
+/// on what's on PATH / facts). The numbered values select a specific
+/// backend; the agent returns BAD_REQUEST if the requested manager isn't
+/// implemented.
+pub mod package_manager {
+    /// Agent picks a manager based on what's on PATH / gathered facts.
+    pub const AUTO: u8 = 0;
+    /// Debian-family `apt-get`.
+    pub const APT: u8 = 1;
+    /// RHEL-family `dnf` (reserved).
+    pub const DNF: u8 = 2;
+    /// RHEL-family `yum` (reserved).
+    pub const YUM: u8 = 3;
+    /// Alpine `apk` (reserved).
+    pub const APK: u8 = 4;
+    /// Arch `pacman` (reserved).
+    pub const PACMAN: u8 = 5;
+    /// SUSE `zypper` (reserved).
+    pub const ZYPPER: u8 = 6;
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn op_apt(
+pub fn op_package(
+    manager: u8,
     names: Vec<String>,
     state: u8,
     update_cache: bool,
@@ -257,8 +280,9 @@ pub fn op_apt(
     default_release: String,
     allow_unauthenticated: bool,
 ) -> Op {
-    Op::OpApt(OpAptOutput {
+    Op::OpPackage(OpPackageOutput {
         kind: 10,
+        manager,
         names,
         state,
         update_cache: if update_cache { 1 } else { 0 },

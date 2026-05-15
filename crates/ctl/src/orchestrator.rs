@@ -41,8 +41,8 @@ use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AptOp, AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector,
-    LineInFileOp, LoopSpec, MetaAction, OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp,
+    AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp,
+    LoopSpec, MetaAction, OnFailure, PackageOp, Play, Playbook, SetFactMap, ShellOp, StatOp,
     Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, WaitForOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
@@ -1893,25 +1893,26 @@ fn render_op(
                 no_block: s.no_block,
             })
         }
-        TaskOp::Apt(a) => {
-            let mut names = Vec::with_capacity(a.names.len());
-            for n in &a.names {
+        TaskOp::Package(p) => {
+            let mut names = Vec::with_capacity(p.names.len());
+            for n in &p.names {
                 names.push(render_str(env, n, &view)?);
             }
-            let default_release = if a.default_release.is_empty() {
+            let default_release = if p.default_release.is_empty() {
                 String::new()
             } else {
-                render_str(env, &a.default_release, &view)?
+                render_str(env, &p.default_release, &view)?
             };
-            TaskOp::Apt(AptOp {
+            TaskOp::Package(PackageOp {
+                manager: p.manager,
                 names,
-                state: a.state,
-                update_cache: a.update_cache,
-                cache_valid_time: a.cache_valid_time,
-                purge: a.purge,
-                autoremove: a.autoremove,
+                state: p.state,
+                update_cache: p.update_cache,
+                cache_valid_time: p.cache_valid_time,
+                purge: p.purge,
+                autoremove: p.autoremove,
                 default_release,
-                allow_unauthenticated: a.allow_unauthenticated,
+                allow_unauthenticated: p.allow_unauthenticated,
             })
         }
         TaskOp::Ufw(u) => {

@@ -19,6 +19,8 @@
 #   6. latest when version moves → changed
 #   7. latest when version stable → no-op
 #   8. update_cache + install → update precedes install in log
+#   9. `package:` (auto) install → routes through apt backend via the
+#      same stubs, proving auto-detection picks up `apt-get` on PATH.
 
 - name: apt demo (against stub)
   hosts: all
@@ -202,3 +204,22 @@
 
     - name: final log snapshot
       shell: cp /tmp/rsansible-apt-stub/log /tmp/rsansible-apt-stub/log.final
+
+    # --- 9. `package:` (manager=auto) install. The auto dispatcher
+    #        scans PATH for known manager binaries; finding our planted
+    #        /usr/local/bin/apt-get, it picks the apt backend. The same
+    #        stub services this scenario as scenarios 1–8.
+    - name: clear log for auto-detect test
+      shell: ": > /tmp/rsansible-apt-stub/log"
+
+    - name: install htop via generic `package:` (auto-detected apt)
+      package:
+        name: htop
+      register: r9
+
+    - name: assert auto-detected install reported changed
+      assert:
+        that: [r9.changed]
+
+    - name: snapshot auto-detect log
+      shell: cp /tmp/rsansible-apt-stub/log /tmp/rsansible-apt-stub/log.auto

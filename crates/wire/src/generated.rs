@@ -972,7 +972,8 @@ impl From<OpBlockInFileOutput> for OpBlockInFileInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct OpAptInput {
+pub struct OpPackageInput {
+    pub manager: u8,
     pub names: Vec<std::string::String>,
     pub state: u8,
     pub update_cache: u8,
@@ -984,8 +985,9 @@ pub struct OpAptInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct OpAptOutput {
+pub struct OpPackageOutput {
     pub kind: u8,
+    pub manager: u8,
     pub names: Vec<std::string::String>,
     pub state: u8,
     pub update_cache: u8,
@@ -996,9 +998,9 @@ pub struct OpAptOutput {
     pub allow_unauthenticated: u8,
 }
 
-pub type OpApt = OpAptOutput;
+pub type OpPackage = OpPackageOutput;
 
-impl OpAptInput {
+impl OpPackageInput {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
         self.encode_into(&mut encoder)?;
@@ -1007,6 +1009,7 @@ impl OpAptInput {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(10);
+        encoder.write_byte(self.manager);
         encoder.write_u16_le(self.names.len() as u16);
         for item in &self.names {
             encoder.write_u16_le(item.len() as u16);
@@ -1030,7 +1033,7 @@ impl OpAptInput {
 
 }
 
-impl OpAptOutput {
+impl OpPackageOutput {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
         Self::decode_with_decoder(&mut decoder)
@@ -1041,6 +1044,7 @@ impl OpAptOutput {
         if kind != 10u8 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
         }
+        let manager = decoder.read_byte()?;
         let length = decoder.read_u16_le()? as usize;
         let mut names = Vec::with_capacity(length);
         for _ in 0..length {
@@ -1060,6 +1064,7 @@ impl OpAptOutput {
         let allow_unauthenticated = decoder.read_byte()?;
         Ok(Self {
             kind,
+            manager,
             names,
             state,
             update_cache,
@@ -1071,16 +1076,17 @@ impl OpAptOutput {
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
-        OpAptInput::from(self.clone()).encode()
+        OpPackageInput::from(self.clone()).encode()
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        OpAptInput::from(self.clone()).encode_into(encoder)
+        OpPackageInput::from(self.clone()).encode_into(encoder)
     }
 }
 
-impl From<OpAptOutput> for OpAptInput {
-    fn from(o: OpAptOutput) -> Self {
+impl From<OpPackageOutput> for OpPackageInput {
+    fn from(o: OpPackageOutput) -> Self {
         Self {
+            manager: o.manager,
             names: o.names,
             state: o.state,
             update_cache: o.update_cache,
@@ -1395,7 +1401,7 @@ pub enum Op {
     OpLineInFile(OpLineInFileOutput),
     OpBlockInFile(OpBlockInFileOutput),
     OpSystemd(OpSystemdOutput),
-    OpApt(OpAptOutput),
+    OpPackage(OpPackageOutput),
     OpUfw(OpUfwOutput),
 }
 
@@ -1606,8 +1612,9 @@ impl Op {
                 encoder.write_uint8(v.daemon_reload);
                 encoder.write_uint8(v.no_block);
             }
-            Op::OpApt(v) => {
+            Op::OpPackage(v) => {
                 encoder.write_uint8(v.kind);
+                encoder.write_uint8(v.manager);
                 encoder.write_uint16(v.names.len() as u16, Endianness::LittleEndian);
                 for item in &v.names {
                     encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
@@ -1711,7 +1718,7 @@ impl Op {
         } else if value == 9 {
             Ok(Op::OpSystemd(OpSystemdOutput::decode_with_decoder(decoder)?))
         } else if value == 10 {
-            Ok(Op::OpApt(OpAptOutput::decode_with_decoder(decoder)?))
+            Ok(Op::OpPackage(OpPackageOutput::decode_with_decoder(decoder)?))
         } else if value == 11 {
             Ok(Op::OpUfw(OpUfwOutput::decode_with_decoder(decoder)?))
         } else {

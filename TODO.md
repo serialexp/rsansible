@@ -349,23 +349,37 @@ new wire framing roundtrip for `OpGatherFacts`.
   → re-start (no-op) → restart (changed) → enable (changed) →
   daemon_reload + start (daemon-reload precedes start in log) → mask
   (changed).
-- [x] **`OpApt`** — name(s), state (present/absent/latest), update_cache,
-  cache_valid_time, purge, autoremove, default_release,
-  allow_unauthenticated. Wire op kind=10. Batched: one wire op carries
-  the full list of package names; the agent probes each via
-  `dpkg-query -W` and feeds only the missing/present subset to
-  `apt-get install -y` / `apt-get remove -y`. For `state=latest` the
-  agent captures pre- and post-versions to drive accurate `changed`
-  reporting. `update_cache` honors `cache_valid_time` by checking
-  `/var/cache/apt/pkgcache.bin` mtime. apt-get is invoked with
-  `DEBIAN_FRONTEND=noninteractive`. `RSANSIBLE_APT_GET` /
-  `RSANSIBLE_DPKG_QUERY` env overrides power the tests with stubs.
-  YAML accepts `name:` as string or list and `state:` aliases
-  (installed/removed). e2e plants apt-get + dpkg-query stubs on an
-  Alpine container and exercises install (changed) → re-install
-  (no-op) → batch install (only-missing) → remove (changed) → second
-  remove (no-op) → latest with version bump (changed) → latest stable
-  (no-op) → update_cache + install (update precedes install).
+- [x] **`OpPackage`** — generic package-manager wrapper (one wire op
+  per manager kept dying the moment a second manager landed, so the
+  protocol carries a single op with a `manager` discriminator byte:
+  0=auto, 1=apt, 2=dnf (reserved), 3=yum (reserved), 4=apk (reserved),
+  5=pacman (reserved), 6=zypper (reserved)). Wire op kind=10 with
+  manager + name(s) + state (present/absent/latest) + update_cache +
+  cache_valid_time + purge + autoremove + default_release +
+  allow_unauthenticated. The wire shape carries the *union* of all
+  backends' knobs; each backend ignores fields it doesn't consume.
+  Batched: one wire op carries the full list of package names; the
+  apt backend probes each via `dpkg-query -W` and feeds only the
+  missing/present subset to `apt-get install -y` / `apt-get remove -y`.
+  For `state=latest` the agent captures pre- and post-versions to
+  drive accurate `changed` reporting. `update_cache` honors
+  `cache_valid_time` by checking `/var/cache/apt/pkgcache.bin` mtime.
+  apt-get is invoked with `DEBIAN_FRONTEND=noninteractive`.
+  `RSANSIBLE_APT_GET` / `RSANSIBLE_DPKG_QUERY` env overrides power the
+  tests with stubs. YAML surface: `apt:` (pins manager=Apt, accepts
+  the full apt-specific knob set), `package:` (manager=Auto; the
+  agent picks the backend by probing PATH for known manager binaries —
+  refuses apt-only knobs at parse time since we can't promise the
+  auto-detected backend will honor them). Both keys accept `name:` as
+  string or list and `state:` aliases (installed/removed). Agent layout:
+  `modules/package/mod.rs` (dispatch + auto-detect) +
+  `modules/package/apt.rs` (apt backend). e2e plants apt-get +
+  dpkg-query stubs on an Alpine container and exercises install
+  (changed) → re-install (no-op) → batch install (only-missing) →
+  remove (changed) → second remove (no-op) → latest with version bump
+  (changed) → latest stable (no-op) → update_cache + install (update
+  precedes install) → `package:` (auto-detect picks apt backend via
+  PATH probe, installs htop).
 - [x] **`OpUfw`** — Uncomplicated Firewall control. Wire op kind=11
   with op (rule/enable/disable/reset/default/reload/logging) +
   rule/direction/proto/from_ip/from_port/to_ip/to_port/interface/
