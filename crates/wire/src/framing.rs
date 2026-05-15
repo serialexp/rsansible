@@ -154,6 +154,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_file() {
+        roundtrip(msg::task_dispatch(
+            104,
+            msg::op_file(
+                "/etc/foo".into(),
+                msg::file_state::DIRECTORY,
+                Some(0o755),
+                "root".into(),
+                "root".into(),
+                false,
+            ),
+        ))
+        .await;
+        // mode=None branch + empty owner/group + recurse.
+        roundtrip(msg::task_dispatch(
+            105,
+            msg::op_file(
+                "/var/log/app".into(),
+                msg::file_state::DIRECTORY,
+                None,
+                String::new(),
+                String::new(),
+                true,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,

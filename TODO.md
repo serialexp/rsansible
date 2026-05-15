@@ -277,9 +277,35 @@ new wire framing roundtrip for `OpGatherFacts`.
   single-container e2e (`tests/stat_e2e.rs`) covering regular file
   (incl. exact sha256 of `"hello\n"`), directory, missing path, and
   `when: foo.stat.exists` gating both positive and negative paths.
-- [ ] **`OpFile`** — proper file module: ensure absent/file/directory/link
-  with mode/owner/group, atomic. Subsumes some uses of write_file's mode
-  param plus chmod via shell. 26 file sites.
+- [x] **`OpFile`** — Ansible's `file:` task module. New wire op kind=5
+  (`{path, state, has_mode, mode, owner, group, recurse}`); agent
+  module supports the four states gothab uses: `directory` (mkdir -p
+  + chmod/chown; recurse flag walks descendants), `absent` (rm -rf for
+  dirs, unlink for files/symlinks; no-op when missing), `touch`
+  (create-if-missing + bump atime/mtime, always-changed per Ansible's
+  contract), and `file` (assert regular-file existence; apply
+  mode/owner/group). Idempotency is real: `changed` is set iff the
+  filesystem actually moved. Owner/group are resolved via a 30-line
+  `/etc/passwd` + `/etc/group` parser (NSS-free; agent stays FFI-
+  light and `forbid(unsafe_code)`). `chown` and the utime bump shell
+  out to `/usr/bin/chown -h` and `/usr/bin/touch -a -m` for the same
+  reason — keeps us off `rustix::fs::{Uid,Gid}::from_raw` which are
+  unsafe in 0.38. Controller-side `TaskOp::File(FileOp)` with a
+  `FileState` enum and a mode deserializer that accepts both YAML
+  ints (`0o755`) and Ansible's stringly-typed octal (`"0755"`).
+  `path`, `owner`, and `group` are Jinja-rendered at task time;
+  template precompile checks them. `recurse: yes` is validated to
+  reject any state other than `directory`. Caveat documented in
+  `examples/file.yaml`: the file op is not argv-wrapped by `become:`
+  (matches `write_file`/`template`/`copy`/`gather_facts`), so
+  `owner:` only works when the agent itself runs with CAP_CHOWN —
+  agent-side privilege escalation for non-argv ops is a separate
+  Phase 3+ deferral. 10 agent unit tests (per state + idempotency +
+  recurse + passwd parser) + 7 parser tests + 3 validator tests +
+  one single-container e2e (`tests/file_e2e.rs`) running an 11-task
+  playbook whose internal `assert:` chain validates every
+  changed/no-op claim along the directory → idempotent → touch →
+  chmod-changed → chmod-noop → recurse → absent → absent-noop path.
 - [ ] **`OpLineInFile` / `OpBlockInFile`** — idempotent line/block edits
   using anchored regex; preserves file mode/ownership. 6 sites.
 - [ ] **`OpSystemd`** — start / stop / restart / reload / enable /

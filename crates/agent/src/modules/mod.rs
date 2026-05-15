@@ -7,6 +7,7 @@ use rsansible_wire::{msg, Op};
 use crate::writer::Sender;
 
 mod exec;
+mod file;
 mod gather_facts;
 mod stat;
 mod write_file;
@@ -39,6 +40,7 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
         Op::OpWriteFile(o) => write_file::run(ctx, seq, o).await,
         Op::OpGatherFacts(_) => gather_facts::run(ctx, seq).await,
         Op::OpStat(o) => stat::run(ctx, seq, o).await,
+        Op::OpFile(o) => file::run(ctx, seq, o).await,
     }
 }
 

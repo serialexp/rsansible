@@ -1,0 +1,113 @@
+# End-to-end exercise of the `file:` task module.
+#
+# Probes all four supported states (directory, absent, touch, file) and
+# verifies idempotency (a no-op second run reports `changed: false`).
+#
+# We deliberately don't exercise owner:/group: here — the file: op runs
+# agent-side (not argv-wrapped by `become:`), and the agent is launched
+# as the SSH login user (`test`) without CAP_CHOWN. Agent-side privilege
+# escalation for non-argv ops is a separate Phase 3+ item; the parser /
+# wire / agent code path for owner+group is covered by unit tests.
+
+- name: file demo
+  hosts: all
+  gather_facts: false
+  tasks:
+    # ── directory ───────────────────────────────────────────────────
+    - name: create directory tree
+      file:
+        path: /tmp/rsansible-file/dir/sub
+        state: directory
+        mode: "0750"
+      register: mkdir_first
+
+    - name: assert first mkdir reported changed
+      assert:
+        that: mkdir_first.changed
+
+    - name: re-create same directory (idempotency check)
+      file:
+        path: /tmp/rsansible-file/dir/sub
+        state: directory
+        mode: "0750"
+      register: mkdir_second
+
+    - name: assert second mkdir was a no-op
+      assert:
+        that: not mkdir_second.changed
+
+    # ── touch ───────────────────────────────────────────────────────
+    - name: touch a marker file
+      file:
+        path: /tmp/rsansible-file/dir/sub/marker
+        state: touch
+        mode: "0644"
+      register: touch_out
+
+    - name: assert touch reported changed
+      assert:
+        that: touch_out.changed
+
+    # ── file (mode flip + re-apply) ─────────────────────────────────
+    - name: tighten marker mode
+      file:
+        path: /tmp/rsansible-file/dir/sub/marker
+        state: file
+        mode: "0600"
+      register: chmod_first
+
+    - name: assert chmod reported changed
+      assert:
+        that: chmod_first.changed
+
+    - name: re-apply tighter mode (no-op)
+      file:
+        path: /tmp/rsansible-file/dir/sub/marker
+        state: file
+        mode: "0600"
+      register: chmod_second
+
+    - name: assert re-chmod was a no-op
+      assert:
+        that: not chmod_second.changed
+
+    # ── recurse ─────────────────────────────────────────────────────
+    - name: seed a nested file with the wrong mode
+      shell: "install -m 0600 /dev/null /tmp/rsansible-file/dir/sub/innerfile"
+
+    - name: recurse chmod across the tree
+      file:
+        path: /tmp/rsansible-file/dir
+        state: directory
+        mode: "0755"
+        recurse: yes
+      register: recurse_out
+
+    - name: assert recurse reported changed
+      assert:
+        that: recurse_out.changed
+
+    # ── absent ──────────────────────────────────────────────────────
+    - name: remove the whole tree
+      file:
+        path: /tmp/rsansible-file
+        state: absent
+      register: rm_first
+
+    - name: assert rm reported changed
+      assert:
+        that: rm_first.changed
+
+    - name: remove the same (now-missing) tree
+      file:
+        path: /tmp/rsansible-file
+        state: absent
+      register: rm_second
+
+    - name: assert rm of missing path was a no-op
+      assert:
+        that: not rm_second.changed
+
+    # ── error path: state=file on a missing path ────────────────────
+    - name: write a sentinel proving we got this far
+      shell: "echo ok > /tmp/rsansible-file-sentinel"

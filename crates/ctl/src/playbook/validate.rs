@@ -354,6 +354,21 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::File(f) => {
+            if f.path.is_empty() {
+                bail!("{}: task[{ti}] {:?}: file.path is empty", where_, task.name);
+            }
+            // recurse only applies to directory state — warn the user by
+            // failing validation rather than silently ignoring.
+            if f.recurse && f.state != crate::playbook::FileState::Directory {
+                bail!(
+                    "{}: task[{ti}] {:?}: file.recurse only applies to state=directory",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -653,6 +668,62 @@ mod tests {
         )
         .unwrap();
         validate(&pb, None).expect("valid stat task");
+    }
+
+    #[test]
+    fn rejects_file_empty_path() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: mkdir
+      file:
+        path: ""
+        state: directory
+"#,
+        )
+        .unwrap();
+        let err = validate(&pb, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("file.path") && msg.contains("empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_recurse_on_non_directory() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: rm
+      file:
+        path: /tmp/x
+        state: absent
+        recurse: yes
+"#,
+        )
+        .unwrap();
+        let err = validate(&pb, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("recurse") && msg.contains("directory"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_file_directory_with_owner() {
+        let pb: Playbook = serde_yaml::from_str(
+            r#"
+- name: p
+  tasks:
+    - name: mk
+      file:
+        path: /opt/foo
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+"#,
+        )
+        .unwrap();
+        validate(&pb, None).expect("valid file task");
     }
 
     #[test]

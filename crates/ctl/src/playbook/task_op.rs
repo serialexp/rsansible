@@ -22,7 +22,7 @@
 
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
-    msg::{op_exec, op_gather_facts, op_shell, op_stat, op_write_file},
+    msg::{op_exec, op_file, op_gather_facts, op_shell, op_stat, op_write_file},
     Op,
 };
 use serde::{de::Error as _, Deserialize, Deserializer};
@@ -169,6 +169,110 @@ pub enum TaskOp {
     /// object on stdout describing the path; the orchestrator lifts it
     /// into `register.stat` (matching Ansible's `foo.stat.exists` shape).
     Stat(StatOp),
+    /// `file:` — Ansible's `ansible.builtin.file` module. Ensures a
+    /// filesystem path is in the requested state
+    /// (directory/absent/touch/file) with optional mode/owner/group +
+    /// recurse for directories.
+    File(FileOp),
+}
+
+/// `file: { path: …, state: directory, mode: "0755", owner: root,
+/// group: root, recurse: yes }`
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FileOp {
+    pub path: String,
+    pub state: FileState,
+    /// `mode: "0755"` (string), `mode: 0o755` (int) — Ansible playbooks
+    /// use both. Parsed by `deserialize_file_mode` into a 12-bit perm
+    /// value. Absent → don't chmod.
+    #[serde(default, deserialize_with = "deserialize_file_mode")]
+    pub mode: Option<u32>,
+    /// Owner / group as user-resolvable names. Empty → don't chown.
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Only meaningful for `state: directory`. When true, recursively
+    /// apply mode/owner/group to all descendants (Ansible behavior).
+    #[serde(default, deserialize_with = "deserialize_ansible_bool")]
+    pub recurse: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileState {
+    Directory,
+    Absent,
+    Touch,
+    /// Regular file — ensure it exists; doesn't create. Used to chmod /
+    /// chown an existing file.
+    File,
+}
+
+impl FileState {
+    /// Wire byte matching `schema/wire.schema.json5` OpFile.state.
+    pub fn wire_byte(self) -> u8 {
+        match self {
+            FileState::Directory => 0,
+            FileState::Absent => 1,
+            FileState::Touch => 2,
+            FileState::File => 3,
+        }
+    }
+}
+
+/// Parse `mode:` from either a string (`"0755"`, `"755"`, `"0o755"`)
+/// or an int (e.g. `0o755` literal in YAML). Strings with a leading `0`
+/// are treated as octal — Ansible's behavior. Returns the parsed value
+/// or an error; `None` means the field was absent.
+fn deserialize_file_mode<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = match Option::<serde_yaml::Value>::deserialize(d)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let n = match v {
+        serde_yaml::Value::Null => return Ok(None),
+        serde_yaml::Value::Number(n) => {
+            n.as_u64().ok_or_else(|| {
+                D::Error::custom(format!("mode: expected non-negative integer, got: {n}"))
+            })? as u32
+        }
+        serde_yaml::Value::String(s) => parse_mode_str(&s).map_err(D::Error::custom)?,
+        other => {
+            return Err(D::Error::custom(format!(
+                "mode: expected string or int, got: {other:?}"
+            )))
+        }
+    };
+    if n & !0o7777 != 0 {
+        return Err(D::Error::custom(format!(
+            "mode: only the low 12 bits are meaningful (got 0o{n:o})"
+        )));
+    }
+    Ok(Some(n))
+}
+
+/// Strings like `"0755"` and `"755"` → 0o755. `"0o755"` and `"0755"`
+/// also accepted. No symbolic modes (`u=rwx,g=rx`) — gothab doesn't use
+/// them.
+fn parse_mode_str(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("mode: empty string".to_string());
+    }
+    let (body, radix) = if let Some(rest) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        (rest, 8u32)
+    } else if t.starts_with('0') && t.len() > 1 {
+        (t, 8u32)
+    } else {
+        (t, 8u32)
+    };
+    u32::from_str_radix(body, radix)
+        .map_err(|e| format!("mode: invalid octal {s:?}: {e}"))
 }
 
 /// `stat: { path: /etc/foo, follow: yes }`. `follow` selects stat() vs
@@ -221,6 +325,7 @@ const BODY_KEYS: &[&str] = &[
     "template",
     "copy",
     "stat",
+    "file",
     "assert",
     "fail",
     "set_fact",
@@ -389,6 +494,9 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "stat" => TaskBody::Op(TaskOp::Stat(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "file" => TaskBody::Op(TaskOp::File(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "assert" => TaskBody::Assert(
@@ -791,6 +899,14 @@ impl TaskOp {
             }
             TaskOp::GatherFacts => Ok(op_gather_facts()),
             TaskOp::Stat(s) => Ok(op_stat(s.path.clone(), s.follow)),
+            TaskOp::File(f) => Ok(op_file(
+                f.path.clone(),
+                f.state.wire_byte(),
+                f.mode,
+                f.owner.clone().unwrap_or_default(),
+                f.group.clone().unwrap_or_default(),
+                f.recurse,
+            )),
         }
     }
 }
@@ -1186,6 +1302,189 @@ stat:
         .unwrap_err()
         .to_string();
         assert!(err.contains("path"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_file_directory_with_mode_string() {
+        let t = parse_task(
+            r#"
+name: mkdir
+file:
+  path: /opt/foo
+  state: directory
+  owner: root
+  group: root
+  mode: "0755"
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::File(f)) => {
+                assert_eq!(f.path, "/opt/foo");
+                assert_eq!(f.state, FileState::Directory);
+                assert_eq!(f.owner.as_deref(), Some("root"));
+                assert_eq!(f.group.as_deref(), Some("root"));
+                assert_eq!(f.mode, Some(0o755));
+                assert!(!f.recurse);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_file_absent_minimal() {
+        let t = parse_task(
+            r#"
+name: rm
+file:
+  path: /tmp/junk
+  state: absent
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::File(f)) => {
+                assert_eq!(f.state, FileState::Absent);
+                assert!(f.mode.is_none());
+                assert!(f.owner.is_none());
+                assert!(f.group.is_none());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_file_touch_and_recurse() {
+        let t = parse_task(
+            r#"
+name: t
+file:
+  path: /tmp/marker
+  state: touch
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::File(f)) => assert_eq!(f.state, FileState::Touch),
+            other => panic!("got {other:?}"),
+        }
+
+        let t = parse_task(
+            r#"
+name: r
+file:
+  path: /var/lib/x
+  state: directory
+  mode: "0700"
+  recurse: yes
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::File(f)) => {
+                assert!(f.recurse);
+                assert_eq!(f.state, FileState::Directory);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_mode_accepts_int_and_octal_string() {
+        // Plain int (e.g. YAML `0o644` → 420; serde_yaml parses 0o…
+        // octal literals).
+        let t = parse_task(
+            r#"
+name: m
+file:
+  path: /tmp/x
+  state: file
+  mode: 0o644
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::File(f)) => assert_eq!(f.mode, Some(0o644)),
+            other => panic!("got {other:?}"),
+        }
+        // String form with leading 0.
+        let t = parse_task(
+            r#"
+name: m
+file:
+  path: /tmp/x
+  state: file
+  mode: "0644"
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::File(f)) => assert_eq!(f.mode, Some(0o644)),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_rejects_unknown_state() {
+        let err = try_parse_task(
+            r#"
+name: x
+file:
+  path: /tmp/x
+  state: bogus
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bogus") || err.contains("unknown variant"), "got: {err}");
+    }
+
+    #[test]
+    fn file_rejects_unknown_field() {
+        let err = try_parse_task(
+            r#"
+name: x
+file:
+  path: /tmp/x
+  state: file
+  force: yes
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("force") || err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn file_to_wire_carries_state_byte() {
+        let t = TaskOp::File(FileOp {
+            path: "/tmp/x".into(),
+            state: FileState::Directory,
+            mode: Some(0o755),
+            owner: Some("root".into()),
+            group: Some("root".into()),
+            recurse: true,
+        });
+        let WireOp::OpFile(o) = t.to_wire_op().unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.kind, 5);
+        assert_eq!(o.path, "/tmp/x");
+        assert_eq!(o.state, 0);
+        assert_eq!(o.has_mode, 1);
+        assert_eq!(o.mode, 0o755);
+        assert_eq!(o.owner, "root");
+        assert_eq!(o.group, "root");
+        assert_eq!(o.recurse, 1);
+
+        let t = TaskOp::File(FileOp {
+            path: "/x".into(),
+            state: FileState::Absent,
+            mode: None,
+            owner: None,
+            group: None,
+            recurse: false,
+        });
+        let WireOp::OpFile(o) = t.to_wire_op().unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.state, 1);
+        assert_eq!(o.has_mode, 0);
+        assert_eq!(o.owner, "");
     }
 
     #[test]

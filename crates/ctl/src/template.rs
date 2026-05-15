@@ -315,6 +315,18 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(&s.path)
                 .map_err(|e| anyhow!("stat.path: {e}"))?;
         }
+        TaskOp::File(f) => {
+            env.template_from_str(&f.path)
+                .map_err(|e| anyhow!("file.path: {e}"))?;
+            if let Some(o) = &f.owner {
+                env.template_from_str(o)
+                    .map_err(|e| anyhow!("file.owner: {e}"))?;
+            }
+            if let Some(g) = &f.group {
+                env.template_from_str(g)
+                    .map_err(|e| anyhow!("file.group: {e}"))?;
+            }
+        }
     }
     Ok(())
 }

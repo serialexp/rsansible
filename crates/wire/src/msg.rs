@@ -60,6 +60,41 @@ pub fn op_stat(path: String, follow: bool) -> Op {
     })
 }
 
+/// Numeric `state` enum that matches the schema doc. Kept in sync by
+/// convention; constructors below use it so callers don't have to
+/// remember the integers.
+pub mod file_state {
+    pub const DIRECTORY: u8 = 0;
+    pub const ABSENT: u8 = 1;
+    pub const TOUCH: u8 = 2;
+    pub const FILE: u8 = 3;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_file(
+    path: String,
+    state: u8,
+    mode: Option<u32>,
+    owner: String,
+    group: String,
+    recurse: bool,
+) -> Op {
+    let (has_mode, mode_val) = match mode {
+        Some(m) => (1u8, m),
+        None => (0u8, 0u32),
+    };
+    Op::OpFile(OpFileOutput {
+        kind: 5,
+        path,
+        state,
+        has_mode,
+        mode: mode_val,
+        owner,
+        group,
+        recurse: if recurse { 1 } else { 0 },
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

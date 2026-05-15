@@ -99,6 +99,20 @@
       ],
     },
 
+    OpFile: {
+      description: "Ensure a filesystem path is in the requested state. Maps Ansible's `ansible.builtin.file` module. The agent applies the state and reports TaskDone with `changed=1` iff anything actually changed (creation, removal, mode bits flipped, owner/group changed, touch updated mtime). `state` is a uint8 enum: 0=directory (mkdir -p semantics; recurse chmod/chown if `recurse=1`), 1=absent (rm -rf if dir, unlink if file/symlink), 2=touch (create empty file if missing; always bumps mtime/atime — Ansible reports touch as always-changed), 3=file (ensure regular file exists; errors if path is missing or wrong type; still applies mode/owner/group). `has_mode` is 0/1: when 1, the low 12 bits of `mode` are applied via chmod; when 0, no chmod runs. Empty `owner`/`group` strings mean \"don't change\"; non-empty values are resolved via /etc/passwd and /etc/group (no NSS) and applied via chown. `recurse` (0/1) only applies to state=directory.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 5 },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "state", type: "uint8" },
+        { name: "has_mode", type: "uint8" },
+        { name: "mode", type: "uint32" },
+        { name: "owner", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "group", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "recurse", type: "uint8" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -111,6 +125,7 @@
         { type: "OpWriteFile", when: "value === 2" },
         { type: "OpGatherFacts", when: "value === 3" },
         { type: "OpStat", when: "value === 4" },
+        { type: "OpFile", when: "value === 5" },
       ],
     },
 
