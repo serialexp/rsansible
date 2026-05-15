@@ -239,6 +239,37 @@ pub fn op_systemd(
     })
 }
 
+/// `state:` byte values for `OpApt`.
+pub mod apt_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+    pub const LATEST: u8 = 2;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_apt(
+    names: Vec<String>,
+    state: u8,
+    update_cache: bool,
+    cache_valid_time: u32,
+    purge: bool,
+    autoremove: bool,
+    default_release: String,
+    allow_unauthenticated: bool,
+) -> Op {
+    Op::OpApt(OpAptOutput {
+        kind: 10,
+        names,
+        state,
+        update_cache: if update_cache { 1 } else { 0 },
+        cache_valid_time,
+        purge: if purge { 1 } else { 0 },
+        autoremove: if autoremove { 1 } else { 0 },
+        default_release,
+        allow_unauthenticated: if allow_unauthenticated { 1 } else { 0 },
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

@@ -361,6 +361,16 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(&s.name)
                 .map_err(|e| anyhow!("systemd.name: {e}"))?;
         }
+        TaskOp::Apt(a) => {
+            for n in &a.names {
+                env.template_from_str(n)
+                    .map_err(|e| anyhow!("apt.name: {e}"))?;
+            }
+            if !a.default_release.is_empty() {
+                env.template_from_str(&a.default_release)
+                    .map_err(|e| anyhow!("apt.default_release: {e}"))?;
+            }
+        }
     }
     Ok(())
 }

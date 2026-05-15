@@ -466,6 +466,25 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::Apt(a) => {
+            if a.names.is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: apt.name is empty",
+                    where_,
+                    task.name
+                );
+            }
+            for n in &a.names {
+                if n.trim().is_empty() {
+                    bail!(
+                        "{}: task[{ti}] {:?}: apt.name contains an empty entry",
+                        where_,
+                        task.name
+                    );
+                }
+            }
+            Ok(())
+        }
         TaskOp::BlockInFile(b) => {
             if b.path.is_empty() {
                 bail!(

@@ -1,0 +1,204 @@
+# End-to-end exercise of `apt:` (Phase 3, package management).
+#
+# Alpine sshd containers don't have apt-get, so the playbook stages
+# *stub* `apt-get` and `dpkg-query` scripts in /usr/local/bin that log
+# invocations and read/write a tiny "DB" file. The agent's `apt:` op
+# invokes the stubs via the agent's inherited PATH (and the
+# `RSANSIBLE_APT_GET` / `RSANSIBLE_DPKG_QUERY` env overrides aren't
+# touched — the stubs literally squat on `apt-get`/`dpkg-query` names).
+#
+# DB format (/tmp/rsansible-apt-stub/DB): one line per installed pkg
+# as `<name> <version>`.
+#
+# Scenarios:
+#   1. present when missing  → changed, install logged
+#   2. present when installed → no-op, no install
+#   3. present batch where one is missing → only the missing one installed
+#   4. absent when installed → changed, remove logged
+#   5. absent when not installed → no-op
+#   6. latest when version moves → changed
+#   7. latest when version stable → no-op
+#   8. update_cache + install → update precedes install in log
+
+- name: apt demo (against stub)
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: stage stub directory
+      file:
+        path: /tmp/rsansible-apt-stub
+        state: directory
+        mode: '0755'
+
+    - name: clear stub log
+      shell: ": > /tmp/rsansible-apt-stub/log"
+
+    - name: seed empty DB
+      shell: ": > /tmp/rsansible-apt-stub/DB"
+
+    - name: stage apt-get stub under /tmp
+      write_file:
+        path: /tmp/rsansible-apt-stub/apt-get.in
+        mode: 0o755
+        content: |
+          #!/bin/sh
+          DB=/tmp/rsansible-apt-stub/DB
+          LOG=/tmp/rsansible-apt-stub/log
+          echo "$@" >> "$LOG"
+          verb="$1"; shift
+          case "$verb" in
+            update) ;;
+            autoremove) ;;
+            install)
+              while [ "${1#-}" != "$1" ]; do
+                if [ "$1" = "-t" ]; then shift 2; else shift; fi
+              done
+              for pkg in "$@"; do
+                grep -v "^$pkg " "$DB" > "$DB.tmp" || true
+                # Determine version from version-table file, falling
+                # back to "installed-2".
+                VTABLE=/tmp/rsansible-apt-stub/VERSIONS
+                ver="installed-2"
+                if [ -f "$VTABLE" ]; then
+                  v=$(grep "^$pkg " "$VTABLE" | head -n1 | cut -d' ' -f2)
+                  [ -n "$v" ] && ver="$v"
+                fi
+                echo "$pkg $ver" >> "$DB.tmp"
+                mv "$DB.tmp" "$DB"
+              done
+              ;;
+            remove|purge)
+              while [ "${1#-}" != "$1" ]; do shift; done
+              for pkg in "$@"; do
+                grep -v "^$pkg " "$DB" > "$DB.tmp" || true
+                mv "$DB.tmp" "$DB"
+              done
+              ;;
+          esac
+
+    - name: stage dpkg-query stub under /tmp
+      write_file:
+        path: /tmp/rsansible-apt-stub/dpkg-query.in
+        mode: 0o755
+        content: |
+          #!/bin/sh
+          DB=/tmp/rsansible-apt-stub/DB
+          [ "$1" = "-W" ] && shift
+          [ "$1" = "-f" ] && shift 2
+          for pkg in "$@"; do
+            ver=$(grep "^$pkg " "$DB" | head -n1 | cut -d' ' -f2)
+            if [ -n "$ver" ]; then
+              echo "$pkg installed $ver"
+            fi
+          done
+
+    - name: install apt-get stub into /usr/local/bin
+      become: true
+      shell: "install -m 0755 /tmp/rsansible-apt-stub/apt-get.in /usr/local/bin/apt-get"
+
+    - name: install dpkg-query stub into /usr/local/bin
+      become: true
+      shell: "install -m 0755 /tmp/rsansible-apt-stub/dpkg-query.in /usr/local/bin/dpkg-query"
+
+    # --- 1. present when missing → changed. ---
+    - name: install nginx (should be changed)
+      apt:
+        name: nginx
+      register: r1
+
+    - name: assert install reported changed
+      assert:
+        that: [r1.changed]
+
+    # --- 2. present when already installed → no-op. ---
+    - name: install nginx again (should be no-op)
+      apt:
+        name: nginx
+      register: r2
+
+    - name: assert second install no-op
+      assert:
+        that: [not r2.changed]
+
+    # --- 3. present batch: nginx installed, curl missing. ---
+    - name: clear log for batch test
+      shell: ": > /tmp/rsansible-apt-stub/log"
+
+    - name: install nginx + curl (curl only)
+      apt:
+        name:
+          - nginx
+          - curl
+      register: r3
+
+    - name: assert batch reported changed
+      assert:
+        that: [r3.changed]
+
+    - name: snapshot batch log
+      shell: cp /tmp/rsansible-apt-stub/log /tmp/rsansible-apt-stub/log.batch
+
+    # --- 4. absent when installed → changed. ---
+    - name: remove curl
+      apt:
+        name: curl
+        state: absent
+      register: r4
+
+    - name: assert remove reported changed
+      assert:
+        that: [r4.changed]
+
+    # --- 5. absent when not installed → no-op. ---
+    - name: remove curl again
+      apt:
+        name: curl
+        state: absent
+      register: r5
+
+    - name: assert second remove no-op
+      assert:
+        that: [not r5.changed]
+
+    # --- 6. latest when version moves. Prep VERSIONS so apt-get
+    #        install bumps nginx to a new version. ---
+    - name: prime new version
+      shell: "echo 'nginx installed-3' > /tmp/rsansible-apt-stub/VERSIONS"
+
+    - name: latest nginx (version moves)
+      apt:
+        name: nginx
+        state: latest
+      register: r6
+
+    - name: assert latest reported changed
+      assert:
+        that: [r6.changed]
+
+    # --- 7. latest when version stable. ---
+    - name: latest nginx again (no version change)
+      apt:
+        name: nginx
+        state: latest
+      register: r7
+
+    - name: assert latest no-op
+      assert:
+        that: [not r7.changed]
+
+    # --- 8. update_cache + install. ---
+    - name: clear log for update-cache test
+      shell: ": > /tmp/rsansible-apt-stub/log"
+
+    - name: install vim with update_cache
+      apt:
+        name: vim
+        update_cache: yes
+      register: r8
+
+    - name: assert install reported changed
+      assert:
+        that: [r8.changed]
+
+    - name: final log snapshot
+      shell: cp /tmp/rsansible-apt-stub/log /tmp/rsansible-apt-stub/log.final

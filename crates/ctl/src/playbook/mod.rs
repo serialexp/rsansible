@@ -22,10 +22,10 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
-    AssertTask, BlockInFileOp, BlockInFileState, CopyOp, ExecOp, FailTask, FileOp, FileState,
-    IncludeRoleSpec, LineInFileOp, LineInFileState, LoopControl, LoopSpec, MetaAction, SetFactMap,
-    ShellOp, StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp, WaitForOp,
-    WaitForState, WriteFileOp,
+    AptOp, AptState, AssertTask, BlockInFileOp, BlockInFileState, CopyOp, ExecOp, FailTask, FileOp,
+    FileState, IncludeRoleSpec, LineInFileOp, LineInFileState, LoopControl, LoopSpec, MetaAction,
+    SetFactMap, ShellOp, StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp,
+    WaitForOp, WaitForState, WriteFileOp,
 };
 pub use validate::validate;
 

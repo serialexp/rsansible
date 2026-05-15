@@ -972,6 +972,128 @@ impl From<OpBlockInFileOutput> for OpBlockInFileInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpAptInput {
+    pub names: Vec<std::string::String>,
+    pub state: u8,
+    pub update_cache: u8,
+    pub cache_valid_time: u32,
+    pub purge: u8,
+    pub autoremove: u8,
+    pub default_release: std::string::String,
+    pub allow_unauthenticated: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAptOutput {
+    pub kind: u8,
+    pub names: Vec<std::string::String>,
+    pub state: u8,
+    pub update_cache: u8,
+    pub cache_valid_time: u32,
+    pub purge: u8,
+    pub autoremove: u8,
+    pub default_release: std::string::String,
+    pub allow_unauthenticated: u8,
+}
+
+pub type OpApt = OpAptOutput;
+
+impl OpAptInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(10);
+        encoder.write_u16_le(self.names.len() as u16);
+        for item in &self.names {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_byte(self.state);
+        encoder.write_byte(self.update_cache);
+        encoder.write_u32_le(self.cache_valid_time);
+        encoder.write_byte(self.purge);
+        encoder.write_byte(self.autoremove);
+        encoder.write_u16_le(self.default_release.len() as u16);
+        let string_bytes: &[u8] = self.default_release.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.allow_unauthenticated);
+        Ok(())
+    }
+
+}
+
+impl OpAptOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 10u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(kind as u64));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let mut names = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            names.push(item);
+        }
+        let state = decoder.read_byte()?;
+        let update_cache = decoder.read_byte()?;
+        let cache_valid_time = decoder.read_u32_le()?;
+        let purge = decoder.read_byte()?;
+        let autoremove = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let default_release = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let allow_unauthenticated = decoder.read_byte()?;
+        Ok(Self {
+            kind,
+            names,
+            state,
+            update_cache,
+            cache_valid_time,
+            purge,
+            autoremove,
+            default_release,
+            allow_unauthenticated,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpAptInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpAptInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpAptOutput> for OpAptInput {
+    fn from(o: OpAptOutput) -> Self {
+        Self {
+            names: o.names,
+            state: o.state,
+            update_cache: o.update_cache,
+            cache_valid_time: o.cache_valid_time,
+            purge: o.purge,
+            autoremove: o.autoremove,
+            default_release: o.default_release,
+            allow_unauthenticated: o.allow_unauthenticated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpSystemdInput {
     pub name: std::string::String,
     pub state: u8,
@@ -1092,6 +1214,7 @@ pub enum Op {
     OpLineInFile(OpLineInFileOutput),
     OpBlockInFile(OpBlockInFileOutput),
     OpSystemd(OpSystemdOutput),
+    OpApt(OpAptOutput),
 }
 
 impl Op {
@@ -1301,6 +1424,27 @@ impl Op {
                 encoder.write_uint8(v.daemon_reload);
                 encoder.write_uint8(v.no_block);
             }
+            Op::OpApt(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.names.len() as u16, Endianness::LittleEndian);
+                for item in &v.names {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint8(v.update_cache);
+                encoder.write_uint32(v.cache_valid_time, Endianness::LittleEndian);
+                encoder.write_uint8(v.purge);
+                encoder.write_uint8(v.autoremove);
+                encoder.write_uint16(v.default_release.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.default_release.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.allow_unauthenticated);
+            }
         }
         Ok(())
     }
@@ -1333,6 +1477,8 @@ impl Op {
             Ok(Op::OpBlockInFile(OpBlockInFileOutput::decode_with_decoder(decoder)?))
         } else if value == 9 {
             Ok(Op::OpSystemd(OpSystemdOutput::decode_with_decoder(decoder)?))
+        } else if value == 10 {
+            Ok(Op::OpApt(OpAptOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(value as u64))
         }

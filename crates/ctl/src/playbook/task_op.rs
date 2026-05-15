@@ -23,8 +23,8 @@
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
     msg::{
-        op_blockinfile, op_exec, op_file, op_gather_facts, op_lineinfile, op_shell, op_stat,
-        op_systemd, op_wait_for, op_write_file,
+        op_apt, op_blockinfile, op_exec, op_file, op_gather_facts, op_lineinfile, op_shell,
+        op_stat, op_systemd, op_wait_for, op_write_file,
     },
     Op,
 };
@@ -191,6 +191,45 @@ pub enum TaskOp {
     /// `systemd:` / `service:` — manage a systemd unit's run-state and
     /// enable-state. Idempotent via `is-active` / `is-enabled` probes.
     Systemd(SystemdOp),
+    /// `apt:` — install/remove/upgrade Debian-family packages. Batched
+    /// (one wire op carries multiple `name`s). Idempotent via
+    /// `dpkg-query`.
+    Apt(AptOp),
+}
+
+/// `apt:` parsed form. Mirrors Ansible's `ansible.builtin.apt` (subset).
+/// `names` is the list of packages — Ansible's `name:` accepts either
+/// a single string or a list; we normalize to a Vec at parse time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AptOp {
+    pub names: Vec<String>,
+    pub state: AptState,
+    pub update_cache: bool,
+    /// Seconds; only meaningful with `update_cache=true`. 0 = always
+    /// update.
+    pub cache_valid_time: u32,
+    pub purge: bool,
+    pub autoremove: bool,
+    /// Empty = unused; maps to `apt-get -t <release>`.
+    pub default_release: String,
+    pub allow_unauthenticated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AptState {
+    Present,
+    Absent,
+    Latest,
+}
+
+impl AptState {
+    pub fn wire_byte(self) -> u8 {
+        match self {
+            AptState::Present => 0,
+            AptState::Absent => 1,
+            AptState::Latest => 2,
+        }
+    }
 }
 
 /// `systemd:` parsed form. Mirrors Ansible's `ansible.builtin.systemd_service`
@@ -803,6 +842,129 @@ impl<'de> Deserialize<'de> for SystemdOp {
     }
 }
 
+/// Hand-written so we can:
+///   - accept `name:` as either string or list (Ansible's wart)
+///   - reject `update_cache: no` + `cache_valid_time: N` (no effect)
+///   - default state to Present (Ansible default)
+impl<'de> Deserialize<'de> for AptOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        // `name:` is required and may be a string or a list of strings.
+        // Ansible also accepts `pkg:` and `package:` as aliases; gothab
+        // only uses `name:` so we keep the surface tight.
+        let names = match map.remove("name") {
+            None => return Err(D::Error::custom("apt: missing required field `name`")),
+            Some(serde_yaml::Value::String(s)) => vec![s],
+            Some(serde_yaml::Value::Sequence(seq)) => {
+                let mut out = Vec::with_capacity(seq.len());
+                for v in seq {
+                    match v {
+                        serde_yaml::Value::String(s) => out.push(s),
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "apt.name list items must be strings, got: {other:?}"
+                            )))
+                        }
+                    }
+                }
+                out
+            }
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "apt.name must be a string or list of strings, got: {other:?}"
+                )))
+            }
+        };
+
+        let state = match map.remove("state") {
+            None => AptState::Present,
+            Some(serde_yaml::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "present" | "installed" => AptState::Present,
+                "absent" | "removed" => AptState::Absent,
+                "latest" => AptState::Latest,
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "apt.state: expected one of [present, installed, absent, removed, latest], got: {other:?}"
+                    )))
+                }
+            },
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "apt.state must be a string, got: {other:?}"
+                )))
+            }
+        };
+
+        let update_cache = take_optional_ansible_bool(&mut map, "update_cache")?.unwrap_or(false);
+        let cache_valid_time = match map.remove("cache_valid_time") {
+            None | Some(serde_yaml::Value::Null) => 0u32,
+            Some(serde_yaml::Value::Number(n)) => n.as_u64().ok_or_else(|| {
+                D::Error::custom(format!(
+                    "apt.cache_valid_time must be a non-negative integer, got: {n}"
+                ))
+            })? as u32,
+            Some(serde_yaml::Value::String(s)) => s.parse::<u32>().map_err(|e| {
+                D::Error::custom(format!("apt.cache_valid_time: invalid int {s:?}: {e}"))
+            })?,
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "apt.cache_valid_time must be a number, got: {other:?}"
+                )))
+            }
+        };
+        let purge = take_optional_ansible_bool(&mut map, "purge")?.unwrap_or(false);
+        let autoremove = take_optional_ansible_bool(&mut map, "autoremove")?.unwrap_or(false);
+        let default_release =
+            take_optional_field_string(&mut map, "default_release")?.unwrap_or_default();
+        let allow_unauthenticated =
+            take_optional_ansible_bool(&mut map, "allow_unauthenticated")?.unwrap_or(false);
+        // Accept and discard `force_apt_get` — we always use apt-get.
+        let _ = map.remove("force_apt_get");
+        // Accept and discard `install_recommends` for now; gothab doesn't
+        // set it. (Ansible's default ON matches apt-get's default ON.)
+        let _ = map.remove("install_recommends");
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "apt: unknown field(s): {unknown:?}; expected one of \
+                 [name, state, update_cache, cache_valid_time, purge, autoremove, default_release, allow_unauthenticated, install_recommends, force_apt_get]"
+            )));
+        }
+
+        if names.is_empty() {
+            return Err(D::Error::custom(
+                "apt.name: must specify at least one package",
+            ));
+        }
+        for n in &names {
+            if n.trim().is_empty() {
+                return Err(D::Error::custom("apt.name: empty package name"));
+            }
+        }
+        if !update_cache && cache_valid_time != 0 {
+            return Err(D::Error::custom(
+                "apt: `cache_valid_time` requires `update_cache: true`",
+            ));
+        }
+
+        Ok(AptOp {
+            names,
+            state,
+            update_cache,
+            cache_valid_time,
+            purge,
+            autoremove,
+            default_release,
+            allow_unauthenticated,
+        })
+    }
+}
+
 /// Hand-written so we can apply Ansible-flavored defaults (marker
 /// template, marker_begin/end, append-default insertion) and enforce
 /// cross-field constraints (insertbefore/insertafter mutual exclusion).
@@ -983,6 +1145,7 @@ const BODY_KEYS: &[&str] = &[
     "blockinfile",
     "systemd",
     "service",
+    "apt",
     "assert",
     "fail",
     "set_fact",
@@ -1169,6 +1332,9 @@ impl<'de> Deserialize<'de> for Task {
             // them as separate modules but for our subset they're the
             // same wrapper; we accept either spelling.
             "systemd" | "service" => TaskBody::Op(TaskOp::Systemd(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "apt" => TaskBody::Op(TaskOp::Apt(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "assert" => TaskBody::Assert(
@@ -1618,6 +1784,16 @@ impl TaskOp {
                 s.masked,
                 s.daemon_reload,
                 s.no_block,
+            )),
+            TaskOp::Apt(a) => Ok(op_apt(
+                a.names.clone(),
+                a.state.wire_byte(),
+                a.update_cache,
+                a.cache_valid_time,
+                a.purge,
+                a.autoremove,
+                a.default_release.clone(),
+                a.allow_unauthenticated,
             )),
         }
     }
@@ -3048,6 +3224,132 @@ systemd:
             format!("{err}").contains("only `system`"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn parses_apt_single_name_default_state() {
+        let t = parse_task(
+            r#"
+name: t
+apt:
+  name: nginx
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Apt(a)) => {
+                assert_eq!(a.names, vec!["nginx".to_string()]);
+                assert_eq!(a.state, AptState::Present);
+                assert!(!a.update_cache);
+                assert!(!a.purge);
+            }
+            _ => panic!("expected Apt"),
+        }
+    }
+
+    #[test]
+    fn parses_apt_name_list_with_state_latest() {
+        let t = parse_task(
+            r#"
+name: t
+apt:
+  name:
+    - nginx
+    - curl
+  state: latest
+  update_cache: yes
+  cache_valid_time: 3600
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Apt(a)) => {
+                assert_eq!(a.names, vec!["nginx".to_string(), "curl".to_string()]);
+                assert_eq!(a.state, AptState::Latest);
+                assert!(a.update_cache);
+                assert_eq!(a.cache_valid_time, 3600);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn apt_rejects_cache_valid_time_without_update_cache() {
+        let yaml = r#"
+name: t
+apt:
+  name: nginx
+  cache_valid_time: 3600
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        assert!(
+            format!("{err}").contains("requires `update_cache: true`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn apt_rejects_unknown_field() {
+        let yaml = r#"
+name: t
+apt:
+  name: nginx
+  bogus: true
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn apt_accepts_installed_and_removed_aliases() {
+        let t = parse_task(
+            r#"
+name: t
+apt:
+  name: nginx
+  state: installed
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Apt(a)) => assert_eq!(a.state, AptState::Present),
+            _ => panic!(),
+        }
+        let t = parse_task(
+            r#"
+name: t
+apt:
+  name: nginx
+  state: removed
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Apt(a)) => assert_eq!(a.state, AptState::Absent),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn apt_to_wire_carries_fields() {
+        let t = TaskOp::Apt(AptOp {
+            names: vec!["nginx".into(), "curl".into()],
+            state: AptState::Latest,
+            update_cache: true,
+            cache_valid_time: 3600,
+            purge: false,
+            autoremove: true,
+            default_release: "bookworm-backports".into(),
+            allow_unauthenticated: false,
+        });
+        let wire = t.to_wire_op().unwrap();
+        let rsansible_wire::generated::Op::OpApt(o) = wire else {
+            panic!("expected OpApt")
+        };
+        assert_eq!(o.names, vec!["nginx".to_string(), "curl".to_string()]);
+        assert_eq!(o.state, 2);
+        assert_eq!(o.update_cache, 1);
+        assert_eq!(o.cache_valid_time, 3600);
+        assert_eq!(o.purge, 0);
+        assert_eq!(o.autoremove, 1);
+        assert_eq!(o.default_release, "bookworm-backports");
+        assert_eq!(o.allow_unauthenticated, 0);
     }
 
     #[test]

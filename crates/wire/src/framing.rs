@@ -315,6 +315,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_apt() {
+        roundtrip(msg::task_dispatch(
+            114,
+            msg::op_apt(
+                vec!["nginx".into(), "curl".into()],
+                msg::apt_state::PRESENT,
+                true,
+                3600,
+                false,
+                true,
+                String::new(),
+                false,
+            ),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            115,
+            msg::op_apt(
+                vec!["openssh-server".into()],
+                msg::apt_state::LATEST,
+                false,
+                0,
+                false,
+                false,
+                "bookworm-backports".into(),
+                true,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,

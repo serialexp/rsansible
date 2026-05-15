@@ -162,6 +162,27 @@
       ],
     },
 
+    OpApt: {
+      description: "`apt-get` wrapper. Maps Ansible's `ansible.builtin.apt` (subset). `names` is the list of package names to manage (one wire op handles a batch). `state` is a uint8: 0=present (install if missing), 1=absent (remove if installed), 2=latest (install + upgrade to latest available). `update_cache=1` runs `apt-get update` first; `cache_valid_time` (seconds) suppresses the update if `/var/cache/apt/pkgcache.bin` mtime is fresher than that (0 = always update when update_cache=1). `purge=1` switches absent's `remove` for `purge`. `autoremove=1` runs `apt-get autoremove -y` after the main op. `default_release` (empty = unused) maps to `-t <release>`. `allow_unauthenticated=1` adds `--allow-unauthenticated`. The agent runs apt-get with `DEBIAN_FRONTEND=noninteractive`. Idempotency: state=present skips packages already installed (`dpkg-query -W`); state=absent skips packages already absent; state=latest probes pre/post versions and reports changed iff anything moved.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 10 },
+        {
+          name: "names",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+        { name: "state", type: "uint8" },
+        { name: "update_cache", type: "uint8" },
+        { name: "cache_valid_time", type: "uint32" },
+        { name: "purge", type: "uint8" },
+        { name: "autoremove", type: "uint8" },
+        { name: "default_release", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "allow_unauthenticated", type: "uint8" },
+      ],
+    },
+
     OpSystemd: {
       description: "systemctl wrapper. Maps Ansible's `ansible.builtin.systemd_service` / `service` (subset). `state` is a uint8: 0=unchanged (only manage enable/mask), 1=started, 2=stopped, 3=restarted, 4=reloaded. `has_enabled=1` means apply `enabled` (0/1); `has_masked=1` means apply `masked` (0/1). `daemon_reload=1` runs `systemctl daemon-reload` before anything else. `no_block=1` passes `--no-block` to start/stop/restart. Order of operations: daemon-reload → mask/unmask → enable/disable → state transition. Idempotency: the agent probes `is-active` and `is-enabled` first and skips no-op transitions; `restarted`/`reloaded` are always reported as changed (matches Ansible).",
       sequence: [
@@ -194,6 +215,7 @@
         { type: "OpLineInFile", when: "value === 7" },
         { type: "OpBlockInFile", when: "value === 8" },
         { type: "OpSystemd", when: "value === 9" },
+        { type: "OpApt", when: "value === 10" },
       ],
     },
 

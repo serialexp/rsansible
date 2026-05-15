@@ -41,9 +41,9 @@ use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp,
-    LoopSpec, MetaAction, OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp, Strategy,
-    SystemdOp, Task, TaskBody, TaskOp, WaitForOp, WriteFileOp,
+    AptOp, AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector,
+    LineInFileOp, LoopSpec, MetaAction, OnFailure, Play, Playbook, SetFactMap, ShellOp, StatOp,
+    Strategy, SystemdOp, Task, TaskBody, TaskOp, WaitForOp, WriteFileOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1891,6 +1891,27 @@ fn render_op(
                 masked: s.masked,
                 daemon_reload: s.daemon_reload,
                 no_block: s.no_block,
+            })
+        }
+        TaskOp::Apt(a) => {
+            let mut names = Vec::with_capacity(a.names.len());
+            for n in &a.names {
+                names.push(render_str(env, n, &view)?);
+            }
+            let default_release = if a.default_release.is_empty() {
+                String::new()
+            } else {
+                render_str(env, &a.default_release, &view)?
+            };
+            TaskOp::Apt(AptOp {
+                names,
+                state: a.state,
+                update_cache: a.update_cache,
+                cache_valid_time: a.cache_valid_time,
+                purge: a.purge,
+                autoremove: a.autoremove,
+                default_release,
+                allow_unauthenticated: a.allow_unauthenticated,
             })
         }
     })

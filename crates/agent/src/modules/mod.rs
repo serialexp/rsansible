@@ -6,6 +6,7 @@ use rsansible_wire::{msg, Op};
 
 use crate::writer::Sender;
 
+mod apt;
 mod blockinfile;
 mod exec;
 mod file;
@@ -49,6 +50,7 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
         Op::OpLineInFile(o) => lineinfile::run(ctx, seq, o).await,
         Op::OpBlockInFile(o) => blockinfile::run(ctx, seq, o).await,
         Op::OpSystemd(o) => systemd::run(ctx, seq, o).await,
+        Op::OpApt(o) => apt::run(ctx, seq, o).await,
     }
 }
 

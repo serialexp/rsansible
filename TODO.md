@@ -349,8 +349,23 @@ new wire framing roundtrip for `OpGatherFacts`.
   → re-start (no-op) → restart (changed) → enable (changed) →
   daemon_reload + start (daemon-reload precedes start in log) → mask
   (changed).
-- [ ] **`OpApt`** — name(s), state (present/absent/latest), update_cache.
-  Wraps apt-get with DEBIAN_FRONTEND=noninteractive. 13 sites.
+- [x] **`OpApt`** — name(s), state (present/absent/latest), update_cache,
+  cache_valid_time, purge, autoremove, default_release,
+  allow_unauthenticated. Wire op kind=10. Batched: one wire op carries
+  the full list of package names; the agent probes each via
+  `dpkg-query -W` and feeds only the missing/present subset to
+  `apt-get install -y` / `apt-get remove -y`. For `state=latest` the
+  agent captures pre- and post-versions to drive accurate `changed`
+  reporting. `update_cache` honors `cache_valid_time` by checking
+  `/var/cache/apt/pkgcache.bin` mtime. apt-get is invoked with
+  `DEBIAN_FRONTEND=noninteractive`. `RSANSIBLE_APT_GET` /
+  `RSANSIBLE_DPKG_QUERY` env overrides power the tests with stubs.
+  YAML accepts `name:` as string or list and `state:` aliases
+  (installed/removed). e2e plants apt-get + dpkg-query stubs on an
+  Alpine container and exercises install (changed) → re-install
+  (no-op) → batch install (only-missing) → remove (changed) → second
+  remove (no-op) → latest with version bump (changed) → latest stable
+  (no-op) → update_cache + install (update precedes install).
 - [ ] **`OpUfw`** — allow/deny/limit + from/to/port/proto + reset/enable.
   14 sites. Wraps `ufw`.
 - [x] **`OpWaitFor`** — port-ready (host + port + timeout) or path-exists.
