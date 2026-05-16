@@ -107,6 +107,39 @@ the error.
 
 ---
 
+## 4. `until:` requires `register:`
+
+| Aspect | Ansible | rsansible |
+|---|---|---|
+| `until: <expr>` without `register:` | Binds an implicit `result` var the expression can reference | Parse error: "`until:` requires `register:` to also be set" |
+
+**Ansible behavior.** Even without `register:`, Ansible exposes the
+task's result envelope under a synthetic name (effectively `result`)
+that the `until:` expression can evaluate against. Authors writing
+`until: result.rc == 0` get the implicit binding "for free."
+
+**Why diverge.** The implicit binding is a magic-name surface that
+makes the `until:` expression's meaning depend on hidden state. In
+real-world usage (verified across the entire gothab playbook tree —
+4 playbooks, 9 `until:` sites) **every single `until:` references a
+named registered variable** — `wait_new_primary.rc`,
+`drill_state.stdout`, `writer_status.finished`, etc. Nobody actually
+relies on the implicit binding.
+
+Requiring `register:` makes the expression self-documenting at
+the call site: the reader can see which variable is being polled
+without having to know rsansible's binding conventions.
+
+**Fix when porting an Ansible playbook.** Add `register: result` (or
+some other name) to the task. The expression continues to work
+unchanged.
+
+**Code:** `crates/ctl/src/playbook/task_op.rs::Task::deserialize`
+— the check happens at parse time, surfacing immediately rather than
+mid-run.
+
+---
+
 ## When you add a new divergence
 
 1. **Document it here first.** Add a `## N. <one-line summary>`

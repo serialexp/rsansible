@@ -687,6 +687,9 @@ fn make_gather_facts_task() -> Task {
         check_mode: Some(false),
         async_seconds: None,
         poll_seconds: None,
+        retries: None,
+        delay: None,
+        until: None,
     }
 }
 
@@ -4226,6 +4229,9 @@ all:
             check_mode: None,
             async_seconds: None,
             poll_seconds: None,
+            retries: None,
+            delay: None,
+            until: None,
         }
     }
 

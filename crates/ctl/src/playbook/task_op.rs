@@ -114,6 +114,24 @@ pub struct Task {
     /// n seconds until the job finishes or the async deadline expires.
     /// `None` defaults to 10 when async is set (matches Ansible).
     pub poll_seconds: Option<u32>,
+    /// `retries: <int|jinja>` — re-run the task up to N times on
+    /// failure or until `until:` is satisfied. Stored as a String to
+    /// support templated values like
+    /// `retries: "{{ (duration_s | int) // 5 }}"`; the runtime
+    /// renders + parses to u32 immediately before the retry loop.
+    /// `None` = no retry semantics. See ANSIBLE_COMPAT.md §4 for the
+    /// `register:`-required rule.
+    pub retries: Option<String>,
+    /// `delay: <int|jinja>` — seconds between retry attempts. Same
+    /// templated-string storage as `retries`. Defaults to 5 seconds
+    /// when retry semantics are active and `delay:` is unset
+    /// (matches Ansible).
+    pub delay: Option<String>,
+    /// `until: <jinja expr>` — boolean expression evaluated against
+    /// the registered task result after each attempt. Truthy stops
+    /// the retry loop. Requires `register:` to also be set; see
+    /// ANSIBLE_COMPAT.md §4.
+    pub until: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2005,6 +2023,9 @@ const METADATA_KEYS: &[&str] = &[
     "check_mode",
     "async",
     "poll",
+    "retries",
+    "delay",
+    "until",
 ];
 
 impl<'de> Deserialize<'de> for Task {
@@ -2099,6 +2120,28 @@ impl<'de> Deserialize<'de> for Task {
         if poll_seconds.is_some() && async_seconds.is_none() {
             return Err(D::Error::custom(format!(
                 "task {name:?}: `poll:` is only meaningful with `async:` set"
+            )));
+        }
+        // retries/delay accept either an integer (most common) or a
+        // Jinja-templated string (e.g. `retries: "{{ (n | int) // 5 }}"`).
+        // Store both as String — the runtime renders + parses to u32.
+        let retries = take_int_or_template_string(&mut map, "retries", &name)?;
+        let delay = take_int_or_template_string(&mut map, "delay", &name)?;
+        let until = take_optional_string(&mut map, "until", &name)?;
+        // until: requires register: (we need the registered envelope
+        // to evaluate the expression against). See ANSIBLE_COMPAT.md §4.
+        if until.is_some() && register.is_none() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `until:` requires `register:` to also be \
+                 set — rsansible doesn't bind an implicit `result` var \
+                 (see ANSIBLE_COMPAT.md §4)"
+            )));
+        }
+        // delay: without retries: is meaningless. Surface it instead of
+        // silently dropping the field, same shape as `poll:` without `async:`.
+        if delay.is_some() && retries.is_none() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `delay:` is only meaningful with `retries:` set"
             )));
         }
         let run_once = match map.remove("run_once") {
@@ -2391,6 +2434,9 @@ impl<'de> Deserialize<'de> for Task {
             check_mode,
             async_seconds,
             poll_seconds,
+            retries,
+            delay,
+            until,
         })
     }
 }
@@ -2451,6 +2497,39 @@ fn take_optional_string<E: serde::de::Error>(
         // `when: 1` style typos early.
         Some(other) => Err(E::custom(format!(
             "task {task_name:?}: `{key}` must be a string, got: {other:?}"
+        ))),
+    }
+}
+
+/// Accept either a non-negative integer or a string (typically a Jinja
+/// expression). Returns `Some(String)` either way — integers are
+/// stringified so the runtime has one type to template-render and parse.
+///
+/// Used by `retries:` and `delay:`, which Ansible accepts as either an
+/// integer literal or a Jinja-templated value:
+///
+/// ```yaml
+/// retries: 5
+/// retries: "{{ (duration_s | int) // 5 }}"
+/// ```
+fn take_int_or_template_string<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    key: &str,
+    task_name: &str,
+) -> Result<Option<String>, E> {
+    match map.remove(key) {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
+        Some(serde_yaml::Value::Number(n)) => {
+            let v = n.as_u64().ok_or_else(|| {
+                E::custom(format!(
+                    "task {task_name:?}: `{key}` must be a non-negative integer or a Jinja string, got: {n:?}"
+                ))
+            })?;
+            Ok(Some(v.to_string()))
+        }
+        Some(other) => Err(E::custom(format!(
+            "task {task_name:?}: `{key}` must be a non-negative integer or a Jinja string, got: {other:?}"
         ))),
     }
 }
@@ -4901,6 +4980,117 @@ mod tests {
         });
         let err = t.to_wire_op().unwrap_err().to_string();
         assert!(err.contains("composite probe"), "got: {err}");
+    }
+
+    // ---------- retries / until / delay parse ----------
+
+    #[test]
+    fn retries_integer_form_parses() {
+        let yaml = r#"
+- name: wait
+  shell: check.sh
+  register: r
+  retries: 5
+  delay: 2
+  until: r.rc == 0
+"#;
+        let tasks: Vec<Task> = serde_yaml::from_str(yaml).unwrap();
+        let t = &tasks[0];
+        assert_eq!(t.retries.as_deref(), Some("5"));
+        assert_eq!(t.delay.as_deref(), Some("2"));
+        assert_eq!(t.until.as_deref(), Some("r.rc == 0"));
+        assert_eq!(t.register.as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn retries_jinja_string_form_parses() {
+        // This is the actual shape gothab's drill playbooks use.
+        let yaml = r#"
+- name: wait
+  shell: check.sh
+  register: writer_status
+  retries: "{{ (writer_duration_s | int) // 5 + 5 }}"
+  delay: "{{ poll_interval }}"
+  until: writer_status.finished
+"#;
+        let tasks: Vec<Task> = serde_yaml::from_str(yaml).unwrap();
+        let t = &tasks[0];
+        assert_eq!(
+            t.retries.as_deref(),
+            Some("{{ (writer_duration_s | int) // 5 + 5 }}")
+        );
+        assert_eq!(t.delay.as_deref(), Some("{{ poll_interval }}"));
+    }
+
+    #[test]
+    fn retries_without_until_is_accepted() {
+        // Ansible allows `retries:` without `until:` — retry on failure.
+        let yaml = r#"
+- name: try
+  shell: flake.sh
+  retries: 3
+"#;
+        let tasks: Vec<Task> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(tasks[0].retries.as_deref(), Some("3"));
+        assert!(tasks[0].until.is_none());
+    }
+
+    #[test]
+    fn until_without_register_errors() {
+        let yaml = r#"
+- name: wait
+  shell: check.sh
+  retries: 3
+  until: result.rc == 0
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("until") && s.contains("register"),
+            "unexpected error: {s}"
+        );
+    }
+
+    #[test]
+    fn delay_without_retries_errors() {
+        let yaml = r#"
+- name: foo
+  shell: echo
+  delay: 5
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("delay") && err.to_string().contains("retries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn retries_bool_rejected() {
+        let yaml = r#"
+- name: x
+  shell: e
+  retries: true
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("retries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn retries_negative_rejected() {
+        let yaml = r#"
+- name: x
+  shell: e
+  retries: -1
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("retries"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

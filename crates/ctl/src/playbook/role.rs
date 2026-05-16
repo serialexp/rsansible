@@ -289,6 +289,9 @@ fn expand_one(
             check_mode: None,
             async_seconds: None,
             poll_seconds: None,
+            retries: None,
+            delay: None,
+            until: None,
         };
         spliced.insert(0, synthetic);
     }
