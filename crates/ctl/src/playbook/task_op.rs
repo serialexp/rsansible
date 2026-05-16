@@ -2851,23 +2851,27 @@ pub struct PostgresqlExtOp {
 /// 1. Strip leading whitespace, `-- line comments`, and `/* block */`
 ///    comments (with nesting; postgres supports nested `/* */`).
 /// 2. Look at the first identifier token.
-/// 3. SELECT, SHOW, EXPLAIN, VALUES, WITH, TABLE → read-only.
+/// 3. SELECT, SHOW, VALUES, TABLE → read-only.
+///    EXPLAIN → read-only unless the option list / leading bareword
+///    options include `ANALYZE` (or `EXECUTE` with non-EXPLAIN payload).
+///    `EXPLAIN ANALYZE` runs the wrapped statement; we treat such a
+///    body as a fresh sub-statement and recurse.
+///    WITH → scan every parenthesised CTE body and the trailing
+///    statement; if any of those contain a mutating keyword token
+///    (INSERT/UPDATE/DELETE/MERGE/TRUNCATE/CREATE/DROP/…) at top level
+///    of their respective sub-expression, the whole WITH is mutating.
 ///    Everything else → mutating.
 ///
 /// When the SQL contains multiple statements separated by semicolons,
 /// classify each; only return true if *every* statement is read-only.
 ///
-/// Pitfalls intentionally accepted:
-/// - `EXPLAIN ANALYZE INSERT ...` is classified read-only (because
-///   `EXPLAIN` is the first keyword), but ANALYZE actually executes the
-///   INSERT. Callers planning a check-mode run of explain-analyze on
-///   destructive DML should set `check_mode: false` explicitly.
-/// - `WITH x AS (DELETE ... RETURNING *) INSERT ...` is classified
-///   read-only by the first keyword but mutates via the CTE. Same
-///   escape hatch.
-///
-/// The heuristic is documented; the operator's responsibility is to
-/// hold the knife by the handle.
+/// Remaining caveats (documented; not blocking):
+/// - The keyword scanner is identifier-aware (skips string literals,
+///   dollar-quoted bodies, and double-quoted identifiers) so column /
+///   table names that happen to spell `insert_ts` etc. don't trip it.
+/// - We don't try to follow `EXECUTE` of a prepared statement; if a
+///   caller uses `EXPLAIN ANALYZE EXECUTE foo`, we treat it as
+///   mutating (conservative).
 pub fn classify_sql_readonly(sql: &str) -> bool {
     let stripped = strip_sql_comments(sql);
     let statements = split_sql_statements(&stripped);
@@ -2875,13 +2879,298 @@ pub fn classify_sql_readonly(sql: &str) -> bool {
         // Empty / whitespace-only query: no mutation possible.
         return true;
     }
-    statements.iter().all(|s| {
-        let first = first_sql_keyword(s);
-        matches!(
-            first.as_deref(),
-            Some("SELECT") | Some("SHOW") | Some("EXPLAIN") | Some("VALUES") | Some("WITH") | Some("TABLE")
-        )
-    })
+    statements.iter().all(|s| classify_one_statement_readonly(s))
+}
+
+/// Decide whether a single, comment-stripped statement is read-only.
+fn classify_one_statement_readonly(stmt: &str) -> bool {
+    match first_sql_keyword(stmt).as_deref() {
+        Some("SELECT") | Some("SHOW") | Some("VALUES") | Some("TABLE") => true,
+        Some("EXPLAIN") => explain_is_readonly(stmt),
+        Some("WITH") => with_is_readonly(stmt),
+        _ => false,
+    }
+}
+
+/// Returns true if the EXPLAIN body executes its inner statement.
+/// `EXPLAIN ANALYZE …` runs the inner; `EXPLAIN (ANALYZE) …` runs it;
+/// `EXPLAIN (ANALYZE false) …` does not. Without ANALYZE the inner is
+/// never executed regardless of what it contains.
+fn explain_is_readonly(stmt: &str) -> bool {
+    if !explain_options_include_analyze(stmt) {
+        return true;
+    }
+    // ANALYZE is on — the wrapped statement runs. Strip the EXPLAIN
+    // header (keyword + options block / bareword options) and classify
+    // whatever's left as its own statement.
+    let inner = strip_explain_header(stmt);
+    classify_one_statement_readonly(inner)
+}
+
+/// Returns true if a `WITH …` statement is read-only — i.e. every CTE
+/// body and the trailing statement use only read verbs.
+fn with_is_readonly(stmt: &str) -> bool {
+    // Conservative: if any mutating keyword token appears anywhere in
+    // the WITH (outside string literals / dollar-quoted bodies /
+    // quoted identifiers), call the whole thing mutating. This catches
+    // both `WITH x AS (DELETE …) SELECT …` and the trailing-DML form
+    // `WITH x AS (SELECT …) DELETE FROM t USING x`.
+    !contains_mutating_keyword_token(stmt)
+}
+
+/// Mutating keywords we recognise as standalone identifiers. Lowercase
+/// inputs are normalised by `next_identifier_token`'s `to_ascii_uppercase`.
+const MUTATING_KEYWORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "CREATE", "DROP", "ALTER", "GRANT",
+    "REVOKE", "CLUSTER", "REINDEX", "VACUUM", "REFRESH", "COPY", "CALL", "EXECUTE", "DO",
+    "LISTEN", "UNLISTEN", "NOTIFY", "LOCK", "PREPARE", "DEALLOCATE", "SET", "RESET",
+    "DISCARD", "SECURITY",
+];
+
+/// True if any identifier token in `s` (skipping string/identifier/dollar
+/// literals) matches one of the mutating keywords.
+fn contains_mutating_keyword_token(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(skip_to) = skip_literal(bytes, i) {
+            i = skip_to;
+            continue;
+        }
+        if let Some((tok, next)) = next_identifier_token(bytes, i) {
+            i = next;
+            if MUTATING_KEYWORDS.iter().any(|k| *k == tok) {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True if the EXPLAIN options preceding the wrapped statement include
+/// `ANALYZE` (legacy bareword) or `ANALYZE [TRUE|ON|1]` inside the
+/// parenthesised options list. `ANALYZE FALSE` etc. don't count.
+fn explain_options_include_analyze(stmt: &str) -> bool {
+    let bytes = stmt.as_bytes();
+    // Skip "EXPLAIN" keyword.
+    let mut i = skip_one_keyword(bytes, 0, "EXPLAIN");
+    i = skip_whitespace(bytes, i);
+    // Parenthesised options form?
+    if bytes.get(i).copied() == Some(b'(') {
+        // Find matching ')'.
+        let end = find_matching_paren(bytes, i).unwrap_or(bytes.len());
+        let opts = &stmt[i + 1..end];
+        return options_block_has_analyze_on(opts);
+    }
+    // Legacy bareword form: scan tokens until we hit something that
+    // isn't ANALYZE/VERBOSE.
+    let mut j = i;
+    while j < bytes.len() {
+        j = skip_whitespace(bytes, j);
+        let Some((tok, next)) = next_identifier_token(bytes, j) else { return false };
+        match tok.as_str() {
+            "ANALYZE" => return true,
+            "VERBOSE" => {
+                j = next;
+                continue;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// True if a comma-separated EXPLAIN options block (e.g.
+/// `ANALYZE, BUFFERS true`) sets ANALYZE to a truthy value (or leaves
+/// it bare — defaults to ON).
+fn options_block_has_analyze_on(opts: &str) -> bool {
+    for opt in opts.split(',') {
+        let mut parts = opt.split_ascii_whitespace();
+        let Some(name) = parts.next() else { continue };
+        if name.eq_ignore_ascii_case("ANALYZE") {
+            // ANALYZE alone is ON; ANALYZE TRUE/ON/1 is ON.
+            match parts.next() {
+                None => return true,
+                Some(v) => {
+                    let v = v.to_ascii_uppercase();
+                    if matches!(v.as_str(), "TRUE" | "ON" | "1") {
+                        return true;
+                    }
+                    if matches!(v.as_str(), "FALSE" | "OFF" | "0") {
+                        return false;
+                    }
+                    // Anything else (e.g. malformed) — conservative ON.
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Strip the `EXPLAIN [(...)] [ANALYZE] [VERBOSE]` header from a
+/// statement; return the remaining wrapped statement. Used when ANALYZE
+/// is on and we need to recurse on the inner statement.
+fn strip_explain_header(stmt: &str) -> &str {
+    let bytes = stmt.as_bytes();
+    let mut i = skip_one_keyword(bytes, 0, "EXPLAIN");
+    i = skip_whitespace(bytes, i);
+    if bytes.get(i).copied() == Some(b'(') {
+        let end = find_matching_paren(bytes, i).unwrap_or(bytes.len());
+        i = end + 1;
+        i = skip_whitespace(bytes, i);
+    } else {
+        // Legacy bareword options.
+        while let Some((tok, next)) = next_identifier_token(bytes, i) {
+            if matches!(tok.as_str(), "ANALYZE" | "VERBOSE") {
+                i = next;
+                i = skip_whitespace(bytes, i);
+            } else {
+                break;
+            }
+        }
+    }
+    &stmt[i..]
+}
+
+/// If the byte at `start` opens a string literal, identifier-literal, or
+/// dollar-quoted body, return the index just past the closing delimiter.
+/// Otherwise None.
+fn skip_literal(bytes: &[u8], start: usize) -> Option<usize> {
+    let b = *bytes.get(start)?;
+    match b {
+        b'\'' => {
+            let mut i = start + 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                if c == b'\'' {
+                    if bytes.get(i).copied() == Some(b'\'') {
+                        i += 1;
+                        continue;
+                    }
+                    return Some(i);
+                }
+            }
+            Some(bytes.len())
+        }
+        b'"' => {
+            let mut i = start + 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                if c == b'"' {
+                    if bytes.get(i).copied() == Some(b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    return Some(i);
+                }
+            }
+            Some(bytes.len())
+        }
+        b'$' => {
+            // Dollar-quoted body: $tag$ ... $tag$. tag may be empty.
+            let mut j = start + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if bytes.get(j).copied() != Some(b'$') {
+                return None;
+            }
+            let tag = &bytes[start + 1..j];
+            let mut needle = Vec::with_capacity(tag.len() + 2);
+            needle.push(b'$');
+            needle.extend_from_slice(tag);
+            needle.push(b'$');
+            let body_start = j + 1;
+            if let Some(off) = find_subslice(&bytes[body_start..], &needle) {
+                Some(body_start + off + needle.len())
+            } else {
+                Some(bytes.len())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Return the next identifier token starting at `start` (skipping
+/// leading whitespace), uppercased, plus the index just past it.
+fn next_identifier_token(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut i = skip_whitespace(bytes, start);
+    let token_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        i += 1;
+    }
+    // Allow trailing digits/underscores once at least one alpha char has
+    // been seen — but to keep keyword matching strict, stop at the first
+    // non-alpha-underscore for now (keywords don't contain digits).
+    if i == token_start {
+        return None;
+    }
+    let tok = std::str::from_utf8(&bytes[token_start..i])
+        .ok()?
+        .to_ascii_uppercase();
+    Some((tok, i))
+}
+
+fn skip_whitespace(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Skip the literal keyword `kw` if it appears at `start` (case
+/// insensitive); otherwise return `start` unchanged.
+fn skip_one_keyword(bytes: &[u8], start: usize, kw: &str) -> usize {
+    let s = skip_whitespace(bytes, start);
+    if s + kw.len() <= bytes.len()
+        && bytes[s..s + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+        && bytes
+            .get(s + kw.len())
+            .map(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            .unwrap_or(true)
+    {
+        s + kw.len()
+    } else {
+        start
+    }
+}
+
+/// Given an index pointing at `(`, find the matching `)`, respecting
+/// nested parens and string/dollar/identifier literals inside.
+fn find_matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 1i32;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if let Some(skip_to) = skip_literal(bytes, i) {
+            i = skip_to;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    (0..=last).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
 /// Strip `-- line` and `/* nested */` comments from a SQL string.
@@ -6244,6 +6533,88 @@ openssl_privatekey:
         assert!(classify_sql_readonly(""));
         assert!(classify_sql_readonly("   \n  \t  "));
         assert!(classify_sql_readonly("-- just a comment\n"));
+    }
+
+    #[test]
+    fn classify_sql_explain_without_analyze_is_readonly() {
+        assert!(classify_sql_readonly("EXPLAIN SELECT 1"));
+        assert!(classify_sql_readonly("EXPLAIN INSERT INTO t VALUES (1)"));
+        assert!(classify_sql_readonly("EXPLAIN VERBOSE INSERT INTO t VALUES (1)"));
+        assert!(classify_sql_readonly("EXPLAIN (VERBOSE, BUFFERS) DELETE FROM t"));
+        assert!(classify_sql_readonly("EXPLAIN (ANALYZE FALSE) DELETE FROM t"));
+        assert!(classify_sql_readonly("EXPLAIN (ANALYZE OFF) DELETE FROM t"));
+    }
+
+    #[test]
+    fn classify_sql_explain_analyze_dml_is_mutating() {
+        // Legacy bareword form.
+        assert!(!classify_sql_readonly("EXPLAIN ANALYZE INSERT INTO t VALUES (1)"));
+        assert!(!classify_sql_readonly("explain analyze delete from t"));
+        assert!(!classify_sql_readonly(
+            "EXPLAIN ANALYZE VERBOSE UPDATE t SET x = 1"
+        ));
+        // Parenthesised options form.
+        assert!(!classify_sql_readonly(
+            "EXPLAIN (ANALYZE) INSERT INTO t VALUES (1)"
+        ));
+        assert!(!classify_sql_readonly(
+            "EXPLAIN (ANALYZE TRUE, BUFFERS) UPDATE t SET x = 1"
+        ));
+        assert!(!classify_sql_readonly(
+            "EXPLAIN (ANALYZE ON) DELETE FROM t"
+        ));
+        assert!(!classify_sql_readonly(
+            "EXPLAIN (BUFFERS, ANALYZE 1) MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 1"
+        ));
+        // ANALYZE wrapping a benign SELECT — still read-only because
+        // the inner statement is read-only.
+        assert!(classify_sql_readonly("EXPLAIN ANALYZE SELECT 1"));
+    }
+
+    #[test]
+    fn classify_sql_with_data_modifying_cte_is_mutating() {
+        assert!(!classify_sql_readonly(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+        ));
+        assert!(!classify_sql_readonly(
+            "WITH i AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM i"
+        ));
+        assert!(!classify_sql_readonly(
+            "WITH u AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM u"
+        ));
+        // Trailing DML form.
+        assert!(!classify_sql_readonly(
+            "WITH x AS (SELECT id FROM s) DELETE FROM t USING x WHERE t.id = x.id"
+        ));
+        // Read-only WITH still passes.
+        assert!(classify_sql_readonly(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
+        // Multiple CTEs: any mutating CTE → mutating.
+        assert!(!classify_sql_readonly(
+            "WITH a AS (SELECT 1), b AS (DELETE FROM t RETURNING *) SELECT * FROM a, b"
+        ));
+    }
+
+    #[test]
+    fn classify_sql_with_literal_keywords_dont_trip() {
+        // Identifier-aware scanner: 'INSERT INTO t' as a string literal
+        // should not flag this WITH as mutating.
+        assert!(classify_sql_readonly(
+            "WITH x AS (SELECT 'INSERT INTO t' AS sql) SELECT * FROM x"
+        ));
+        // Quoted-identifier column called "delete" — still read-only.
+        assert!(classify_sql_readonly(
+            r#"WITH x AS (SELECT "delete" FROM t) SELECT * FROM x"#
+        ));
+        // Column called `update_at` — UPDATE_AT ≠ UPDATE, so not a hit.
+        assert!(classify_sql_readonly(
+            "WITH x AS (SELECT update_at FROM t) SELECT * FROM x"
+        ));
+        // Dollar-quoted body containing DML keyword — skipped.
+        assert!(classify_sql_readonly(
+            "WITH x AS (SELECT $body$DELETE FROM t$body$ AS sql) SELECT * FROM x"
+        ));
     }
 
     // ── postgresql_query parsing ─────────────────────────────────
