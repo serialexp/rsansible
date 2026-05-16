@@ -1,0 +1,145 @@
+# End-to-end exercise of `postgresql_query:` and `postgresql_ext:`
+# (Phase 5).
+#
+# Setup: install postgres inside the container, init a data dir, start
+# the server, create a test database. Then exercise:
+#   1. `postgresql_query:` SELECT (read-only) — register.query_result,
+#      register.rowcount, register.statusmessage.
+#   2. Parameterized SELECT with positional_args.
+#   3. INSERT (mutating) — changed=true.
+#   4. `postgresql_ext:` install pg_trgm (changed=true, version
+#      populated).
+#   5. Idempotent re-run of postgresql_ext (changed=false).
+#
+# All connections use the UNIX socket at /var/run/postgresql (peer auth
+# against the `postgres` OS user — the postgres install creates it).
+# Tasks that need DB privileges run with `become: true, become_user:
+# postgres`.
+
+- name: postgresql demo
+  hosts: all
+  gather_facts: false
+  tasks:
+    # ── install + start postgres (alpine) ──────────────────────────
+    - name: install postgresql packages
+      shell: |
+        set -eux
+        apk add --no-cache postgresql postgresql-contrib sudo >/dev/null
+      become: true
+      become_user: root
+
+    - name: ensure data dir
+      shell: |
+        set -eux
+        mkdir -p /var/lib/postgresql/data /run/postgresql
+        chown -R postgres:postgres /var/lib/postgresql /run/postgresql
+      become: true
+      become_user: root
+
+    - name: initdb if empty
+      shell: |
+        set -eux
+        if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+          su - postgres -c "initdb -D /var/lib/postgresql/data --auth-local=trust --auth-host=trust"
+        fi
+      become: true
+      become_user: root
+
+    - name: configure unix socket
+      shell: |
+        set -eux
+        # Default unix_socket_directories is /run/postgresql on alpine.
+        printf "listen_addresses = ''\nunix_socket_directories = '/run/postgresql'\n" \
+          >> /var/lib/postgresql/data/postgresql.conf
+      become: true
+      become_user: root
+
+    - name: start postgres
+      shell: |
+        set -eux
+        # Already running? Detect via pid file. Otherwise start in background.
+        if ! pgrep -f "postgres -D" >/dev/null; then
+          su - postgres -c "pg_ctl -D /var/lib/postgresql/data -l /tmp/pg.log -w start"
+        fi
+      become: true
+      become_user: root
+
+    - name: wait for socket
+      wait_for:
+        path: /run/postgresql/.s.PGSQL.5432
+        timeout: 15
+
+    - name: create testdb
+      shell: |
+        set -eux
+        su - postgres -c "psql -c \"SELECT 1 FROM pg_database WHERE datname='testdb'\" -tA | grep -q 1 || createdb testdb"
+      become: true
+      become_user: root
+
+    # ── 1. SELECT (read-only) ──────────────────────────────────────
+    - name: select numeric expression
+      postgresql_query:
+        query: "SELECT 42 AS answer, 'hello'::text AS greeting"
+        db: testdb
+        login_unix_socket: /run/postgresql
+      register: r_select
+      become: true
+      become_user: postgres
+
+    - name: record select findings
+      shell: "printf '%s\\n%s\\n%s\\n%s\\n' '{{ r_select.rowcount }}' '{{ r_select.query_result[0].answer }}' '{{ r_select.query_result[0].greeting }}' '{{ r_select.changed }}' > /tmp/rsansible-pg-select"
+
+    # ── 2. parameterized SELECT ────────────────────────────────────
+    - name: parameterized lookup
+      postgresql_query:
+        query: "SELECT $1::int * 2 AS doubled"
+        positional_args:
+          - "21"
+        db: testdb
+        login_unix_socket: /run/postgresql
+      register: r_param
+      become: true
+      become_user: postgres
+
+    - name: record param findings
+      shell: "printf '%s\\n' '{{ r_param.query_result[0].doubled }}' > /tmp/rsansible-pg-param"
+
+    # ── 3. mutating SQL (changed=true) ─────────────────────────────
+    - name: create + insert
+      postgresql_query:
+        query: "CREATE TABLE IF NOT EXISTS items(id serial primary key, name text); INSERT INTO items(name) VALUES ('alice'), ('bob')"
+        db: testdb
+        login_unix_socket: /run/postgresql
+        autocommit: yes
+      register: r_insert
+      become: true
+      become_user: postgres
+
+    - name: record insert findings
+      shell: "printf '%s\\n' '{{ r_insert.changed }}' > /tmp/rsansible-pg-insert"
+
+    # ── 4. extension install ───────────────────────────────────────
+    - name: install pg_trgm extension
+      postgresql_ext:
+        name: pg_trgm
+        db: testdb
+        login_unix_socket: /run/postgresql
+      register: r_ext1
+      become: true
+      become_user: postgres
+
+    - name: record ext1 findings
+      shell: "printf '%s\\n%s\\n' '{{ r_ext1.changed }}' '{{ r_ext1.extension }}' > /tmp/rsansible-pg-ext1"
+
+    # ── 5. idempotent re-run ───────────────────────────────────────
+    - name: install pg_trgm again
+      postgresql_ext:
+        name: pg_trgm
+        db: testdb
+        login_unix_socket: /run/postgresql
+      register: r_ext2
+      become: true
+      become_user: postgres
+
+    - name: record ext2 findings
+      shell: "printf '%s\\n' '{{ r_ext2.changed }}' > /tmp/rsansible-pg-ext2"

@@ -48,10 +48,14 @@ templated systemd units, CA cert distribution).
 
 **Estimated:** ~1500 LoC.
 
-- [ ] **`OpPostgresql`** — query and extension management
-  - 11 `postgresql_query` + 3 `postgresql_ext` sites in gothab.
-  - `tokio-postgres` over UNIX socket (Patroni clusters listen there).
-  - Returns rows as JSON-ish for `register:` consumption.
+- [x] **`OpPostgresqlQuery` + `OpPostgresqlExt`** — query + extension management. Shipped:
+  - Two wire ops (kinds 13, 14). `OpPostgresqlQuery` carries a controller-classified `read_only` byte; `OpPostgresqlExt` carries name/state/version/schema/cascade.
+  - Agent uses `tokio-postgres` over UNIX socket (Patroni / peer auth) or TCP. Pure Rust, musl-safe. `simple_query` for the no-args case (text values, real `statusmessage`); typed `query` path for parameterised SQL (common pg oids + String fallback).
+  - SQL classifier on the controller (`classify_sql_readonly`) strips comments, splits on unquoted semicolons, and peeks the first keyword: SELECT/SHOW/EXPLAIN/VALUES/WITH/TABLE → read-only; everything else → mutating. Re-runs post-Jinja in case the rendered SQL differs from the literal source.
+  - `--check` skip: mutating SQL is dropped on the controller (no dispatch) and a skipped register is synthesised; `postgresql_ext` still dispatches (the agent's probe-first idempotency is read-only by construction). Per-task `check_mode: false` overrides.
+  - Register lifting matches Ansible: `register.query_result[0].col`, `register.rowcount`, `register.statusmessage`; for ext, `register.extension`, `register.state`, `register.prior_version`, `register.version`.
+  - v1 caveats: version updates (`ALTER EXTENSION ... UPDATE TO`) aren't implemented; if the extension is already present with a different version, we report `changed=false` and surface `prior_version`. No `named_args` (Ansible's `%(name)s` style) — positional only. SQL classifier is heuristic: `EXPLAIN ANALYZE INSERT ...` and `WITH cte AS (DELETE ...) SELECT ...` are classified read-only by their first keyword.
+  - E2E: `crates/ctl/tests/postgresql_e2e.rs` (`#[ignore]`-gated) installs postgres in the sshd container and runs `examples/postgresql.yaml` end-to-end (SELECT + parameterised + INSERT + ext install + idempotent re-run).
 - [x] **`openssl_privatekey` / `openssl_csr_pipe` / `x509_certificate_pipe`**
   - Shipped in the TLS chunk (commits `d6a38a9` + `2a49eee`).
   - Controller-side via rcgen + aws_lc_rs; agent unchanged for
@@ -116,7 +120,7 @@ Vault).
 | 2 | ~800  | +1 op (`OpGatherFacts`) | site.yml first play | ✅ done |
 | 3 | ~1200 | +6 ops | site.yml `common` role | ✅ done |
 | 4 | ~600  | +1 op (`OpUri`); templates rendered controller-side | site.yml etcd role | ✅ done |
-| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | partial — x509 ✅, postgresql + async open |
+| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | partial — x509 ✅, postgresql ✅, async open |
 | **total** | **~5600 LoC** | **+11 ops** | full gothab | |
 
 For reference, v0 today is roughly 2000 LoC across all crates. So

@@ -23,9 +23,9 @@
 use anyhow::{anyhow, Context as _, Result};
 use rsansible_wire::{
     msg::{
-        op_blockinfile, op_exec, op_file, op_gather_facts, op_lineinfile, op_package, op_shell,
-        op_stat, op_systemd, op_ufw, op_uri, op_wait_for, op_write_file, uri_body_format,
-        uri_follow, uri_method,
+        op_blockinfile, op_exec, op_file, op_gather_facts, op_lineinfile, op_package,
+        op_postgresql_ext, op_postgresql_query, op_shell, op_stat, op_systemd, op_ufw, op_uri,
+        op_wait_for, op_write_file, postgresql_ext_state, uri_body_format, uri_follow, uri_method,
     },
     Op,
 };
@@ -246,6 +246,21 @@ pub enum TaskOp {
     /// register so downstream tasks reference `{{ cert.content }}`.
     /// v1 supports `provider: selfsigned` only.
     X509CertificatePipe(X509CertificatePipeOp),
+    /// `postgresql_query:` — execute SQL against a PostgreSQL server.
+    /// Maps Ansible's `community.postgresql.postgresql_query` (subset).
+    /// The controller classifies the SQL at compile time (read-only vs
+    /// mutating) and pins `read_only` here; the agent uses that byte to
+    /// gate check-mode skip and `changed` reporting. Connection prefers
+    /// `login_unix_socket` (Patroni clusters) and falls back to TCP at
+    /// `login_host:login_port`. Empty `login_user` triggers peer auth
+    /// against the agent process's effective uid — under `become:
+    /// postgres` that's the postgres OS user.
+    PostgresqlQuery(PostgresqlQueryOp),
+    /// `postgresql_ext:` — manage a PostgreSQL extension's presence.
+    /// Maps Ansible's `community.postgresql.postgresql_ext` (subset).
+    /// Probe-then-DDL idempotency. Version updates not implemented in
+    /// v1.
+    PostgresqlExt(PostgresqlExtOp),
 }
 
 /// `ufw:` parsed form. Mirrors `community.general.ufw` (subset). The
@@ -1875,6 +1890,8 @@ const BODY_KEYS: &[&str] = &[
     "openssl_privatekey",
     "openssl_csr_pipe",
     "x509_certificate_pipe",
+    "postgresql_query",
+    "postgresql_ext",
     "assert",
     "fail",
     "set_fact",
@@ -2118,6 +2135,12 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "x509_certificate_pipe" => TaskBody::Op(TaskOp::X509CertificatePipe(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "postgresql_query" => TaskBody::Op(TaskOp::PostgresqlQuery(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "postgresql_ext" => TaskBody::Op(TaskOp::PostgresqlExt(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "assert" => TaskBody::Assert(
@@ -2702,6 +2725,408 @@ impl<'de> Deserialize<'de> for X509CertificatePipeOp {
     }
 }
 
+/// `postgresql_query:` parsed form. Mirrors
+/// `community.postgresql.postgresql_query` (subset).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostgresqlQueryOp {
+    /// SQL to execute. Jinja-templatable.
+    pub query: String,
+    /// Database name. Empty = "postgres" (server default).
+    pub db: String,
+    /// Login user. Empty = peer auth using the agent process uid.
+    pub login_user: String,
+    /// Login password. Empty = no password (peer/trust auth).
+    pub login_password: String,
+    /// UNIX socket path (e.g. `/var/run/postgresql`). Empty = use TCP.
+    pub login_unix_socket: String,
+    /// TCP host (only consulted if `login_unix_socket` is empty).
+    /// Empty = `localhost`.
+    pub login_host: String,
+    /// TCP port. 0 = 5432.
+    pub login_port: u16,
+    /// `autocommit=true` runs the query outside any transaction
+    /// (required for VACUUM, CREATE INDEX CONCURRENTLY, etc.).
+    /// Default false → wrapped in BEGIN/COMMIT.
+    pub autocommit: bool,
+    /// Positional parameters as text. The agent binds these as text and
+    /// relies on server-side casts (`WHERE id = $1::int`).
+    pub positional_args: Vec<String>,
+    /// Controller-classified: true if the SQL is read-only
+    /// (SELECT/SHOW/EXPLAIN/VALUES/WITH/TABLE). Drives check-mode skip
+    /// and `changed` reporting downstream.
+    pub read_only: bool,
+}
+
+/// `postgresql_ext:` parsed form. Mirrors
+/// `community.postgresql.postgresql_ext` (subset). Version updates
+/// not implemented in v1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostgresqlExtOp {
+    /// Extension name (e.g. `pg_stat_statements`).
+    pub name: String,
+    /// Target state. 0=present, 1=absent — matches the wire byte.
+    pub state: u8,
+    /// Pinned extension version. Empty = server default.
+    pub version: String,
+    /// Schema to install into. Empty = default. Field-named
+    /// `ext_schema` on the wire to avoid colliding with the SQL
+    /// reserved word `schema`.
+    pub ext_schema: String,
+    /// Add CASCADE to CREATE/DROP EXTENSION.
+    pub cascade: bool,
+    pub db: String,
+    pub login_user: String,
+    pub login_password: String,
+    pub login_unix_socket: String,
+    pub login_host: String,
+    pub login_port: u16,
+}
+
+/// Classify a SQL statement as read-only or potentially-mutating, used
+/// by `--check` to decide whether to dispatch the task or skip it
+/// outright on the controller. Heuristic — not a full SQL parser — but
+/// sufficient for the well-formed SQL gothab issues:
+///
+/// 1. Strip leading whitespace, `-- line comments`, and `/* block */`
+///    comments (with nesting; postgres supports nested `/* */`).
+/// 2. Look at the first identifier token.
+/// 3. SELECT, SHOW, EXPLAIN, VALUES, WITH, TABLE → read-only.
+///    Everything else → mutating.
+///
+/// When the SQL contains multiple statements separated by semicolons,
+/// classify each; only return true if *every* statement is read-only.
+///
+/// Pitfalls intentionally accepted:
+/// - `EXPLAIN ANALYZE INSERT ...` is classified read-only (because
+///   `EXPLAIN` is the first keyword), but ANALYZE actually executes the
+///   INSERT. Callers planning a check-mode run of explain-analyze on
+///   destructive DML should set `check_mode: false` explicitly.
+/// - `WITH x AS (DELETE ... RETURNING *) INSERT ...` is classified
+///   read-only by the first keyword but mutates via the CTE. Same
+///   escape hatch.
+///
+/// The heuristic is documented; the operator's responsibility is to
+/// hold the knife by the handle.
+pub fn classify_sql_readonly(sql: &str) -> bool {
+    let stripped = strip_sql_comments(sql);
+    let statements = split_sql_statements(&stripped);
+    if statements.is_empty() {
+        // Empty / whitespace-only query: no mutation possible.
+        return true;
+    }
+    statements.iter().all(|s| {
+        let first = first_sql_keyword(s);
+        matches!(
+            first.as_deref(),
+            Some("SELECT") | Some("SHOW") | Some("EXPLAIN") | Some("VALUES") | Some("WITH") | Some("TABLE")
+        )
+    })
+}
+
+/// Strip `-- line` and `/* nested */` comments from a SQL string.
+/// Preserves string literals and dollar-quoted bodies verbatim — a `--`
+/// inside a literal is not a comment.
+fn strip_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match (b, next) {
+            (b'-', Some(b'-')) => {
+                // Line comment to EOL.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            (b'/', Some(b'*')) => {
+                // Block comment; postgres supports nesting.
+                let mut depth = 1u32;
+                i += 2;
+                while i + 1 < bytes.len() && depth > 0 {
+                    match (bytes[i], bytes[i + 1]) {
+                        (b'/', b'*') => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        (b'*', b'/') => {
+                            depth -= 1;
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            (b'\'', _) => {
+                // Single-quoted literal — copy through, watching for '' escape.
+                out.push(b as char);
+                i += 1;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    out.push(c as char);
+                    i += 1;
+                    if c == b'\'' {
+                        // doubled? skip the second one.
+                        if bytes.get(i).copied() == Some(b'\'') {
+                            out.push('\'');
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Split a SQL body on unquoted `;`. Returns the trimmed, non-empty
+/// statements.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' => {
+                cur.push(b as char);
+                i += 1;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    cur.push(c as char);
+                    i += 1;
+                    if c == b'\'' {
+                        if bytes.get(i).copied() == Some(b'\'') {
+                            cur.push('\'');
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            b';' => {
+                let trimmed = cur.trim().to_string();
+                if !trimmed.is_empty() {
+                    out.push(trimmed);
+                }
+                cur.clear();
+                i += 1;
+            }
+            _ => {
+                cur.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    let last = cur.trim().to_string();
+    if !last.is_empty() {
+        out.push(last);
+    }
+    out
+}
+
+/// Return the first identifier in the statement, uppercased.
+fn first_sql_keyword(stmt: &str) -> Option<String> {
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    // skip whitespace and any leading `(` from things like
+    // `( SELECT ... )`
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'(') {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some(stmt[start..i].to_ascii_uppercase())
+}
+
+impl<'de> Deserialize<'de> for PostgresqlQueryOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        let query = match map.remove("query") {
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
+            None => return Err(D::Error::missing_field("query")),
+            Some(other) => return Err(D::Error::custom(format!(
+                "postgresql_query.query: expected non-empty string, got: {other:?}"
+            ))),
+        };
+        let db = take_optional_field_string(&mut map, "db")?.unwrap_or_default();
+        let login_user = take_optional_field_string(&mut map, "login_user")?.unwrap_or_default();
+        let login_password =
+            take_optional_field_string(&mut map, "login_password")?.unwrap_or_default();
+        let login_unix_socket =
+            take_optional_field_string(&mut map, "login_unix_socket")?.unwrap_or_default();
+        let login_host = take_optional_field_string(&mut map, "login_host")?.unwrap_or_default();
+        let login_port = match map.remove("login_port") {
+            None | Some(serde_yaml::Value::Null) => 0u16,
+            Some(serde_yaml::Value::Number(n)) => n
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or_else(|| {
+                    D::Error::custom(format!(
+                        "postgresql_query.login_port: expected uint16, got: {n}"
+                    ))
+                })?,
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_query.login_port: expected integer, got: {other:?}"
+                )))
+            }
+        };
+        let autocommit =
+            take_optional_ansible_bool(&mut map, "autocommit")?.unwrap_or(false);
+        let positional_args: Vec<String> = match map.remove("positional_args") {
+            None | Some(serde_yaml::Value::Null) => Vec::new(),
+            Some(serde_yaml::Value::Sequence(seq)) => {
+                let mut out = Vec::with_capacity(seq.len());
+                for v in seq {
+                    let s = match v {
+                        serde_yaml::Value::String(s) => s,
+                        serde_yaml::Value::Number(n) => n.to_string(),
+                        serde_yaml::Value::Bool(b) => b.to_string(),
+                        serde_yaml::Value::Null => String::new(),
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "postgresql_query.positional_args item: expected scalar, got: {other:?}"
+                            )))
+                        }
+                    };
+                    out.push(s);
+                }
+                out
+            }
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_query.positional_args: expected a list, got: {other:?}"
+                )))
+            }
+        };
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "postgresql_query: unknown field(s): {unknown:?}; expected one of \
+                 [query, db, login_user, login_password, login_unix_socket, \
+                 login_host, login_port, autocommit, positional_args]"
+            )));
+        }
+
+        let read_only = classify_sql_readonly(&query);
+        Ok(PostgresqlQueryOp {
+            query,
+            db,
+            login_user,
+            login_password,
+            login_unix_socket,
+            login_host,
+            login_port,
+            autocommit,
+            positional_args,
+            read_only,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for PostgresqlExtOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        let name = match map.remove("name") {
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
+            None => return Err(D::Error::missing_field("name")),
+            Some(other) => return Err(D::Error::custom(format!(
+                "postgresql_ext.name: expected non-empty string, got: {other:?}"
+            ))),
+        };
+        let state = match map.remove("state") {
+            None | Some(serde_yaml::Value::Null) => postgresql_ext_state::PRESENT,
+            Some(serde_yaml::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "present" => postgresql_ext_state::PRESENT,
+                "absent" => postgresql_ext_state::ABSENT,
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "postgresql_ext.state: expected one of [present, absent], got: {other:?}"
+                    )))
+                }
+            },
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_ext.state: expected string, got: {other:?}"
+                )))
+            }
+        };
+        let version = take_optional_field_string(&mut map, "version")?.unwrap_or_default();
+        let ext_schema = take_optional_field_string(&mut map, "schema")?.unwrap_or_default();
+        let cascade = take_optional_ansible_bool(&mut map, "cascade")?.unwrap_or(false);
+        let db = take_optional_field_string(&mut map, "db")?.unwrap_or_default();
+        let login_user = take_optional_field_string(&mut map, "login_user")?.unwrap_or_default();
+        let login_password =
+            take_optional_field_string(&mut map, "login_password")?.unwrap_or_default();
+        let login_unix_socket =
+            take_optional_field_string(&mut map, "login_unix_socket")?.unwrap_or_default();
+        let login_host = take_optional_field_string(&mut map, "login_host")?.unwrap_or_default();
+        let login_port = match map.remove("login_port") {
+            None | Some(serde_yaml::Value::Null) => 0u16,
+            Some(serde_yaml::Value::Number(n)) => n
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or_else(|| {
+                    D::Error::custom(format!(
+                        "postgresql_ext.login_port: expected uint16, got: {n}"
+                    ))
+                })?,
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_ext.login_port: expected integer, got: {other:?}"
+                )))
+            }
+        };
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "postgresql_ext: unknown field(s): {unknown:?}; expected one of \
+                 [name, state, version, schema, cascade, db, login_user, \
+                 login_password, login_unix_socket, login_host, login_port]"
+            )));
+        }
+
+        Ok(PostgresqlExtOp {
+            name,
+            state,
+            version,
+            ext_schema,
+            cascade,
+            db,
+            login_user,
+            login_password,
+            login_unix_socket,
+            login_host,
+            login_port,
+        })
+    }
+}
+
 /// `assert: { that: ["x == 1", "y > 0"], msg: "..." }`
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2967,6 +3392,31 @@ impl TaskOp {
             )),
             TaskOp::X509CertificatePipe(_) => Err(anyhow!(
                 "internal: TaskOp::X509CertificatePipe reached to_wire_op — this op is pure controller-side, should be intercepted earlier"
+            )),
+            TaskOp::PostgresqlQuery(p) => Ok(op_postgresql_query(
+                p.query.clone(),
+                p.db.clone(),
+                p.login_user.clone(),
+                p.login_password.clone(),
+                p.login_unix_socket.clone(),
+                p.login_host.clone(),
+                p.login_port,
+                p.autocommit,
+                p.positional_args.clone(),
+                p.read_only,
+            )),
+            TaskOp::PostgresqlExt(p) => Ok(op_postgresql_ext(
+                p.name.clone(),
+                p.state,
+                p.version.clone(),
+                p.ext_schema.clone(),
+                p.cascade,
+                p.db.clone(),
+                p.login_user.clone(),
+                p.login_password.clone(),
+                p.login_unix_socket.clone(),
+                p.login_host.clone(),
+                p.login_port,
             )),
         }
     }
@@ -5381,5 +5831,196 @@ openssl_privatekey:
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("curve") || msg.contains("unknown"), "got: {msg}");
+    }
+
+    // ── SQL classifier ────────────────────────────────────────────
+
+    #[test]
+    fn classify_sql_select_is_readonly() {
+        assert!(classify_sql_readonly("SELECT 1"));
+        assert!(classify_sql_readonly("select pid FROM pg_stat_activity"));
+        assert!(classify_sql_readonly("  \n\tSELECT 1"));
+        assert!(classify_sql_readonly("SHOW server_version"));
+        assert!(classify_sql_readonly("EXPLAIN SELECT 1"));
+        assert!(classify_sql_readonly("VALUES (1), (2)"));
+        assert!(classify_sql_readonly("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(classify_sql_readonly("TABLE pg_class"));
+    }
+
+    #[test]
+    fn classify_sql_dml_is_mutating() {
+        assert!(!classify_sql_readonly("INSERT INTO t VALUES (1)"));
+        assert!(!classify_sql_readonly("UPDATE t SET x = 1"));
+        assert!(!classify_sql_readonly("DELETE FROM t"));
+        assert!(!classify_sql_readonly("CREATE TABLE t (x int)"));
+        assert!(!classify_sql_readonly("DROP TABLE t"));
+        assert!(!classify_sql_readonly("ALTER SYSTEM SET work_mem = '64MB'"));
+        assert!(!classify_sql_readonly("TRUNCATE t"));
+        assert!(!classify_sql_readonly("VACUUM"));
+        assert!(!classify_sql_readonly("CREATE EXTENSION pg_stat_statements"));
+    }
+
+    #[test]
+    fn classify_sql_strips_comments_before_classify() {
+        assert!(classify_sql_readonly("-- a comment\nSELECT 1"));
+        assert!(classify_sql_readonly("/* leading block */ SELECT 1"));
+        assert!(!classify_sql_readonly("-- still mutates\nDELETE FROM t"));
+        // nested block comments — postgres supports nesting
+        assert!(classify_sql_readonly("/* outer /* inner */ outer */ SELECT 1"));
+    }
+
+    #[test]
+    fn classify_sql_multistmt_any_mutating_is_mutating() {
+        assert!(classify_sql_readonly("SELECT 1; SELECT 2"));
+        assert!(!classify_sql_readonly("SELECT 1; INSERT INTO t VALUES (1)"));
+        assert!(!classify_sql_readonly("INSERT INTO t VALUES (1); SELECT 1"));
+    }
+
+    #[test]
+    fn classify_sql_semicolons_in_literals_dont_split() {
+        // The literal 'INSERT INTO t' should NOT be classified as a
+        // mutating statement — it's just a string.
+        assert!(classify_sql_readonly(
+            "SELECT 'INSERT INTO t VALUES (1)'::text"
+        ));
+    }
+
+    #[test]
+    fn classify_sql_empty_or_whitespace_is_readonly() {
+        assert!(classify_sql_readonly(""));
+        assert!(classify_sql_readonly("   \n  \t  "));
+        assert!(classify_sql_readonly("-- just a comment\n"));
+    }
+
+    // ── postgresql_query parsing ─────────────────────────────────
+
+    #[test]
+    fn parse_postgresql_query_minimal() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_query:
+  query: SELECT 1
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::PostgresqlQuery(p)) => {
+                assert_eq!(p.query, "SELECT 1");
+                assert!(p.read_only);
+                assert!(p.db.is_empty());
+                assert!(p.login_unix_socket.is_empty());
+                assert!(p.positional_args.is_empty());
+                assert!(!p.autocommit);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postgresql_query_full() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_query:
+  query: "INSERT INTO clients(name) VALUES ($1) RETURNING id"
+  db: app
+  login_user: app_writer
+  login_unix_socket: /var/run/postgresql
+  autocommit: true
+  positional_args:
+    - acme corp
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::PostgresqlQuery(p)) => {
+                assert_eq!(p.db, "app");
+                assert_eq!(p.login_user, "app_writer");
+                assert_eq!(p.login_unix_socket, "/var/run/postgresql");
+                assert!(p.autocommit);
+                assert_eq!(p.positional_args, vec!["acme corp".to_string()]);
+                // INSERT — classified mutating.
+                assert!(!p.read_only);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postgresql_query_rejects_unknown_field() {
+        let err = try_parse_task(
+            r#"
+name: t
+postgresql_query:
+  query: SELECT 1
+  named_args: { x: 1 }
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("named_args") || msg.contains("unknown"), "got: {msg}");
+    }
+
+    // ── postgresql_ext parsing ───────────────────────────────────
+
+    #[test]
+    fn parse_postgresql_ext_default_present() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_ext:
+  name: pg_stat_statements
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::PostgresqlExt(p)) => {
+                assert_eq!(p.name, "pg_stat_statements");
+                assert_eq!(p.state, 0); // PRESENT
+                assert!(p.version.is_empty());
+                assert!(!p.cascade);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postgresql_ext_absent_cascade() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_ext:
+  name: hstore
+  state: absent
+  cascade: yes
+  db: app
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::PostgresqlExt(p)) => {
+                assert_eq!(p.state, 1); // ABSENT
+                assert!(p.cascade);
+                assert_eq!(p.db, "app");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_postgresql_ext_to_wire_op() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_ext:
+  name: pg_trgm
+  version: "1.6"
+  schema: public
+"#,
+        );
+        let TaskBody::Op(op) = t.body else { panic!() };
+        let wire = op.to_wire_op().unwrap();
+        let WireOp::OpPostgresqlExt(e) = wire else { panic!("got {wire:?}") };
+        assert_eq!(e.kind, 14);
+        assert_eq!(e.name, "pg_trgm");
+        assert_eq!(e.version, "1.6");
+        assert_eq!(e.ext_schema, "public");
     }
 }

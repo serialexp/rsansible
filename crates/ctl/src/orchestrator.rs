@@ -43,8 +43,9 @@ use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp,
     LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp, Play,
-    Playbook, SetFactMap, ShellOp, StatOp, Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp,
-    UriOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
+    Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, StatOp, Strategy,
+    SystemdOp, Task, TaskBody, TaskOp, UfwOp, UriOp, WaitForOp, WriteFileOp,
+    X509CertificatePipeOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1666,6 +1667,35 @@ async fn run_op_body(
             };
         }
     };
+
+    // Controller-side --check skip for mutating `postgresql_query:`.
+    // The SQL classifier (re-)ran during render so the read_only flag
+    // reflects the post-Jinja statement. We DON'T dispatch a mutating
+    // SQL statement under check_mode — there's no agent-side probe that
+    // could tell "would this DELETE delete anything" without actually
+    // running it. The escape hatch is per-task `check_mode: false`.
+    {
+        let effective_check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+        if effective_check_mode {
+            if let TaskOp::PostgresqlQuery(p) = &rendered {
+                if !p.read_only {
+                    let mut rv = RegisterValue::default();
+                    rv.took_ms = 0;
+                    rv.skipped = true;
+                    rv.changed = false;
+                    return BodyResult::Ok {
+                        register: rv,
+                        changed: false,
+                        skipped: true,
+                    };
+                }
+            }
+            // postgresql_ext under check_mode: keep dispatching — the
+            // agent probes pg_extension and emits skipped=true itself
+            // if DDL would be needed. That probe is read-only.
+        }
+    }
+
     // Composite-dispatch intercepts. These three ops break the
     // single-op-per-task invariant of the normal path:
     //
@@ -1765,6 +1795,15 @@ async fn run_op_body(
             // rather than the envelope itself.
             if let TaskOp::Uri(_) = op {
                 lift_uri_envelope(&mut rv);
+            }
+            // `postgresql_query:` / `postgresql_ext:` ship JSON
+            // envelopes whose top-level keys (query_result/rowcount/
+            // statusmessage; extension/state/prior_version/version)
+            // belong directly under `register.*` so existing Ansible
+            // playbook accessors like `{{ result.query_result[0].col }}`
+            // work unchanged.
+            if matches!(op, TaskOp::PostgresqlQuery(_) | TaskOp::PostgresqlExt(_)) {
+                lift_postgresql_envelope(&mut rv);
             }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
@@ -2342,6 +2381,42 @@ fn looks_jsonish(s: &str) -> bool {
 /// orchestrator runs the error branch, not this one). The set of
 /// shadow-protected keys is the public RegisterValue field set so a
 /// pathological response body can't override `changed`, `rc`, etc.
+/// Lift a `postgresql_query:` / `postgresql_ext:` JSON envelope into
+/// the register's top-level keys, matching Ansible's
+/// `community.postgresql.postgresql_query` contract:
+///
+/// * `register.query_result[0].col_name` — list of row dicts
+/// * `register.rowcount` — affected/returned row count
+/// * `register.statusmessage` — the PostgreSQL command tag
+///
+/// For `postgresql_ext:` the envelope keys are `extension`, `state`,
+/// `prior_version`, `version`; same lift mechanism, just different
+/// keys. Shadow-protection list matches `lift_uri_envelope`.
+fn lift_postgresql_envelope(rv: &mut RegisterValue) {
+    let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
+        return;
+    };
+    let envelope = obj.clone();
+    for (k, v) in envelope {
+        if matches!(
+            k.as_str(),
+            "changed"
+                | "rc"
+                | "stdout"
+                | "stderr"
+                | "stdout_lines"
+                | "took_ms"
+                | "skipped"
+                | "failed"
+                | "results"
+                | "json"
+        ) {
+            continue;
+        }
+        rv.extra.insert(k, v);
+    }
+}
+
 fn lift_uri_envelope(rv: &mut RegisterValue) {
     let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
         return;
@@ -2674,6 +2749,61 @@ fn render_op(
                 privatekey_content,
                 provider: c.provider.clone(),
                 valid_for_days: c.valid_for_days,
+            })
+        }
+        TaskOp::PostgresqlQuery(p) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            let query = render_str(env, &p.query, &view)?;
+            // SQL classification was done at parse time on the literal
+            // query text. After Jinja renders, the resulting SQL might
+            // differ — e.g. a Jinja-templated query that produces
+            // `SELECT ...` vs `INSERT ...`. Re-classify on the rendered
+            // string to be safe.
+            let read_only = crate::playbook::classify_sql_readonly(&query);
+            let positional_args = p
+                .positional_args
+                .iter()
+                .map(|a| render_str(env, a, &view))
+                .collect::<Result<Vec<_>>>()?;
+            TaskOp::PostgresqlQuery(PostgresqlQueryOp {
+                query,
+                db: render_if(&p.db)?,
+                login_user: render_if(&p.login_user)?,
+                login_password: render_if(&p.login_password)?,
+                login_unix_socket: render_if(&p.login_unix_socket)?,
+                login_host: render_if(&p.login_host)?,
+                login_port: p.login_port,
+                autocommit: p.autocommit,
+                positional_args,
+                read_only,
+            })
+        }
+        TaskOp::PostgresqlExt(p) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            TaskOp::PostgresqlExt(PostgresqlExtOp {
+                name: render_str(env, &p.name, &view)?,
+                state: p.state,
+                version: render_if(&p.version)?,
+                ext_schema: render_if(&p.ext_schema)?,
+                cascade: p.cascade,
+                db: render_if(&p.db)?,
+                login_user: render_if(&p.login_user)?,
+                login_password: render_if(&p.login_password)?,
+                login_unix_socket: render_if(&p.login_unix_socket)?,
+                login_host: render_if(&p.login_host)?,
+                login_port: p.login_port,
             })
         }
     })
@@ -3287,6 +3417,62 @@ mod tests {
         assert!(!rv.changed);
         assert!(!rv.extra.contains_key("rc"));
         assert!(!rv.extra.contains_key("changed"));
+    }
+
+    #[test]
+    fn lift_postgresql_envelope_pulls_query_result_to_top_level() {
+        let envelope = serde_json::json!({
+            "query_result": [
+                {"id": "1", "name": "alice"},
+                {"id": "2", "name": "bob"}
+            ],
+            "rowcount": 2,
+            "statusmessage": "SELECT 2",
+            // Shadow protection.
+            "changed": true,
+            "rc": 999
+        });
+        let stdout = serde_json::to_vec(&envelope).unwrap();
+        let mut rv = RegisterValue::from_exec(0, false, 3, &stdout, b"");
+        lift_postgresql_envelope(&mut rv);
+        let qr = rv.extra.get("query_result").unwrap();
+        assert!(qr.is_array());
+        assert_eq!(qr.as_array().unwrap().len(), 2);
+        assert_eq!(rv.extra.get("rowcount").unwrap(), &serde_json::json!(2));
+        assert_eq!(
+            rv.extra.get("statusmessage").unwrap(),
+            &serde_json::json!("SELECT 2")
+        );
+        // Reserved fields untouched.
+        assert_eq!(rv.rc, 0);
+        assert!(!rv.changed);
+        assert!(!rv.extra.contains_key("rc"));
+        assert!(!rv.extra.contains_key("changed"));
+    }
+
+    #[test]
+    fn lift_postgresql_envelope_pulls_ext_fields_to_top_level() {
+        let envelope = serde_json::json!({
+            "extension": "pg_stat_statements",
+            "state": "present",
+            "prior_version": null,
+            "version": "1.10"
+        });
+        let stdout = serde_json::to_vec(&envelope).unwrap();
+        let mut rv = RegisterValue::from_exec(0, true, 7, &stdout, b"");
+        lift_postgresql_envelope(&mut rv);
+        assert_eq!(
+            rv.extra.get("extension").unwrap(),
+            &serde_json::json!("pg_stat_statements")
+        );
+        assert_eq!(
+            rv.extra.get("state").unwrap(),
+            &serde_json::json!("present")
+        );
+        assert_eq!(
+            rv.extra.get("version").unwrap(),
+            &serde_json::json!("1.10")
+        );
     }
 
     #[test]

@@ -448,6 +448,49 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(&c.privatekey_content)
                 .map_err(|e| anyhow!("x509_certificate_pipe.privatekey_content: {e}"))?;
         }
+        TaskOp::PostgresqlQuery(p) => {
+            // query, db, login_user, login_password, login_host all
+            // support Jinja (Patroni clusters template hostnames from
+            // facts; passwords come from vault). positional_args items
+            // are also templatable. Sockets / ports usually aren't but
+            // we render anyway for symmetry.
+            env.template_from_str(&p.query)
+                .map_err(|e| anyhow!("postgresql_query.query: {e}"))?;
+            for (label, val) in [
+                ("db", &p.db),
+                ("login_user", &p.login_user),
+                ("login_password", &p.login_password),
+                ("login_unix_socket", &p.login_unix_socket),
+                ("login_host", &p.login_host),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(val)
+                        .map_err(|e| anyhow!("postgresql_query.{label}: {e}"))?;
+                }
+            }
+            for (i, a) in p.positional_args.iter().enumerate() {
+                env.template_from_str(a)
+                    .map_err(|e| anyhow!("postgresql_query.positional_args[{i}]: {e}"))?;
+            }
+        }
+        TaskOp::PostgresqlExt(p) => {
+            env.template_from_str(&p.name)
+                .map_err(|e| anyhow!("postgresql_ext.name: {e}"))?;
+            for (label, val) in [
+                ("version", &p.version),
+                ("schema", &p.ext_schema),
+                ("db", &p.db),
+                ("login_user", &p.login_user),
+                ("login_password", &p.login_password),
+                ("login_unix_socket", &p.login_unix_socket),
+                ("login_host", &p.login_host),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(val)
+                        .map_err(|e| anyhow!("postgresql_ext.{label}: {e}"))?;
+                }
+            }
+        }
     }
     Ok(())
 }

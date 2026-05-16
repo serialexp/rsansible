@@ -118,7 +118,14 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         // dispatch a wire op. become: is meaningless for all three.
         | TaskOp::OpenSslPrivkey(_)
         | TaskOp::OpenSslCsrPipe(_)
-        | TaskOp::X509CertificatePipe(_) => {}
+        | TaskOp::X509CertificatePipe(_)
+        // PostgreSQL ops talk to the DB over UNIX socket or TCP; the
+        // agent makes the connection in-process. `become: postgres`
+        // is honoured by the surrounding `sudo` wrapping the agent
+        // binary itself (so peer auth works), not by mutating the
+        // op argv here.
+        | TaskOp::PostgresqlQuery(_)
+        | TaskOp::PostgresqlExt(_) => {}
     }
 }
 
