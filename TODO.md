@@ -68,13 +68,39 @@ templated systemd units, CA cert distribution).
   - v1 caveat: csr_pipe must run in the same play as its privkey
     task — cross-run signing of an existing on-disk key needs
     `OpReadFile`, which is deferred.
-- [ ] **`OpAsync` / async polling**
-  - 2 async sites in drill-failover (continuous-writer side-process).
-  - Agent spawns a child, returns a job handle, later tasks poll it.
-  - Implies a new op kind plus a tracking table inside the agent.
-- [ ] **`OpGetUrl` / `OpUnarchive`** — optional, can be replaced with
-  shell, but the modules are tiny and they show up 12 times total. Worth
-  it if we want to advertise the module list.
+- [x] **`OpAsync` / async polling** — shipped in `fecca35` (agent) +
+  `147bac9` (ctl).
+  - Wire: `OpAsyncStart` (kind=16) wraps any Op + carries timeout_ms;
+    `OpAsyncStatus` (kind=17) polls by `job_id`. Recursive nesting of
+    `Op` works through binschema's discriminated_union codec.
+  - Agent: in-memory `JobTable` keyed by start-dispatch seq; the inner
+    op runs against a capturing mpsc writer so its TaskProgress /
+    TaskDone / TaskError bytes get stashed into the entry. Timeout
+    enforced server-side. Recursive `dispatch` returns `Pin<Box<dyn
+    Future + Send>>` to break the Send-inference cycle.
+  - Ctl: `async:` + `poll:` task-level metadata. `async: N` wraps the
+    inner op; `poll: M (M>0)` runs an inline status-poll loop on the
+    same agent connection until the inner finishes or the deadline
+    elapses. `poll: 0` is fire-and-forget — the register holds the
+    start envelope.
+  - v1 caveats: no `until:` / `retries:` yet, so the canonical
+    `async_status:` polling task body is deferred (users wanting to
+    wait on a fire-and-forget job have to poll manually via a loop
+    or use `poll: M > 0` on the original task). The job table is
+    in-memory only; the controller must finish polling before the
+    agent disconnects.
+- [x] **`OpGetUrl`** — shipped in `fecca35` (wire+agent) + `5dcf346` (ctl).
+  - Wire kind=15. Stream download → atomic rename, sha256/sha1/md5
+    checksum verification, stat-skip on existing dest, mTLS / CA-bundle
+    wiring matching OpUri.
+  - Envelope shape mirrors `ansible.builtin.get_url`: url/dest/
+    checksum_src/checksum_dest/size/status_code/msg, lifted to the
+    register's top level so vendored playbooks unchanged.
+  - `checksum_dest` is always the actual sha256 of the on-disk file
+    (even on the stat-skip path) — registers stay honest.
+- [ ] **`OpUnarchive`** — optional. Shows up alongside `get_url` in a
+  few sites; not blocking for drill playbooks since the failover paths
+  don't extract archives. Defer until something needs it.
 
 **Acceptance:** both `drill-failover.yml` and `drill-valkey-failover.yml`
 run against an existing cluster.
@@ -120,7 +146,7 @@ Vault).
 | 2 | ~800  | +1 op (`OpGatherFacts`) | site.yml first play | ✅ done |
 | 3 | ~1200 | +6 ops | site.yml `common` role | ✅ done |
 | 4 | ~600  | +1 op (`OpUri`); templates rendered controller-side | site.yml etcd role | ✅ done |
-| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | partial — x509 ✅, postgresql ✅, async open |
+| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | done — x509 ✅, postgresql ✅, async ✅, get_url ✅ |
 | **total** | **~5600 LoC** | **+11 ops** | full gothab | |
 
 For reference, v0 today is roughly 2000 LoC across all crates. So
