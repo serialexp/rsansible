@@ -50,6 +50,23 @@ base64 = "0.22"
 sha1 = "0.10"
 md-5 = "0.10"
 
+# OpUnarchive. All four codecs need to be pure-Rust (musl-safe) and
+# at minimum decompress-capable.
+#  - `tar`: pure-Rust tar reader/writer; we only need read.
+#  - `flate2`: uses `miniz_oxide` by default (pure Rust).
+#  - `bzip2-rs`: pure-Rust decoder for bzip2 (read-only, which is all
+#    we need — extraction never writes a bzip2 stream).
+#  - `xz2` would bring in liblzma; instead `liblzma-rs` (aka
+#    `lzma-rs`) is the pure-Rust path. Decompression only.
+#  - `zip`: default features pull in bzip2 / aes / zstd via C deps.
+#    Disable defaults and re-enable just `deflate-flate2` (the only
+#    compression method common archives actually use beyond `Stored`).
+tar = "0.4"
+flate2 = "1"
+bzip2-rs = "0.1"
+lzma-rs = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "process", "io-util", "fs"] }
 # Pin axum/hyper/tower for the OpUri unit-test HTTP server.

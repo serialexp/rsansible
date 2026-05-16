@@ -19,6 +19,7 @@ mod read_file;
 mod stat;
 mod systemd;
 mod ufw;
+mod unarchive;
 mod uri;
 mod wait_for;
 mod write_file;
@@ -84,6 +85,7 @@ pub fn dispatch<'a>(
             Op::OpAsyncStart(o) => async_job::run_start(ctx, seq, o, check_mode).await,
             Op::OpAsyncStatus(o) => async_job::run_status(ctx, seq, o, check_mode).await,
             Op::OpReadFile(o) => read_file::run(ctx, seq, o, check_mode).await,
+            Op::OpUnarchive(o) => unarchive::run(ctx, seq, o, check_mode).await,
         }
     })
 }

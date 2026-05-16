@@ -369,14 +369,37 @@ fn lchown(path: &Path, uid: u32, gid: u32) -> Result<(), FileError> {
 /// Resolve a username → uid by parsing /etc/passwd. NSS-free; this is
 /// fine for the systems rsansible targets. Returns Err(name) on miss so
 /// the caller can surface a useful TaskError.
-fn resolve_user(name: &str) -> Result<u32, String> {
+pub(crate) fn resolve_user(name: &str) -> Result<u32, String> {
     parse_passwd_field(&std::fs::read_to_string("/etc/passwd").unwrap_or_default(), name, 2)
         .ok_or_else(|| name.to_string())
 }
 
-fn resolve_group(name: &str) -> Result<u32, String> {
+pub(crate) fn resolve_group(name: &str) -> Result<u32, String> {
     parse_passwd_field(&std::fs::read_to_string("/etc/group").unwrap_or_default(), name, 2)
         .ok_or_else(|| name.to_string())
+}
+
+/// `chown -h <uid>:<gid> <path>` — `-h` flavour that doesn't follow
+/// symlinks. Shared with `unarchive` so it can chown extracted entries
+/// after the archive walk without re-implementing the same shell-out
+/// fallback. Returns Err(message) on failure.
+pub(crate) fn lchown_path(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    let spec = format!("{uid}:{gid}");
+    let out = std::process::Command::new("chown")
+        .arg("-h")
+        .arg("--")
+        .arg(&spec)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn chown: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "chown -h {spec} {}: {}",
+            path.display(),
+            String::from_utf8_lossy(out.stderr.trim_ascii_end())
+        ));
+    }
+    Ok(())
 }
 
 /// Walk an `:`-delimited file (passwd or group), find the row whose
