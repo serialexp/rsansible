@@ -44,8 +44,8 @@ use crate::playbook::{
     AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, GetUrlOp, HostSelector,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
     Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp, StatOp,
-    Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, UriOp, WaitForOp, WriteFileOp,
-    X509CertificatePipeOp,
+    Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, UnarchiveOp, UriOp, WaitForOp,
+    WriteFileOp, X509CertificatePipeOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -1890,6 +1890,12 @@ async fn run_op_body(
             if matches!(op, TaskOp::Slurp(_)) {
                 lift_slurp_envelope(&mut rv);
             }
+            // unarchive envelope: dest/src/handler/extract_results/files —
+            // Ansible's unarchive return shape. Top-level lift so
+            // playbooks can do `register.files | length > 0` etc.
+            if matches!(op, TaskOp::Unarchive(_)) {
+                lift_unarchive_envelope(&mut rv);
+            }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
                 let changed = exec.done.changed != 0;
@@ -2674,6 +2680,27 @@ fn lift_slurp_envelope(rv: &mut RegisterValue) {
     }
 }
 
+fn lift_unarchive_envelope(rv: &mut RegisterValue) {
+    // Same shape as get_url / slurp: hoist top-level envelope keys into
+    // `rv.extra` so vendored playbooks can `register.files`,
+    // `register.handler`, etc.
+    let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
+        return;
+    };
+    let envelope = obj.clone();
+    rv.json = None;
+    for (k, v) in envelope {
+        if matches!(
+            k.as_str(),
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+                | "failed"
+        ) {
+            continue;
+        }
+        rv.extra.insert(k, v);
+    }
+}
+
 fn lift_uri_envelope(rv: &mut RegisterValue) {
     let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
         return;
@@ -3096,6 +3123,31 @@ fn render_op(
             src: render_str(env, &s.src, &view)?,
             max_bytes: s.max_bytes,
         }),
+        TaskOp::Unarchive(u) => {
+            let include = u
+                .include
+                .iter()
+                .map(|p| render_str(env, p, &view))
+                .collect::<Result<Vec<_>>>()?;
+            let exclude = u
+                .exclude
+                .iter()
+                .map(|p| render_str(env, p, &view))
+                .collect::<Result<Vec<_>>>()?;
+            TaskOp::Unarchive(UnarchiveOp {
+                src: render_str(env, &u.src, &view)?,
+                dest: render_str(env, &u.dest, &view)?,
+                format: u.format,
+                creates: render_str(env, &u.creates, &view)?,
+                mode: u.mode,
+                owner: render_str(env, &u.owner, &view)?,
+                group: render_str(env, &u.group, &view)?,
+                keep_newer: u.keep_newer,
+                list_files: u.list_files,
+                include,
+                exclude,
+            })
+        }
     })
 }
 

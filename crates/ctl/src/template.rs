@@ -518,6 +518,26 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(&s.src)
                 .map_err(|e| anyhow!("slurp.src: {e}"))?;
         }
+        TaskOp::Unarchive(u) => {
+            env.template_from_str(&u.src)
+                .map_err(|e| anyhow!("unarchive.src: {e}"))?;
+            env.template_from_str(&u.dest)
+                .map_err(|e| anyhow!("unarchive.dest: {e}"))?;
+            env.template_from_str(&u.creates)
+                .map_err(|e| anyhow!("unarchive.creates: {e}"))?;
+            env.template_from_str(&u.owner)
+                .map_err(|e| anyhow!("unarchive.owner: {e}"))?;
+            env.template_from_str(&u.group)
+                .map_err(|e| anyhow!("unarchive.group: {e}"))?;
+            for (i, p) in u.include.iter().enumerate() {
+                env.template_from_str(p)
+                    .map_err(|e| anyhow!("unarchive.include[{i}]: {e}"))?;
+            }
+            for (i, p) in u.exclude.iter().enumerate() {
+                env.template_from_str(p)
+                    .map_err(|e| anyhow!("unarchive.exclude[{i}]: {e}"))?;
+            }
+        }
     }
     Ok(())
 }

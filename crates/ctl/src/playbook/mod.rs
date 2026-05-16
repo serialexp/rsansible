@@ -26,8 +26,8 @@ pub use task_op::{
     FileOp, FileState, GetUrlOp, IncludeRoleSpec, LineInFileOp, LineInFileState, LoopControl,
     LoopSpec, MetaAction, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageManager, PackageOp,
     PackageState, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp, StatOp, SystemdOp,
-    SystemdState, Task, TaskBody, TaskOp, TemplateOp, UfwOp, UfwOpKind, UriOp, WaitForOp,
-    WaitForState, WriteFileOp, X509CertificatePipeOp,
+    SystemdState, Task, TaskBody, TaskOp, TemplateOp, UfwOp, UfwOpKind, UnarchiveOp, UriOp,
+    WaitForOp, WaitForState, WriteFileOp, X509CertificatePipeOp,
 };
 pub use validate::validate;
 
