@@ -1,2 +1,3 @@
 commit	date	total_bytes	text	data	bss	subject
 10c4fa8	2026-05-16T17:19:30+09:00	4828784	2682040	5792	6560	docs: mark OpUnarchive shipped
+f9a0f1e	2026-05-16T17:28:56+09:00	4828784	2682040	5792	6560	chore: track agent binary size per commit
