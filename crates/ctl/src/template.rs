@@ -71,6 +71,14 @@ pub fn make_env<'a>() -> Environment<'a> {
     // on the spelling `default(omit)` to make optional fields truly
     // optional rather than getting a stringified empty value.
     env.add_global("omit", MjValue::from(OMIT_SENTINEL));
+    // Controller-side I/O. See CLAUDE.md for the `controller_` /
+    // `target_` prefix convention — these read/run on the machine
+    // invoking rsansible, NOT on the target host. `lookup` is the
+    // Ansible-compatibility shim and forwards to these.
+    env.add_function("controller_read_file", controller_read_file);
+    env.add_function("controller_shell_stdout", controller_shell_stdout);
+    env.add_function("controller_env", controller_env);
+    env.add_function("lookup", lookup_shim);
     env
 }
 
@@ -264,6 +272,142 @@ fn regex_replace_filter(
         )
     })?;
     Ok(MjValue::from(re.replace_all(s, replacement.as_str()).into_owned()))
+}
+
+// =========================================================================
+// Controller-side I/O — see CLAUDE.md "controller_ / target_ prefix" section.
+//
+// These run on the machine invoking rsansible (the controller), at
+// template-render time. The agent never sees the path/command — only
+// the resolved string. That's the whole point: secrets stay on the
+// controller, paths reference the controller's filesystem.
+//
+// There's no caching: a `controller_shell_stdout('date +%s')` called
+// inside a `loop:` will fire once per iteration. That's the right
+// default — caching here would silently make playbooks non-determ
+// across iterations — but means expensive lookups should be hoisted
+// into a `set_fact:` at the top of the play.
+// =========================================================================
+
+/// Read a UTF-8 file from the controller's filesystem.
+///
+/// Canonical replacement for Ansible's `lookup('file', path)`. Errors
+/// loudly on missing files, permission denied, or non-UTF-8 content
+/// (use `controller_read_file_b64` — not yet implemented — when we
+/// need binary blobs in templates).
+fn controller_read_file(path: String) -> Result<MjValue, MjError> {
+    let bytes = std::fs::read(&path).map_err(|e| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("controller_read_file({path:?}): {e}"),
+        )
+    })?;
+    let s = String::from_utf8(bytes).map_err(|e| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("controller_read_file({path:?}): not valid UTF-8: {e}"),
+        )
+    })?;
+    Ok(MjValue::from(s))
+}
+
+/// Run a command on the controller via `sh -c` and capture stdout.
+///
+/// Canonical replacement for Ansible's `lookup('pipe', cmd)`. Trailing
+/// newlines on stdout are trimmed (matches Ansible). A non-zero exit
+/// is an error and surfaces stderr in the message; stderr is otherwise
+/// discarded. There's no stdin and no timeout — if you need either,
+/// reach for `shell:` on the target instead, or factor the command
+/// into a `set_fact:` once.
+fn controller_shell_stdout(cmd: String) -> Result<MjValue, MjError> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .output()
+        .map_err(|e| {
+            MjError::new(
+                MjKind::InvalidOperation,
+                format!("controller_shell_stdout({cmd:?}): spawn failed: {e}"),
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(MjError::new(
+            MjKind::InvalidOperation,
+            format!(
+                "controller_shell_stdout({cmd:?}): exit {:?}: {}",
+                out.status.code(),
+                stderr.trim()
+            ),
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|e| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("controller_shell_stdout({cmd:?}): non-UTF-8 stdout: {e}"),
+        )
+    })?;
+    // Ansible trims a single trailing newline; we trim any run of
+    // \r/\n — same observable result for the common case, less
+    // surprising for `printf 'foo\n\n'`.
+    Ok(MjValue::from(
+        stdout.trim_end_matches(['\r', '\n']).to_string(),
+    ))
+}
+
+/// Read an environment variable from the controller's process env.
+///
+/// Canonical replacement for Ansible's `lookup('env', name)`. Returns
+/// the empty string if the var is unset — same as Ansible's lenient
+/// default. Use `controller_env('FOO') | mandatory` to force a
+/// missing-var to error.
+fn controller_env(name: String) -> Result<MjValue, MjError> {
+    // std::env::var errors on non-UTF-8 or missing; Ansible's behavior
+    // is "missing = empty string, non-UTF-8 = empty string." Match it.
+    Ok(MjValue::from(std::env::var(&name).unwrap_or_default()))
+}
+
+/// Ansible-compat shim for `lookup(plugin, ...args)`.
+///
+/// Translates the god-function spelling into the appropriate
+/// `controller_*` canonical function. Pure translation — no business
+/// logic lives here. Fresh rsansible playbooks should reach for the
+/// canonical names directly.
+///
+/// Unknown plugin names error loudly with the supported list.
+fn lookup_shim(
+    plugin: String,
+    args: minijinja::value::Rest<MjValue>,
+) -> Result<MjValue, MjError> {
+    let supported = "supported plugins: file, pipe, env";
+    // Pull arg[0] as a string with a plugin-aware error message.
+    let arg0_str = |field: &str| -> Result<String, MjError> {
+        let v = args.get(0).ok_or_else(|| {
+            MjError::new(
+                MjKind::InvalidOperation,
+                format!(
+                    "lookup({plugin:?}): missing required argument ({field})"
+                ),
+            )
+        })?;
+        v.as_str()
+            .ok_or_else(|| {
+                MjError::new(
+                    MjKind::InvalidOperation,
+                    format!("lookup({plugin:?}): {field} must be a string"),
+                )
+            })
+            .map(|s| s.to_string())
+    };
+    match plugin.as_str() {
+        "file" => controller_read_file(arg0_str("path")?),
+        "pipe" => controller_shell_stdout(arg0_str("command")?),
+        "env" => controller_env(arg0_str("name")?),
+        other => Err(MjError::new(
+            MjKind::InvalidOperation,
+            format!("lookup({other:?}): unknown plugin ({supported})"),
+        )),
+    }
 }
 
 /// Compile every Jinja string in the playbook so syntax errors surface
@@ -795,6 +939,162 @@ mod tests {
         let users = serde_json::json!({"alice": "a@example"});
         let out = tmpl.render(context! { users => users }).unwrap();
         assert_eq!(out, "[]");
+    }
+
+    // ---------- controller_* I/O + lookup compat shim ----------
+
+    #[test]
+    fn controller_read_file_reads_utf8_contents() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("greeting.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"hello, world\n")
+            .unwrap();
+        let env = make_env();
+        let src = format!(
+            r#"{{{{ controller_read_file({:?}) }}}}"#,
+            path.to_str().unwrap()
+        );
+        let tmpl = env.template_from_str(&src).unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "hello, world\n");
+    }
+
+    #[test]
+    fn controller_read_file_errors_loudly_on_missing() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                r#"{{ controller_read_file("/definitely/does/not/exist/zzz") }}"#,
+            )
+            .unwrap();
+        let err = tmpl.render(context! {}).unwrap_err().to_string();
+        assert!(
+            err.contains("controller_read_file") && err.contains("/definitely/does/not/exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_shell_stdout_captures_and_trims() {
+        let env = make_env();
+        // printf 'foo\n\n' → trailing newlines trimmed.
+        let tmpl = env
+            .template_from_str(r#"[{{ controller_shell_stdout("printf 'foo\n\n'") }}]"#)
+            .unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "[foo]");
+    }
+
+    #[test]
+    fn controller_shell_stdout_surfaces_nonzero_exit() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                r#"{{ controller_shell_stdout("echo nope 1>&2; exit 7") }}"#,
+            )
+            .unwrap();
+        let err = tmpl.render(context! {}).unwrap_err().to_string();
+        assert!(
+            err.contains("exit") && err.contains("nope"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_env_reads_unset_as_empty() {
+        // Pick a name nothing else in this process should have set.
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                r#"[{{ controller_env("RSANSIBLE_TEST_DEFINITELY_UNSET_XYZ") }}]"#,
+            )
+            .unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "[]");
+    }
+
+    #[test]
+    fn controller_env_reads_set_value() {
+        // SAFETY: this test mutates process env. Use a name unique
+        // enough not to clash with other tests running in the same
+        // process under cargo's test harness.
+        std::env::set_var("RSANSIBLE_TEST_CONTROLLER_ENV_SET", "yes-it-is");
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                r#"{{ controller_env("RSANSIBLE_TEST_CONTROLLER_ENV_SET") }}"#,
+            )
+            .unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        std::env::remove_var("RSANSIBLE_TEST_CONTROLLER_ENV_SET");
+        assert_eq!(out, "yes-it-is");
+    }
+
+    #[test]
+    fn lookup_file_shim_forwards_to_controller_read_file() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"shim works")
+            .unwrap();
+        let env = make_env();
+        let src = format!(r#"{{{{ lookup("file", {:?}) }}}}"#, path.to_str().unwrap());
+        let tmpl = env.template_from_str(&src).unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "shim works");
+    }
+
+    #[test]
+    fn lookup_pipe_shim_forwards_to_controller_shell_stdout() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ lookup("pipe", "printf hello") }}"#)
+            .unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn lookup_env_shim_forwards_to_controller_env() {
+        std::env::set_var("RSANSIBLE_TEST_LOOKUP_ENV_SHIM", "via-lookup");
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ lookup("env", "RSANSIBLE_TEST_LOOKUP_ENV_SHIM") }}"#)
+            .unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        std::env::remove_var("RSANSIBLE_TEST_LOOKUP_ENV_SHIM");
+        assert_eq!(out, "via-lookup");
+    }
+
+    #[test]
+    fn lookup_unknown_plugin_errors_with_supported_list() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ lookup("vault", "secret/whatever") }}"#)
+            .unwrap();
+        let err = tmpl.render(context! {}).unwrap_err().to_string();
+        assert!(
+            err.contains("vault") && err.contains("supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lookup_missing_arg_errors_with_field_name() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ lookup("file") }}"#)
+            .unwrap();
+        let err = tmpl.render(context! {}).unwrap_err().to_string();
+        assert!(
+            err.contains("path") && err.contains("missing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
