@@ -110,12 +110,28 @@ templated systemd units, CA cert distribution).
   (0 = unbounded). Also unlocks cross-run `openssl_csr_pipe:` by
   letting the controller fetch a previously-provisioned on-disk PEM
   on cache miss.
-- [ ] **`OpUnarchive`** — survey-elevated to next priority. Used by
-  26/57 real-world repos (the #1 unshipped Ansible module by repo
-  breadth). Wire op + agent should support `tar.gz` / `tar.bz2` /
-  `tar.xz` / `zip` extraction with idempotency by mtime-stamp or by
-  presence-of-marker-file. Owner/group/mode on extracted files. Not
-  yet started.
+- [x] **`OpUnarchive` + `unarchive:`** — wire kind=19. Pure-Rust
+  extractors (musl-safe): `flate2` (miniz_oxide) for gz, `bzip2-rs`
+  for bz2, `lzma-rs` for xz, the `tar` crate for tar walking, and
+  `zip = "2"` (deflate-only) for zip. Format inferred from the `src`
+  extension when `format:` is omitted (auto/tar.gz/tgz/tar.bz2/tbz2/
+  tar.xz/txz/tar/zip). Idempotency via `creates:` marker (the agent
+  short-circuits without opening the archive when the marker
+  exists). `keep_newer:` skips entries whose archive mtime is older
+  than the on-disk file. `include:` / `exclude:` filter archive
+  entry paths (exact match, no globbing). Owner/group/mode applied
+  to all extracted entries post-walk. Envelope matches Ansible's
+  `unarchive` return shape (`dest` / `src` / `handler` /
+  `extract_results` / optional `files`); top-level lift so vendored
+  playbooks resolve `register.files | length` and `register.handler`
+  the way they expect. Safety: archive entries with absolute or
+  `..`-bearing paths are rejected before any write (zip-slip /
+  tar-slip protection); same for symlinks whose targets would
+  escape `dest`. v1 caveats: `remote_src: yes` is required (no
+  controller→agent archive push — combine with a prior `copy:` /
+  `get_url:`); no `extra_opts:` (we don't shell out to `tar`); the
+  xz path decompresses into memory before tar-walking (fine for
+  the < 100 MiB archives we've seen, fragile beyond that).
 
 **Acceptance:** both `drill-failover.yml` and `drill-valkey-failover.yml`
 run against an existing cluster.
@@ -161,8 +177,8 @@ Vault).
 | 2 | ~800  | +1 op (`OpGatherFacts`) | site.yml first play | ✅ done |
 | 3 | ~1200 | +6 ops | site.yml `common` role | ✅ done |
 | 4 | ~600  | +1 op (`OpUri`); templates rendered controller-side | site.yml etcd role | ✅ done |
-| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | done — x509 ✅, postgresql ✅, async ✅, get_url ✅, read_file ✅ |
-| **total** | **~5600 LoC** | **+12 ops** | full gothab | |
+| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | done — x509 ✅, postgresql ✅, async ✅, get_url ✅, read_file ✅, unarchive ✅ |
+| **total** | **~5600 LoC** | **+13 ops** | full gothab | |
 
 For reference, v0 today is roughly 2000 LoC across all crates. So
 running gothab is a ~3.5× larger codebase than what's there now. Not
