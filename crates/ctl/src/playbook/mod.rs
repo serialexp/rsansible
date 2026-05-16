@@ -59,6 +59,19 @@ pub struct Play {
     /// [`crate::exec_ctx::HostCtx::play_vars`].
     #[serde(default)]
     pub vars: BTreeMap<String, serde_yaml::Value>,
+    /// `vars_files:` — list of YAML files (each a flat or nested mapping)
+    /// loaded at playbook-load time and merged into `vars` BEFORE this
+    /// struct reaches the orchestrator. Resolution is relative to the
+    /// playbook file's directory; absolute paths are used as-is. Inline
+    /// `vars:` entries win over anything loaded via `vars_files:`; later
+    /// `vars_files:` entries win over earlier ones (Ansible behavior).
+    ///
+    /// The field is only meaningful between YAML deserialization and
+    /// the `merge_vars_files` pass in `load()` — by the time the
+    /// orchestrator sees the `Play`, `vars` is the merged final view
+    /// and `vars_files` is empty.
+    #[serde(default)]
+    pub vars_files: Vec<String>,
     /// `roles:` directive. Each entry resolves to a directory under
     /// `<playbook_dir>/roles/<name>/`; its tasks are prepended to
     /// `tasks` (and handlers to `handlers`) by the role-flatten pass.
@@ -189,6 +202,8 @@ pub fn load(path: &Path) -> Result<Playbook> {
     let mut pb: Playbook =
         parse(&text).with_context(|| format!("parsing playbook {}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
+    merge_vars_files(&mut pb, base)
+        .with_context(|| format!("loading vars_files in {}", path.display()))?;
     import::flatten_playbook(&mut pb, base)
         .with_context(|| format!("resolving imports in {}", path.display()))?;
     role::flatten_playbook(&mut pb, base)
@@ -201,6 +216,103 @@ pub fn load(path: &Path) -> Result<Playbook> {
         .with_context(|| format!("loading copy sources in {}", path.display()))?;
     inherit_become_defaults(&mut pb);
     Ok(pb)
+}
+
+/// Resolve every play's `vars_files:` list against `base` and merge the
+/// loaded mappings into the play's `vars` field.
+///
+/// Precedence (low → high, matching Ansible):
+/// 1. First `vars_files:` entry loaded
+/// 2. … later entries override earlier ones
+/// 3. Inline `vars:` on the play wins over everything from `vars_files:`
+///
+/// After this pass returns, `play.vars_files` is empty and `play.vars`
+/// holds the merged final view. The orchestrator never sees the raw
+/// file list.
+///
+/// Errors:
+/// * File missing → loud error naming the path.
+/// * File parses but isn't a top-level YAML mapping → loud error.
+/// * Path resolution: relative paths against `base` (the playbook
+///   file's parent directory); absolute paths used as-is.
+fn merge_vars_files(pb: &mut Playbook, base: &Path) -> Result<()> {
+    for (play_idx, play) in pb.plays.iter_mut().enumerate() {
+        // Drain so we don't double-load on a hypothetical second pass.
+        let files = std::mem::take(&mut play.vars_files);
+        if files.is_empty() {
+            continue;
+        }
+        // Stash inline vars; we re-apply them last so inline wins.
+        let inline = std::mem::take(&mut play.vars);
+        for rel in files {
+            let path = {
+                let p = Path::new(&rel);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    base.join(p)
+                }
+            };
+            let text = std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "play[{play_idx}] {:?}: vars_files entry {rel:?} ({})",
+                    play.name,
+                    path.display(),
+                )
+            })?;
+            let value: serde_yaml::Value = serde_yaml::from_str(&text)
+                .with_context(|| {
+                    format!(
+                        "play[{play_idx}] {:?}: parsing vars_files {rel:?}",
+                        play.name,
+                    )
+                })?;
+            let map = match value {
+                serde_yaml::Value::Mapping(m) => m,
+                serde_yaml::Value::Null => continue, // empty file: skip
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "play[{play_idx}] {:?}: vars_files {rel:?} must be a top-level \
+                         YAML mapping, got: {:?}",
+                        play.name,
+                        kind_of(&other),
+                    ));
+                }
+            };
+            for (k, v) in map {
+                let key = match k {
+                    serde_yaml::Value::String(s) => s,
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "play[{play_idx}] {:?}: vars_files {rel:?}: \
+                             non-string key {other:?}",
+                            play.name,
+                        ));
+                    }
+                };
+                play.vars.insert(key, v); // later vars_files wins
+            }
+        }
+        // Re-apply inline vars on top.
+        for (k, v) in inline {
+            play.vars.insert(k, v);
+        }
+    }
+    Ok(())
+}
+
+/// Short description of a YAML Value's kind for diagnostics — we don't
+/// want to dump the entire offending document into a one-line error.
+fn kind_of(v: &serde_yaml::Value) -> &'static str {
+    match v {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "bool",
+        serde_yaml::Value::Number(_) => "number",
+        serde_yaml::Value::String(_) => "string",
+        serde_yaml::Value::Sequence(_) => "sequence",
+        serde_yaml::Value::Mapping(_) => "mapping",
+        serde_yaml::Value::Tagged(_) => "tagged",
+    }
 }
 
 /// Push play-level `become:` / `become_user:` defaults down onto every
@@ -241,6 +353,245 @@ mod tests {
             TaskBody::Op(op) => op,
             other => panic!("expected Op body, got {other:?}"),
         }
+    }
+
+    // ---------- vars_files: ----------
+
+    /// Lay out a tempdir with a playbook + vars_files and load it via
+    /// the public `load()` entry point, exercising the whole pipeline.
+    fn write_playbook_tree(
+        playbook_yaml: &str,
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let pb_path = dir.path().join("play.yml");
+        std::fs::write(&pb_path, playbook_yaml).unwrap();
+        for (rel, body) in files {
+            let p = dir.path().join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, body).unwrap();
+        }
+        (dir, pb_path)
+    }
+
+    #[test]
+    fn vars_files_merges_single_file() {
+        let (_dir, path) = write_playbook_tree(
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: t
+      shell: "echo {{ greeting }}"
+"#,
+            &[("vars.yml", "greeting: hello\nport: 8080\n")],
+        );
+        let pb = load(&path).unwrap();
+        let v = &pb.plays[0].vars;
+        assert!(pb.plays[0].vars_files.is_empty(), "should be drained");
+        assert_eq!(
+            v.get("greeting"),
+            Some(&serde_yaml::Value::String("hello".into()))
+        );
+        assert_eq!(
+            v.get("port"),
+            Some(&serde_yaml::Value::Number(8080.into()))
+        );
+    }
+
+    #[test]
+    fn vars_files_later_overrides_earlier() {
+        let (_dir, path) = write_playbook_tree(
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - a.yml
+    - b.yml
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+            &[
+                ("a.yml", "x: from-a\ny: only-in-a\n"),
+                ("b.yml", "x: from-b\n"),
+            ],
+        );
+        let pb = load(&path).unwrap();
+        let v = &pb.plays[0].vars;
+        assert_eq!(
+            v.get("x"),
+            Some(&serde_yaml::Value::String("from-b".into())),
+            "later vars_files entry must win"
+        );
+        assert_eq!(
+            v.get("y"),
+            Some(&serde_yaml::Value::String("only-in-a".into())),
+        );
+    }
+
+    #[test]
+    fn inline_vars_wins_over_vars_files() {
+        let (_dir, path) = write_playbook_tree(
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - vars.yml
+  vars:
+    greeting: inline-wins
+    extra: only-inline
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+            &[("vars.yml", "greeting: from-file\nport: 8080\n")],
+        );
+        let pb = load(&path).unwrap();
+        let v = &pb.plays[0].vars;
+        assert_eq!(
+            v.get("greeting"),
+            Some(&serde_yaml::Value::String("inline-wins".into())),
+            "inline vars: must win over vars_files",
+        );
+        assert_eq!(
+            v.get("port"),
+            Some(&serde_yaml::Value::Number(8080.into())),
+            "non-conflicting vars_files entry preserved",
+        );
+        assert_eq!(
+            v.get("extra"),
+            Some(&serde_yaml::Value::String("only-inline".into())),
+        );
+    }
+
+    #[test]
+    fn vars_files_relative_path_resolves_against_playbook_dir() {
+        // Layout:
+        //   tempdir/
+        //     play.yml          ← playbook
+        //     ../sibling.yml    (one level up)
+        //   tempdir2/
+        // Make a nested layout where vars_files reaches ../shared.yml
+        let outer = tempfile::tempdir().unwrap();
+        let inner = outer.path().join("playbooks");
+        std::fs::create_dir(&inner).unwrap();
+        let pb_path = inner.join("play.yml");
+        std::fs::write(
+            &pb_path,
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - ../shared.yml
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+        )
+        .unwrap();
+        std::fs::write(outer.path().join("shared.yml"), "k: found\n").unwrap();
+        let pb = load(&pb_path).unwrap();
+        assert_eq!(
+            pb.plays[0].vars.get("k"),
+            Some(&serde_yaml::Value::String("found".into()))
+        );
+    }
+
+    #[test]
+    fn vars_files_absolute_path_used_as_is() {
+        let outer = tempfile::tempdir().unwrap();
+        let abs = outer.path().join("global.yml");
+        std::fs::write(&abs, "absolute: yes\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pb_path = dir.path().join("play.yml");
+        let pb_yaml = format!(
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - {abs}
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+            abs = abs.to_str().unwrap()
+        );
+        std::fs::write(&pb_path, pb_yaml).unwrap();
+        let pb = load(&pb_path).unwrap();
+        assert_eq!(
+            pb.plays[0].vars.get("absolute"),
+            Some(&serde_yaml::Value::String("yes".into()))
+        );
+    }
+
+    #[test]
+    fn vars_files_missing_errors_loudly() {
+        let (_dir, path) = write_playbook_tree(
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - no-such-file.yml
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+            &[],
+        );
+        let err = format!("{:#}", load(&path).unwrap_err());
+        assert!(
+            err.contains("vars_files") && err.contains("no-such-file.yml"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vars_files_non_mapping_errors_loudly() {
+        let (_dir, path) = write_playbook_tree(
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - sequence.yml
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+            &[("sequence.yml", "- one\n- two\n")],
+        );
+        let err = format!("{:#}", load(&path).unwrap_err());
+        assert!(
+            err.contains("vars_files") && err.contains("sequence.yml") && err.contains("mapping"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vars_files_empty_file_is_a_noop() {
+        let (_dir, path) = write_playbook_tree(
+            r#"
+- name: p
+  hosts: localhost
+  vars_files:
+    - empty.yml
+  vars:
+    x: 1
+  tasks:
+    - name: t
+      shell: echo hi
+"#,
+            &[("empty.yml", "")],
+        );
+        let pb = load(&path).unwrap();
+        assert_eq!(
+            pb.plays[0].vars.get("x"),
+            Some(&serde_yaml::Value::Number(1.into()))
+        );
     }
 
     #[test]
@@ -461,6 +812,7 @@ all:
                 on_failure: OnFailure::Stop,
                 gather_facts: true,
                 vars: BTreeMap::new(),
+                vars_files: Vec::new(),
                 roles: Vec::new(),
                 tasks: vec![],
                 handlers: vec![],
