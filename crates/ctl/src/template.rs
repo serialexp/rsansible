@@ -229,6 +229,16 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
             env.template_from_str(&f.msg)
                 .map_err(|e| anyhow!("fail.msg: {e}"))?;
         }
+        TaskBody::Debug(d) => {
+            if let Some(s) = &d.msg {
+                env.template_from_str(s)
+                    .map_err(|e| anyhow!("debug.msg: {e}"))?;
+            }
+            if let Some(s) = &d.var {
+                env.template_from_str(s)
+                    .map_err(|e| anyhow!("debug.var: {e}"))?;
+            }
+        }
         TaskBody::SetFact(m) => {
             for (k, v) in &m.0 {
                 if let serde_yaml::Value::String(s) = v {

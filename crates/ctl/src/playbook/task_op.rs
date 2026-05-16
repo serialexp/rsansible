@@ -124,6 +124,9 @@ pub enum TaskBody {
     Assert(AssertTask),
     /// Controller-side: unconditional failure with `msg:`.
     Fail(FailTask),
+    /// Controller-side: print a Jinja-rendered message or the value of
+    /// a named variable. No state change.
+    Debug(DebugTask),
     /// Controller-side: bind values into the host's set_facts dict.
     SetFact(SetFactMap),
     /// Parse-time directive: splice in tasks from `<file>`. After the
@@ -1976,6 +1979,7 @@ const BODY_KEYS: &[&str] = &[
     "unarchive",
     "assert",
     "fail",
+    "debug",
     "set_fact",
     "import_tasks",
     "include_role",
@@ -2271,6 +2275,9 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             ),
             "fail" => TaskBody::Fail(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            ),
+            "debug" => TaskBody::Debug(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             ),
             "set_fact" => {
@@ -4071,6 +4078,79 @@ pub struct FailTask {
 
 fn default_fail_msg() -> String {
     "Failed as requested".to_string()
+}
+
+/// `debug: { msg: "..." }` or `debug: { var: "name.path" }`. Controller-
+/// side; emits an info-level log line and registers a no-change result.
+/// Exactly one of `msg`/`var` must be set. `verbosity:` is parsed and
+/// ignored — every debug task runs at info level for now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugTask {
+    pub msg: Option<String>,
+    pub var: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for DebugTask {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_yaml::Value::deserialize(d)?;
+        // Shorthand: `debug: "string"` → msg=string.
+        if let serde_yaml::Value::String(s) = &v {
+            return Ok(DebugTask {
+                msg: Some(s.clone()),
+                var: None,
+            });
+        }
+        let mut map = match v {
+            serde_yaml::Value::Mapping(m) => m,
+            other => {
+                return Err(D::Error::custom(format!(
+                    "debug: expected a mapping (or a string shorthand), got: {other:?}"
+                )))
+            }
+        };
+        let msg = match map.remove("msg") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::String(s)) => Some(s),
+            // Ansible accepts non-string msg (list/dict/number) and
+            // prints them via repr. Accept whatever it is and stringify
+            // via YAML to_string for fidelity.
+            Some(other) => Some(
+                serde_yaml::to_string(&other)
+                    .map_err(D::Error::custom)?
+                    .trim_end()
+                    .to_string(),
+            ),
+        };
+        let var = match map.remove("var") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "debug.var: expected a non-empty string, got: {other:?}"
+                )))
+            }
+        };
+        // `verbosity:` parsed and discarded (we always print).
+        let _ = map.remove("verbosity");
+        if let Some((k, _)) = map.into_iter().next() {
+            return Err(D::Error::custom(format!(
+                "debug: unknown field {k:?}; only msg/var/verbosity accepted"
+            )));
+        }
+        if msg.is_some() && var.is_some() {
+            return Err(D::Error::custom(
+                "debug: msg and var are mutually exclusive",
+            ));
+        }
+        if msg.is_none() && var.is_none() {
+            // Ansible defaults to msg="Hello world!" when neither is given.
+            return Ok(DebugTask {
+                msg: Some("Hello world!".into()),
+                var: None,
+            });
+        }
+        Ok(DebugTask { msg, var })
+    }
 }
 
 fn deserialize_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
@@ -7391,6 +7471,99 @@ unarchive:
         let WireOp::OpUnarchive(o) = wire else { panic!() };
         assert_eq!(o.has_mode, 0);
         assert_eq!(o.mode, 0);
+    }
+
+    // ── debug ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_debug_msg() {
+        let t = parse_task(
+            r#"
+name: t
+debug:
+  msg: "value is {{ foo }}"
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert_eq!(d.msg.as_deref(), Some("value is {{ foo }}"));
+        assert!(d.var.is_none());
+    }
+
+    #[test]
+    fn parse_debug_var() {
+        let t = parse_task(
+            r#"
+name: t
+debug:
+  var: my_register.stdout
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert!(d.msg.is_none());
+        assert_eq!(d.var.as_deref(), Some("my_register.stdout"));
+    }
+
+    #[test]
+    fn parse_debug_string_shorthand() {
+        let t = parse_task(
+            r#"
+name: t
+debug: hello world
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert_eq!(d.msg.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn parse_debug_empty_defaults_to_hello() {
+        let t = parse_task(
+            r#"
+name: t
+debug: {}
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert_eq!(d.msg.as_deref(), Some("Hello world!"));
+    }
+
+    #[test]
+    fn parse_debug_rejects_msg_and_var_together() {
+        let yaml = r#"
+name: t
+debug:
+  msg: x
+  var: y
+"#;
+        let result: Result<Task, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+        let err = format!("{:?}", result.err());
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn parse_debug_ignores_verbosity() {
+        let t = parse_task(
+            r#"
+name: t
+debug:
+  msg: x
+  verbosity: 3
+"#,
+        );
+        let TaskBody::Debug(_) = t.body else { panic!() };
+    }
+
+    #[test]
+    fn parse_debug_rejects_unknown_field() {
+        let yaml = r#"
+name: t
+debug:
+  msg: x
+  bogus: 1
+"#;
+        let result: Result<Task, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
     }
 
     #[test]

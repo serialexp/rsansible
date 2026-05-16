@@ -237,6 +237,7 @@ fn validate_task(task: &Task, where_: &str, ti: usize) -> Result<()> {
             }
         }
         TaskBody::Fail(_) => {}
+        TaskBody::Debug(_) => {}
         TaskBody::ImportTasks(p) => {
             // After load(), this shouldn't appear. Treat it as an error so a
             // caller that bypasses load() (parse + validate manually) sees a

@@ -41,7 +41,7 @@ use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, GetUrlOp, HostSelector,
+    AssertTask, BlockInFileOp, CopyOp, DebugTask, ExecOp, FailTask, FileOp, GetUrlOp, HostSelector,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
     Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp, StatOp,
     Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, UnarchiveOp, UriOp, WaitForOp,
@@ -1617,6 +1617,7 @@ async fn run_body_once(
         TaskBody::Op(op) => run_op_body(task, op, target_conn, ctx, env, world, next_seq).await,
         TaskBody::Assert(a) => run_assert_body(a, ctx, env, world),
         TaskBody::Fail(f) => run_fail_body(f, ctx, env, world),
+        TaskBody::Debug(d) => run_debug_body(d, task, ctx, env, world),
         TaskBody::SetFact(m) => run_set_fact_body(m, ctx, env, world),
         TaskBody::ImportTasks(p) => BodyResult::Failed {
             reason: format!(
@@ -2507,6 +2508,83 @@ fn run_fail_body(
         register: Some(rv),
         conn_alive: true,
     }
+}
+
+fn run_debug_body(
+    d: &DebugTask,
+    task: &Task,
+    ctx: &HostCtx,
+    env: &Environment<'static>,
+    world: &WorldVars,
+) -> BodyResult {
+    let view = build_template_ctx(ctx, world);
+    // Render msg (Jinja-templated) or look up var by dotted path.
+    let (label, payload) = match (&d.msg, &d.var) {
+        (Some(msg), _) => match render_str(env, msg, &view) {
+            Ok(rendered) => ("msg".to_string(), JsonValue::String(rendered)),
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!("debug.msg render: {e:#}"),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        },
+        (None, Some(var_name)) => {
+            // First render the var-name string itself (Ansible allows
+            // `var: "{{ dyn_name }}"`), then dotted-path-lookup.
+            let resolved_name = match render_str(env, var_name, &view) {
+                Ok(s) => s,
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!("debug.var render: {e:#}"),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            };
+            let value = resolve_dotted_path(&view, &resolved_name).unwrap_or(JsonValue::String(
+                format!("VARIABLE IS NOT DEFINED!: {resolved_name}"),
+            ));
+            (resolved_name, value)
+        }
+        (None, None) => unreachable!("DebugTask::deserialize forbids this"),
+    };
+    // Emit one info line so the operator sees it. Matches Ansible's
+    // playbook output format: "TASK [<name>] => { "<label>": <value> }".
+    let value_str = match &payload {
+        JsonValue::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    };
+    info!(task = %task.name, label = %label, value = %value_str, "debug");
+    let mut rv = RegisterValue::default();
+    rv.changed = false;
+    rv.extra.insert(label, payload);
+    BodyResult::Ok {
+        register: rv,
+        changed: false,
+        skipped: false,
+    }
+}
+
+/// Resolve a dotted path like `groups.postgres[0].ansible_host` against
+/// the template view. Returns None if any segment is missing. Brackets
+/// are not parsed — `foo.bar.0` works for lists, `foo[0]` does not.
+fn resolve_dotted_path(view: &BTreeMap<String, JsonValue>, path: &str) -> Option<JsonValue> {
+    let mut parts = path.split('.');
+    let head = parts.next()?;
+    let mut cur = view.get(head)?.clone();
+    for seg in parts {
+        cur = match cur {
+            JsonValue::Object(mut o) => o.remove(seg)?,
+            JsonValue::Array(arr) => {
+                let idx = seg.parse::<usize>().ok()?;
+                arr.into_iter().nth(idx)?
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
 }
 
 fn run_set_fact_body(
