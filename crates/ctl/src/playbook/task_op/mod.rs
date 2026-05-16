@@ -1,0 +1,2244 @@
+//! Task YAML types and conversion to wire `Op` messages.
+//!
+//! A task is `{ name: <str>, [metadata...], <body-kind>: <body-payload> }`.
+//! The body kind is identified by a top-level key (Ansible-style): one of
+//! `shell`, `exec`, `write_file`, `assert`, `fail`, `set_fact`,
+//! `import_tasks`, `meta`. Metadata keys (`when`, `register`, `loop`,
+//! `loop_control`, `tags`, `name`, `delegate_to`, `run_once`, `notify`)
+//! sit alongside.
+//!
+//! Serde derives can't express "exactly one of N body keys, plus any of M
+//! metadata keys, plus reject the rest" — `flatten` + an externally-tagged
+//! enum silently picks the first body key and fights `deny_unknown_fields`.
+//! So Task has a hand-written `Deserialize` that:
+//!
+//!   * requires `name: <str>`
+//!   * extracts metadata fields if present (each strongly typed)
+//!   * requires exactly one body key from the BODY_KEYS list
+//!   * rejects everything else
+//!
+//! The body sub-types keep their derived `Deserialize` with
+//! `deny_unknown_fields` to catch typos one level down.
+
+use anyhow::{anyhow, Result};
+use rsansible_wire::{
+    msg::{
+        op_blockinfile, op_exec, op_file, op_gather_facts, op_get_url, op_lineinfile, op_package,
+        op_postgresql_ext, op_postgresql_query, op_shell, op_stat, op_systemd, op_ufw, op_uri,
+        op_wait_for, op_write_file,
+    },
+    Op,
+};
+use serde::{de::Error as _, Deserialize, Deserializer};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+mod shared;
+mod shell;
+mod exec;
+mod command;
+mod write_file;
+mod template;
+mod copy;
+mod stat;
+mod file;
+mod wait_for;
+mod lineinfile;
+mod blockinfile;
+mod systemd;
+mod package;
+mod ufw;
+mod uri;
+mod openssl;
+mod postgresql;
+mod get_url;
+mod slurp;
+mod unarchive;
+
+pub use blockinfile::{BlockInFileOp, BlockInFileState};
+pub use command::CommandOp;
+pub use copy::CopyOp;
+pub use exec::ExecOp;
+pub use file::{FileOp, FileState};
+pub use get_url::GetUrlOp;
+pub use lineinfile::{LineInFileOp, LineInFileState};
+pub use openssl::{OpenSslCsrPipeOp, OpenSslPrivkeyOp, X509CertificatePipeOp};
+pub use package::{PackageManager, PackageOp, PackageState};
+pub use postgresql::{classify_sql_readonly, PostgresqlExtOp, PostgresqlQueryOp};
+pub use shell::ShellOp;
+pub use slurp::SlurpOp;
+pub use stat::StatOp;
+pub use systemd::{SystemdOp, SystemdState};
+pub use template::TemplateOp;
+pub use ufw::{UfwOp, UfwOpKind};
+pub use unarchive::UnarchiveOp;
+pub use uri::UriOp;
+pub use wait_for::{WaitForOp, WaitForState};
+pub use write_file::WriteFileOp;
+
+use package::parse_package_body;
+use shared::{read_pem_if_set, take_int_or_template_string, take_optional_string};
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Task {
+    pub name: String,
+    pub body: TaskBody,
+    /// `when:` — a single Jinja expression; the task is skipped on a host
+    /// where this evaluates to a falsy value.
+    pub when: Option<String>,
+    /// `register: my_result` — name to bind the result under in the host's
+    /// register dict.
+    pub register: Option<String>,
+    /// `loop:` — iterate the task over a sequence. Two shapes: an inline
+    /// YAML list (`loop: [a, b, c]`) or a Jinja expression string.
+    pub loop_spec: Option<LoopSpec>,
+    /// `loop_control:` — currently only `loop_var:` is supported (rename
+    /// `item`). Any other key is rejected.
+    pub loop_control: Option<LoopControl>,
+    /// `tags:` — currently parsed and stored but not yet honored by the
+    /// orchestrator (Phase 1a defers `--tags`/`--skip-tags` filtering).
+    pub tags: Vec<String>,
+    /// `delegate_to: somehost` — Jinja-templated hostname. The task body
+    /// runs against this host's connection, but register/set_fact effects
+    /// land in the *originating* host's context (Ansible semantics).
+    pub delegate_to: Option<String>,
+    /// `run_once: true` — exactly one host (the first targeted, or the
+    /// `delegate_to` target) runs the task; the resulting register/set_fact
+    /// is broadcast to every other targeted host.
+    pub run_once: bool,
+    /// `notify: [handler_a, handler_b]` (or a single string). Handler
+    /// names are queued onto the host's pending-handlers set when the
+    /// task changes; deduped and flushed at end-of-play (or on `meta:
+    /// flush_handlers`). Names are Jinja-templated at enqueue time.
+    pub notify: Vec<String>,
+    /// Path of the role directory this task came from, if the task was
+    /// pulled in by the role-flatten pass. `None` for tasks declared
+    /// directly under a play. Used by `TaskOp::Template` to resolve
+    /// `src:` relative to the role's `templates/` directory.
+    ///
+    /// Not Deserialize-able — populated at load time.
+    pub role_dir: Option<PathBuf>,
+    /// `become: true|false` — run this task with elevated privileges
+    /// via `sudo`. `None` means "inherit from the play's become
+    /// keyword" — a play-level default push-down pass at load time
+    /// fills it in. `Some(false)` explicitly opts out of an inherited
+    /// `become: true`. The orchestrator wraps `shell:` / `exec:` argv
+    /// with `sudo -n -u <become_user> --` when this is true; non-argv
+    /// ops (`write_file:` / `template:` / `copy:` / `gather_facts`)
+    /// run with the agent's own privileges and rely on the agent
+    /// having been pushed as a sufficiently privileged user.
+    pub become_: Option<bool>,
+    /// `become_user: <name>` — target user for `become: true`. None
+    /// means "inherit from play, then default to root". Only meaningful
+    /// when `become_` resolves to true at runtime.
+    pub become_user: Option<String>,
+    /// `ignore_errors: true` — when this task fails on a host, don't
+    /// halt the play and don't mark the host failed. The register (if
+    /// any) still reflects the failure (`.failed=true`, `.rc=...`) so
+    /// downstream `when:` clauses can inspect it. Notifies are NOT
+    /// enqueued for an ignored failure — handlers don't fire on
+    /// errored tasks regardless. Default `None` (treated as false).
+    pub ignore_errors: Option<bool>,
+    /// `check_mode: true|false` — per-task override of the run-level
+    /// `--check` flag. `None` means "inherit". `Some(true)` forces this
+    /// task to dry-run even when the run is live; `Some(false)` forces
+    /// this task to run for real even when the CLI passed `--check`
+    /// (useful for fact-gathering shells that have no side effects).
+    /// The orchestrator computes the effective flag at dispatch time:
+    /// `task.check_mode.unwrap_or(ctx.check_mode)`.
+    pub check_mode: Option<bool>,
+    /// `async: <seconds>` — run the task body as a background job on
+    /// the agent. Wraps the inner wire op in `OpAsyncStart(timeout_ms
+    /// = async*1000, inner)`. `Some(0)` is interpreted as "synchronous"
+    /// (matches Ansible: async: 0 disables async). `None` means absent.
+    pub async_seconds: Option<u32>,
+    /// `poll: <seconds>` — how often the orchestrator polls the job
+    /// for completion. `Some(0)` is fire-and-forget: the orchestrator
+    /// returns the start envelope (`ansible_job_id`, `started:1`,
+    /// `finished:0`) and lets the user poll later via `async_status:`.
+    /// `Some(n)` with n>0 makes the orchestrator block, polling every
+    /// n seconds until the job finishes or the async deadline expires.
+    /// `None` defaults to 10 when async is set (matches Ansible).
+    pub poll_seconds: Option<u32>,
+    /// `retries: <int|jinja>` — re-run the task up to N times on
+    /// failure or until `until:` is satisfied. Stored as a String to
+    /// support templated values like
+    /// `retries: "{{ (duration_s | int) // 5 }}"`; the runtime
+    /// renders + parses to u32 immediately before the retry loop.
+    /// `None` = no retry semantics. See ANSIBLE_COMPAT.md §4 for the
+    /// `register:`-required rule.
+    pub retries: Option<String>,
+    /// `delay: <int|jinja>` — seconds between retry attempts. Same
+    /// templated-string storage as `retries`. Defaults to 5 seconds
+    /// when retry semantics are active and `delay:` is unset
+    /// (matches Ansible).
+    pub delay: Option<String>,
+    /// `until: <jinja expr>` — boolean expression evaluated against
+    /// the registered task result after each attempt. Truthy stops
+    /// the retry loop. Requires `register:` to also be set; see
+    /// ANSIBLE_COMPAT.md §4.
+    pub until: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskBody {
+    /// Existing v0 ops. Sent to the agent as a wire `Op`.
+    Op(TaskOp),
+    /// Controller-side: each `that:` expression must evaluate truthy.
+    Assert(AssertTask),
+    /// Controller-side: unconditional failure with `msg:`.
+    Fail(FailTask),
+    /// Controller-side: print a Jinja-rendered message or the value of
+    /// a named variable. No state change.
+    Debug(DebugTask),
+    /// Controller-side: bind values into the host's set_facts dict.
+    SetFact(SetFactMap),
+    /// Parse-time directive: splice in tasks from `<file>`. After the
+    /// import-flattening pass walks the playbook, no `ImportTasks` body
+    /// should remain.
+    ImportTasks(PathBuf),
+    /// Parse-time directive: splice in tasks from another role's
+    /// `tasks/<tasks_from>.yml`. The role's `defaults/main.yml` is
+    /// merged into the play's role_defaults; the role's
+    /// `handlers/main.yml` (if any) is appended to the play's handler
+    /// list; the included tasks are tagged with the role's directory so
+    /// `template:` / `copy:` lookups resolve relative to that role.
+    /// `vars:` on the include site become a synthetic prepended
+    /// `set_fact:` so they're visible to the spliced tasks. After the
+    /// include-role expansion pass, no `IncludeRole` body should remain.
+    IncludeRole(IncludeRoleSpec),
+    /// Control-flow marker: e.g. `meta: flush_handlers` to force the
+    /// pending-handler queue to drain mid-play.
+    Meta(MetaAction),
+}
+
+/// Parsed body of an `include_role:` task. The optional `vars:` sits
+/// alongside `name:` / `tasks_from:` on the task; `vars:` at the task
+/// level (sibling of `include_role:`) is folded in by the parser.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncludeRoleSpec {
+    /// Name of the role to include (simple identifier — no path
+    /// separators). Resolved to `<base_dir>/roles/<name>/` at load time.
+    pub name: String,
+    /// Which file in the role's `tasks/` directory to load. Defaults to
+    /// `"main"`. The `.yml` (or `.yaml`) extension is added if missing.
+    pub tasks_from: String,
+    /// Per-include variable overrides. Spliced in as a synthetic
+    /// `set_fact:` prepended to the included tasks. Values can be Jinja
+    /// strings and will be rendered at runtime against the host's view.
+    pub vars: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// `meta:` task kinds. Currently only `flush_handlers`; the variant exists
+/// so future controls (`clear_host_errors`, `end_play`, …) can be added
+/// without another body-key churn.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaAction {
+    FlushHandlers,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskOp {
+    Shell(ShellOp),
+    Exec(ExecOp),
+    Command(CommandOp),
+    WriteFile(WriteFileOp),
+    /// `template:` — controller-side. The op declaration carries `src`
+    /// (a file path resolved at load time against the invoking role's
+    /// `templates/` dir, then the playbook dir) and a `dest` plus
+    /// `mode`. At execution time the orchestrator looks up the
+    /// pre-loaded template source from the playbook's `TemplateRegistry`,
+    /// renders it against the host's view, and dispatches the result
+    /// as an `OpWriteFile`. No new wire variant needed.
+    Template(TemplateOp),
+    /// `copy:` — controller-side. The op declaration carries `src` (a
+    /// file path resolved at load time against the invoking role's
+    /// `files/` dir, then the playbook dir) and a `dest` plus `mode`.
+    /// At execution time the orchestrator looks up the pre-loaded raw
+    /// bytes from the `CopyOp.body`, renders `dest` against the host's
+    /// view, and dispatches the result as an `OpWriteFile`. No new wire
+    /// variant needed. Unlike `template:`, the body is **not** Jinja-
+    /// rendered — `copy:` ships bytes verbatim, including binary.
+    Copy(CopyOp),
+    /// Implicit op emitted by the orchestrator when `gather_facts: true`
+    /// is set on a play. Not produced by parsing user YAML — there is
+    /// no `gather_facts:` task-body key.
+    GatherFacts,
+    /// `stat:` — read-only filesystem inspection. The agent emits a JSON
+    /// object on stdout describing the path; the orchestrator lifts it
+    /// into `register.stat` (matching Ansible's `foo.stat.exists` shape).
+    Stat(StatOp),
+    /// `file:` — Ansible's `ansible.builtin.file` module. Ensures a
+    /// filesystem path is in the requested state
+    /// (directory/absent/touch/file) with optional mode/owner/group +
+    /// recurse for directories.
+    File(FileOp),
+    /// `wait_for:` — block until a TCP port is reachable OR a path
+    /// appears/disappears. No state change; `changed` is always 0.
+    WaitFor(WaitForOp),
+    /// `lineinfile:` — idempotent single-line edit. Ensures or removes
+    /// a line in a text file; supports anchored-regex match,
+    /// `insertbefore`/`insertafter` placement, and backref substitution.
+    LineInFile(LineInFileOp),
+    /// `blockinfile:` — idempotent multi-line block edit. Delimited by
+    /// templated marker comments; replaces an existing block in place
+    /// or inserts a fresh one via `insertbefore`/`insertafter`.
+    BlockInFile(BlockInFileOp),
+    /// `systemd:` / `service:` — manage a systemd unit's run-state and
+    /// enable-state. Idempotent via `is-active` / `is-enabled` probes.
+    Systemd(SystemdOp),
+    /// `package:` / `apt:` / `dnf:` / `apk:` / ... — install/remove/upgrade
+    /// OS packages. One TaskOp variant covers every per-manager YAML key
+    /// (the YAML deserializer pins the `manager` field); `package:` uses
+    /// `Auto` to let the agent pick at run time. Batched (one wire op
+    /// carries multiple `name`s). Idempotency is per-backend.
+    Package(PackageOp),
+    /// `ufw:` — Uncomplicated Firewall control. One op covers one of
+    /// rule / enable / disable / reset / default / reload / logging.
+    Ufw(UfwOp),
+    /// `uri:` — HTTP client. Maps Ansible's `ansible.builtin.uri`
+    /// (subset). The agent emits a JSON envelope on stdout describing
+    /// the response; the orchestrator lifts the envelope fields to the
+    /// top level of `register` so `register.status`, `register.content`,
+    /// `register.json.<body-field>` etc. all resolve in templates,
+    /// matching Ansible's contract.
+    Uri(UriOp),
+    /// `openssl_privatekey:` — controller-side. Generates a fresh RSA
+    /// or Ed25519 private key on the controller via `rcgen`, then
+    /// dispatches an `OpWriteFile` to ship the PEM. The dispatch is
+    /// **composite**: depending on the per-host wire-cost heuristic
+    /// (`WireStrategy` × `should_probe_first`) it either probes with
+    /// `OpStat` first and conditionally writes, or ships blind with
+    /// `OpWriteFile { only_if_missing: 1 }`. Matches Ansible's
+    /// `community.crypto.openssl_privatekey` idempotency: an existing
+    /// key on disk is never overwritten.
+    OpenSslPrivkey(OpenSslPrivkeyOp),
+    /// `openssl_csr_pipe:` — controller-side, no wire dispatch.
+    /// Computes a CSR PEM on the controller (using the privkey PEM
+    /// cached on `HostCtx` by an earlier `openssl_privatekey` task)
+    /// and stashes the bytes into the synthetic register so
+    /// downstream tasks reference `{{ csr.content }}`.
+    OpenSslCsrPipe(OpenSslCsrPipeOp),
+    /// `x509_certificate_pipe:` — controller-side, no wire dispatch.
+    /// Self-signs a cert against the supplied CSR + private key
+    /// (both fed in as PEM strings, typically via Jinja from earlier
+    /// registers) and stashes the cert PEM into the synthetic
+    /// register so downstream tasks reference `{{ cert.content }}`.
+    /// v1 supports `provider: selfsigned` only.
+    X509CertificatePipe(X509CertificatePipeOp),
+    /// `postgresql_query:` — execute SQL against a PostgreSQL server.
+    /// Maps Ansible's `community.postgresql.postgresql_query` (subset).
+    /// The controller classifies the SQL at compile time (read-only vs
+    /// mutating) and pins `read_only` here; the agent uses that byte to
+    /// gate check-mode skip and `changed` reporting. Connection prefers
+    /// `login_unix_socket` (Patroni clusters) and falls back to TCP at
+    /// `login_host:login_port`. Empty `login_user` triggers peer auth
+    /// against the agent process's effective uid — under `become:
+    /// postgres` that's the postgres OS user.
+    PostgresqlQuery(PostgresqlQueryOp),
+    /// `postgresql_ext:` — manage a PostgreSQL extension's presence.
+    /// Maps Ansible's `community.postgresql.postgresql_ext` (subset).
+    /// Probe-then-DDL idempotency. Version updates not implemented in
+    /// v1.
+    PostgresqlExt(PostgresqlExtOp),
+    /// `get_url:` — HTTP file downloader. Maps Ansible's
+    /// `ansible.builtin.get_url` (subset). The agent does stat-skip on
+    /// existing dest (with optional checksum match), atomic-renames a
+    /// staged tmp file on success, and verifies any operator-supplied
+    /// checksum post-download. The envelope shape matches Ansible
+    /// (`url`, `dest`, `checksum_src`, `checksum_dest`, `size`,
+    /// `status_code`, `msg`) so vendored playbooks register-lift
+    /// unchanged.
+    GetUrl(GetUrlOp),
+    /// `slurp:` — Ansible's `ansible.builtin.slurp` module. Reads a
+    /// file on the remote host and registers a base64-encoded copy of
+    /// its contents (`register.content`, `register.source`,
+    /// `register.encoding`). Dispatched via `OpReadFile`. Read-only;
+    /// `changed` is always 0.
+    Slurp(SlurpOp),
+    /// `unarchive:` — Ansible's `ansible.builtin.unarchive` module
+    /// (`remote_src: yes` flavour only). Extracts an archive that
+    /// already lives on the agent host. Dispatched via `OpUnarchive`.
+    Unarchive(UnarchiveOp),
+}
+
+const BODY_KEYS: &[&str] = &[
+    "shell",
+    "exec",
+    "command",
+    "write_file",
+    "template",
+    "copy",
+    "stat",
+    "file",
+    "wait_for",
+    "lineinfile",
+    "blockinfile",
+    "systemd",
+    "service",
+    "apt",
+    "package",
+    "ufw",
+    "uri",
+    "openssl_privatekey",
+    "openssl_csr_pipe",
+    "x509_certificate_pipe",
+    "postgresql_query",
+    "postgresql_ext",
+    "get_url",
+    "slurp",
+    "unarchive",
+    "assert",
+    "fail",
+    "debug",
+    "set_fact",
+    "import_tasks",
+    "include_role",
+    "meta",
+];
+
+/// Top-level keys that don't select a body but do carry per-task metadata.
+const METADATA_KEYS: &[&str] = &[
+    "name",
+    "when",
+    "register",
+    "loop",
+    "loop_control",
+    "tags",
+    "delegate_to",
+    "run_once",
+    "notify",
+    "become",
+    "become_user",
+    "ignore_errors",
+    "check_mode",
+    "async",
+    "poll",
+    "retries",
+    "delay",
+    "until",
+];
+
+
+impl<'de> Deserialize<'de> for Task {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        let name = match map.remove("name") {
+            Some(serde_yaml::Value::String(s)) => s,
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task `name` must be a string, got: {other:?}"
+                )));
+            }
+            None => return Err(D::Error::missing_field("name")),
+        };
+
+        // Extract metadata fields.
+        let when = take_optional_string(&mut map, "when", &name)?;
+        let register = take_optional_string(&mut map, "register", &name)?;
+        let loop_spec = match map.remove("loop") {
+            None => None,
+            Some(v) => Some(LoopSpec::from_yaml(v).map_err(|e| {
+                D::Error::custom(format!("task {name:?}: loop: {e}"))
+            })?),
+        };
+        let loop_control = match map.remove("loop_control") {
+            None => None,
+            Some(v) => Some(serde_yaml::from_value::<LoopControl>(v).map_err(|e| {
+                D::Error::custom(format!("task {name:?}: loop_control: {e}"))
+            })?),
+        };
+        let tags = match map.remove("tags") {
+            None => Vec::new(),
+            Some(v) => parse_tags_value::<D::Error>(v)
+                .map_err(|e| D::Error::custom(format!("task {name:?}: tags: {e}")))?,
+        };
+        let delegate_to = take_optional_string(&mut map, "delegate_to", &name)?;
+        let become_ = match map.remove("become") {
+            None => None,
+            Some(serde_yaml::Value::Bool(b)) => Some(b),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `become` must be a bool, got: {other:?}"
+                )));
+            }
+        };
+        let become_user = take_optional_string(&mut map, "become_user", &name)?;
+        let ignore_errors = match map.remove("ignore_errors") {
+            None => None,
+            Some(serde_yaml::Value::Bool(b)) => Some(b),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `ignore_errors` must be a bool, got: {other:?}"
+                )));
+            }
+        };
+        let check_mode = match map.remove("check_mode") {
+            None => None,
+            Some(serde_yaml::Value::Bool(b)) => Some(b),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `check_mode` must be a bool, got: {other:?}"
+                )));
+            }
+        };
+        let async_seconds = match map.remove("async") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
+                D::Error::custom(format!(
+                    "task {name:?}: `async` must be a non-negative integer (seconds), got: {n:?}"
+                ))
+            })? as u32),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `async` must be an integer number of seconds, got: {other:?}"
+                )));
+            }
+        };
+        let poll_seconds = match map.remove("poll") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
+                D::Error::custom(format!(
+                    "task {name:?}: `poll` must be a non-negative integer (seconds), got: {n:?}"
+                ))
+            })? as u32),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `poll` must be an integer number of seconds, got: {other:?}"
+                )));
+            }
+        };
+        if poll_seconds.is_some() && async_seconds.is_none() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `poll:` is only meaningful with `async:` set"
+            )));
+        }
+        // retries/delay accept either an integer (most common) or a
+        // Jinja-templated string (e.g. `retries: "{{ (n | int) // 5 }}"`).
+        // Store both as String — the runtime renders + parses to u32.
+        let retries = take_int_or_template_string(&mut map, "retries", &name)?;
+        let delay = take_int_or_template_string(&mut map, "delay", &name)?;
+        let until = take_optional_string(&mut map, "until", &name)?;
+        // until: requires register: (we need the registered envelope
+        // to evaluate the expression against). See ANSIBLE_COMPAT.md §4.
+        if until.is_some() && register.is_none() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `until:` requires `register:` to also be \
+                 set — rsansible doesn't bind an implicit `result` var \
+                 (see ANSIBLE_COMPAT.md §4)"
+            )));
+        }
+        // delay: without retries: is meaningless. Surface it instead of
+        // silently dropping the field, same shape as `poll:` without `async:`.
+        if delay.is_some() && retries.is_none() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `delay:` is only meaningful with `retries:` set"
+            )));
+        }
+        let run_once = match map.remove("run_once") {
+            None => false,
+            Some(serde_yaml::Value::Bool(b)) => b,
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `run_once` must be a bool, got: {other:?}"
+                )));
+            }
+        };
+        // `vars:` only has meaning on `include_role:` today. We strip it
+        // here so it doesn't trigger the unknown-key check, then enforce
+        // the include_role-only restriction once the body kind is known.
+        let task_vars: Option<BTreeMap<String, serde_yaml::Value>> = match map.remove("vars") {
+            None => None,
+            Some(serde_yaml::Value::Mapping(m)) => {
+                let mut out = BTreeMap::new();
+                for (k, v) in m {
+                    let key = k.as_str().ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "task {name:?}: vars keys must be strings, got {k:?}"
+                        ))
+                    })?;
+                    out.insert(key.to_string(), v);
+                }
+                Some(out)
+            }
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `vars` must be a mapping, got: {other:?}"
+                )));
+            }
+        };
+
+        let notify = match map.remove("notify") {
+            None => Vec::new(),
+            Some(serde_yaml::Value::String(s)) => vec![s],
+            Some(serde_yaml::Value::Sequence(seq)) => seq
+                .into_iter()
+                .map(|item| match item {
+                    serde_yaml::Value::String(s) => Ok(s),
+                    other => Err(D::Error::custom(format!(
+                        "task {name:?}: notify entries must be strings, got: {other:?}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `notify` must be a string or list of strings, got: {other:?}"
+                )));
+            }
+        };
+
+        // Find exactly one body key.
+        let mut chosen: Option<(&'static str, serde_yaml::Value)> = None;
+        for &k in BODY_KEYS {
+            if let Some(v) = map.remove(k) {
+                if let Some((prev, _)) = &chosen {
+                    return Err(D::Error::custom(format!(
+                        "task {name:?}: more than one body key set ({prev:?} and {k:?}); \
+                         a task must have exactly one of {BODY_KEYS:?}"
+                    )));
+                }
+                chosen = Some((k, v));
+            }
+        }
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "task {name:?}: unknown field(s): {unknown:?}; \
+                 expected metadata in {METADATA_KEYS:?} plus one of {BODY_KEYS:?}"
+            )));
+        }
+
+        let (kind, body_yaml) = chosen.ok_or_else(|| {
+            D::Error::custom(format!(
+                "task {name:?}: missing body — expected one of {BODY_KEYS:?}"
+            ))
+        })?;
+
+        let body = match kind {
+            "shell" => TaskBody::Op(TaskOp::Shell(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "exec" => TaskBody::Op(TaskOp::Exec(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "command" => TaskBody::Op(TaskOp::Command(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "write_file" => TaskBody::Op(TaskOp::WriteFile(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "template" => TaskBody::Op(TaskOp::Template(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "copy" => TaskBody::Op(TaskOp::Copy(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "stat" => TaskBody::Op(TaskOp::Stat(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "file" => TaskBody::Op(TaskOp::File(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "wait_for" => TaskBody::Op(TaskOp::WaitFor(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "lineinfile" => TaskBody::Op(TaskOp::LineInFile(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "blockinfile" => TaskBody::Op(TaskOp::BlockInFile(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            // `service:` is an alias for `systemd:` — Ansible treats
+            // them as separate modules but for our subset they're the
+            // same wrapper; we accept either spelling.
+            "systemd" | "service" => TaskBody::Op(TaskOp::Systemd(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "apt" => {
+                // `apt:` pins manager=Apt; reuses the shared package
+                // body parser.
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Package(parse_package_body::<D::Error>(
+                    PackageManager::Apt,
+                    map,
+                )?))
+            }
+            "package" => {
+                // `package:` uses manager=Auto — the agent picks at run
+                // time based on what's on PATH / gathered facts. Refuses
+                // apt-only knobs since we can't promise the picked
+                // backend honors them.
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Package(parse_package_body::<D::Error>(
+                    PackageManager::Auto,
+                    map,
+                )?))
+            }
+            "ufw" => TaskBody::Op(TaskOp::Ufw(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "uri" => TaskBody::Op(TaskOp::Uri(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "openssl_privatekey" => TaskBody::Op(TaskOp::OpenSslPrivkey(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "openssl_csr_pipe" => TaskBody::Op(TaskOp::OpenSslCsrPipe(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "x509_certificate_pipe" => TaskBody::Op(TaskOp::X509CertificatePipe(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "postgresql_query" => TaskBody::Op(TaskOp::PostgresqlQuery(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "postgresql_ext" => TaskBody::Op(TaskOp::PostgresqlExt(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "get_url" => TaskBody::Op(TaskOp::GetUrl(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "slurp" => TaskBody::Op(TaskOp::Slurp(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "unarchive" => TaskBody::Op(TaskOp::Unarchive(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "assert" => TaskBody::Assert(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            ),
+            "fail" => TaskBody::Fail(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            ),
+            "debug" => TaskBody::Debug(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            ),
+            "set_fact" => {
+                let raw: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                let mut out = BTreeMap::new();
+                for (k, v) in raw {
+                    let key = k.as_str().ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "task {name:?}: set_fact keys must be strings, got {k:?}"
+                        ))
+                    })?;
+                    out.insert(key.to_string(), v);
+                }
+                TaskBody::SetFact(SetFactMap(out))
+            }
+            "import_tasks" => {
+                let path: String =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::ImportTasks(PathBuf::from(path))
+            }
+            "include_role" => {
+                // include_role body is itself a mapping: { name, tasks_from? }.
+                let mut body_map = match body_yaml {
+                    serde_yaml::Value::Mapping(m) => m,
+                    other => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role body must be a mapping, got: {other:?}"
+                        )));
+                    }
+                };
+                let role_name = match body_map.remove("name") {
+                    Some(serde_yaml::Value::String(s)) => s,
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role.name must be a string, got: {other:?}"
+                        )));
+                    }
+                    None => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role missing required `name`"
+                        )));
+                    }
+                };
+                let tasks_from = match body_map.remove("tasks_from") {
+                    None => "main".to_string(),
+                    Some(serde_yaml::Value::String(s)) => s,
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: include_role.tasks_from must be a string, got: {other:?}"
+                        )));
+                    }
+                };
+                if !body_map.is_empty() {
+                    let unknown: Vec<String> = body_map
+                        .keys()
+                        .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                        .collect();
+                    return Err(D::Error::custom(format!(
+                        "task {name:?}: include_role: unknown field(s) {unknown:?}; \
+                         expected [name, tasks_from]"
+                    )));
+                }
+                let vars = task_vars.clone().unwrap_or_default();
+                TaskBody::IncludeRole(IncludeRoleSpec {
+                    name: role_name,
+                    tasks_from,
+                    vars,
+                })
+            }
+            "meta" => {
+                let action: MetaAction = serde_yaml::from_value(body_yaml).map_err(|e| {
+                    D::Error::custom(format!(
+                        "task {name:?}: meta: expected one of [flush_handlers], got: {e}"
+                    ))
+                })?;
+                TaskBody::Meta(action)
+            }
+            _ => unreachable!("body key not in BODY_KEYS dispatch"),
+        };
+
+        // `vars:` is consumed by the include_role arm above. If it's set
+        // on any other body kind, surface the error (rather than silently
+        // dropping the override).
+        if task_vars.is_some() && !matches!(body, TaskBody::IncludeRole(_)) {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `vars:` is only supported on `include_role:` tasks; \
+                 use set_fact or play-level vars for general task variables"
+            )));
+        }
+        Ok(Task {
+            name,
+            body,
+            when,
+            register,
+            loop_spec,
+            loop_control,
+            tags,
+            delegate_to,
+            run_once,
+            notify,
+            role_dir: None,
+            become_,
+            become_user,
+            ignore_errors,
+            check_mode,
+            async_seconds,
+            poll_seconds,
+            retries,
+            delay,
+            until,
+        })
+    }
+}
+
+/// Deserialize a `tags:` value into `Vec<String>`. Ansible accepts both
+/// `tags: foo` and `tags: [foo, bar]`; we accept both shapes here. Empty
+/// or whitespace-only tag strings are rejected — they almost always
+/// indicate a typo (a trailing comma, an unquoted YAML null, etc.) and
+/// silently dropping them would mask the bug.
+pub(crate) fn parse_tags_value<E: serde::de::Error>(
+    v: serde_yaml::Value,
+) -> Result<Vec<String>, E> {
+    let raw: Vec<String> = match v {
+        serde_yaml::Value::String(s) => vec![s],
+        serde_yaml::Value::Sequence(_) => serde_yaml::from_value::<Vec<String>>(v)
+            .map_err(|e| E::custom(format!("expected a list of strings: {e}")))?,
+        serde_yaml::Value::Null => Vec::new(),
+        other => {
+            return Err(E::custom(format!(
+                "expected a string or list of strings, got: {other:?}"
+            )))
+        }
+    };
+    for s in &raw {
+        if s.trim().is_empty() {
+            return Err(E::custom(
+                "tag entries must be non-empty (check for stray commas \
+                 or unquoted YAML nulls)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(raw)
+}
+
+/// `serde::Deserialize` adapter for the standalone `tags:` field on
+/// `RoleSpec`. The task-level parser does its own field-by-field
+/// extraction (so it doesn't use this directly) but the role-spec
+/// derive flow does.
+pub(crate) fn deserialize_tags<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_yaml::Value::deserialize(d)?;
+    parse_tags_value(v)
+}
+
+/// `assert: { that: ["x == 1", "y > 0"], msg: "..." }`
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssertTask {
+    /// One or more Jinja expressions. Ansible accepts a single string in
+    /// place of a list; honor that for ergonomics.
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    pub that: Vec<String>,
+    #[serde(default)]
+    pub msg: Option<String>,
+}
+
+/// `fail: { msg: "..." }`
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FailTask {
+    #[serde(default = "default_fail_msg")]
+    pub msg: String,
+}
+
+fn default_fail_msg() -> String {
+    "Failed as requested".to_string()
+}
+
+/// `debug: { msg: "..." }` or `debug: { var: "name.path" }`. Controller-
+/// side; emits an info-level log line and registers a no-change result.
+/// Exactly one of `msg`/`var` must be set. `verbosity:` is parsed and
+/// ignored — every debug task runs at info level for now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugTask {
+    pub msg: Option<String>,
+    pub var: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for DebugTask {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_yaml::Value::deserialize(d)?;
+        // Shorthand: `debug: "string"` → msg=string.
+        if let serde_yaml::Value::String(s) = &v {
+            return Ok(DebugTask {
+                msg: Some(s.clone()),
+                var: None,
+            });
+        }
+        let mut map = match v {
+            serde_yaml::Value::Mapping(m) => m,
+            other => {
+                return Err(D::Error::custom(format!(
+                    "debug: expected a mapping (or a string shorthand), got: {other:?}"
+                )))
+            }
+        };
+        let msg = match map.remove("msg") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::String(s)) => Some(s),
+            // Ansible accepts non-string msg (list/dict/number) and
+            // prints them via repr. Accept whatever it is and stringify
+            // via YAML to_string for fidelity.
+            Some(other) => Some(
+                serde_yaml::to_string(&other)
+                    .map_err(D::Error::custom)?
+                    .trim_end()
+                    .to_string(),
+            ),
+        };
+        let var = match map.remove("var") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "debug.var: expected a non-empty string, got: {other:?}"
+                )))
+            }
+        };
+        // `verbosity:` parsed and discarded (we always print).
+        let _ = map.remove("verbosity");
+        if let Some((k, _)) = map.into_iter().next() {
+            return Err(D::Error::custom(format!(
+                "debug: unknown field {k:?}; only msg/var/verbosity accepted"
+            )));
+        }
+        if msg.is_some() && var.is_some() {
+            return Err(D::Error::custom(
+                "debug: msg and var are mutually exclusive",
+            ));
+        }
+        if msg.is_none() && var.is_none() {
+            // Ansible defaults to msg="Hello world!" when neither is given.
+            return Ok(DebugTask {
+                msg: Some("Hello world!".into()),
+                var: None,
+            });
+        }
+        Ok(DebugTask { msg, var })
+    }
+}
+
+fn deserialize_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_yaml::Value::deserialize(d)?;
+    match v {
+        serde_yaml::Value::String(s) => Ok(vec![s]),
+        serde_yaml::Value::Sequence(seq) => seq
+            .into_iter()
+            .map(|item| match item {
+                serde_yaml::Value::String(s) => Ok(s),
+                other => Err(D::Error::custom(format!(
+                    "expected string, got: {other:?}"
+                ))),
+            })
+            .collect(),
+        other => Err(D::Error::custom(format!(
+            "expected string or list of strings, got: {other:?}"
+        ))),
+    }
+}
+
+/// Values inside a `set_fact:` map. Stored as `serde_yaml::Value` so
+/// scalar strings can be Jinja-rendered at runtime and structured values
+/// (lists, maps, numbers, bools) pass through unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetFactMap(pub BTreeMap<String, serde_yaml::Value>);
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoopSpec {
+    /// `loop: [a, b, c]` — literal list.
+    Items(Vec<serde_yaml::Value>),
+    /// `loop: "{{ some_list }}"` — Jinja expression that yields a list.
+    Expr(String),
+}
+
+impl LoopSpec {
+    fn from_yaml(v: serde_yaml::Value) -> Result<Self, String> {
+        match v {
+            serde_yaml::Value::String(s) => Ok(LoopSpec::Expr(s)),
+            serde_yaml::Value::Sequence(seq) => Ok(LoopSpec::Items(seq)),
+            other => Err(format!(
+                "expected list or Jinja string, got: {other:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopControl {
+    /// Variable name to expose the current iteration's item under.
+    /// Defaults to `item` when absent.
+    #[serde(default)]
+    pub loop_var: Option<String>,
+}
+
+impl TaskOp {
+    /// Convert this playbook-level op into a wire `Op` message body.
+    ///
+    /// Caller is responsible for having rendered any Jinja in the op
+    /// fields before calling this — `to_wire_op` itself is a pure
+    /// structural conversion.
+    pub fn to_wire_op(&self) -> Result<Op> {
+        match self {
+            TaskOp::Shell(s) => Ok(op_shell(s.command().to_string(), s.timeout_ms())),
+            TaskOp::Exec(e) => {
+                if e.argv.is_empty() {
+                    return Err(anyhow!("exec.argv is empty"));
+                }
+                let (env_keys, env_values): (Vec<_>, Vec<_>) =
+                    e.env.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+                Ok(op_exec(
+                    e.argv.clone(),
+                    env_keys,
+                    env_values,
+                    e.cwd.clone().unwrap_or_default(),
+                    e.stdin.as_bytes().to_vec(),
+                    e.timeout_ms,
+                ))
+            }
+            TaskOp::Command(c) => {
+                // `creates:` / `removes:` are honored via a composite
+                // OpStat probe in the orchestrator, not here. Reject
+                // them at to_wire_op so we fail loudly if the
+                // composite path forgets to peel them off.
+                if !c.creates.is_empty() || !c.removes.is_empty() {
+                    return Err(anyhow!(
+                        "internal: TaskOp::Command with creates/removes reached to_wire_op without composite probe"
+                    ));
+                }
+                if c.argv.is_empty() {
+                    return Err(anyhow!("command.argv is empty"));
+                }
+                Ok(op_exec(
+                    c.argv.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    c.chdir.clone(),
+                    c.stdin.as_bytes().to_vec(),
+                    c.timeout_ms,
+                ))
+            }
+            TaskOp::WriteFile(w) => Ok(op_write_file(
+                w.path.clone(),
+                w.mode,
+                false,
+                w.content.as_bytes().to_vec(),
+            )),
+            // `template:` is desugared to `OpWriteFile` by the orchestrator
+            // (after rendering the template body), so we should never see
+            // a raw `TaskOp::Template` here.
+            TaskOp::Template(_) => Err(anyhow!(
+                "internal: TaskOp::Template reached to_wire_op without being desugared to TaskOp::WriteFile"
+            )),
+            TaskOp::Copy(c) => {
+                // `copy:` keeps its variant through render_op (rather
+                // than desugaring to WriteFile) so we can ship bytes
+                // verbatim — WriteFileOp.content is String, which would
+                // lossy-convert binary blobs.
+                let body = c.body.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "internal: TaskOp::Copy src {:?} body not resolved at to_wire_op time",
+                        c.src
+                    )
+                })?;
+                Ok(op_write_file(c.dest.clone(), c.mode, false, body.clone()))
+            }
+            TaskOp::GatherFacts => Ok(op_gather_facts()),
+            TaskOp::Stat(s) => Ok(op_stat(s.path.clone(), s.follow)),
+            TaskOp::WaitFor(w) => Ok(op_wait_for(
+                w.host.clone().unwrap_or_default(),
+                w.port.unwrap_or(0),
+                w.path.clone().unwrap_or_default(),
+                w.state.wire_byte(),
+                w.timeout_ms,
+                w.delay_ms,
+                w.sleep_ms,
+            )),
+            TaskOp::File(f) => Ok(op_file(
+                f.path.clone(),
+                f.state.wire_byte(),
+                f.mode,
+                f.owner.clone().unwrap_or_default(),
+                f.group.clone().unwrap_or_default(),
+                f.recurse,
+            )),
+            TaskOp::LineInFile(l) => Ok(op_lineinfile(
+                l.path.clone(),
+                l.regexp.clone(),
+                l.line.clone(),
+                l.state.wire_byte(),
+                l.mode,
+                l.create,
+                l.insertbefore.clone(),
+                l.insertafter.clone(),
+                l.backrefs,
+            )),
+            TaskOp::BlockInFile(b) => Ok(op_blockinfile(
+                b.path.clone(),
+                b.block.clone(),
+                b.marker.clone(),
+                b.marker_begin.clone(),
+                b.marker_end.clone(),
+                b.state.wire_byte(),
+                b.mode,
+                b.create,
+                b.insertbefore.clone(),
+                b.insertafter.clone(),
+            )),
+            TaskOp::Systemd(s) => Ok(op_systemd(
+                s.name.clone(),
+                s.state.wire_byte(),
+                s.enabled,
+                s.masked,
+                s.daemon_reload,
+                s.no_block,
+            )),
+            TaskOp::Package(p) => Ok(op_package(
+                p.manager.wire_byte(),
+                p.names.clone(),
+                p.state.wire_byte(),
+                p.update_cache,
+                p.cache_valid_time,
+                p.purge,
+                p.autoremove,
+                p.default_release.clone(),
+                p.allow_unauthenticated,
+            )),
+            TaskOp::Ufw(u) => Ok(op_ufw(
+                u.op.wire_byte(),
+                u.rule.clone(),
+                u.direction.clone(),
+                u.proto.clone(),
+                u.from_ip.clone(),
+                u.from_port.clone(),
+                u.to_ip.clone(),
+                u.to_port.clone(),
+                u.interface.clone(),
+                u.comment.clone(),
+                u.delete,
+                u.insert,
+            )),
+            TaskOp::Uri(u) => {
+                // BTreeMap iteration is sorted → deterministic on the wire.
+                let (header_keys, header_values): (Vec<_>, Vec<_>) =
+                    u.headers.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+                // mTLS PEM material: read from the controller filesystem at
+                // wire-emit time. Paths are already Jinja-rendered (the
+                // orchestrator renders all UriOp string fields before
+                // to_wire_op runs). Empty path → empty bytes (= absent on
+                // the wire, agent skips the mTLS branch).
+                let client_cert_pem = read_pem_if_set(&u.client_cert, "client_cert")?;
+                let client_key_pem = read_pem_if_set(&u.client_key, "client_key")?;
+                let ca_bundle_pem = read_pem_if_set(&u.ca_path, "ca_path")?;
+                Ok(op_uri(
+                    u.method,
+                    u.url.clone(),
+                    header_keys,
+                    header_values,
+                    u.body.as_bytes().to_vec(),
+                    u.body_format,
+                    u.status_codes.clone(),
+                    u.timeout_ms,
+                    u.return_content,
+                    u.validate_certs,
+                    u.follow_redirects,
+                    client_cert_pem,
+                    client_key_pem,
+                    ca_bundle_pem,
+                ))
+            }
+            // These three are dispatched through the orchestrator's
+            // composite-dispatch path (see `dispatch_plan` /
+            // `run_body_op`), not via to_wire_op:
+            //
+            //   - OpenSslPrivkey emits OpStat + maybe OpWriteFile.
+            //   - OpenSslCsrPipe / X509CertificatePipe synthesize a
+            //     register entry without any wire dispatch.
+            //
+            // Reaching to_wire_op for any of them is a routing bug.
+            TaskOp::OpenSslPrivkey(_) => Err(anyhow!(
+                "internal: TaskOp::OpenSslPrivkey reached to_wire_op without being routed through composite dispatch"
+            )),
+            TaskOp::OpenSslCsrPipe(_) => Err(anyhow!(
+                "internal: TaskOp::OpenSslCsrPipe reached to_wire_op — this op is pure controller-side, should be intercepted earlier"
+            )),
+            TaskOp::X509CertificatePipe(_) => Err(anyhow!(
+                "internal: TaskOp::X509CertificatePipe reached to_wire_op — this op is pure controller-side, should be intercepted earlier"
+            )),
+            TaskOp::PostgresqlQuery(p) => Ok(op_postgresql_query(
+                p.query.clone(),
+                p.db.clone(),
+                p.login_user.clone(),
+                p.login_password.clone(),
+                p.login_unix_socket.clone(),
+                p.login_host.clone(),
+                p.login_port,
+                p.autocommit,
+                p.positional_args.clone(),
+                p.read_only,
+            )),
+            TaskOp::PostgresqlExt(p) => Ok(op_postgresql_ext(
+                p.name.clone(),
+                p.state,
+                p.version.clone(),
+                p.ext_schema.clone(),
+                p.cascade,
+                p.db.clone(),
+                p.login_user.clone(),
+                p.login_password.clone(),
+                p.login_unix_socket.clone(),
+                p.login_host.clone(),
+                p.login_port,
+            )),
+            TaskOp::GetUrl(g) => {
+                let (header_keys, header_values): (Vec<_>, Vec<_>) =
+                    g.headers.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+                let client_cert_pem = read_pem_if_set(&g.client_cert, "client_cert")?;
+                let client_key_pem = read_pem_if_set(&g.client_key, "client_key")?;
+                let ca_bundle_pem = read_pem_if_set(&g.ca_path, "ca_path")?;
+                Ok(op_get_url(
+                    g.url.clone(),
+                    g.dest.clone(),
+                    g.checksum.clone(),
+                    g.mode,
+                    g.owner.clone(),
+                    g.group.clone(),
+                    header_keys,
+                    header_values,
+                    g.timeout_ms,
+                    g.force,
+                    g.validate_certs,
+                    g.follow_redirects,
+                    client_cert_pem,
+                    client_key_pem,
+                    ca_bundle_pem,
+                ))
+            }
+            TaskOp::Slurp(s) => Ok(rsansible_wire::msg::op_read_file(
+                s.src.clone(),
+                s.max_bytes,
+            )),
+            TaskOp::Unarchive(u) => {
+                let (has_mode, mode_bits) = match u.mode {
+                    Some(m) => (1u8, m),
+                    None => (0u8, 0u32),
+                };
+                Ok(rsansible_wire::msg::op_unarchive(
+                    u.src.clone(),
+                    u.dest.clone(),
+                    u.format,
+                    u.creates.clone(),
+                    has_mode,
+                    mode_bits,
+                    u.owner.clone(),
+                    u.group.clone(),
+                    if u.keep_newer { 1 } else { 0 },
+                    if u.list_files { 1 } else { 0 },
+                    u.include.clone(),
+                    u.exclude.clone(),
+                ))
+            }
+        }
+    }
+}
+
+/// Test helper: parse a single Task from YAML, panicking on failure.
+/// Lives at file level (rather than inside `mod tests`) so per-op submodule
+/// tests can reuse it via `use crate::playbook::task_op::parse_task_for_test;`.
+#[cfg(test)]
+pub(crate) fn parse_task_for_test(yaml: &str) -> Task {
+    serde_yaml::from_str(yaml).expect("parses")
+}
+
+/// Test helper: parse a Task from YAML, returning the serde error on failure.
+#[cfg(test)]
+pub(crate) fn try_parse_task_for_test(yaml: &str) -> Result<Task, serde_yaml::Error> {
+    serde_yaml::from_str(yaml)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task, *,
+    };
+
+    #[test]
+    fn retries_integer_form_parses() {
+        let yaml = r#"
+- name: wait
+  shell: check.sh
+  register: r
+  retries: 5
+  delay: 2
+  until: r.rc == 0
+"#;
+        let tasks: Vec<Task> = serde_yaml::from_str(yaml).unwrap();
+        let t = &tasks[0];
+        assert_eq!(t.retries.as_deref(), Some("5"));
+        assert_eq!(t.delay.as_deref(), Some("2"));
+        assert_eq!(t.until.as_deref(), Some("r.rc == 0"));
+        assert_eq!(t.register.as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn retries_jinja_string_form_parses() {
+        // This is the actual shape gothab's drill playbooks use.
+        let yaml = r#"
+- name: wait
+  shell: check.sh
+  register: writer_status
+  retries: "{{ (writer_duration_s | int) // 5 + 5 }}"
+  delay: "{{ poll_interval }}"
+  until: writer_status.finished
+"#;
+        let tasks: Vec<Task> = serde_yaml::from_str(yaml).unwrap();
+        let t = &tasks[0];
+        assert_eq!(
+            t.retries.as_deref(),
+            Some("{{ (writer_duration_s | int) // 5 + 5 }}")
+        );
+        assert_eq!(t.delay.as_deref(), Some("{{ poll_interval }}"));
+    }
+
+    #[test]
+    fn retries_without_until_is_accepted() {
+        // Ansible allows `retries:` without `until:` — retry on failure.
+        let yaml = r#"
+- name: try
+  shell: flake.sh
+  retries: 3
+"#;
+        let tasks: Vec<Task> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(tasks[0].retries.as_deref(), Some("3"));
+        assert!(tasks[0].until.is_none());
+    }
+
+    #[test]
+    fn until_without_register_errors() {
+        let yaml = r#"
+- name: wait
+  shell: check.sh
+  retries: 3
+  until: result.rc == 0
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("until") && s.contains("register"),
+            "unexpected error: {s}"
+        );
+    }
+
+    #[test]
+    fn delay_without_retries_errors() {
+        let yaml = r#"
+- name: foo
+  shell: echo
+  delay: 5
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("delay") && err.to_string().contains("retries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn retries_bool_rejected() {
+        let yaml = r#"
+- name: x
+  shell: e
+  retries: true
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("retries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn retries_negative_rejected() {
+        let yaml = r#"
+- name: x
+  shell: e
+  retries: -1
+"#;
+        let err = serde_yaml::from_str::<Vec<Task>>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("retries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_task_with_metadata() {
+        let t = parse_task(
+            r#"
+name: greet
+when: "1 == 1"
+register: greet_out
+tags: [smoke, hello]
+shell: "echo hi"
+"#,
+        );
+        assert_eq!(t.name, "greet");
+        assert_eq!(t.when.as_deref(), Some("1 == 1"));
+        assert_eq!(t.register.as_deref(), Some("greet_out"));
+        assert_eq!(t.tags, vec!["smoke", "hello"]);
+        assert!(matches!(t.body, TaskBody::Op(TaskOp::Shell(_))));
+    }
+
+    #[test]
+    fn parses_bare_string_tag() {
+        // Ansible-style shorthand: `tags: foo` (no brackets).
+        let t = parse_task(
+            r#"
+name: t
+tags: smoke
+shell: "echo hi"
+"#,
+        );
+        assert_eq!(t.tags, vec!["smoke"]);
+    }
+
+    #[test]
+    fn rejects_non_string_tag_scalar() {
+        let err = serde_yaml::from_str::<Task>(
+            r#"
+name: t
+tags: 42
+shell: "echo hi"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("tags"),
+            "expected a tags-related error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_tag_in_list() {
+        let err = serde_yaml::from_str::<Task>(
+            r#"
+name: t
+tags: [smoke, ""]
+shell: "echo hi"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("non-empty"),
+            "expected non-empty error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_assert_body() {
+        let t = parse_task(
+            r#"
+name: check
+assert:
+  that:
+    - "x == 1"
+    - "y > 0"
+  msg: not happy
+"#,
+        );
+        match t.body {
+            TaskBody::Assert(a) => {
+                assert_eq!(a.that, vec!["x == 1", "y > 0"]);
+                assert_eq!(a.msg.as_deref(), Some("not happy"));
+            }
+            other => panic!("expected assert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assert_accepts_single_string_for_that() {
+        let t = parse_task(
+            r#"
+name: check
+assert:
+  that: "x == 1"
+"#,
+        );
+        match t.body {
+            TaskBody::Assert(a) => assert_eq!(a.that, vec!["x == 1"]),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_fail_body() {
+        let t = parse_task(
+            r#"
+name: bail
+fail:
+  msg: nope
+"#,
+        );
+        match t.body {
+            TaskBody::Fail(f) => assert_eq!(f.msg, "nope"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_set_fact_body() {
+        let t = parse_task(
+            r#"
+name: facts
+set_fact:
+  greeting: "{{ result.stdout }}"
+  count: 3
+  enabled: true
+"#,
+        );
+        match t.body {
+            TaskBody::SetFact(s) => {
+                assert_eq!(s.0.len(), 3);
+                assert!(s.0.contains_key("greeting"));
+                assert!(s.0.contains_key("count"));
+                assert!(s.0.contains_key("enabled"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_import_tasks_body() {
+        let t = parse_task(
+            r#"
+name: include common
+import_tasks: tasks/common.yml
+"#,
+        );
+        match t.body {
+            TaskBody::ImportTasks(p) => assert_eq!(p, PathBuf::from("tasks/common.yml")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_become_metadata() {
+        let t = parse_task(
+            r#"
+name: install pg
+become: true
+become_user: postgres
+shell: "apt install -y postgresql"
+"#,
+        );
+        assert_eq!(t.become_, Some(true));
+        assert_eq!(t.become_user.as_deref(), Some("postgres"));
+    }
+
+    #[test]
+    fn become_defaults_to_none_for_inheritance() {
+        let t = parse_task(
+            r#"
+name: t
+shell: hi
+"#,
+        );
+        assert_eq!(t.become_, None, "None signals 'inherit from play'");
+        assert_eq!(t.become_user, None);
+    }
+
+    #[test]
+    fn become_false_distinguishes_from_unset() {
+        let t = parse_task(
+            r#"
+name: t
+become: false
+shell: hi
+"#,
+        );
+        assert_eq!(
+            t.become_,
+            Some(false),
+            "Some(false) signals 'opt out of inherited become: true'"
+        );
+    }
+
+    #[test]
+    fn become_non_bool_rejected() {
+        let err = try_parse_task(
+            r#"
+name: t
+become: "yes"
+shell: hi
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("become") && msg.contains("bool"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_include_role_minimal() {
+        let t = parse_task(
+            r#"
+name: include role
+include_role:
+  name: web
+"#,
+        );
+        match t.body {
+            TaskBody::IncludeRole(ir) => {
+                assert_eq!(ir.name, "web");
+                assert_eq!(ir.tasks_from, "main");
+                assert!(ir.vars.is_empty());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_include_role_with_tasks_from_and_vars() {
+        let t = parse_task(
+            r#"
+name: flip archive_command
+include_role:
+  name: postgres-node
+  tasks_from: apply-cluster-config
+vars:
+  pg_archive_command: "/usr/bin/wrapper %p"
+  retries: 3
+"#,
+        );
+        match t.body {
+            TaskBody::IncludeRole(ir) => {
+                assert_eq!(ir.name, "postgres-node");
+                assert_eq!(ir.tasks_from, "apply-cluster-config");
+                assert_eq!(ir.vars.len(), 2);
+                assert_eq!(
+                    ir.vars.get("pg_archive_command").and_then(|v| v.as_str()),
+                    Some("/usr/bin/wrapper %p")
+                );
+                assert_eq!(
+                    ir.vars.get("retries").and_then(|v| v.as_u64()),
+                    Some(3)
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn include_role_rejects_missing_name() {
+        let err = try_parse_task(
+            r#"
+name: t
+include_role:
+  tasks_from: setup
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("name"), "got: {msg}");
+    }
+
+    #[test]
+    fn include_role_rejects_unknown_field() {
+        let err = try_parse_task(
+            r#"
+name: t
+include_role:
+  name: web
+  apply: { tags: [setup] }
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("apply"), "got: {msg}");
+    }
+
+    #[test]
+    fn vars_on_non_include_role_task_is_rejected() {
+        let err = try_parse_task(
+            r#"
+name: t
+shell: echo hi
+vars:
+  x: 1
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("include_role") && msg.contains("vars"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parses_loop_as_literal_list() {
+        let t = parse_task(
+            r#"
+name: greet each
+loop: [alice, bob]
+shell: "echo {{ item }}"
+"#,
+        );
+        match t.loop_spec {
+            Some(LoopSpec::Items(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].as_str(), Some("alice"));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_loop_as_expr() {
+        let t = parse_task(
+            r#"
+name: greet each
+loop: "{{ users }}"
+shell: "echo {{ item }}"
+"#,
+        );
+        match t.loop_spec {
+            Some(LoopSpec::Expr(s)) => assert_eq!(s, "{{ users }}"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_loop_control_loop_var() {
+        let t = parse_task(
+            r#"
+name: x
+loop: [1, 2]
+loop_control:
+  loop_var: i
+shell: "echo {{ i }}"
+"#,
+        );
+        assert_eq!(
+            t.loop_control.as_ref().and_then(|c| c.loop_var.as_deref()),
+            Some("i")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_loop_control_key() {
+        let err = try_parse_task(
+            r#"
+name: x
+loop: [1]
+loop_control:
+  label: "{{ item }}"
+shell: echo
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("label") || msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_two_body_keys() {
+        let err = try_parse_task(
+            r#"
+name: x
+shell: "echo"
+write_file:
+  path: /tmp/x
+  mode: 0o644
+  content: ""
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("more than one") || msg.contains("body"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_missing_body() {
+        let err = try_parse_task(
+            r#"
+name: x
+when: "1 == 1"
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing body"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_key() {
+        let err = try_parse_task(
+            r#"
+name: x
+this_is_not_a_real_key: web1
+shell: echo
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("this_is_not_a_real_key") || msg.contains("unknown"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parses_delegate_to_literal() {
+        let t = parse_task(
+            r#"
+name: t
+delegate_to: web1
+shell: echo
+"#,
+        );
+        assert_eq!(t.delegate_to.as_deref(), Some("web1"));
+    }
+
+    #[test]
+    fn parses_delegate_to_template() {
+        let t = parse_task(
+            r#"
+name: t
+delegate_to: "{{ groups['etcd'][0] }}"
+shell: echo
+"#,
+        );
+        assert_eq!(t.delegate_to.as_deref(), Some("{{ groups['etcd'][0] }}"));
+    }
+
+    #[test]
+    fn parses_run_once() {
+        let t = parse_task(
+            r#"
+name: t
+run_once: true
+shell: echo
+"#,
+        );
+        assert!(t.run_once);
+
+        let t = parse_task(
+            r#"
+name: t
+shell: echo
+"#,
+        );
+        assert!(!t.run_once);
+    }
+
+    #[test]
+    fn parses_ignore_errors_true() {
+        let t = parse_task(
+            r#"
+name: t
+ignore_errors: true
+shell: echo
+"#,
+        );
+        assert_eq!(t.ignore_errors, Some(true));
+    }
+
+    #[test]
+    fn parses_ignore_errors_false() {
+        let t = parse_task(
+            r#"
+name: t
+ignore_errors: false
+shell: echo
+"#,
+        );
+        assert_eq!(t.ignore_errors, Some(false));
+    }
+
+    #[test]
+    fn ignore_errors_defaults_to_none() {
+        let t = parse_task(
+            r#"
+name: t
+shell: echo
+"#,
+        );
+        assert_eq!(t.ignore_errors, None);
+    }
+
+    #[test]
+    fn rejects_non_bool_ignore_errors() {
+        let err = try_parse_task(
+            r#"
+name: t
+ignore_errors: "yes"
+shell: echo
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ignore_errors"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_check_mode_true() {
+        let t = parse_task(
+            r#"
+name: t
+check_mode: true
+shell: echo
+"#,
+        );
+        assert_eq!(t.check_mode, Some(true));
+    }
+
+    #[test]
+    fn parses_check_mode_false() {
+        let t = parse_task(
+            r#"
+name: t
+check_mode: false
+shell: echo
+"#,
+        );
+        assert_eq!(t.check_mode, Some(false));
+    }
+
+    #[test]
+    fn check_mode_defaults_to_none() {
+        let t = parse_task(
+            r#"
+name: t
+shell: echo
+"#,
+        );
+        assert_eq!(t.check_mode, None);
+    }
+
+    #[test]
+    fn rejects_non_bool_check_mode() {
+        let err = try_parse_task(
+            r#"
+name: t
+check_mode: "yes"
+shell: echo
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("check_mode"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_non_bool_run_once() {
+        let err = try_parse_task(
+            r#"
+name: t
+run_once: "yes"
+shell: echo
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("run_once"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_notify_string() {
+        let t = parse_task(
+            r#"
+name: t
+notify: restart_sshd
+shell: echo
+"#,
+        );
+        assert_eq!(t.notify, vec!["restart_sshd".to_string()]);
+    }
+
+    #[test]
+    fn parses_notify_list() {
+        let t = parse_task(
+            r#"
+name: t
+notify:
+  - restart_sshd
+  - log_change
+shell: echo
+"#,
+        );
+        assert_eq!(
+            t.notify,
+            vec!["restart_sshd".to_string(), "log_change".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_meta_flush_handlers() {
+        let t = parse_task(
+            r#"
+name: drain
+meta: flush_handlers
+"#,
+        );
+        match t.body {
+            TaskBody::Meta(MetaAction::FlushHandlers) => {}
+            other => panic!("expected meta flush_handlers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_meta_action() {
+        let err = try_parse_task(
+            r#"
+name: t
+meta: hammer_time
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("meta") || msg.contains("flush_handlers"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_non_string_when() {
+        let err = try_parse_task(
+            r#"
+name: x
+when: 1
+shell: echo
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("when"), "got: {msg}");
+    }
+
+    #[test]
+    fn env_yaml_coerces_scalars() {
+        let t = parse_task(
+            r#"
+name: x
+exec:
+  argv: [/bin/true]
+  env:
+    B: 2
+    A: 1
+    C: true
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Exec(e)) => {
+                assert_eq!(e.env.get("A").map(String::as_str), Some("1"));
+                assert_eq!(e.env.get("B").map(String::as_str), Some("2"));
+                assert_eq!(e.env.get("C").map(String::as_str), Some("true"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_debug_msg() {
+        let t = parse_task(
+            r#"
+name: t
+debug:
+  msg: "value is {{ foo }}"
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert_eq!(d.msg.as_deref(), Some("value is {{ foo }}"));
+        assert!(d.var.is_none());
+    }
+
+    #[test]
+    fn parse_debug_var() {
+        let t = parse_task(
+            r#"
+name: t
+debug:
+  var: my_register.stdout
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert!(d.msg.is_none());
+        assert_eq!(d.var.as_deref(), Some("my_register.stdout"));
+    }
+
+    #[test]
+    fn parse_debug_string_shorthand() {
+        let t = parse_task(
+            r#"
+name: t
+debug: hello world
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert_eq!(d.msg.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn parse_debug_empty_defaults_to_hello() {
+        let t = parse_task(
+            r#"
+name: t
+debug: {}
+"#,
+        );
+        let TaskBody::Debug(d) = t.body else { panic!() };
+        assert_eq!(d.msg.as_deref(), Some("Hello world!"));
+    }
+
+    #[test]
+    fn parse_debug_rejects_msg_and_var_together() {
+        let yaml = r#"
+name: t
+debug:
+  msg: x
+  var: y
+"#;
+        let result: Result<Task, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+        let err = format!("{:?}", result.err());
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn parse_debug_ignores_verbosity() {
+        let t = parse_task(
+            r#"
+name: t
+debug:
+  msg: x
+  verbosity: 3
+"#,
+        );
+        let TaskBody::Debug(_) = t.body else { panic!() };
+    }
+
+    #[test]
+    fn parse_debug_rejects_unknown_field() {
+        let yaml = r#"
+name: t
+debug:
+  msg: x
+  bogus: 1
+"#;
+        let result: Result<Task, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_async_poll_metadata() {
+        let t = parse_task(
+            r#"
+name: t
+shell: sleep 5
+async: 60
+poll: 5
+"#,
+        );
+        assert_eq!(t.async_seconds, Some(60));
+        assert_eq!(t.poll_seconds, Some(5));
+    }
+
+    #[test]
+    fn parse_async_without_poll_is_ok() {
+        let t = parse_task(
+            r#"
+name: t
+shell: sleep 5
+async: 60
+"#,
+        );
+        assert_eq!(t.async_seconds, Some(60));
+        assert_eq!(t.poll_seconds, None);
+    }
+
+    #[test]
+    fn parse_poll_without_async_rejected() {
+        let yaml = r#"
+name: t
+shell: sleep 5
+poll: 5
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        assert!(r.is_err());
+        assert!(format!("{:?}", r.err()).contains("poll"));
+    }
+
+    #[test]
+    fn parse_async_zero_treated_as_value_but_orchestrator_skips() {
+        // The parser accepts async: 0; the orchestrator treats `Some(0)`
+        // the same as `None` (synchronous). Verifying just the parse here.
+        let t = parse_task(
+            r#"
+name: t
+shell: ok
+async: 0
+"#,
+        );
+        assert_eq!(t.async_seconds, Some(0));
+    }
+}
