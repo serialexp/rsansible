@@ -52,7 +52,7 @@ async fn hello_then_shell_then_bye() {
     // Run `echo hello`.
     write_frame(
         &mut stdin,
-        &msg::task_dispatch(1, msg::op_shell("echo hello".into(), 0)),
+        &msg::task_dispatch(1, false, msg::op_shell("echo hello".into(), 0)),
     )
     .await
     .unwrap();
@@ -73,7 +73,7 @@ async fn hello_then_shell_then_bye() {
     // Non-zero exit propagates cleanly.
     write_frame(
         &mut stdin,
-        &msg::task_dispatch(2, msg::op_shell("exit 7".into(), 0)),
+        &msg::task_dispatch(2, false, msg::op_shell("exit 7".into(), 0)),
     )
     .await
     .unwrap();
@@ -107,6 +107,7 @@ async fn op_exec_with_env_and_cwd() {
         &mut stdin,
         &msg::task_dispatch(
             1,
+            false,
             msg::op_exec(
                 vec!["/bin/sh".into(), "-c".into(), "printf '%s:%s' \"$FOO\" \"$PWD\"".into()],
                 vec!["FOO".into()],
@@ -161,6 +162,7 @@ async fn op_write_file_atomic() {
         &mut stdin,
         &msg::task_dispatch(
             1,
+            false,
             msg::op_write_file(
                 target.to_string_lossy().into_owned(),
                 0o644,
@@ -182,6 +184,7 @@ async fn op_write_file_atomic() {
         &mut stdin,
         &msg::task_dispatch(
             2,
+            false,
             msg::op_write_file(
                 target.to_string_lossy().into_owned(),
                 0o644,
@@ -229,6 +232,7 @@ async fn op_write_file_only_if_missing() {
         &mut stdin,
         &msg::task_dispatch(
             1,
+            false,
             msg::op_write_file(
                 target.to_string_lossy().into_owned(),
                 0o600,
@@ -251,6 +255,7 @@ async fn op_write_file_only_if_missing() {
         &mut stdin,
         &msg::task_dispatch(
             2,
+            false,
             msg::op_write_file(
                 target.to_string_lossy().into_owned(),
                 0o600,
@@ -297,6 +302,7 @@ async fn missing_binary_is_not_found() {
         &mut stdin,
         &msg::task_dispatch(
             1,
+            false,
             msg::op_exec(
                 vec!["/no/such/binary".into()],
                 vec![],

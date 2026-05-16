@@ -44,11 +44,11 @@ const OP_DEFAULT: u8 = 4;
 const OP_RELOAD: u8 = 5;
 const OP_LOGGING: u8 = 6;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpUfwOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpUfwOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
     let bin = std::env::var("RSANSIBLE_UFW").unwrap_or_else(|_| "ufw".to_string());
-    let result = tokio::task::spawn_blocking(move || apply(&bin, &op))
+    let result = tokio::task::spawn_blocking(move || apply(&bin, &op, check_mode))
         .await
         .map_err(|e| anyhow::anyhow!("ufw join: {e}"))?;
 
@@ -69,7 +69,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpUfwOutput) -> anyhow::Result<()>
     };
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, started_unix_ns, finished))
+    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
         .await;
     Ok(())
 }
@@ -81,28 +81,28 @@ enum UfwError {
     BadRequest(String),
 }
 
-fn apply(bin: &str, op: &OpUfwOutput) -> Result<bool, UfwError> {
+fn apply(bin: &str, op: &OpUfwOutput, check_mode: bool) -> Result<bool, UfwError> {
     match op.op {
-        OP_RULE => apply_rule(bin, op),
-        OP_ENABLE => apply_enable(bin, op, true),
-        OP_DISABLE => apply_enable(bin, op, false),
+        OP_RULE => apply_rule(bin, op, check_mode),
+        OP_ENABLE => apply_enable(bin, op, true, check_mode),
+        OP_DISABLE => apply_enable(bin, op, false, check_mode),
         OP_RESET => {
-            run_ufw(bin, &["--force", "reset"])?;
+            run_ufw(bin, &["--force", "reset"], check_mode)?;
             Ok(true)
         }
-        OP_DEFAULT => apply_default(bin, op),
+        OP_DEFAULT => apply_default(bin, op, check_mode),
         OP_RELOAD => {
-            run_ufw(bin, &["reload"])?;
+            run_ufw(bin, &["reload"], check_mode)?;
             Ok(true)
         }
-        OP_LOGGING => apply_logging(bin, op),
+        OP_LOGGING => apply_logging(bin, op, check_mode),
         other => Err(UfwError::BadRequest(format!(
             "ufw: unknown op byte {other}"
         ))),
     }
 }
 
-fn apply_rule(bin: &str, op: &OpUfwOutput) -> Result<bool, UfwError> {
+fn apply_rule(bin: &str, op: &OpUfwOutput, check_mode: bool) -> Result<bool, UfwError> {
     if op.rule.is_empty() {
         return Err(UfwError::BadRequest(
             "ufw.rule: required for op=rule".into(),
@@ -174,11 +174,11 @@ fn apply_rule(bin: &str, op: &OpUfwOutput) -> Result<bool, UfwError> {
     }
 
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_ufw(bin, &argv)?;
+    run_ufw(bin, &argv, check_mode)?;
     Ok(true)
 }
 
-fn apply_enable(bin: &str, _op: &OpUfwOutput, want_active: bool) -> Result<bool, UfwError> {
+fn apply_enable(bin: &str, _op: &OpUfwOutput, want_active: bool, check_mode: bool) -> Result<bool, UfwError> {
     let status = run_ufw_capture(bin, &["status", "verbose"])?;
     let is_active = status
         .lines()
@@ -187,11 +187,11 @@ fn apply_enable(bin: &str, _op: &OpUfwOutput, want_active: bool) -> Result<bool,
         return Ok(false);
     }
     let verb = if want_active { "enable" } else { "disable" };
-    run_ufw(bin, &["--force", verb])?;
+    run_ufw(bin, &["--force", verb], check_mode)?;
     Ok(true)
 }
 
-fn apply_default(bin: &str, op: &OpUfwOutput) -> Result<bool, UfwError> {
+fn apply_default(bin: &str, op: &OpUfwOutput, check_mode: bool) -> Result<bool, UfwError> {
     if op.rule.is_empty() {
         return Err(UfwError::BadRequest(
             "ufw.rule: required for op=default (allow/deny/reject)".into(),
@@ -226,11 +226,11 @@ fn apply_default(bin: &str, op: &OpUfwOutput) -> Result<bool, UfwError> {
             return Ok(false);
         }
     }
-    run_ufw(bin, &["default", &policy, &direction])?;
+    run_ufw(bin, &["default", &policy, &direction], check_mode)?;
     Ok(true)
 }
 
-fn apply_logging(bin: &str, op: &OpUfwOutput) -> Result<bool, UfwError> {
+fn apply_logging(bin: &str, op: &OpUfwOutput, check_mode: bool) -> Result<bool, UfwError> {
     if op.rule.is_empty() {
         return Err(UfwError::BadRequest(
             "ufw.rule: required for op=logging (on/off/low/medium/high/full)".into(),
@@ -264,7 +264,7 @@ fn apply_logging(bin: &str, op: &OpUfwOutput) -> Result<bool, UfwError> {
             return Ok(false);
         }
     }
-    run_ufw(bin, &["logging", &level])?;
+    run_ufw(bin, &["logging", &level], check_mode)?;
     Ok(true)
 }
 
@@ -337,7 +337,13 @@ fn line_matches_key(line: &str, key: &RuleKey) -> bool {
     true
 }
 
-fn run_ufw(bin: &str, args: &[&str]) -> Result<(), UfwError> {
+fn run_ufw(bin: &str, args: &[&str], check_mode: bool) -> Result<(), UfwError> {
+    // Mutating call gate: under check_mode, never touch the host.
+    // Callers still rely on `Ok(())` to drive their `changed=true`
+    // returns; that's the whole point.
+    if check_mode {
+        return Ok(());
+    }
     let out = spawn_with_etxtbsy_retry(bin, args)
         .map_err(|e| UfwError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
@@ -473,6 +479,7 @@ exit 0
         let changed = apply(
             stub.path().to_str().unwrap(),
             &rule_op("allow", "22", "tcp"),
+            false,
         )
         .unwrap();
         assert!(changed);
@@ -485,6 +492,7 @@ exit 0
         let changed = apply(
             stub.path().to_str().unwrap(),
             &rule_op("allow", "22", "tcp"),
+            false,
         )
         .unwrap();
         assert!(!changed);
@@ -507,7 +515,7 @@ exit 0
         let stub = Stub::new("rule-del", STATUS_ACTIVE_22);
         let mut o = rule_op("allow", "22", "tcp");
         o.delete = 1;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         assert!(stub.log().contains("delete"), "log={:?}", stub.log());
     }
@@ -517,7 +525,7 @@ exit 0
         let stub = Stub::new("rule-del-noop", STATUS_INACTIVE);
         let mut o = rule_op("allow", "22", "tcp");
         o.delete = 1;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
     }
 
@@ -526,7 +534,7 @@ exit 0
         let stub = Stub::new("enable", STATUS_INACTIVE);
         let mut o = rule_op("", "", "");
         o.op = OP_ENABLE;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         assert!(stub.log().contains("--force enable"), "log={:?}", stub.log());
     }
@@ -536,7 +544,7 @@ exit 0
         let stub = Stub::new("enable-noop", STATUS_ACTIVE_22);
         let mut o = rule_op("", "", "");
         o.op = OP_ENABLE;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
     }
 
@@ -545,7 +553,7 @@ exit 0
         let stub = Stub::new("disable", STATUS_ACTIVE_22);
         let mut o = rule_op("", "", "");
         o.op = OP_DISABLE;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         assert!(stub.log().contains("--force disable"), "log={:?}", stub.log());
     }
@@ -558,7 +566,7 @@ exit 0
         o.op = OP_DEFAULT;
         o.rule = "deny".into();
         o.direction = "in".into();
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
     }
 
@@ -569,7 +577,7 @@ exit 0
         o.op = OP_DEFAULT;
         o.rule = "reject".into();
         o.direction = "in".into();
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         assert!(stub.log().contains("default reject incoming"), "log={:?}", stub.log());
     }
@@ -579,7 +587,7 @@ exit 0
         let stub = Stub::new("reset", STATUS_ACTIVE_22);
         let mut o = rule_op("", "", "");
         o.op = OP_RESET;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         assert!(stub.log().contains("--force reset"), "log={:?}", stub.log());
     }
@@ -591,7 +599,7 @@ exit 0
         let mut o = rule_op("", "", "");
         o.op = OP_LOGGING;
         o.rule = "low".into();
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
     }
 
@@ -601,7 +609,7 @@ exit 0
         let mut o = rule_op("", "", "");
         o.op = OP_LOGGING;
         o.rule = "high".into();
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         assert!(stub.log().contains("logging high"), "log={:?}", stub.log());
     }

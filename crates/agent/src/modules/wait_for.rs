@@ -41,7 +41,11 @@ const STATE_ABSENT: u8 = 1;
 /// `sleep_ms` so a slow refusal/RST doesn't eat the full poll cycle.
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
 
-pub async fn run(ctx: &Context, seq: u32, op: OpWaitForOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpWaitForOutput, _check_mode: bool) -> anyhow::Result<()> {
+    // wait_for is a read-only probe — it never mutates host state, so
+    // it runs unchanged under `--check`. Surfacing a missing dependency
+    // is the whole point of dry-run, so we intentionally do NOT skip
+    // the wait. `_check_mode` is accepted for plumbing uniformity.
     let started_unix_ns = now_unix_ns();
 
     let mode = match classify(&op) {
@@ -83,7 +87,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWaitForOutput) -> anyhow::Result
     match outcome {
         Outcome::Met => {
             let finished_unix_ns = now_unix_ns();
-            ctx.emit(msg::task_done(seq, 0, false, started_unix_ns, finished_unix_ns))
+            ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished_unix_ns))
                 .await;
         }
         Outcome::Timeout(detail) => {

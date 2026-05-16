@@ -318,6 +318,10 @@
         // echoes it back in TaskProgress/TaskDone/TaskError so the controller
         // can correlate streams.
         { name: "seq", type: "uint32" },
+        // 0 = normal execution, 1 = dry-run / check mode. Each module decides
+        // what check mode means for it (skip mutation, probe-only, etc.); the
+        // controller composite ops (e.g. openssl_privatekey) also branch on it.
+        { name: "check_mode", type: "uint8" },
         { name: "op", type: "Op" },
       ],
     },
@@ -342,6 +346,10 @@
         { name: "exit_code", type: "int32" },
         // 0 = unchanged, 1 = changed. Idempotency reporting (Ansible-style).
         { name: "changed", type: "uint8" },
+        // 0 = ran, 1 = skipped (e.g. shell/exec under check_mode, or method-aware uri skip).
+        // Distinguished from `changed=0` so end-of-run summaries can say
+        // "ok=N changed=M skipped=K" instead of conflating no-ops with skips.
+        { name: "skipped", type: "uint8" },
         { name: "started_unix_ns", type: "uint64" },
         { name: "finished_unix_ns", type: "uint64" },
       ],

@@ -2114,6 +2114,7 @@ impl From<HelloOutput> for HelloInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskDispatchInput {
     pub seq: u32,
+    pub check_mode: u8,
     pub op: Op,
 }
 
@@ -2121,6 +2122,7 @@ pub struct TaskDispatchInput {
 pub struct TaskDispatchOutput {
     pub kind: u8,
     pub seq: u32,
+    pub check_mode: u8,
     pub op: Op,
 }
 
@@ -2136,6 +2138,7 @@ impl TaskDispatchInput {
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_byte(1);
         encoder.write_u32_le(self.seq);
+        encoder.write_byte(self.check_mode);
         self.op.encode_into(encoder)?;
         Ok(())
     }
@@ -2154,10 +2157,12 @@ impl TaskDispatchOutput {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 1, got {}", kind)));
         }
         let seq = decoder.read_u32_le()?;
+        let check_mode = decoder.read_byte()?;
         let op = Op::decode_with_decoder(decoder)?;
         Ok(Self {
             kind,
             seq,
+            check_mode,
             op,
         })
     }
@@ -2173,6 +2178,7 @@ impl From<TaskDispatchOutput> for TaskDispatchInput {
     fn from(o: TaskDispatchOutput) -> Self {
         Self {
             seq: o.seq,
+            check_mode: o.check_mode,
             op: o.op,
         }
     }
@@ -2264,6 +2270,7 @@ pub struct TaskDoneInput {
     pub seq: u32,
     pub exit_code: i32,
     pub changed: u8,
+    pub skipped: u8,
     pub started_unix_ns: u64,
     pub finished_unix_ns: u64,
 }
@@ -2274,6 +2281,7 @@ pub struct TaskDoneOutput {
     pub seq: u32,
     pub exit_code: i32,
     pub changed: u8,
+    pub skipped: u8,
     pub started_unix_ns: u64,
     pub finished_unix_ns: u64,
 }
@@ -2292,6 +2300,7 @@ impl TaskDoneInput {
         encoder.write_u32_le(self.seq);
         encoder.write_u32_le(self.exit_code as u32);
         encoder.write_byte(self.changed);
+        encoder.write_byte(self.skipped);
         encoder.write_u64_le(self.started_unix_ns);
         encoder.write_u64_le(self.finished_unix_ns);
         Ok(())
@@ -2313,6 +2322,7 @@ impl TaskDoneOutput {
         let seq = decoder.read_u32_le()?;
         let exit_code = decoder.read_u32_le()? as i32;
         let changed = decoder.read_byte()?;
+        let skipped = decoder.read_byte()?;
         let started_unix_ns = decoder.read_u64_le()?;
         let finished_unix_ns = decoder.read_u64_le()?;
         Ok(Self {
@@ -2320,6 +2330,7 @@ impl TaskDoneOutput {
             seq,
             exit_code,
             changed,
+            skipped,
             started_unix_ns,
             finished_unix_ns,
         })
@@ -2338,6 +2349,7 @@ impl From<TaskDoneOutput> for TaskDoneInput {
             seq: o.seq,
             exit_code: o.exit_code,
             changed: o.changed,
+            skipped: o.skipped,
             started_unix_ns: o.started_unix_ns,
             finished_unix_ns: o.finished_unix_ns,
         }
@@ -2646,6 +2658,7 @@ impl Message {
             Message::TaskDispatch(v) => {
                 encoder.write_uint8(v.kind);
                 encoder.write_uint32(v.seq, Endianness::LittleEndian);
+                encoder.write_uint8(v.check_mode);
                 v.op.encode_into(encoder)?;
             }
             Message::TaskProgress(v) => {
@@ -2662,6 +2675,7 @@ impl Message {
                 encoder.write_uint32(v.seq, Endianness::LittleEndian);
                 encoder.write_int32(v.exit_code, Endianness::LittleEndian);
                 encoder.write_uint8(v.changed);
+                encoder.write_uint8(v.skipped);
                 encoder.write_uint64(v.started_unix_ns, Endianness::LittleEndian);
                 encoder.write_uint64(v.finished_unix_ns, Endianness::LittleEndian);
             }

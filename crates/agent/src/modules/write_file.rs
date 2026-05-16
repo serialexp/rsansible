@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::{emit_error, Context};
 
-pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
     let path = PathBuf::from(&op.path);
     let mode = op.mode;
@@ -29,7 +29,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput) -> anyhow::Resu
         match tokio::fs::symlink_metadata(&path).await {
             Ok(_) => {
                 let finished_unix_ns = now_unix_ns();
-                ctx.emit(msg::task_done(seq, 0, false, started_unix_ns, finished_unix_ns))
+                ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished_unix_ns))
                     .await;
                 return Ok(());
             }
@@ -70,6 +70,27 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput) -> anyhow::Resu
         Ok(m) => Some(m.permissions().mode() & 0o7777),
         Err(_) => None,
     };
+    // Compute the would-change diff up front; both the check-mode path
+    // and the normal post-write path use it.
+    let would_change = prior.as_deref() != Some(op.content.as_slice())
+        || prior_mode.map(|m| m != (mode & 0o7777)).unwrap_or(true);
+
+    // Dry-run: report what we'd change without touching the file. The
+    // diff is exact (we read prior content and mode above) so the
+    // `changed` flag is the same value we'd report on a real run.
+    if check_mode {
+        let finished_unix_ns = now_unix_ns();
+        ctx.emit(msg::task_done(
+            seq,
+            0,
+            would_change,
+            false,
+            started_unix_ns,
+            finished_unix_ns,
+        ))
+        .await;
+        return Ok(());
+    }
 
     // Stage to a tmp file in the same directory so rename(2) is atomic. If the
     // target has no parent (i.e. relative bare filename), stage in CWD.
@@ -123,11 +144,10 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput) -> anyhow::Resu
         return Ok(());
     }
 
-    let changed = prior.as_deref() != Some(op.content.as_slice())
-        || prior_mode.map(|m| m != (mode & 0o7777)).unwrap_or(true);
+    let changed = would_change;
 
     let finished_unix_ns = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, started_unix_ns, finished_unix_ns)).await;
+    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished_unix_ns)).await;
     Ok(())
 }
 

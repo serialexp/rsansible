@@ -70,6 +70,14 @@ pub struct HostCtx {
     /// only thing threaded through the per-task dispatch path. `Auto`
     /// defers to `wire_cost::should_probe_first`.
     pub wire_strategy: WireStrategy,
+    /// Run-scoped dry-run flag, seeded once from `RunSpec.check_mode`.
+    /// The per-task `check_mode:` field overrides this either direction
+    /// (see `Task::check_mode`); the *effective* flag for each task is
+    /// computed in the orchestrator immediately before dispatch and
+    /// becomes the `TaskDispatch.check_mode` wire byte. Stored on
+    /// `HostCtx` so the controller-side composite paths (e.g.
+    /// `openssl_privatekey`) can branch on the run-level default.
+    pub check_mode: bool,
     /// In-memory cache of private-key PEM bytes generated this run,
     /// keyed by the remote dest path. Populated by the
     /// `OpenSslPrivkey` composite-dispatch path when it actually
@@ -101,6 +109,7 @@ impl HostCtx {
             pending_handlers: BTreeSet::new(),
             wire_cost: WireCost::default(),
             wire_strategy: WireStrategy::default(),
+            check_mode: false,
             privkey_pem_cache: BTreeMap::new(),
         }
     }
@@ -181,6 +190,18 @@ impl RegisterValue {
         stdout_bytes: &[u8],
         stderr_bytes: &[u8],
     ) -> Self {
+        Self::from_exec_with_skipped(exit_code, changed, false, took_ms, stdout_bytes, stderr_bytes)
+    }
+
+    /// Like `from_exec` but accepts the `skipped` bit from `TaskDone`.
+    pub fn from_exec_with_skipped(
+        exit_code: i32,
+        changed: bool,
+        skipped: bool,
+        took_ms: u64,
+        stdout_bytes: &[u8],
+        stderr_bytes: &[u8],
+    ) -> Self {
         let stdout = String::from_utf8_lossy(stdout_bytes).into_owned();
         let stderr = String::from_utf8_lossy(stderr_bytes).into_owned();
         let stdout_lines: Vec<String> = stdout
@@ -207,8 +228,8 @@ impl RegisterValue {
             stdout_lines,
             json,
             took_ms,
-            skipped: false,
-            failed: exit_code != 0,
+            skipped,
+            failed: exit_code != 0 && !skipped,
             results: None,
             extra: BTreeMap::new(),
         }

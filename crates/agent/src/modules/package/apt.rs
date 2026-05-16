@@ -43,10 +43,10 @@ const STATE_LATEST: u8 = 2;
 
 /// Apt backend entry point. Reads env-var overrides for the apt-get and
 /// dpkg-query binary paths (used by tests with stubs) and does the work.
-pub(crate) fn apply(op: &OpPackageOutput) -> Result<bool, PackageError> {
+pub(crate) fn apply(op: &OpPackageOutput, check_mode: bool) -> Result<bool, PackageError> {
     let bin = std::env::var("RSANSIBLE_APT_GET").unwrap_or_else(|_| "apt-get".to_string());
     let dpkg = std::env::var("RSANSIBLE_DPKG_QUERY").unwrap_or_else(|_| "dpkg-query".to_string());
-    apply_with_bins(&bin, &dpkg, op)
+    apply_with_bins(&bin, &dpkg, op, check_mode)
 }
 
 /// Test-visible apply: caller passes explicit binary paths so unit
@@ -55,12 +55,15 @@ pub(crate) fn apply_with_bins(
     bin: &str,
     dpkg: &str,
     op: &OpPackageOutput,
+    check_mode: bool,
 ) -> Result<bool, PackageError> {
     let mut changed = false;
 
     // 1. update_cache (with cache_valid_time gate).
     if op.update_cache != 0 && cache_update_needed(op.cache_valid_time) {
-        run_apt(bin, &["update"])?;
+        if !check_mode {
+            run_apt(bin, &["update"])?;
+        }
         // Per Ansible, cache_updated is reported separately and doesn't
         // by itself set `changed`. We follow that here — only package
         // movement counts.
@@ -77,11 +80,13 @@ pub(crate) fn apply_with_bins(
                 .map(String::as_str)
                 .collect();
             if !missing.is_empty() {
-                let mut args: Vec<String> = vec!["install".into(), "-y".into()];
-                push_install_flags(&mut args, op);
-                args.extend(missing.iter().map(|s| s.to_string()));
-                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                run_apt(bin, &argv)?;
+                if !check_mode {
+                    let mut args: Vec<String> = vec!["install".into(), "-y".into()];
+                    push_install_flags(&mut args, op);
+                    args.extend(missing.iter().map(|s| s.to_string()));
+                    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                    run_apt(bin, &argv)?;
+                }
                 changed = true;
             }
         }
@@ -94,30 +99,50 @@ pub(crate) fn apply_with_bins(
                 .map(String::as_str)
                 .collect();
             if !present.is_empty() {
-                let verb = if op.purge != 0 { "purge" } else { "remove" };
-                let mut args: Vec<String> = vec![verb.into(), "-y".into()];
-                args.extend(present.iter().map(|s| s.to_string()));
-                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                run_apt(bin, &argv)?;
+                if !check_mode {
+                    let verb = if op.purge != 0 { "purge" } else { "remove" };
+                    let mut args: Vec<String> = vec![verb.into(), "-y".into()];
+                    args.extend(present.iter().map(|s| s.to_string()));
+                    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                    run_apt(bin, &argv)?;
+                }
                 changed = true;
             }
         }
         STATE_LATEST => {
-            // Capture pre-versions for everything (including not-installed),
-            // run install, capture post-versions, compare.
-            let pre = probe_installed(dpkg, &op.names)?;
-            let mut args: Vec<String> = vec!["install".into(), "-y".into()];
-            push_install_flags(&mut args, op);
-            args.extend(op.names.iter().cloned());
-            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_apt(bin, &argv)?;
-            let post = probe_installed(dpkg, &op.names)?;
-            for n in &op.names {
-                let pre_v = pre.get(n.as_str()).cloned().unwrap_or_default();
-                let post_v = post.get(n.as_str()).cloned().unwrap_or_default();
-                if pre_v != post_v {
+            if check_mode {
+                // Without running `apt-get install`, we can't know
+                // post-versions cheaply. Conservative: report
+                // `changed=true` whenever any requested package isn't
+                // currently installed at all. v2 should parse
+                // `apt-cache policy` to distinguish "already at
+                // candidate" from "would upgrade". TODO: see
+                // TODO.md — package(apt) STATE_LATEST check-mode
+                // precision.
+                let pre = probe_installed(dpkg, &op.names)?;
+                if op.names.iter().any(|n| !pre.contains_key(n.as_str())) {
                     changed = true;
-                    break;
+                }
+                // For all-installed-but-maybe-outdated, we don't know
+                // without policy parsing; err on the side of "would
+                // change" only when we have evidence (missing pkg).
+            } else {
+                // Capture pre-versions for everything (including not-installed),
+                // run install, capture post-versions, compare.
+                let pre = probe_installed(dpkg, &op.names)?;
+                let mut args: Vec<String> = vec!["install".into(), "-y".into()];
+                push_install_flags(&mut args, op);
+                args.extend(op.names.iter().cloned());
+                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                run_apt(bin, &argv)?;
+                let post = probe_installed(dpkg, &op.names)?;
+                for n in &op.names {
+                    let pre_v = pre.get(n.as_str()).cloned().unwrap_or_default();
+                    let post_v = post.get(n.as_str()).cloned().unwrap_or_default();
+                    if pre_v != post_v {
+                        changed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -130,20 +155,28 @@ pub(crate) fn apply_with_bins(
 
     // 3. autoremove last (so newly-orphaned packages get swept).
     if op.autoremove != 0 {
-        // We can't easily tell whether autoremove was a no-op without
-        // parsing apt output. Mark changed conservatively only if it
-        // actually removed something — we approximate by capturing the
-        // stdout and looking for "0 to remove" / "0 removed".
-        let out = run_apt_capture(bin, &["autoremove", "-y"])?;
-        // apt-get prints a summary line like "0 upgraded, 0 newly
-        // installed, 0 to remove and N not upgraded." We treat absence
-        // of "0 to remove" as "something was removed".
-        if !out.contains("0 to remove") && !out.contains("0 removed") {
-            // The line wasn't found at all, or removal happened.
-            // Don't fail closed — only flip to `changed` if we see
-            // evidence of removal.
-            if out.contains("Removing ") {
-                changed = true;
+        if check_mode {
+            // Without running `apt-get autoremove`, we don't know
+            // whether anything would be removed. Conservative skip:
+            // do not toggle `changed`; the operator can re-run for
+            // real to see if there's actually work to do. (Mirrors
+            // Ansible's behavior for autoremove under --check.)
+        } else {
+            // We can't easily tell whether autoremove was a no-op without
+            // parsing apt output. Mark changed conservatively only if it
+            // actually removed something — we approximate by capturing the
+            // stdout and looking for "0 to remove" / "0 removed".
+            let out = run_apt_capture(bin, &["autoremove", "-y"])?;
+            // apt-get prints a summary line like "0 upgraded, 0 newly
+            // installed, 0 to remove and N not upgraded." We treat absence
+            // of "0 to remove" as "something was removed".
+            if !out.contains("0 to remove") && !out.contains("0 removed") {
+                // The line wasn't found at all, or removal happened.
+                // Don't fail closed — only flip to `changed` if we see
+                // evidence of removal.
+                if out.contains("Removing ") {
+                    changed = true;
+                }
             }
         }
     }
@@ -442,6 +475,7 @@ done
             stub.apt_path().to_str().unwrap(),
             stub.dpkg_path().to_str().unwrap(),
             op,
+            false,
         )
     }
 

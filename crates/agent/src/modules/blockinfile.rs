@@ -39,7 +39,7 @@ use super::{emit_error, Context};
 const STATE_PRESENT: u8 = 0;
 const STATE_ABSENT: u8 = 1;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
     let mode = if op.has_mode != 0 { Some(op.mode & 0o7777) } else { None };
@@ -126,7 +126,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput) -> anyhow::Re
         (None, State::Absent, _) => {
             // Absent + missing → done, unchanged.
             let finished = now_unix_ns();
-            ctx.emit(msg::task_done(seq, 0, false, started_unix_ns, finished))
+            ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished))
                 .await;
             return Ok(());
         }
@@ -178,33 +178,37 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput) -> anyhow::Re
     };
 
     if changed {
-        if let Err(e) = write_atomic(path, new_text.as_bytes(), mode, !file_existed) {
-            emit_error(
-                ctx,
-                seq,
-                err::IO,
-                format!("blockinfile: writing {}: {e}", path.display()),
-            )
-            .await;
-            return Ok(());
+        if !check_mode {
+            if let Err(e) = write_atomic(path, new_text.as_bytes(), mode, !file_existed) {
+                emit_error(
+                    ctx,
+                    seq,
+                    err::IO,
+                    format!("blockinfile: writing {}: {e}", path.display()),
+                )
+                .await;
+                return Ok(());
+            }
         }
     } else if let Some(m) = mode {
         match fs::metadata(path) {
             Ok(meta) => {
                 let cur = meta.permissions().mode() & 0o7777;
                 if cur != m {
-                    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(m)) {
-                        emit_error(
-                            ctx,
-                            seq,
-                            err::IO,
-                            format!("blockinfile: chmod {}: {e}", path.display()),
-                        )
-                        .await;
-                        return Ok(());
+                    if !check_mode {
+                        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(m)) {
+                            emit_error(
+                                ctx,
+                                seq,
+                                err::IO,
+                                format!("blockinfile: chmod {}: {e}", path.display()),
+                            )
+                            .await;
+                            return Ok(());
+                        }
                     }
                     let finished = now_unix_ns();
-                    ctx.emit(msg::task_done(seq, 0, true, started_unix_ns, finished))
+                    ctx.emit(msg::task_done(seq, 0, true, false, started_unix_ns, finished))
                         .await;
                     return Ok(());
                 }
@@ -223,7 +227,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput) -> anyhow::Re
     }
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, started_unix_ns, finished))
+    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
         .await;
     Ok(())
 }

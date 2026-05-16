@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 
 use super::{emit_error, Context};
 
-pub async fn run(ctx: &Context, seq: u32, op: OpUriOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpUriOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
     // Parse the method byte first. Bad method = controller bug; surface
@@ -51,6 +51,26 @@ pub async fn run(ctx: &Context, seq: u32, op: OpUriOutput) -> anyhow::Result<()>
             return Ok(());
         }
     };
+
+    // Check mode is method-aware: GET / HEAD have no server-visible
+    // mutation by HTTP spec, so they pass through normally (operators
+    // use them as health probes). POST / PUT / PATCH / DELETE all
+    // mutate, so we skip outright and report `skipped: true`. Per-task
+    // `check_mode: false` overrides this for unusual cases (e.g. an
+    // endpoint that only accepts POST but is itself idempotent).
+    if check_mode && method_is_mutating(op.method) {
+        let finished_unix_ns = now_unix_ns();
+        ctx.emit(msg::task_done(
+            seq,
+            0,
+            false,
+            true,
+            started_unix_ns,
+            finished_unix_ns,
+        ))
+        .await;
+        return Ok(());
+    }
 
     // Build the reqwest Client. We pay a one-Client-per-call cost so we
     // can wire per-request `validate_certs` / `follow_redirects` without
@@ -170,6 +190,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpUriOutput) -> anyhow::Result<()>
         seq,
         exit_code,
         changed_flag,
+        false,
         started_unix_ns,
         finished_unix_ns,
     ))
@@ -499,7 +520,7 @@ mod tests {
     async fn run_op(op: OpUriOutput) -> OpResult {
         let (tx, rx) = mpsc::channel::<rsansible_wire::Message>(64);
         let ctx = Context::new(crate::writer::Sender(tx));
-        run(&ctx, 1, op).await.unwrap();
+        run(&ctx, 1, op, false).await.unwrap();
         drop(ctx);
         drain(rx).await
     }

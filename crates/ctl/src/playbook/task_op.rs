@@ -93,6 +93,14 @@ pub struct Task {
     /// enqueued for an ignored failure — handlers don't fire on
     /// errored tasks regardless. Default `None` (treated as false).
     pub ignore_errors: Option<bool>,
+    /// `check_mode: true|false` — per-task override of the run-level
+    /// `--check` flag. `None` means "inherit". `Some(true)` forces this
+    /// task to dry-run even when the run is live; `Some(false)` forces
+    /// this task to run for real even when the CLI passed `--check`
+    /// (useful for fact-gathering shells that have no side effects).
+    /// The orchestrator computes the effective flag at dispatch time:
+    /// `task.check_mode.unwrap_or(ctx.check_mode)`.
+    pub check_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1889,6 +1897,7 @@ const METADATA_KEYS: &[&str] = &[
     "become",
     "become_user",
     "ignore_errors",
+    "check_mode",
 ];
 
 impl<'de> Deserialize<'de> for Task {
@@ -1942,6 +1951,15 @@ impl<'de> Deserialize<'de> for Task {
             Some(other) => {
                 return Err(D::Error::custom(format!(
                     "task {name:?}: `ignore_errors` must be a bool, got: {other:?}"
+                )));
+            }
+        };
+        let check_mode = match map.remove("check_mode") {
+            None => None,
+            Some(serde_yaml::Value::Bool(b)) => Some(b),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `check_mode` must be a bool, got: {other:?}"
                 )));
             }
         };
@@ -2211,6 +2229,7 @@ impl<'de> Deserialize<'de> for Task {
             become_,
             become_user,
             ignore_errors,
+            check_mode,
         })
     }
 }
@@ -3827,6 +3846,55 @@ shell: echo
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("ignore_errors"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_check_mode_true() {
+        let t = parse_task(
+            r#"
+name: t
+check_mode: true
+shell: echo
+"#,
+        );
+        assert_eq!(t.check_mode, Some(true));
+    }
+
+    #[test]
+    fn parses_check_mode_false() {
+        let t = parse_task(
+            r#"
+name: t
+check_mode: false
+shell: echo
+"#,
+        );
+        assert_eq!(t.check_mode, Some(false));
+    }
+
+    #[test]
+    fn check_mode_defaults_to_none() {
+        let t = parse_task(
+            r#"
+name: t
+shell: echo
+"#,
+        );
+        assert_eq!(t.check_mode, None);
+    }
+
+    #[test]
+    fn rejects_non_bool_check_mode() {
+        let err = try_parse_task(
+            r#"
+name: t
+check_mode: "yes"
+shell: echo
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("check_mode"), "got: {msg}");
     }
 
     #[test]

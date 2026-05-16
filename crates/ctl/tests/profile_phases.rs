@@ -109,6 +109,7 @@ async fn profile_three_host_run() -> Result<()> {
         1,
         rsansible_wire::msg::task_dispatch(
             1,
+            false,
             op_shell("printf 'hi from %s\\n' \"$(hostname)\"".into(), 5_000),
         ),
     )
@@ -120,6 +121,7 @@ async fn profile_three_host_run() -> Result<()> {
         2,
         task_dispatch(
             2,
+            false,
             op_write_file(
                 "/tmp/rsansible-hello".into(),
                 0o644,
@@ -136,6 +138,7 @@ async fn profile_three_host_run() -> Result<()> {
         3,
         task_dispatch(
             3,
+            false,
             rsansible_wire::msg::op_exec(
                 vec!["/bin/cat".into(), "/tmp/rsansible-hello".into()],
                 vec!["LC_ALL".into()],

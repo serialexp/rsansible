@@ -430,8 +430,13 @@ pub fn hello(
     })
 }
 
-pub fn task_dispatch(seq: u32, op: Op) -> Message {
-    Message::TaskDispatch(TaskDispatchOutput { kind: 1, seq, op })
+pub fn task_dispatch(seq: u32, check_mode: bool, op: Op) -> Message {
+    Message::TaskDispatch(TaskDispatchOutput {
+        kind: 1,
+        seq,
+        check_mode: if check_mode { 1 } else { 0 },
+        op,
+    })
 }
 
 pub fn task_progress(seq: u32, stream: u8, chunk: Vec<u8>) -> Message {
@@ -454,6 +459,7 @@ pub fn task_done(
     seq: u32,
     exit_code: i32,
     changed: bool,
+    skipped: bool,
     started_unix_ns: u64,
     finished_unix_ns: u64,
 ) -> Message {
@@ -462,6 +468,7 @@ pub fn task_done(
         seq,
         exit_code,
         changed: if changed { 1 } else { 0 },
+        skipped: if skipped { 1 } else { 0 },
         started_unix_ns,
         finished_unix_ns,
     })

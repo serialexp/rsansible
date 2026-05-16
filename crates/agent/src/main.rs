@@ -84,8 +84,9 @@ async fn main() -> anyhow::Result<()> {
                 // controller), an individual agent still receives dispatches
                 // one at a time per the protocol.
                 let seq = td.seq;
-                debug!(seq, op = ?std::mem::discriminant(&td.op), "dispatching");
-                if let Err(e) = modules::dispatch(&ctx, seq, td.op).await {
+                let check_mode = td.check_mode != 0;
+                debug!(seq, check_mode, op = ?std::mem::discriminant(&td.op), "dispatching");
+                if let Err(e) = modules::dispatch(&ctx, seq, td.op, check_mode).await {
                     // Module-internal errors should already have been reported
                     // as TaskError. If we end up here, log loudly.
                     error!(seq, error = %e, "module dispatch returned an error after handling");

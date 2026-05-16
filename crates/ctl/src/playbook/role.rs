@@ -286,6 +286,7 @@ fn expand_one(
             become_: Some(false),
             become_user: None,
             ignore_errors: None,
+            check_mode: None,
         };
         spliced.insert(0, synthetic);
     }

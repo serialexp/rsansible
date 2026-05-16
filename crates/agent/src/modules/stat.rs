@@ -41,7 +41,9 @@ use sha2::{Digest, Sha256};
 
 use super::{emit_error, Context};
 
-pub async fn run(ctx: &Context, seq: u32, op: OpStatOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpStatOutput, _check_mode: bool) -> anyhow::Result<()> {
+    // stat is read-only; `_check_mode` is accepted for plumbing
+    // uniformity and ignored.
     let started_unix_ns = now_unix_ns();
     let follow = op.follow != 0;
     let path = op.path;
@@ -65,6 +67,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpStatOutput) -> anyhow::Result<()
     ctx.emit(msg::task_done(
         seq,
         0,
+        false,
         false,
         started_unix_ns,
         finished_unix_ns,

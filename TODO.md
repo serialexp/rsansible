@@ -83,8 +83,21 @@ These don't fit neatly into a phase but should happen alongside the work.
 Done items live in `TODO_DONE.md` (Tags, `--limit`, `ignore_errors:`,
 Vault).
 
-- [ ] **`--check` mode** — dry-run; every op reports what it *would* do
-  without changing state. Each new module needs a check-mode codepath.
+- [x] **`--check` mode** — dry-run; every op reports what it *would* do
+  without changing state. Shipped:
+  - Wire envelope carries `TaskDispatch.check_mode` (1 byte) and `TaskDone.skipped` (1 byte).
+  - CLI `--check` flag + per-task `check_mode: true/false` YAML override.
+  - Per-module behavior: read-only modules pass through; probe-only modules
+    (write_file/file/lineinfile/blockinfile/systemd/package/ufw) compute
+    `changed` without mutating; exec/shell skip outright; uri is method-aware
+    (GET/HEAD pass through, mutating verbs skip).
+  - Composite privkey path: forces probe under check_mode, synthesizes a
+    `changed=true, skipped=true` result, still caches the generated PEM so
+    chained `csr_pipe`/`cert_pipe` produce meaningful register output.
+  - Banner + per-task `[CHECK]`/`[WOULD CHANGE]`/`[CHECK OK]` markers + end-of-run summary.
+  - Follow-ups: `--diff` (show actual diffs), apt `STATE_LATEST` proper
+    `apt-cache policy` parsing under check mode (currently only flags
+    missing packages as would-change).
 - [ ] **Better progress output** — current `info!` stream is fine but a
   per-host status line ("[pg1] task 7/15: Configure patroni — changed
   (41ms)") would be a big quality bump.

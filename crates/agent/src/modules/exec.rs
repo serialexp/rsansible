@@ -16,9 +16,21 @@ use super::{emit_error, Context};
 /// controller sees output incrementally rather than in giant bursts.
 const CHUNK_CAP: usize = 4 * 1024;
 
-pub async fn run_exec(ctx: &Context, seq: u32, op: OpExecOutput) -> anyhow::Result<()> {
+pub async fn run_exec(ctx: &Context, seq: u32, op: OpExecOutput, check_mode: bool) -> anyhow::Result<()> {
     if op.argv.is_empty() {
         emit_error(ctx, seq, msg::err::BAD_REQUEST, "OpExec.argv is empty").await;
+        return Ok(());
+    }
+    if check_mode {
+        // Arbitrary process execution has no safe probe path — we can't
+        // simulate "what would this command have changed?" Skip outright
+        // and report `skipped: true` so the controller's summary can
+        // distinguish this from a no-op. Per-task `check_mode: false`
+        // is the escape hatch for genuinely read-only fact-gathering
+        // shells.
+        let started_unix_ns = now_unix_ns();
+        let finished_unix_ns = started_unix_ns;
+        ctx.emit(msg::task_done(seq, 0, false, true, started_unix_ns, finished_unix_ns)).await;
         return Ok(());
     }
     let mut cmd = Command::new(&op.argv[0]);
@@ -60,7 +72,14 @@ pub async fn run_exec(ctx: &Context, seq: u32, op: OpExecOutput) -> anyhow::Resu
     .await
 }
 
-pub async fn run_shell(ctx: &Context, seq: u32, op: OpShellOutput) -> anyhow::Result<()> {
+pub async fn run_shell(ctx: &Context, seq: u32, op: OpShellOutput, check_mode: bool) -> anyhow::Result<()> {
+    if check_mode {
+        // Mirror run_exec — arbitrary shell has no safe probe.
+        let started_unix_ns = now_unix_ns();
+        let finished_unix_ns = started_unix_ns;
+        ctx.emit(msg::task_done(seq, 0, false, true, started_unix_ns, finished_unix_ns)).await;
+        return Ok(());
+    }
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(&op.command);
     run_command(ctx, seq, cmd, None, op.timeout_ms).await
@@ -128,7 +147,7 @@ async fn run_command(
             // module flags any successful run as changed. Match that so
             // playbook UX feels familiar.
             let changed = code == 0;
-            ctx.emit(msg::task_done(seq, code, changed, started_unix_ns, finished_unix_ns)).await;
+            ctx.emit(msg::task_done(seq, code, changed, false, started_unix_ns, finished_unix_ns)).await;
         }
         Ok(None) => {
             // Timeout: child was killed by wait_with_timeout.

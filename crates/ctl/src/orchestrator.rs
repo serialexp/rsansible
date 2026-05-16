@@ -120,6 +120,13 @@ pub struct RunSpec {
     /// `Blind` / `Probe` force one branch globally — useful for
     /// debugging and benchmarks.
     pub wire_strategy: crate::wire_cost::WireStrategy,
+    /// CLI `--check` (dry-run). When true, agent modules skip
+    /// mutations (reporting what they *would* change), `shell`/`exec`
+    /// are skipped outright, and mutating `uri` verbs are skipped.
+    /// Per-task `check_mode: false` reverses this for individual
+    /// tasks; per-task `check_mode: true` forces check mode for that
+    /// task even when the CLI flag is unset.
+    pub check_mode: bool,
 }
 
 impl RunSpec {
@@ -135,6 +142,7 @@ impl RunSpec {
             skip_tags: Vec::new(),
             limit: Vec::new(),
             wire_strategy: crate::wire_cost::WireStrategy::default(),
+            check_mode: false,
         }
     }
 }
@@ -144,6 +152,19 @@ impl RunSpec {
 pub struct RunReport {
     pub host_outcomes: BTreeMap<String, HostOutcome>,
     pub stopped_early: bool,
+    /// True iff the run was executed in `--check` (dry-run) mode. Surfaced
+    /// to main so the summary line can distinguish "would change" from
+    /// real changes.
+    pub check_mode: bool,
+    /// Total task-on-host successful invocations that reported
+    /// `changed=true` (including would-change under `--check`).
+    pub tasks_changed: u64,
+    /// Total task-on-host successful invocations where the module
+    /// declined to mutate state because of `--check` (or because the
+    /// module has no probe — exec/shell/mutating uri).
+    pub tasks_skipped: u64,
+    /// Total task-on-host successful invocations regardless of changed/skipped.
+    pub tasks_ok: u64,
 }
 
 impl RunReport {
@@ -165,6 +186,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         skip_tags,
         limit,
         wire_strategy,
+        check_mode,
     } = spec;
     // Plumbed through to per-task dispatch so privkey (and any future
     // composite-dispatch op) can override the auto heuristic. Cheap to
@@ -307,12 +329,19 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         // Same value across every host but stashed per-ctx because
         // HostCtx is the only thing threaded through dispatch.
         ctx.wire_strategy = wire_strategy;
+        // Run-scoped dry-run flag — same value across every host.
+        // Per-task `check_mode:` overrides this at dispatch time.
+        ctx.check_mode = check_mode;
         ctxs.insert(name.clone(), ctx);
     }
 
     let mut report = RunReport {
         host_outcomes: outcomes,
         stopped_early: false,
+        check_mode,
+        tasks_changed: 0,
+        tasks_skipped: 0,
+        tasks_ok: 0,
     };
 
     let next_seq = Arc::new(AtomicU32::new(1));
@@ -652,6 +681,9 @@ fn make_gather_facts_task() -> Task {
         become_: Some(false),
         become_user: None,
         ignore_errors: None,
+        // Fact-gathering reads /proc and produces facts; no side
+        // effects. Always run for real even under `--check`.
+        check_mode: Some(false),
     }
 }
 
@@ -711,7 +743,7 @@ async fn gather_facts_for_play(
         // Drain the transient register; user code never sees it.
         let reg = r.ctx.registers.remove(GATHER_FACTS_REGISTER);
         match &r.outcome {
-            HostTaskOutcome::Ok => {
+            HostTaskOutcome::Ok { .. } => {
                 if let Some(reg) = reg {
                     match reg.json {
                         Some(JsonValue::Object(map)) => {
@@ -902,7 +934,7 @@ async fn run_task_once_per_task(
         _ => BTreeMap::new(),
     };
     let notify_snapshot: BTreeSet<String> = task.notify.iter().cloned().collect();
-    let notify_fired = matches!(result.outcome, HostTaskOutcome::Ok)
+    let notify_fired = matches!(result.outcome, HostTaskOutcome::Ok { .. })
         && !task.notify.is_empty()
         && register_for_broadcast
             .as_ref()
@@ -1064,7 +1096,7 @@ async fn run_play_per_play(
                             TaskBody::SetFact(_) => ran.ctx.set_facts.clone(),
                             _ => BTreeMap::new(),
                         };
-                        let success = matches!(ran.outcome, HostTaskOutcome::Ok);
+                        let success = matches!(ran.outcome, HostTaskOutcome::Ok { .. });
                         let _ = cell.set(RunOnceResult {
                             register: register_val,
                             set_facts: set_facts_snap,
@@ -1115,7 +1147,7 @@ async fn run_play_per_play(
                         };
                         ctx = r.ctx;
                         match &r.outcome {
-                            HostTaskOutcome::Ok | HostTaskOutcome::Skipped => {}
+                            HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {}
                             HostTaskOutcome::Failed { reason } => {
                                 if first_failure.is_none() {
                                     first_failure = Some((task.name.clone(), reason.clone()));
@@ -1143,7 +1175,7 @@ async fn run_play_per_play(
                 }
                 ctx = r.ctx;
                 match &r.outcome {
-                    HostTaskOutcome::Ok | HostTaskOutcome::Skipped => {}
+                    HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {}
                     HostTaskOutcome::Failed { reason } => {
                         if first_failure.is_none() {
                             first_failure = Some((task.name.clone(), reason.clone()));
@@ -1233,7 +1265,10 @@ struct RunOnceResult {
 
 fn clone_outcome(o: &HostTaskOutcome) -> HostTaskOutcome {
     match o {
-        HostTaskOutcome::Ok => HostTaskOutcome::Ok,
+        HostTaskOutcome::Ok { changed, skipped } => HostTaskOutcome::Ok {
+            changed: *changed,
+            skipped: *skipped,
+        },
         HostTaskOutcome::Skipped => HostTaskOutcome::Skipped,
         HostTaskOutcome::Failed { reason } => HostTaskOutcome::Failed {
             reason: reason.clone(),
@@ -1251,9 +1286,19 @@ struct PerPlayHostResult {
 
 #[derive(Debug, Clone)]
 enum HostTaskOutcome {
-    Ok,
+    Ok {
+        /// Module reported `changed=true` (or under `--check`, would have
+        /// changed). Used for the end-of-run summary.
+        changed: bool,
+        /// Module declined to mutate under `--check`, or skipped outright
+        /// (exec/shell/mutating uri). Distinct from `changed=false` —
+        /// see RunReport docs.
+        skipped: bool,
+    },
     Skipped,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 struct PerHostTaskResult {
@@ -1362,12 +1407,12 @@ async fn run_task_on_one_host(
         };
         let exec = run_body_once(task, &target, &mut ctx, &env, &world, &next_seq).await;
         let outcome = match exec {
-            BodyResult::Ok { register, changed } => {
+            BodyResult::Ok { register, changed, skipped } => {
                 if let Some(reg_name) = &task.register {
                     ctx.record_register(reg_name, register);
                 }
                 enqueue_notifies(task, changed, false, &mut ctx, &env, &world);
-                HostTaskOutcome::Ok
+                HostTaskOutcome::Ok { changed, skipped }
             }
             BodyResult::Failed { reason, register, conn_alive } => {
                 if let Some(reg_name) = &task.register {
@@ -1425,7 +1470,9 @@ async fn run_task_on_one_host(
         };
         let exec = run_body_once(task, &target, &mut ctx, &env, &world, &next_seq).await;
         match exec {
-            BodyResult::Ok { register, changed: _ } => iter_registers.push(register),
+            BodyResult::Ok { register, changed: _, skipped: _ } => {
+                iter_registers.push(register);
+            }
             BodyResult::Failed { reason, register, conn_alive } => {
                 if any_failed.is_none() {
                     any_failed = Some(reason.clone());
@@ -1444,6 +1491,7 @@ async fn run_task_on_one_host(
     }
     ctx.iter_item = None;
     let any_changed = iter_registers.iter().any(|r| r.changed);
+    let all_skipped = !iter_registers.is_empty() && iter_registers.iter().all(|r| r.skipped);
     let any_iter_failed = iter_registers.iter().any(|r| r.failed);
     let aggregate = RegisterValue {
         changed: any_changed,
@@ -1457,7 +1505,7 @@ async fn run_task_on_one_host(
     let outcome = match any_failed {
         None => {
             enqueue_notifies(task, any_changed, false, &mut ctx, &env, &world);
-            HostTaskOutcome::Ok
+            HostTaskOutcome::Ok { changed: any_changed, skipped: all_skipped }
         }
         Some(reason) => {
             ctx.failed = true;
@@ -1495,7 +1543,7 @@ fn maybe_ignore_failure(
                 reason = %reason,
                 "task failed but ignored (ignore_errors: true)"
             );
-            HostTaskOutcome::Ok
+            HostTaskOutcome::Ok { changed: false, skipped: false }
         }
         _ => outcome,
     }
@@ -1541,6 +1589,11 @@ enum BodyResult {
         register: RegisterValue,
         /// Whether the task actually changed state. Used to gate `notify`.
         changed: bool,
+        /// True iff the agent (or controller composite path) declined to
+        /// mutate state under `--check`. Distinct from `changed=false`
+        /// (which is "ran and was idempotent"): `skipped` means "did not
+        /// run at all" or "would have mutated but didn't, because dry-run."
+        skipped: bool,
     },
     Failed {
         reason: String,
@@ -1672,7 +1725,10 @@ async fn run_op_body(
         }
     };
     let clock_offset_ns = conn.clock_offset_ns;
-    let result = run_one_task_op(conn, seq, wire_op, capture, clock_offset_ns).await;
+    // Effective per-task check_mode: task field wins both directions,
+    // otherwise inherit the run-level flag.
+    let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+    let result = run_one_task_op(conn, seq, wire_op, capture, clock_offset_ns, check_mode).await;
     let label = conn.label.clone();
     drop(guard); // release the lock before doing CPU work / waiting on ctx
     let _ = ctx; // ctx isn't mutated here; silence unused-mut
@@ -1682,9 +1738,10 @@ async fn run_op_body(
             let agent_elapsed_ns =
                 exec.done.finished_unix_ns.saturating_sub(exec.done.started_unix_ns);
             let took_ms = (agent_elapsed_ns / 1_000_000).min(u64::MAX);
-            let mut rv = RegisterValue::from_exec(
+            let mut rv = RegisterValue::from_exec_with_skipped(
                 exec.done.exit_code,
                 exec.done.changed != 0,
+                exec.done.skipped != 0,
                 took_ms,
                 &exec.stdout,
                 &exec.stderr,
@@ -1711,19 +1768,35 @@ async fn run_op_body(
             }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
+                let changed = exec.done.changed != 0;
+                let skipped = exec.done.skipped != 0;
                 info!(
                     host = %label,
                     task = %task.name,
                     seq,
                     exit = exec.done.exit_code,
-                    changed = exec.done.changed != 0,
+                    changed,
+                    skipped,
                     took_ms,
                     "ok",
                 );
-                let changed = exec.done.changed != 0;
+                // Surface per-task check-mode markers on stderr so the
+                // operator can see at a glance what happened. Real runs
+                // stay quiet — the existing summary line carries the count.
+                if check_mode {
+                    let marker = if skipped {
+                        "[CHECK]"
+                    } else if changed {
+                        "[WOULD CHANGE]"
+                    } else {
+                        "[CHECK OK]"
+                    };
+                    eprintln!("  {marker} {label}: {task_name}", task_name = task.name);
+                }
                 BodyResult::Ok {
                     register: rv,
                     changed,
+                    skipped,
                 }
             } else {
                 warn!(
@@ -1810,10 +1883,17 @@ async fn run_privkey_composite(
     // shouldn't have asked us to generate a key.)
     ctx.privkey_pem_cache.insert(p.path.clone(), pem.clone());
 
+    // Effective check_mode for this task (per-task field wins, else inherit).
+    let effective_check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+
     // Decide which branch to take. force_probe wins over both auto and
     // CLI overrides — operator opt-in to exact Ansible-flavored
-    // idempotency reporting.
-    let probe = p.force_probe || ctx.wire_strategy.decide(&ctx.wire_cost, pem.len());
+    // idempotency reporting. Under --check we force probing
+    // unconditionally: the dry-run path *must* see whether the key
+    // exists so we can report a meaningful `changed`/`skipped` pair
+    // without writing bytes.
+    let probe =
+        effective_check_mode || p.force_probe || ctx.wire_strategy.decide(&ctx.wire_cost, pem.len());
 
     if probe {
         // Step 1: OpStat. Short, cheap, returns JSON on stdout.
@@ -1832,7 +1912,10 @@ async fn run_privkey_composite(
                 }
             };
             let clock_offset_ns = conn.clock_offset_ns;
-            let r = run_one_task_op(conn, stat_seq, stat_op, true, clock_offset_ns).await;
+            // OpStat is read-only; pass effective check_mode through
+            // for consistency (the agent's stat module ignores it).
+            let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+            let r = run_one_task_op(conn, stat_seq, stat_op, true, clock_offset_ns, check_mode).await;
             let _label = conn.label.clone();
             r
         };
@@ -1881,9 +1964,31 @@ async fn run_privkey_composite(
             return BodyResult::Ok {
                 register: rv,
                 changed: false,
+                skipped: false,
             };
         }
-        // File is absent — fall through to ship the bytes. only_if_missing=0
+        // File is absent.
+        //
+        // Under --check we stop here: synthesize a `changed=true,
+        // skipped=true` result and keep the freshly-generated PEM in
+        // the cache so a chained csr_pipe / cert_pipe can still produce
+        // a meaningful register during the dry-run. We never dispatch
+        // OpWriteFile in this branch — that's the whole point.
+        if effective_check_mode {
+            let pem_str = String::from_utf8_lossy(&pem).into_owned();
+            let mut rv = RegisterValue::default();
+            rv.took_ms = 0;
+            rv.skipped = true;
+            rv.changed = true;
+            rv.extra
+                .insert("content".into(), JsonValue::String(pem_str));
+            return BodyResult::Ok {
+                register: rv,
+                changed: true,
+                skipped: true,
+            };
+        }
+        // Real run: fall through to ship the bytes. only_if_missing=0
         // because we already know it's gone; the agent shouldn't re-stat.
         let _ = task; // satisfy unused warning when this branch returns early
     }
@@ -1914,17 +2019,26 @@ async fn run_privkey_composite(
             }
         };
         let clock_offset_ns = conn.clock_offset_ns;
-        run_one_task_op(conn, write_seq, write_op, task.register.is_some(), clock_offset_ns)
-            .await
+        let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+        run_one_task_op(
+            conn,
+            write_seq,
+            write_op,
+            task.register.is_some(),
+            clock_offset_ns,
+            check_mode,
+        )
+        .await
     };
     match write_result {
         Ok(exec) => {
             let agent_elapsed_ns =
                 exec.done.finished_unix_ns.saturating_sub(exec.done.started_unix_ns);
             let took_ms = (agent_elapsed_ns / 1_000_000).min(u64::MAX);
-            let mut rv = RegisterValue::from_exec(
+            let mut rv = RegisterValue::from_exec_with_skipped(
                 exec.done.exit_code,
                 exec.done.changed != 0,
+                exec.done.skipped != 0,
                 took_ms,
                 &exec.stdout,
                 &exec.stderr,
@@ -1939,6 +2053,7 @@ async fn run_privkey_composite(
                 BodyResult::Ok {
                     register: rv,
                     changed: exec.done.changed != 0,
+                    skipped: exec.done.skipped != 0,
                 }
             } else {
                 BodyResult::Failed {
@@ -2007,6 +2122,7 @@ fn synth_csr_pipe(c: &OpenSslCsrPipeOp, ctx: &HostCtx) -> BodyResult {
     BodyResult::Ok {
         register: rv,
         changed: false,
+        skipped: false,
     }
 }
 
@@ -2050,6 +2166,7 @@ fn synth_cert_pipe(c: &X509CertificatePipeOp) -> BodyResult {
     BodyResult::Ok {
         register: rv,
         changed: false,
+        skipped: false,
     }
 }
 
@@ -2103,6 +2220,7 @@ fn run_assert_body(
             ..RegisterValue::default()
         },
         changed: false,
+        skipped: false,
     }
 }
 
@@ -2193,6 +2311,7 @@ fn run_set_fact_body(
     BodyResult::Ok {
         register: RegisterValue::synthetic_ok(),
         changed: true,
+        skipped: false,
     }
 }
 
@@ -2726,8 +2845,9 @@ async fn run_one_task_op(
     op: Op,
     capture: bool,
     clock_offset_ns: i64,
+    check_mode: bool,
 ) -> Result<OpExecOutcome> {
-    let dispatch = task_dispatch(seq, op);
+    let dispatch = task_dispatch(seq, check_mode, op);
     write_frame(&mut conn.stream, &dispatch)
         .await
         .with_context(|| format!("writing TaskDispatch to {}", conn.label))?;
@@ -2838,14 +2958,26 @@ async fn apply_per_host_result(
         conn_alive,
     } = r;
     let failed = matches!(outcome, HostTaskOutcome::Failed { .. });
-    if let HostTaskOutcome::Failed { reason } = &outcome {
-        report.host_outcomes.insert(
-            name.clone(),
-            HostOutcome::Failed {
-                task: task.name.clone(),
-                reason: reason.clone(),
-            },
-        );
+    match &outcome {
+        HostTaskOutcome::Ok { changed, skipped } => {
+            report.tasks_ok += 1;
+            if *changed {
+                report.tasks_changed += 1;
+            }
+            if *skipped {
+                report.tasks_skipped += 1;
+            }
+        }
+        HostTaskOutcome::Failed { reason } => {
+            report.host_outcomes.insert(
+                name.clone(),
+                HostOutcome::Failed {
+                    task: task.name.clone(),
+                    reason: reason.clone(),
+                },
+            );
+        }
+        HostTaskOutcome::Skipped => {}
     }
     // Always reinsert ctx — set_facts/registers should persist even from failed hosts.
     ctxs.insert(name.clone(), ctx);
@@ -3406,6 +3538,7 @@ all:
             become_: None,
             become_user: None,
             ignore_errors: ignore,
+            check_mode: None,
         }
     }
 
@@ -3416,7 +3549,7 @@ all:
             reason: "exit 1".into(),
         };
         let got = maybe_ignore_failure(&task, outcome, "h1");
-        assert!(matches!(got, HostTaskOutcome::Ok));
+        assert!(matches!(got, HostTaskOutcome::Ok { .. }));
     }
 
     #[test]
@@ -3444,8 +3577,8 @@ all:
     #[test]
     fn maybe_ignore_failure_leaves_ok_alone() {
         let task = shell_task_with_ignore(Some(true));
-        let got = maybe_ignore_failure(&task, HostTaskOutcome::Ok, "h1");
-        assert!(matches!(got, HostTaskOutcome::Ok));
+        let got = maybe_ignore_failure(&task, HostTaskOutcome::Ok { changed: false, skipped: false }, "h1");
+        assert!(matches!(got, HostTaskOutcome::Ok { .. }));
     }
 
     #[test]
@@ -3487,7 +3620,7 @@ all:
         };
         let result = synth_csr_pipe(&op, &ctx);
         let rv = match result {
-            BodyResult::Ok { register, changed } => {
+            BodyResult::Ok { register, changed, .. } => {
                 assert!(!changed, "_pipe always changed=false");
                 register
             }

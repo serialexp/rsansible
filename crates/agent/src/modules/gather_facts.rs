@@ -23,14 +23,18 @@ use serde_json::{json, Value};
 
 use super::Context;
 
-pub async fn run(ctx: &Context, seq: u32) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, _check_mode: bool) -> anyhow::Result<()> {
+    // gather_facts is read-only: it only reads /proc, /etc/os-release,
+    // and asks the kernel which local address it would route to 1.1.1.1.
+    // No state changes; `_check_mode` is accepted for plumbing
+    // uniformity and ignored.
     let started_unix_ns = now_unix_ns();
     let facts = collect_facts();
     let bytes = serde_json::to_vec(&facts)?;
     ctx.emit(msg::task_progress(seq, msg::stream::STDOUT, bytes))
         .await;
     let finished_unix_ns = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, false, started_unix_ns, finished_unix_ns)).await;
+    ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished_unix_ns)).await;
     Ok(())
 }
 

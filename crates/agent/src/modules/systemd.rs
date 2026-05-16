@@ -38,7 +38,7 @@ const STATE_STOPPED: u8 = 2;
 const STATE_RESTARTED: u8 = 3;
 const STATE_RELOADED: u8 = 4;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpSystemdOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpSystemdOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
     if op.name.trim().is_empty() {
@@ -53,7 +53,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpSystemdOutput) -> anyhow::Result
     }
 
     let bin = std::env::var("RSANSIBLE_SYSTEMCTL").unwrap_or_else(|_| "systemctl".to_string());
-    let result = tokio::task::spawn_blocking(move || apply(&bin, &op))
+    let result = tokio::task::spawn_blocking(move || apply(&bin, &op, check_mode))
         .await
         .map_err(|e| anyhow::anyhow!("systemd join: {e}"))?;
 
@@ -74,7 +74,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpSystemdOutput) -> anyhow::Result
     };
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, started_unix_ns, finished))
+    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
         .await;
     Ok(())
 }
@@ -86,12 +86,21 @@ enum SystemdError {
     BadRequest(String),
 }
 
-fn apply(bin: &str, op: &OpSystemdOutput) -> Result<bool, SystemdError> {
+fn apply(bin: &str, op: &OpSystemdOutput, check_mode: bool) -> Result<bool, SystemdError> {
     let name = op.name.as_str();
     let mut changed = false;
+    // Tiny helper to gate the actual mutation behind check_mode while
+    // still tracking `changed` for the would-have-mutated case.
+    let do_mutate = |args: &[&str]| -> Result<(), SystemdError> {
+        if check_mode {
+            Ok(())
+        } else {
+            run_systemctl(bin, args).map(|_| ())
+        }
+    };
 
     if op.daemon_reload != 0 {
-        run_systemctl(bin, &["daemon-reload"])?;
+        do_mutate(&["daemon-reload"])?;
         // daemon-reload itself counts as changed per Ansible.
         changed = true;
     }
@@ -102,10 +111,10 @@ fn apply(bin: &str, op: &OpSystemdOutput) -> Result<bool, SystemdError> {
         let cur = probe_is_enabled(&bin, name)?;
         let is_masked = cur == "masked";
         if want_masked && !is_masked {
-            run_systemctl(bin, &["mask", name])?;
+            do_mutate(&["mask", name])?;
             changed = true;
         } else if !want_masked && is_masked {
-            run_systemctl(bin, &["unmask", name])?;
+            do_mutate(&["unmask", name])?;
             changed = true;
         }
     }
@@ -120,10 +129,10 @@ fn apply(bin: &str, op: &OpSystemdOutput) -> Result<bool, SystemdError> {
         // anyway.
         let is_enabled = matches!(cur.as_str(), "enabled" | "enabled-runtime" | "alias" | "static");
         if want_enabled && !is_enabled {
-            run_systemctl(bin, &["enable", name])?;
+            do_mutate(&["enable", name])?;
             changed = true;
         } else if !want_enabled && is_enabled && cur != "static" {
-            run_systemctl(bin, &["disable", name])?;
+            do_mutate(&["disable", name])?;
             changed = true;
         }
     }
@@ -138,7 +147,7 @@ fn apply(bin: &str, op: &OpSystemdOutput) -> Result<bool, SystemdError> {
                     args.insert(0, "--no-block");
                 }
                 args.push(name);
-                run_systemctl(bin, &args)?;
+                do_mutate(&args)?;
                 changed = true;
             }
         }
@@ -149,7 +158,7 @@ fn apply(bin: &str, op: &OpSystemdOutput) -> Result<bool, SystemdError> {
                     args.insert(0, "--no-block");
                 }
                 args.push(name);
-                run_systemctl(bin, &args)?;
+                do_mutate(&args)?;
                 changed = true;
             }
         }
@@ -159,11 +168,11 @@ fn apply(bin: &str, op: &OpSystemdOutput) -> Result<bool, SystemdError> {
                 args.insert(0, "--no-block");
             }
             args.push(name);
-            run_systemctl(bin, &args)?;
+            do_mutate(&args)?;
             changed = true;
         }
         STATE_RELOADED => {
-            run_systemctl(bin, &["reload", name])?;
+            do_mutate(&["reload", name])?;
             changed = true;
         }
         other => {
@@ -314,7 +323,7 @@ esac
     #[test]
     fn started_when_already_active_is_noop() {
         let stub = Stub::new("started-noop", Some("active\n"), None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("nginx.service", STATE_STARTED)).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &op("nginx.service", STATE_STARTED), false).unwrap();
         assert!(!changed);
         let log = stub.log();
         assert!(log.contains("is-active nginx.service"), "log={log:?}");
@@ -324,7 +333,7 @@ esac
     #[test]
     fn started_when_inactive_triggers_start() {
         let stub = Stub::new("started-go", None, None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STARTED)).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STARTED), false).unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("start foo.service"), "log={log:?}");
@@ -333,7 +342,7 @@ esac
     #[test]
     fn stopped_when_active_triggers_stop() {
         let stub = Stub::new("stopped-go", Some("active\n"), None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STOPPED)).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STOPPED), false).unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("stop foo.service"), "log={log:?}");
@@ -342,7 +351,7 @@ esac
     #[test]
     fn stopped_when_already_inactive_is_noop() {
         let stub = Stub::new("stopped-noop", None, None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STOPPED)).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STOPPED), false).unwrap();
         assert!(!changed);
         let log = stub.log();
         assert!(!log.contains("stop "), "log={log:?}");
@@ -351,7 +360,7 @@ esac
     #[test]
     fn restarted_always_runs_and_reports_changed() {
         let stub = Stub::new("restarted", Some("active\n"), None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_RESTARTED)).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_RESTARTED), false).unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("restart foo.service"), "log={log:?}");
@@ -363,7 +372,7 @@ esac
         let mut o = op("foo.service", STATE_NONE);
         o.has_enabled = 1;
         o.enabled = 1;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("is-enabled foo.service"), "log={log:?}");
@@ -376,7 +385,7 @@ esac
         let mut o = op("foo.service", STATE_NONE);
         o.has_enabled = 1;
         o.enabled = 1;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
         let log = stub.log();
         assert!(!log.contains("\nenable foo.service\n"), "log={log:?}");
@@ -387,7 +396,7 @@ esac
         let stub = Stub::new("dr", None, None);
         let mut o = op("foo.service", STATE_STARTED);
         o.daemon_reload = 1;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         let log = stub.log();
         let dr_pos = log.find("daemon-reload").unwrap();
@@ -400,7 +409,7 @@ esac
         let stub = Stub::new("noblock", None, None);
         let mut o = op("foo.service", STATE_STARTED);
         o.no_block = 1;
-        let _ = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let _ = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         let log = stub.log();
         assert!(
             log.contains("--no-block start foo.service"),
@@ -414,7 +423,7 @@ esac
         let mut o = op("foo.service", STATE_NONE);
         o.has_masked = 1;
         o.masked = 1;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("mask foo.service"), "log={log:?}");
@@ -426,7 +435,7 @@ esac
         let mut o = op("foo.service", STATE_NONE);
         o.has_masked = 1;
         o.masked = 1;
-        let changed = apply(stub.path().to_str().unwrap(), &o).unwrap();
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
         let log = stub.log();
         assert!(!log.contains("\nmask foo.service\n"), "log={log:?}");

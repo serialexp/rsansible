@@ -91,6 +91,12 @@ enum Cmd {
         /// `blind` skips the stat probe; `probe` always probes.
         #[arg(long = "wire-strategy", value_enum, default_value = "auto")]
         wire_strategy: WireStrategyArg,
+        /// Run in check (dry-run) mode: no changes are made to target
+        /// hosts. Modules report what they *would* change. `shell` /
+        /// `exec` and mutating `uri` verbs are skipped; per-task
+        /// `check_mode: false` overrides both directions.
+        #[arg(long)]
+        check: bool,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -146,6 +152,7 @@ async fn main() -> ExitCode {
             skip_tags,
             limit,
             wire_strategy,
+            check,
             playbook,
         } => match cmd_run(
             inventory,
@@ -157,6 +164,7 @@ async fn main() -> ExitCode {
             skip_tags,
             limit,
             wire_strategy,
+            check,
             playbook,
         )
         .await
@@ -208,6 +216,7 @@ async fn cmd_run(
     skip_tags: Vec<String>,
     limit: Vec<String>,
     wire_strategy: WireStrategyArg,
+    check_mode: bool,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -232,6 +241,10 @@ async fn cmd_run(
     spec.skip_tags = skip_tags;
     spec.limit = limit;
     spec.wire_strategy = wire_strategy.into();
+    spec.check_mode = check_mode;
+    if check_mode {
+        eprintln!("*** running in check mode — no changes will be made ***");
+    }
     let report = orchestrator::run(spec)
         .await
         .context("orchestrator failed")?;
@@ -260,14 +273,23 @@ async fn cmd_run(
             }
         }
     }
-    eprintln!(
-        "summary: ok={ok} failed={failed} unreachable={unreachable} not_targeted={skipped}{}",
-        if report.stopped_early {
-            " (stopped early)"
-        } else {
-            ""
-        }
-    );
+    let early = if report.stopped_early { " (stopped early)" } else { "" };
+    if report.check_mode {
+        eprintln!(
+            "summary: ok={ok} failed={failed} unreachable={unreachable} not_targeted={skipped} \
+             tasks_run={tr} would-change={wc} skipped-by-check={sc}{early}",
+            tr = report.tasks_ok,
+            wc = report.tasks_changed,
+            sc = report.tasks_skipped,
+        );
+    } else {
+        eprintln!(
+            "summary: ok={ok} failed={failed} unreachable={unreachable} not_targeted={skipped} \
+             tasks_run={tr} changed={ch}{early}",
+            tr = report.tasks_ok,
+            ch = report.tasks_changed,
+        );
+    }
     if failed + unreachable > 0 || report.stopped_early {
         Ok(ExitCode::FAILURE)
     } else {

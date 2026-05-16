@@ -120,13 +120,14 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_task_dispatch_shell() {
-        roundtrip(msg::task_dispatch(42, msg::op_shell("echo hi".into(), 0))).await;
+        roundtrip(msg::task_dispatch(42, false, msg::op_shell("echo hi".into(), 0))).await;
     }
 
     #[tokio::test]
     async fn roundtrip_task_dispatch_exec() {
         roundtrip(msg::task_dispatch(
             7,
+            false,
             msg::op_exec(
                 vec!["/bin/true".into()],
                 vec!["FOO".into()],
@@ -143,6 +144,7 @@ mod tests {
     async fn roundtrip_task_dispatch_write_file() {
         roundtrip(msg::task_dispatch(
             99,
+            false,
             msg::op_write_file("/etc/motd".into(), 0o644, false, b"hello world\n".to_vec()),
         ))
         .await;
@@ -150,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_task_dispatch_gather_facts() {
-        roundtrip(msg::task_dispatch(101, msg::op_gather_facts())).await;
+        roundtrip(msg::task_dispatch(101, false, msg::op_gather_facts())).await;
     }
 
     #[tokio::test]
@@ -158,6 +160,7 @@ mod tests {
         // TCP-mode
         roundtrip(msg::task_dispatch(
             106,
+            false,
             msg::op_wait_for(
                 "10.0.0.5".into(),
                 8080,
@@ -172,6 +175,7 @@ mod tests {
         // path-mode (port=0)
         roundtrip(msg::task_dispatch(
             107,
+            false,
             msg::op_wait_for(
                 String::new(),
                 0,
@@ -189,6 +193,7 @@ mod tests {
     async fn roundtrip_task_dispatch_file() {
         roundtrip(msg::task_dispatch(
             104,
+            false,
             msg::op_file(
                 "/etc/foo".into(),
                 msg::file_state::DIRECTORY,
@@ -202,6 +207,7 @@ mod tests {
         // mode=None branch + empty owner/group + recurse.
         roundtrip(msg::task_dispatch(
             105,
+            false,
             msg::op_file(
                 "/var/log/app".into(),
                 msg::file_state::DIRECTORY,
@@ -219,6 +225,7 @@ mod tests {
         // state=present with regexp + insertafter.
         roundtrip(msg::task_dispatch(
             108,
+            false,
             msg::op_lineinfile(
                 "/etc/foo.conf".into(),
                 "^foo=".into(),
@@ -235,6 +242,7 @@ mod tests {
         // state=absent with empty regexp + create=false + mode=None.
         roundtrip(msg::task_dispatch(
             109,
+            false,
             msg::op_lineinfile(
                 "/etc/bar".into(),
                 String::new(),
@@ -254,6 +262,7 @@ mod tests {
     async fn roundtrip_task_dispatch_blockinfile() {
         roundtrip(msg::task_dispatch(
             110,
+            false,
             msg::op_blockinfile(
                 "/etc/foo".into(),
                 "alpha\nbeta\n".into(),
@@ -270,6 +279,7 @@ mod tests {
         .await;
         roundtrip(msg::task_dispatch(
             111,
+            false,
             msg::op_blockinfile(
                 "/etc/foo".into(),
                 String::new(),
@@ -290,6 +300,7 @@ mod tests {
     async fn roundtrip_task_dispatch_systemd() {
         roundtrip(msg::task_dispatch(
             112,
+            false,
             msg::op_systemd(
                 "nginx.service".into(),
                 msg::systemd_state::RESTARTED,
@@ -302,6 +313,7 @@ mod tests {
         .await;
         roundtrip(msg::task_dispatch(
             113,
+            false,
             msg::op_systemd(
                 "foo.service".into(),
                 msg::systemd_state::NONE,
@@ -318,6 +330,7 @@ mod tests {
     async fn roundtrip_task_dispatch_ufw() {
         roundtrip(msg::task_dispatch(
             116,
+            false,
             msg::op_ufw(
                 msg::ufw_op::RULE,
                 "allow".into(),
@@ -336,6 +349,7 @@ mod tests {
         .await;
         roundtrip(msg::task_dispatch(
             117,
+            false,
             msg::op_ufw(
                 msg::ufw_op::ENABLE,
                 String::new(),
@@ -358,6 +372,7 @@ mod tests {
     async fn roundtrip_task_dispatch_package() {
         roundtrip(msg::task_dispatch(
             114,
+            false,
             msg::op_package(
                 msg::package_manager::APT,
                 vec!["nginx".into(), "curl".into()],
@@ -373,6 +388,7 @@ mod tests {
         .await;
         roundtrip(msg::task_dispatch(
             115,
+            false,
             msg::op_package(
                 msg::package_manager::APT,
                 vec!["openssh-server".into()],
@@ -389,6 +405,7 @@ mod tests {
         // Auto-manager (no specific backend pinned).
         roundtrip(msg::task_dispatch(
             116,
+            false,
             msg::op_package(
                 msg::package_manager::AUTO,
                 vec!["curl".into()],
@@ -408,11 +425,13 @@ mod tests {
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,
+            false,
             msg::op_stat("/etc/hostname".into(), true),
         ))
         .await;
         roundtrip(msg::task_dispatch(
             103,
+            false,
             msg::op_stat("/nope".into(), false),
         ))
         .await;
@@ -424,6 +443,7 @@ mod tests {
         // — otherwise the agent's skip-if-exists branch never fires.
         roundtrip(msg::task_dispatch(
             42,
+            false,
             msg::op_write_file("/etc/ssl/key.pem".into(), 0o600, true, b"PEM".to_vec()),
         ))
         .await;
@@ -435,6 +455,7 @@ mod tests {
         // wire-vs-runtime mismatch surfaces here, not in production.
         roundtrip(msg::task_dispatch(
             77,
+            false,
             msg::op_uri(
                 msg::uri_method::GET,
                 "https://etcd.example/v2".into(),
@@ -462,7 +483,25 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_task_done() {
-        roundtrip(msg::task_done(42, 0, true, 1_700_000_000_000_000_000, 1_700_000_000_137_000_000)).await;
+        roundtrip(msg::task_done(42, 0, true, false, 1_700_000_000_000_000_000, 1_700_000_000_137_000_000)).await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_done_skipped() {
+        // skipped=true is set by modules that decline under check_mode
+        // (exec/shell, and uri for mutating verbs).
+        roundtrip(msg::task_done(43, 0, false, true, 1_700_000_000_000_000_000, 1_700_000_000_001_000_000)).await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_check_mode() {
+        // check_mode=true should roundtrip through the envelope.
+        roundtrip(msg::task_dispatch(
+            44,
+            true,
+            msg::op_shell("echo dry-run".into(), 0),
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -512,14 +551,14 @@ mod tests {
     async fn multiple_frames_back_to_back() {
         let mut buf: Vec<u8> = Vec::new();
         write_frame(&mut buf, &msg::bye()).await.unwrap();
-        write_frame(&mut buf, &msg::task_done(1, 0, false, 100, 110))
+        write_frame(&mut buf, &msg::task_done(1, 0, false, false, 100, 110))
             .await
             .unwrap();
         let mut r = BufReader::new(Cursor::new(buf));
         assert_eq!(read_frame(&mut r).await.unwrap().unwrap(), msg::bye());
         assert_eq!(
             read_frame(&mut r).await.unwrap().unwrap(),
-            msg::task_done(1, 0, false, 100, 110)
+            msg::task_done(1, 0, false, false, 100, 110)
         );
         assert!(read_frame(&mut r).await.unwrap().is_none());
     }

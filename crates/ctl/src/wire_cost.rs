@@ -55,7 +55,9 @@ impl Default for WireCost {
 /// (and we never overwrite) or it doesn't (and we ship anyway), so the
 /// expected probe cost is just the RTT. Probe wins iff:
 ///
-///     rtt_ms < (size_bytes * 1000) / bw_bytes_per_s
+/// ```text
+/// rtt_ms < (size_bytes * 1000) / bw_bytes_per_s
+/// ```
 ///
 /// i.e. iff the payload would have taken longer than one RTT to ship.
 /// Equivalently: probe iff `size > rtt × bw`, the bandwidth-delay

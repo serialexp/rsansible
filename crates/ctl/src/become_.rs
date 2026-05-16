@@ -179,6 +179,7 @@ mod tests {
             become_: b,
             become_user: u.map(String::from),
             ignore_errors: None,
+            check_mode: None,
         }
     }
 

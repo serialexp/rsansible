@@ -34,7 +34,7 @@ const STATE_ABSENT: u8 = 1;
 const STATE_TOUCH: u8 = 2;
 const STATE_FILE: u8 = 3;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput) -> anyhow::Result<()> {
+pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
     let path = op.path;
     let mode = if op.has_mode != 0 { Some(op.mode & 0o7777) } else { None };
@@ -64,10 +64,10 @@ pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput) -> anyhow::Result<()
     };
 
     let result = match op.state {
-        STATE_DIRECTORY => apply_directory(Path::new(&path), mode, uid, gid, recurse),
-        STATE_ABSENT => apply_absent(Path::new(&path)),
-        STATE_TOUCH => apply_touch(Path::new(&path), mode, uid, gid),
-        STATE_FILE => apply_file(Path::new(&path), mode, uid, gid),
+        STATE_DIRECTORY => apply_directory(Path::new(&path), mode, uid, gid, recurse, check_mode),
+        STATE_ABSENT => apply_absent(Path::new(&path), check_mode),
+        STATE_TOUCH => apply_touch(Path::new(&path), mode, uid, gid, check_mode),
+        STATE_FILE => apply_file(Path::new(&path), mode, uid, gid, check_mode),
         other => {
             emit_error(
                 ctx,
@@ -101,7 +101,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput) -> anyhow::Result<()
     };
 
     let finished_unix_ns = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, started_unix_ns, finished_unix_ns))
+    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished_unix_ns))
         .await;
     Ok(())
 }
@@ -130,6 +130,7 @@ fn apply_directory(
     uid: Option<u32>,
     gid: Option<u32>,
     recurse: bool,
+    check_mode: bool,
 ) -> Result<bool, FileError> {
     let mut changed = false;
     // Snapshot pre-state so we can decide `changed`.
@@ -145,25 +146,35 @@ fn apply_directory(
         }
     }
     if !exists_as_dir {
-        std::fs::create_dir_all(path).map_err(FileError::from)?;
+        if !check_mode {
+            std::fs::create_dir_all(path).map_err(FileError::from)?;
+        }
         changed = true;
+        // Under check_mode the directory doesn't exist yet, so further
+        // probes (mode/owner/group/recurse) have nothing to look at.
+        if check_mode {
+            return Ok(true);
+        }
     }
     // Apply mode/owner/group to the top-level path.
-    if apply_mode_owner_group(path, mode, uid, gid)? {
+    if apply_mode_owner_group(path, mode, uid, gid, check_mode)? {
         changed = true;
     }
     if recurse {
-        walk_apply(path, mode, uid, gid, &mut changed)?;
+        walk_apply(path, mode, uid, gid, &mut changed, check_mode)?;
     }
     Ok(changed)
 }
 
-fn apply_absent(path: &Path) -> Result<bool, FileError> {
+fn apply_absent(path: &Path, check_mode: bool) -> Result<bool, FileError> {
     let pre = std::fs::symlink_metadata(path);
     match pre {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(FileError::from(e)),
         Ok(m) => {
+            if check_mode {
+                return Ok(true);
+            }
             // Symlinks count as "not a directory" even when their target
             // is — removing the link itself is what we want.
             if m.is_dir() && !m.file_type().is_symlink() {
@@ -181,8 +192,14 @@ fn apply_touch(
     mode: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
+    check_mode: bool,
 ) -> Result<bool, FileError> {
     let existed = path.exists();
+    // Touch is always-changed by Ansible's contract — under check_mode
+    // we report changed=true and skip the file ops entirely.
+    if check_mode {
+        return Ok(true);
+    }
     if !existed {
         std::fs::OpenOptions::new()
             .create(true)
@@ -198,7 +215,7 @@ fn apply_touch(
     set_file_times(path, now, now)?;
     // Apply mode/owner/group. The return tells us whether they changed
     // but touch is always-changed by Ansible's contract.
-    let _ = apply_mode_owner_group(path, mode, uid, gid)?;
+    let _ = apply_mode_owner_group(path, mode, uid, gid, false)?;
     let _ = existed; // suppress unused warning if branches collapse
     Ok(true)
 }
@@ -208,6 +225,7 @@ fn apply_file(
     mode: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
+    check_mode: bool,
 ) -> Result<bool, FileError> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -226,7 +244,7 @@ fn apply_file(
             meta.file_type()
         )));
     }
-    apply_mode_owner_group(path, mode, uid, gid)
+    apply_mode_owner_group(path, mode, uid, gid, check_mode)
 }
 
 /// Apply mode/owner/group to `path` if they differ from current. Returns
@@ -239,6 +257,7 @@ fn apply_mode_owner_group(
     mode: Option<u32>,
     uid: Option<u32>,
     gid: Option<u32>,
+    check_mode: bool,
 ) -> Result<bool, FileError> {
     let meta = std::fs::symlink_metadata(path).map_err(FileError::from)?;
     let mut changed = false;
@@ -249,8 +268,10 @@ fn apply_mode_owner_group(
         if !meta.file_type().is_symlink() {
             let cur = meta.permissions().mode() & 0o7777;
             if cur != want & 0o7777 {
-                let perms = std::fs::Permissions::from_mode(want & 0o7777);
-                std::fs::set_permissions(path, perms).map_err(FileError::from)?;
+                if !check_mode {
+                    let perms = std::fs::Permissions::from_mode(want & 0o7777);
+                    std::fs::set_permissions(path, perms).map_err(FileError::from)?;
+                }
                 changed = true;
             }
         }
@@ -262,7 +283,9 @@ fn apply_mode_owner_group(
     let want_uid = uid.unwrap_or(cur_uid);
     let want_gid = gid.unwrap_or(cur_gid);
     if want_uid != cur_uid || want_gid != cur_gid {
-        lchown(path, want_uid, want_gid)?;
+        if !check_mode {
+            lchown(path, want_uid, want_gid)?;
+        }
         changed = true;
     }
 
@@ -275,6 +298,7 @@ fn walk_apply(
     uid: Option<u32>,
     gid: Option<u32>,
     changed: &mut bool,
+    check_mode: bool,
 ) -> Result<(), FileError> {
     let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -287,7 +311,7 @@ fn walk_apply(
             let p = ent.path();
             // Don't descend through symlinks (Ansible's recurse behavior).
             let m = ent.metadata().map_err(FileError::from)?;
-            if apply_mode_owner_group(&p, mode, uid, gid)? {
+            if apply_mode_owner_group(&p, mode, uid, gid, check_mode)? {
                 *changed = true;
             }
             if m.is_dir() && !m.file_type().is_symlink() {
@@ -392,10 +416,10 @@ mod tests {
     fn directory_create_then_idempotent() {
         let root = tempdir();
         let p = root.join("a/b/c");
-        let changed = apply_directory(&p, Some(0o755), None, None, false).unwrap();
+        let changed = apply_directory(&p, Some(0o755), None, None, false, false).unwrap();
         assert!(changed, "first apply creates");
         assert!(p.is_dir());
-        let changed = apply_directory(&p, Some(0o755), None, None, false).unwrap();
+        let changed = apply_directory(&p, Some(0o755), None, None, false, false).unwrap();
         assert!(!changed, "second apply is a no-op");
     }
 
@@ -403,8 +427,8 @@ mod tests {
     fn directory_mode_change_is_reported_changed() {
         let root = tempdir();
         let p = root.join("d");
-        apply_directory(&p, Some(0o700), None, None, false).unwrap();
-        let changed = apply_directory(&p, Some(0o755), None, None, false).unwrap();
+        apply_directory(&p, Some(0o700), None, None, false, false).unwrap();
+        let changed = apply_directory(&p, Some(0o755), None, None, false, false).unwrap();
         assert!(changed, "mode flip should report changed");
         let m = std::fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
         assert_eq!(m, 0o755);
@@ -415,7 +439,7 @@ mod tests {
         let root = tempdir();
         let p = root.join("conflict");
         std::fs::write(&p, b"x").unwrap();
-        let err = apply_directory(&p, None, None, None, false).unwrap_err();
+        let err = apply_directory(&p, None, None, None, false, false).unwrap_err();
         match err {
             FileError::BadRequest(m) => assert!(m.contains("isn't a directory"), "got {m}"),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -427,17 +451,17 @@ mod tests {
         let root = tempdir();
         let f = root.join("file");
         std::fs::write(&f, b"x").unwrap();
-        let changed = apply_absent(&f).unwrap();
+        let changed = apply_absent(&f, false).unwrap();
         assert!(changed);
         assert!(!f.exists());
         // Second time = no-op.
-        let changed = apply_absent(&f).unwrap();
+        let changed = apply_absent(&f, false).unwrap();
         assert!(!changed);
 
         let d = root.join("d/sub");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("inside"), b"x").unwrap();
-        let changed = apply_absent(&root.join("d")).unwrap();
+        let changed = apply_absent(&root.join("d"), false).unwrap();
         assert!(changed);
         assert!(!root.join("d").exists());
     }
@@ -446,11 +470,11 @@ mod tests {
     fn touch_creates_and_always_changed() {
         let root = tempdir();
         let p = root.join("ping");
-        let changed = apply_touch(&p, Some(0o644), None, None).unwrap();
+        let changed = apply_touch(&p, Some(0o644), None, None, false).unwrap();
         assert!(changed);
         assert!(p.exists());
         // Second touch on existing file is still changed (Ansible contract).
-        let changed = apply_touch(&p, Some(0o644), None, None).unwrap();
+        let changed = apply_touch(&p, Some(0o644), None, None, false).unwrap();
         assert!(changed);
     }
 
@@ -458,7 +482,7 @@ mod tests {
     fn file_state_errors_when_missing() {
         let root = tempdir();
         let p = root.join("nope");
-        let err = apply_file(&p, None, None, None).unwrap_err();
+        let err = apply_file(&p, None, None, None, false).unwrap_err();
         match err {
             FileError::NotFound(_) => {}
             other => panic!("expected NotFound, got {other:?}"),
@@ -471,9 +495,9 @@ mod tests {
         let p = root.join("f");
         std::fs::write(&p, b"x").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let changed = apply_file(&p, Some(0o644), None, None).unwrap();
+        let changed = apply_file(&p, Some(0o644), None, None, false).unwrap();
         assert!(changed, "mode change");
-        let changed = apply_file(&p, Some(0o644), None, None).unwrap();
+        let changed = apply_file(&p, Some(0o644), None, None, false).unwrap();
         assert!(!changed, "re-apply is a no-op");
     }
 
@@ -485,11 +509,59 @@ mod tests {
         std::fs::write(a.join("inside"), b"x").unwrap();
         std::fs::set_permissions(a.join("inside"), std::fs::Permissions::from_mode(0o600))
             .unwrap();
-        let changed = apply_directory(&root.join("r"), Some(0o755), None, None, true).unwrap();
+        let changed = apply_directory(&root.join("r"), Some(0o755), None, None, true, false).unwrap();
         assert!(changed);
         let m = std::fs::metadata(a.join("inside")).unwrap().permissions().mode() & 0o7777;
         // Inner file gets the same mode.
         assert_eq!(m, 0o755);
+    }
+
+    #[test]
+    fn check_mode_directory_does_not_create() {
+        let root = tempdir();
+        let p = root.join("ck/a/b");
+        let changed = apply_directory(&p, Some(0o755), None, None, false, true).unwrap();
+        assert!(changed, "absent dir should report would-change");
+        assert!(!p.exists(), "check_mode must NOT create the directory");
+    }
+
+    #[test]
+    fn check_mode_directory_mode_change_does_not_apply() {
+        let root = tempdir();
+        let p = root.join("ck-mode");
+        apply_directory(&p, Some(0o700), None, None, false, false).unwrap();
+        let changed = apply_directory(&p, Some(0o755), None, None, false, true).unwrap();
+        assert!(changed, "mode diff should report would-change");
+        let m = std::fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(m, 0o700, "check_mode must not apply chmod");
+    }
+
+    #[test]
+    fn check_mode_absent_does_not_remove() {
+        let root = tempdir();
+        let p = root.join("ck-rm");
+        std::fs::write(&p, b"x").unwrap();
+        let changed = apply_absent(&p, true).unwrap();
+        assert!(changed, "existing file should report would-change");
+        assert!(p.exists(), "check_mode must NOT delete the file");
+    }
+
+    #[test]
+    fn check_mode_absent_missing_is_noop() {
+        let root = tempdir();
+        let p = root.join("ck-nope");
+        let changed = apply_absent(&p, true).unwrap();
+        assert!(!changed);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn check_mode_touch_reports_changed_without_creating() {
+        let root = tempdir();
+        let p = root.join("ck-touch");
+        let changed = apply_touch(&p, Some(0o644), None, None, true).unwrap();
+        assert!(changed, "touch is always-changed (Ansible contract)");
+        assert!(!p.exists(), "check_mode must NOT create the file");
     }
 
     #[test]

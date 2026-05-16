@@ -40,21 +40,21 @@ impl Context {
 /// Top-level dispatch. Returns Ok even on module-level failure — the failure
 /// is communicated to the controller via TaskError. An Err result indicates an
 /// agent-internal bug (channel closed, etc.).
-pub async fn dispatch(ctx: &Context, seq: u32, op: Op) -> anyhow::Result<()> {
+pub async fn dispatch(ctx: &Context, seq: u32, op: Op, check_mode: bool) -> anyhow::Result<()> {
     match op {
-        Op::OpExec(o) => exec::run_exec(ctx, seq, o).await,
-        Op::OpShell(o) => exec::run_shell(ctx, seq, o).await,
-        Op::OpWriteFile(o) => write_file::run(ctx, seq, o).await,
-        Op::OpGatherFacts(_) => gather_facts::run(ctx, seq).await,
-        Op::OpStat(o) => stat::run(ctx, seq, o).await,
-        Op::OpFile(o) => file::run(ctx, seq, o).await,
-        Op::OpWaitFor(o) => wait_for::run(ctx, seq, o).await,
-        Op::OpLineInFile(o) => lineinfile::run(ctx, seq, o).await,
-        Op::OpBlockInFile(o) => blockinfile::run(ctx, seq, o).await,
-        Op::OpSystemd(o) => systemd::run(ctx, seq, o).await,
-        Op::OpPackage(o) => package::run(ctx, seq, o).await,
-        Op::OpUfw(o) => ufw::run(ctx, seq, o).await,
-        Op::OpUri(o) => uri::run(ctx, seq, o).await,
+        Op::OpExec(o) => exec::run_exec(ctx, seq, o, check_mode).await,
+        Op::OpShell(o) => exec::run_shell(ctx, seq, o, check_mode).await,
+        Op::OpWriteFile(o) => write_file::run(ctx, seq, o, check_mode).await,
+        Op::OpGatherFacts(_) => gather_facts::run(ctx, seq, check_mode).await,
+        Op::OpStat(o) => stat::run(ctx, seq, o, check_mode).await,
+        Op::OpFile(o) => file::run(ctx, seq, o, check_mode).await,
+        Op::OpWaitFor(o) => wait_for::run(ctx, seq, o, check_mode).await,
+        Op::OpLineInFile(o) => lineinfile::run(ctx, seq, o, check_mode).await,
+        Op::OpBlockInFile(o) => blockinfile::run(ctx, seq, o, check_mode).await,
+        Op::OpSystemd(o) => systemd::run(ctx, seq, o, check_mode).await,
+        Op::OpPackage(o) => package::run(ctx, seq, o, check_mode).await,
+        Op::OpUfw(o) => ufw::run(ctx, seq, o, check_mode).await,
+        Op::OpUri(o) => uri::run(ctx, seq, o, check_mode).await,
     }
 }
 
