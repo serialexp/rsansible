@@ -52,13 +52,18 @@ templated systemd units, CA cert distribution).
   - 11 `postgresql_query` + 3 `postgresql_ext` sites in gothab.
   - `tokio-postgres` over UNIX socket (Patroni clusters listen there).
   - Returns rows as JSON-ish for `register:` consumption.
-- [ ] **`OpOpenSslPrivkey` / `OpOpenSslCsr` / `OpX509Certificate`**
-  - 4 `openssl_privatekey` + 4 `openssl_csr_pipe` + 4 `x509_certificate_pipe`
-    sites — the etcd CA bootstrap.
-  - `rcgen` is the obvious crate; or `aws-lc-rs` since we already pulled
-    it in for russh, but rcgen is simpler.
-  - Output keys/certs need to be returnable via `register` (they're
-    consumed by later `copy:` tasks).
+- [x] **`openssl_privatekey` / `openssl_csr_pipe` / `x509_certificate_pipe`**
+  - Shipped in the TLS chunk (commits `d6a38a9` + `2a49eee`).
+  - Controller-side via rcgen + aws_lc_rs; agent unchanged for
+    csr_pipe / cert_pipe (synthetic register.content), privkey
+    rides on OpWriteFile + the new `only_if_missing` byte.
+  - Composite dispatch in the orchestrator: privkey ships blind
+    or probes-first based on the wire-cost heuristic.
+  - mTLS for `uri:` (PEM bytes on OpUri) shipped alongside in
+    `e5ad8a2`.
+  - v1 caveat: csr_pipe must run in the same play as its privkey
+    task — cross-run signing of an existing on-disk key needs
+    `OpReadFile`, which is deferred.
 - [ ] **`OpAsync` / async polling**
   - 2 async sites in drill-failover (continuous-writer side-process).
   - Agent spawns a child, returns a job handle, later tasks poll it.
@@ -98,7 +103,7 @@ Vault).
 | 2 | ~800  | +1 op (`OpGatherFacts`) | site.yml first play | ✅ done |
 | 3 | ~1200 | +6 ops | site.yml `common` role | ✅ done |
 | 4 | ~600  | +1 op (`OpUri`); templates rendered controller-side | site.yml etcd role | ✅ done |
-| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | open |
+| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | partial — x509 ✅, postgresql + async open |
 | **total** | **~5600 LoC** | **+11 ops** | full gothab | |
 
 For reference, v0 today is roughly 2000 LoC across all crates. So
