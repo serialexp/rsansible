@@ -43,12 +43,17 @@
 //!
 //! ## OpPostgresqlExt
 //!
-//! Probes `pg_extension` first; only runs DDL if state diverges. Version
-//! upgrades (ALTER EXTENSION ... UPDATE TO) are intentionally **not**
-//! implemented in v1 — if the caller supplies `version` and the
-//! extension is already present with a different version, we report
-//! `changed=false` and surface the prior_version in the envelope so the
-//! caller can decide whether to handle it themselves. Document this.
+//! Probes `pg_extension` first; only runs DDL if state diverges.
+//!
+//! Version handling:
+//! - present + not installed → `CREATE EXTENSION ... [VERSION '<v>']`
+//! - present + already installed at same version (or no version pinned)
+//!   → `changed=false`
+//! - present + already installed at a different version than `version:`
+//!   → `ALTER EXTENSION "<name>" UPDATE TO '<v>'` (`changed=true`); the
+//!   server enforces that an update script from the current version to
+//!   the target exists.
+//! - absent + installed → `DROP EXTENSION [CASCADE]`
 //!
 //! Envelope shape:
 //! ```json
@@ -360,6 +365,15 @@ fn pg_typed_to_json(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Value {
 
 // ── OpPostgresqlExt ─────────────────────────────────────────────────
 
+/// What DDL the probe-then-act loop decided to issue.
+enum ExtAction {
+    Noop,
+    Create,
+    Drop,
+    /// `ALTER EXTENSION ... UPDATE TO '<version>'`.
+    Update(String),
+}
+
 pub async fn run_ext(
     ctx: &Context,
     seq: u32,
@@ -401,13 +415,26 @@ pub async fn run_ext(
     let prior_version = extract_probe_version(&probe_messages);
     let currently_present = prior_version.is_some();
     let want_present = op.state == postgresql_ext_state::PRESENT;
-    let needs_change = currently_present != want_present;
 
     let target_version: Option<String> = if op.version.is_empty() {
         None
     } else {
         Some(op.version.clone())
     };
+
+    // Decide what DDL (if any) is required.
+    let action = match (currently_present, want_present) {
+        (false, false) => ExtAction::Noop,
+        (false, true) => ExtAction::Create,
+        (true, false) => ExtAction::Drop,
+        (true, true) => match (&target_version, &prior_version) {
+            (Some(target), Some(prior)) if target != prior => {
+                ExtAction::Update(target.clone())
+            }
+            _ => ExtAction::Noop,
+        },
+    };
+    let needs_change = !matches!(action, ExtAction::Noop);
 
     if !needs_change {
         // Already in the desired state. Build the envelope and return
@@ -452,10 +479,13 @@ pub async fn run_ext(
         return Ok(());
     }
 
-    let ddl = if want_present {
-        build_create_ext_sql(&op.name, &op.ext_schema, &op.version, op.cascade != 0)
-    } else {
-        build_drop_ext_sql(&op.name, op.cascade != 0)
+    let ddl = match &action {
+        ExtAction::Create => {
+            build_create_ext_sql(&op.name, &op.ext_schema, &op.version, op.cascade != 0)
+        }
+        ExtAction::Drop => build_drop_ext_sql(&op.name, op.cascade != 0),
+        ExtAction::Update(target) => build_alter_ext_update_sql(&op.name, target),
+        ExtAction::Noop => unreachable!("noop short-circuited above"),
     };
 
     if let Err(e) = client.simple_query(&ddl).await {
@@ -537,6 +567,16 @@ fn build_drop_ext_sql(name: &str, cascade: bool) -> String {
         sql.push_str(" CASCADE");
     }
     sql
+}
+
+/// `ALTER EXTENSION "<name>" UPDATE TO '<version>'`. The server validates
+/// that an update script exists for the current→target hop.
+fn build_alter_ext_update_sql(name: &str, version: &str) -> String {
+    format!(
+        "ALTER EXTENSION \"{}\" UPDATE TO '{}'",
+        escape_ident(name),
+        escape_sql_literal(version)
+    )
 }
 
 /// Escape a SQL string literal — double up single quotes. The wider
@@ -649,6 +689,24 @@ mod tests {
     fn create_ext_sql_cascade() {
         let s = build_create_ext_sql("postgis", "", "", true);
         assert_eq!(s, r#"CREATE EXTENSION IF NOT EXISTS "postgis" CASCADE"#);
+    }
+
+    #[test]
+    fn alter_ext_update_sql_basic() {
+        assert_eq!(
+            build_alter_ext_update_sql("hstore", "1.8"),
+            r#"ALTER EXTENSION "hstore" UPDATE TO '1.8'"#
+        );
+    }
+
+    #[test]
+    fn alter_ext_update_sql_escapes_quotes() {
+        // Pathological but legal — the name must survive identifier
+        // escaping and the version must survive literal escaping.
+        assert_eq!(
+            build_alter_ext_update_sql(r#"weird"name"#, "1'2"),
+            r#"ALTER EXTENSION "weird""name" UPDATE TO '1''2'"#
+        );
     }
 
     #[test]
