@@ -41,9 +41,9 @@ use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, HostSelector, LineInFileOp,
-    LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp, Play,
-    Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, StatOp, Strategy,
+    AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, GetUrlOp, HostSelector,
+    LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
+    Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, StatOp, Strategy,
     SystemdOp, Task, TaskBody, TaskOp, UfwOp, UriOp, WaitForOp, WriteFileOp,
     X509CertificatePipeOp,
 };
@@ -1805,6 +1805,13 @@ async fn run_op_body(
             if matches!(op, TaskOp::PostgresqlQuery(_) | TaskOp::PostgresqlExt(_)) {
                 lift_postgresql_envelope(&mut rv);
             }
+            // get_url envelope: url/dest/checksum_src/checksum_dest/size/
+            // status_code/msg all live at the top level of the register
+            // so vendored playbooks can do `register.checksum_dest ==
+            // expected` directly, matching ansible.builtin.get_url.
+            if matches!(op, TaskOp::GetUrl(_)) {
+                lift_get_url_envelope(&mut rv);
+            }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
                 let changed = exec.done.changed != 0;
@@ -2417,6 +2424,30 @@ fn lift_postgresql_envelope(rv: &mut RegisterValue) {
     }
 }
 
+fn lift_get_url_envelope(rv: &mut RegisterValue) {
+    // The agent's envelope is a single JSON object on stdout; the
+    // orchestrator parses it into `rv.json`. Move the well-known keys
+    // out to the top level so vendored playbooks see
+    // `register.checksum_dest`, `register.dest`, etc. — matching
+    // ansible.builtin.get_url's contract — without needing to dig
+    // into `register.json`.
+    let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
+        return;
+    };
+    let envelope = obj.clone();
+    rv.json = None;
+    for (k, v) in envelope {
+        if matches!(
+            k.as_str(),
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+                | "failed"
+        ) {
+            continue;
+        }
+        rv.extra.insert(k, v);
+    }
+}
+
 fn lift_uri_envelope(rv: &mut RegisterValue) {
     let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
         return;
@@ -2804,6 +2835,35 @@ fn render_op(
                 login_unix_socket: render_if(&p.login_unix_socket)?,
                 login_host: render_if(&p.login_host)?,
                 login_port: p.login_port,
+            })
+        }
+        TaskOp::GetUrl(g) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            let mut rendered_headers = BTreeMap::new();
+            for (k, v) in &g.headers {
+                rendered_headers.insert(k.clone(), render_str(env, v, &view)?);
+            }
+            TaskOp::GetUrl(GetUrlOp {
+                url: render_str(env, &g.url, &view)?,
+                dest: render_str(env, &g.dest, &view)?,
+                checksum: render_if(&g.checksum)?,
+                mode: g.mode,
+                owner: render_if(&g.owner)?,
+                group: render_if(&g.group)?,
+                headers: rendered_headers,
+                timeout_ms: g.timeout_ms,
+                force: g.force,
+                validate_certs: g.validate_certs,
+                follow_redirects: g.follow_redirects,
+                client_cert: render_if(&g.client_cert)?,
+                client_key: render_if(&g.client_key)?,
+                ca_path: render_if(&g.ca_path)?,
             })
         }
     })
@@ -3472,6 +3532,32 @@ mod tests {
         assert_eq!(
             rv.extra.get("version").unwrap(),
             &serde_json::json!("1.10")
+        );
+    }
+
+    #[test]
+    fn lift_get_url_envelope_pulls_dest_and_checksum_to_top_level() {
+        let envelope = serde_json::json!({
+            "url": "https://example.com/x",
+            "dest": "/tmp/x",
+            "checksum_src": "sha256:abc",
+            "checksum_dest": "deadbeef",
+            "size": 12345,
+            "status_code": 200,
+            "msg": "OK"
+        });
+        let stdout = serde_json::to_vec(&envelope).unwrap();
+        let mut rv = RegisterValue::from_exec(0, true, 7, &stdout, b"");
+        lift_get_url_envelope(&mut rv);
+        assert_eq!(rv.extra.get("dest").unwrap(), &serde_json::json!("/tmp/x"));
+        assert_eq!(
+            rv.extra.get("checksum_dest").unwrap(),
+            &serde_json::json!("deadbeef")
+        );
+        assert_eq!(rv.extra.get("size").unwrap(), &serde_json::json!(12345));
+        assert_eq!(
+            rv.extra.get("status_code").unwrap(),
+            &serde_json::json!(200)
         );
     }
 

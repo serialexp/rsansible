@@ -124,6 +124,10 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         // is honoured by the surrounding `sudo` wrapping the agent
         // binary itself (so peer auth works), not by mutating the
         // op argv here.
+        // get_url: agent runs the HTTP client in-process. become: is
+        // honoured by the surrounding sudo wrapping the agent itself
+        // (for write-permission to dest), not by mutating any argv.
+        | TaskOp::GetUrl(_)
         | TaskOp::PostgresqlQuery(_)
         | TaskOp::PostgresqlExt(_) => {}
     }

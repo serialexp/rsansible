@@ -491,6 +491,29 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 }
             }
         }
+        TaskOp::GetUrl(g) => {
+            env.template_from_str(&g.url)
+                .map_err(|e| anyhow!("get_url.url: {e}"))?;
+            env.template_from_str(&g.dest)
+                .map_err(|e| anyhow!("get_url.dest: {e}"))?;
+            for (label, val) in [
+                ("checksum", &g.checksum),
+                ("owner", &g.owner),
+                ("group", &g.group),
+                ("client_cert", &g.client_cert),
+                ("client_key", &g.client_key),
+                ("ca_path", &g.ca_path),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(val)
+                        .map_err(|e| anyhow!("get_url.{label}: {e}"))?;
+                }
+            }
+            for (k, v) in &g.headers {
+                env.template_from_str(v)
+                    .map_err(|e| anyhow!("get_url.headers[{k}]: {e}"))?;
+            }
+        }
     }
     Ok(())
 }
