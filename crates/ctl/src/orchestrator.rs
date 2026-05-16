@@ -685,6 +685,8 @@ fn make_gather_facts_task() -> Task {
         // Fact-gathering reads /proc and produces facts; no side
         // effects. Always run for real even under `--check`.
         check_mode: Some(false),
+        async_seconds: None,
+        poll_seconds: None,
     }
 }
 
@@ -1727,7 +1729,7 @@ async fn run_op_body(
     // side).
     let eff = become_::effective(task, ctx);
     become_::apply(&mut rendered, &eff);
-    let wire_op = match rendered.to_wire_op() {
+    let inner_wire_op = match rendered.to_wire_op() {
         Ok(w) => w,
         Err(e) => {
             return BodyResult::Failed {
@@ -1737,6 +1739,21 @@ async fn run_op_body(
             };
         }
     };
+
+    // `async: N` (with N>0) wraps the inner op in OpAsyncStart so the
+    // agent runs it as a background job. `async: 0` (or absent) is
+    // synchronous — same as Ansible.
+    let async_wrap = task
+        .async_seconds
+        .and_then(|n| if n > 0 { Some(n) } else { None });
+    let wire_op = match async_wrap {
+        Some(seconds) => rsansible_wire::msg::op_async_start(
+            seconds.saturating_mul(1000),
+            inner_wire_op,
+        ),
+        None => inner_wire_op,
+    };
+
     let seq = next_seq.fetch_add(1, Ordering::Relaxed);
     let capture = task.register.is_some();
     let started = Instant::now();
@@ -1758,7 +1775,61 @@ async fn run_op_body(
     // Effective per-task check_mode: task field wins both directions,
     // otherwise inherit the run-level flag.
     let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
-    let result = run_one_task_op(conn, seq, wire_op, capture, clock_offset_ns, check_mode).await;
+    let mut result =
+        run_one_task_op(conn, seq, wire_op, capture, clock_offset_ns, check_mode).await;
+
+    // Async poll loop: when `async: N, poll: M (M>0)`, the orchestrator
+    // blocks on the same connection, dispatching OpAsyncStatus every M
+    // seconds until the job reports `finished:1` or the async deadline
+    // elapses. The register receives the FINAL status envelope (inner
+    // module fields lifted via the agent), making the wrapped task feel
+    // like a synchronous run from the caller's perspective.
+    if let (Some(async_n), Ok(exec)) = (async_wrap, result.as_ref()) {
+        let poll = task.poll_seconds.unwrap_or(10);
+        if poll > 0 && exec.done.exit_code == 0 {
+            let deadline = Instant::now() + std::time::Duration::from_secs(async_n as u64);
+            let job_id = seq;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(poll as u64)).await;
+                if Instant::now() > deadline {
+                    // Treat as timeout: dispatch a final status (to harvest
+                    // any partial output) but don't loop further. The
+                    // envelope's `finished` flag will say if the agent has
+                    // actually finished by then.
+                }
+                let poll_seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                let status_op = rsansible_wire::msg::op_async_status(job_id);
+                let r = run_one_task_op(
+                    conn,
+                    poll_seq,
+                    status_op,
+                    /*capture=*/ true,
+                    clock_offset_ns,
+                    /*check_mode=*/ false,
+                )
+                .await;
+                let exec_now = match r {
+                    Ok(e) => e,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                };
+                let finished = serde_json::from_slice::<JsonValue>(&exec_now.stdout)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("finished")
+                            .and_then(|n| n.as_u64().map(|u| u != 0))
+                    })
+                    .unwrap_or(false);
+                let past_deadline = Instant::now() > deadline;
+                result = Ok(exec_now);
+                if finished || past_deadline {
+                    break;
+                }
+            }
+        }
+    }
     let label = conn.label.clone();
     drop(guard); // release the lock before doing CPU work / waiting on ctx
     let _ = ctx; // ctx isn't mutated here; silence unused-mut
@@ -3811,6 +3882,8 @@ all:
             become_user: None,
             ignore_errors: ignore,
             check_mode: None,
+            async_seconds: None,
+            poll_seconds: None,
         }
     }
 

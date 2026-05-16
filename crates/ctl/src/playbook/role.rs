@@ -287,6 +287,8 @@ fn expand_one(
             become_user: None,
             ignore_errors: None,
             check_mode: None,
+            async_seconds: None,
+            poll_seconds: None,
         };
         spliced.insert(0, synthetic);
     }

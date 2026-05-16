@@ -191,6 +191,8 @@ mod tests {
             become_user: u.map(String::from),
             ignore_errors: None,
             check_mode: None,
+            async_seconds: None,
+            poll_seconds: None,
         }
     }
 

@@ -23,10 +23,9 @@
 use anyhow::{anyhow, Context as _, Result};
 use rsansible_wire::{
     msg::{
-        op_async_start, op_async_status, op_blockinfile, op_exec, op_file, op_gather_facts,
-        op_get_url, op_lineinfile, op_package, op_postgresql_ext, op_postgresql_query, op_shell,
-        op_stat, op_systemd, op_ufw, op_uri, op_wait_for, op_write_file, postgresql_ext_state,
-        uri_body_format, uri_follow, uri_method,
+        op_blockinfile, op_exec, op_file, op_gather_facts, op_get_url, op_lineinfile, op_package,
+        op_postgresql_ext, op_postgresql_query, op_shell, op_stat, op_systemd, op_ufw, op_uri,
+        op_wait_for, op_write_file, postgresql_ext_state, uri_body_format, uri_follow, uri_method,
     },
     Op,
 };
@@ -102,6 +101,19 @@ pub struct Task {
     /// The orchestrator computes the effective flag at dispatch time:
     /// `task.check_mode.unwrap_or(ctx.check_mode)`.
     pub check_mode: Option<bool>,
+    /// `async: <seconds>` — run the task body as a background job on
+    /// the agent. Wraps the inner wire op in `OpAsyncStart(timeout_ms
+    /// = async*1000, inner)`. `Some(0)` is interpreted as "synchronous"
+    /// (matches Ansible: async: 0 disables async). `None` means absent.
+    pub async_seconds: Option<u32>,
+    /// `poll: <seconds>` — how often the orchestrator polls the job
+    /// for completion. `Some(0)` is fire-and-forget: the orchestrator
+    /// returns the start envelope (`ansible_job_id`, `started:1`,
+    /// `finished:0`) and lets the user poll later via `async_status:`.
+    /// `Some(n)` with n>0 makes the orchestrator block, polling every
+    /// n seconds until the job finishes or the async deadline expires.
+    /// `None` defaults to 10 when async is set (matches Ansible).
+    pub poll_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1926,6 +1938,8 @@ const METADATA_KEYS: &[&str] = &[
     "become_user",
     "ignore_errors",
     "check_mode",
+    "async",
+    "poll",
 ];
 
 impl<'de> Deserialize<'de> for Task {
@@ -1991,6 +2005,37 @@ impl<'de> Deserialize<'de> for Task {
                 )));
             }
         };
+        let async_seconds = match map.remove("async") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
+                D::Error::custom(format!(
+                    "task {name:?}: `async` must be a non-negative integer (seconds), got: {n:?}"
+                ))
+            })? as u32),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `async` must be an integer number of seconds, got: {other:?}"
+                )));
+            }
+        };
+        let poll_seconds = match map.remove("poll") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
+                D::Error::custom(format!(
+                    "task {name:?}: `poll` must be a non-negative integer (seconds), got: {n:?}"
+                ))
+            })? as u32),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `poll` must be an integer number of seconds, got: {other:?}"
+                )));
+            }
+        };
+        if poll_seconds.is_some() && async_seconds.is_none() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `poll:` is only meaningful with `async:` set"
+            )));
+        }
         let run_once = match map.remove("run_once") {
             None => false,
             Some(serde_yaml::Value::Bool(b)) => b,
@@ -2267,6 +2312,8 @@ impl<'de> Deserialize<'de> for Task {
             become_user,
             ignore_errors,
             check_mode,
+            async_seconds,
+            poll_seconds,
         })
     }
 }
@@ -6401,6 +6448,61 @@ get_url:
         assert!(result.is_err(), "unknown field should be rejected");
         let err = format!("{:?}", result.err());
         assert!(err.contains("bogus"), "error should mention the unknown field: {err}");
+    }
+
+    // ── async/poll metadata ─────────────────────────────────────────
+
+    #[test]
+    fn parse_async_poll_metadata() {
+        let t = parse_task(
+            r#"
+name: t
+shell: sleep 5
+async: 60
+poll: 5
+"#,
+        );
+        assert_eq!(t.async_seconds, Some(60));
+        assert_eq!(t.poll_seconds, Some(5));
+    }
+
+    #[test]
+    fn parse_async_without_poll_is_ok() {
+        let t = parse_task(
+            r#"
+name: t
+shell: sleep 5
+async: 60
+"#,
+        );
+        assert_eq!(t.async_seconds, Some(60));
+        assert_eq!(t.poll_seconds, None);
+    }
+
+    #[test]
+    fn parse_poll_without_async_rejected() {
+        let yaml = r#"
+name: t
+shell: sleep 5
+poll: 5
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        assert!(r.is_err());
+        assert!(format!("{:?}", r.err()).contains("poll"));
+    }
+
+    #[test]
+    fn parse_async_zero_treated_as_value_but_orchestrator_skips() {
+        // The parser accepts async: 0; the orchestrator treats `Some(0)`
+        // the same as `None` (synchronous). Verifying just the parse here.
+        let t = parse_task(
+            r#"
+name: t
+shell: ok
+async: 0
+"#,
+        );
+        assert_eq!(t.async_seconds, Some(0));
     }
 
     #[test]
