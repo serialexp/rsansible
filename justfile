@@ -36,6 +36,15 @@ build-agent-musl:
     cargo build -p rsansible-agent --profile agent --target x86_64-unknown-linux-musl
     @ls -lh target/x86_64-unknown-linux-musl/agent/rsansible-agent
 
+# Record the agent binary's stripped size at the current HEAD into
+# agent-size-history.tsv. No-op if HEAD's short SHA is already there.
+size:
+    @./scripts/record-agent-size.sh
+
+# Crate-level bloat report against the stripped musl agent.
+bloat:
+    cargo bloat --target x86_64-unknown-linux-musl --profile agent -p rsansible-agent --crates -n 30
+
 # Standard checks.
 check:
     cargo check --workspace --all-targets
