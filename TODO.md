@@ -66,9 +66,12 @@ templated systemd units, CA cert distribution).
     or probes-first based on the wire-cost heuristic.
   - mTLS for `uri:` (PEM bytes on OpUri) shipped alongside in
     `e5ad8a2`.
-  - v1 caveat: csr_pipe must run in the same play as its privkey
-    task — cross-run signing of an existing on-disk key needs
-    `OpReadFile`, which is deferred.
+  - Cross-run signing now works: on `csr_pipe` cache miss the
+    controller dispatches `OpReadFile` against the agent to fetch the
+    on-disk PEM (1 MiB cap), caches it, and signs from there. So a
+    play can call `openssl_csr_pipe:` directly against a key
+    provisioned in a previous run; no need to chain through an
+    `openssl_privatekey:` task each time.
 - [x] **`OpAsync` / async polling** — shipped in `fecca35` (agent) +
   `147bac9` (ctl).
   - Wire: `OpAsyncStart` (kind=16) wraps any Op + carries timeout_ms;
@@ -99,9 +102,20 @@ templated systemd units, CA cert distribution).
     register's top level so vendored playbooks unchanged.
   - `checksum_dest` is always the actual sha256 of the on-disk file
     (even on the stat-skip path) — registers stay honest.
-- [ ] **`OpUnarchive`** — optional. Shows up alongside `get_url` in a
-  few sites; not blocking for drill playbooks since the failover paths
-  don't extract archives. Defer until something needs it.
+- [x] **`OpReadFile` + `slurp:`** — wire kind=18; reads a file on the
+  agent and ships its contents back in a base64 `slurp`-shaped
+  envelope (`content`/`source`/`encoding`). Lifted to the top level of
+  the register so `register.content | b64decode` resolves the way
+  vendored playbooks expect. Adds an optional `max_bytes:` safety cap
+  (0 = unbounded). Also unlocks cross-run `openssl_csr_pipe:` by
+  letting the controller fetch a previously-provisioned on-disk PEM
+  on cache miss.
+- [ ] **`OpUnarchive`** — survey-elevated to next priority. Used by
+  26/57 real-world repos (the #1 unshipped Ansible module by repo
+  breadth). Wire op + agent should support `tar.gz` / `tar.bz2` /
+  `tar.xz` / `zip` extraction with idempotency by mtime-stamp or by
+  presence-of-marker-file. Owner/group/mode on extracted files. Not
+  yet started.
 
 **Acceptance:** both `drill-failover.yml` and `drill-valkey-failover.yml`
 run against an existing cluster.
@@ -147,8 +161,8 @@ Vault).
 | 2 | ~800  | +1 op (`OpGatherFacts`) | site.yml first play | ✅ done |
 | 3 | ~1200 | +6 ops | site.yml `common` role | ✅ done |
 | 4 | ~600  | +1 op (`OpUri`); templates rendered controller-side | site.yml etcd role | ✅ done |
-| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | done — x509 ✅, postgresql ✅, async ✅, get_url ✅ |
-| **total** | **~5600 LoC** | **+11 ops** | full gothab | |
+| 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | done — x509 ✅, postgresql ✅, async ✅, get_url ✅, read_file ✅ |
+| **total** | **~5600 LoC** | **+12 ops** | full gothab | |
 
 For reference, v0 today is roughly 2000 LoC across all crates. So
 running gothab is a ~3.5× larger codebase than what's there now. Not
