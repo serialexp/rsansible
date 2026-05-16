@@ -312,6 +312,23 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
         TaskOp::Exec(e) if e.argv.is_empty() => {
             bail!("{}: task[{ti}] {:?}: exec.argv is empty", where_, task.name)
         }
+        TaskOp::Command(c) if c.argv.is_empty() => {
+            bail!(
+                "{}: task[{ti}] {:?}: command.argv is empty",
+                where_,
+                task.name
+            )
+        }
+        TaskOp::Command(c) if !c.creates.is_empty() || !c.removes.is_empty() => {
+            // v1: composite OpStat probe for creates/removes isn't wired
+            // yet. Fail loudly at validate time rather than at dispatch.
+            bail!(
+                "{}: task[{ti}] {:?}: command.creates/command.removes \
+                 are not yet supported (file an issue if you need them)",
+                where_,
+                task.name
+            )
+        }
         TaskOp::WriteFile(w) if w.path.is_empty() => {
             bail!(
                 "{}: task[{ti}] {:?}: write_file.path is empty",

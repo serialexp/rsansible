@@ -298,6 +298,20 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(stdin)
                 .map_err(|e| anyhow!("exec.stdin: {e}"))?;
         }
+        TaskOp::Command(c) => {
+            for (i, a) in c.argv.iter().enumerate() {
+                env.template_from_str(a)
+                    .map_err(|e| anyhow!("command.argv[{i}]: {e}"))?;
+            }
+            env.template_from_str(&c.chdir)
+                .map_err(|e| anyhow!("command.chdir: {e}"))?;
+            env.template_from_str(&c.creates)
+                .map_err(|e| anyhow!("command.creates: {e}"))?;
+            env.template_from_str(&c.removes)
+                .map_err(|e| anyhow!("command.removes: {e}"))?;
+            env.template_from_str(&c.stdin)
+                .map_err(|e| anyhow!("command.stdin: {e}"))?;
+        }
         TaskOp::WriteFile(WriteFileOp { path, content, .. }) => {
             env.template_from_str(path)
                 .map_err(|e| anyhow!("write_file.path: {e}"))?;

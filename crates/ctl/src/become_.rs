@@ -98,6 +98,7 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
     match op {
         TaskOp::Shell(s) => wrap_shell(s, &eff.user),
         TaskOp::Exec(e) => wrap_exec(e, &eff.user),
+        TaskOp::Command(c) => wrap_command(c, &eff.user),
         // Non-argv ops: the agent runs them in-process with its own
         // credentials. There's no command to wrap. See module docs.
         TaskOp::WriteFile(_)
@@ -170,6 +171,19 @@ fn wrap_exec(e: &mut ExecOp, user: &str) {
     ];
     prefix.append(&mut e.argv);
     e.argv = prefix;
+}
+
+fn wrap_command(c: &mut crate::playbook::CommandOp, user: &str) {
+    // Same shape as wrap_exec — `command:` carries a literal argv.
+    let mut prefix = vec![
+        "sudo".to_string(),
+        "-n".to_string(),
+        "-u".to_string(),
+        user.to_string(),
+        "--".to_string(),
+    ];
+    prefix.append(&mut c.argv);
+    c.argv = prefix;
 }
 
 #[cfg(test)]

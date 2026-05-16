@@ -2847,6 +2847,25 @@ fn render_op(
                 timeout_ms: e.timeout_ms,
             })
         }
+        TaskOp::Command(c) => {
+            let argv = c
+                .argv
+                .iter()
+                .map(|a| render_str(env, a, &view))
+                .collect::<Result<Vec<_>>>()?;
+            let chdir = render_str(env, &c.chdir, &view)?;
+            let creates = render_str(env, &c.creates, &view)?;
+            let removes = render_str(env, &c.removes, &view)?;
+            let stdin = render_str(env, &c.stdin, &view)?;
+            TaskOp::Command(crate::playbook::CommandOp {
+                argv,
+                chdir,
+                creates,
+                removes,
+                stdin,
+                timeout_ms: c.timeout_ms,
+            })
+        }
         TaskOp::WriteFile(w) => {
             let path = render_str(env, &w.path, &view)?;
             let content = render_str(env, &w.content, &view)?;

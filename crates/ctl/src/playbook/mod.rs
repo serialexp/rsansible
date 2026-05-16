@@ -22,7 +22,8 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
-    classify_sql_readonly, AssertTask, BlockInFileOp, BlockInFileState, CopyOp, DebugTask, ExecOp,
+    classify_sql_readonly, AssertTask, BlockInFileOp, BlockInFileState, CommandOp, CopyOp,
+    DebugTask, ExecOp,
     FailTask, FileOp, FileState, GetUrlOp, IncludeRoleSpec, LineInFileOp, LineInFileState,
     LoopControl, LoopSpec, MetaAction, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageManager,
     PackageOp, PackageState, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp,
