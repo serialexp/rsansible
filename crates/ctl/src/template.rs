@@ -66,6 +66,7 @@ pub fn make_env<'a>() -> Environment<'a> {
     // under `tojson`, this adds the Ansible alias.
     env.add_filter("to_json", to_json_filter);
     env.add_filter("regex_replace", regex_replace_filter);
+    env.add_filter("extract", extract_filter);
     // `omit` global: see OMIT_SENTINEL doc above. Ansible playbooks rely
     // on the spelling `default(omit)` to make optional fields truly
     // optional rather than getting a stringified empty value.
@@ -106,6 +107,68 @@ fn subelements_filter(value: MjValue, field: String) -> Result<MjValue, MjError>
         }
     }
     Ok(MjValue::from(out))
+}
+
+/// `key | extract(container, morekeys=None)` — drill into a container.
+///
+/// Ansible idiom. Typical use:
+///
+/// ```jinja
+/// {{ groups['web'] | map('extract', hostvars, 'ansible_host') | list }}
+/// ```
+///
+/// — for each `hostname` in `groups['web']`, look up
+/// `hostvars[hostname]['ansible_host']`. `morekeys` (a single string,
+/// integer, or list of either) lets you descend further into the
+/// resolved value without chaining filters.
+///
+/// On any miss (key absent, index out of range, intermediate value not
+/// indexable) we return undefined — same as native minijinja attribute
+/// access, and equivalent to Ansible's lenient default.
+fn extract_filter(
+    key: MjValue,
+    container: MjValue,
+    morekeys: Option<MjValue>,
+) -> Result<MjValue, MjError> {
+    let first = lookup_one(&container, &key)?;
+    let Some(more) = morekeys else { return Ok(first) };
+    // `morekeys` accepts a single scalar or a list of scalars. Ansible's
+    // docs say "string or list" but in practice integers also work for
+    // list indexing.
+    let extra: Vec<MjValue> = if more.kind() == minijinja::value::ValueKind::Seq {
+        more.try_iter()?.collect()
+    } else {
+        vec![more]
+    };
+    let mut current = first;
+    for k in extra {
+        current = lookup_one(&current, &k)?;
+    }
+    Ok(current)
+}
+
+/// Single-step container lookup used by `extract_filter`. Handles both
+/// dict-key and sequence-index access uniformly.
+fn lookup_one(container: &MjValue, key: &MjValue) -> Result<MjValue, MjError> {
+    // Sequence indexing: accept integer keys.
+    if container.kind() == minijinja::value::ValueKind::Seq {
+        // `as_usize` returns None for floats / negatives / non-integers.
+        if let Ok(i) = i64::try_from(key.clone()) {
+            // Negative indexing mirrors Python/Ansible.
+            let len = container.len().unwrap_or(0) as i64;
+            let idx = if i < 0 { len + i } else { i };
+            if idx < 0 || idx >= len {
+                return Ok(MjValue::UNDEFINED);
+            }
+            return container.get_item_by_index(idx as usize);
+        }
+    }
+    // Dict / object: try by string key first (the common case),
+    // then fall back to the raw value (for non-string keys like ints).
+    if let Some(s) = key.as_str() {
+        return Ok(container.get_attr(s)?);
+    }
+    container.get_item(key)
 }
 
 /// `value | b64encode` — base64-encode a string. Ansible accepts strings
@@ -647,6 +710,91 @@ mod tests {
         ]);
         let out = tmpl.render(context! { users => users }).unwrap();
         assert_eq!(out, "alice:a1;alice:a2;bob:b1;");
+    }
+
+    #[test]
+    fn extract_filter_dict_key() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ "alice" | extract(users) }}"#)
+            .unwrap();
+        let users = serde_json::json!({"alice": "a@example", "bob": "b@example"});
+        let out = tmpl.render(context! { users => users }).unwrap();
+        assert_eq!(out, "a@example");
+    }
+
+    #[test]
+    fn extract_filter_nested_via_morekeys_string() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                r#"{{ "alice" | extract(hostvars, "ansible_host") }}"#,
+            )
+            .unwrap();
+        let hostvars = serde_json::json!({
+            "alice": {"ansible_host": "10.0.0.1"},
+            "bob":   {"ansible_host": "10.0.0.2"},
+        });
+        let out = tmpl.render(context! { hostvars => hostvars }).unwrap();
+        assert_eq!(out, "10.0.0.1");
+    }
+
+    #[test]
+    fn extract_filter_morekeys_list_path() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                r#"{{ "alice" | extract(hostvars, ["nested", "deep"]) }}"#,
+            )
+            .unwrap();
+        let hostvars = serde_json::json!({
+            "alice": {"nested": {"deep": "found"}}
+        });
+        let out = tmpl.render(context! { hostvars => hostvars }).unwrap();
+        assert_eq!(out, "found");
+    }
+
+    #[test]
+    fn extract_filter_seq_index() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ 1 | extract(xs) }}"#)
+            .unwrap();
+        let xs = serde_json::json!(["a", "b", "c"]);
+        let out = tmpl.render(context! { xs => xs }).unwrap();
+        assert_eq!(out, "b");
+    }
+
+    #[test]
+    fn extract_filter_in_map_over_group() {
+        // The canonical Ansible idiom this filter exists to support.
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                "{{ groups.web | map('extract', hostvars, 'ansible_host') | join(',') }}",
+            )
+            .unwrap();
+        let groups = serde_json::json!({"web": ["alice", "bob"]});
+        let hostvars = serde_json::json!({
+            "alice": {"ansible_host": "10.0.0.1"},
+            "bob":   {"ansible_host": "10.0.0.2"},
+        });
+        let out = tmpl
+            .render(context! { groups => groups, hostvars => hostvars })
+            .unwrap();
+        assert_eq!(out, "10.0.0.1,10.0.0.2");
+    }
+
+    #[test]
+    fn extract_filter_missing_key_renders_undefined_lenient() {
+        // Lenient undefined → empty rendered output, no error.
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"[{{ "missing" | extract(users) }}]"#)
+            .unwrap();
+        let users = serde_json::json!({"alice": "a@example"});
+        let out = tmpl.render(context! { users => users }).unwrap();
+        assert_eq!(out, "[]");
     }
 
     #[test]
