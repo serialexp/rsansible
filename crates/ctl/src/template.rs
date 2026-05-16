@@ -18,6 +18,9 @@
 //! `precompile_all` walks the playbook and compiles every Jinja string
 //! ahead of time so syntax errors surface at `validate`, not mid-run.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use anyhow::{anyhow, Result};
 use minijinja::{Environment, Error as MjError, ErrorKind as MjKind, Value as MjValue};
 
@@ -75,11 +78,110 @@ pub fn make_env<'a>() -> Environment<'a> {
     // `target_` prefix convention — these read/run on the machine
     // invoking rsansible, NOT on the target host. `lookup` is the
     // Ansible-compatibility shim and forwards to these.
-    env.add_function("controller_read_file", controller_read_file);
-    env.add_function("controller_shell_stdout", controller_shell_stdout);
-    env.add_function("controller_env", controller_env);
-    env.add_function("lookup", lookup_shim);
+    //
+    // The cache is per-`Environment` and therefore per-`run()`:
+    // identical calls within one rsansible invocation execute once
+    // and reuse the result. See LookupCache for rationale.
+    let cache: LookupCache = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let cache = cache.clone();
+        env.add_function(
+            "controller_read_file",
+            move |path: String| -> Result<MjValue, MjError> {
+                controller_read_file_impl(&cache, path)
+            },
+        );
+    }
+    {
+        let cache = cache.clone();
+        env.add_function(
+            "controller_shell_stdout",
+            move |cmd: String| -> Result<MjValue, MjError> {
+                controller_shell_stdout_impl(&cache, cmd)
+            },
+        );
+    }
+    {
+        let cache = cache.clone();
+        env.add_function(
+            "controller_env",
+            move |name: String| -> Result<MjValue, MjError> {
+                controller_env_impl(&cache, name)
+            },
+        );
+    }
+    {
+        let cache = cache.clone();
+        env.add_function(
+            "lookup",
+            move |plugin: String,
+                  args: minijinja::value::Rest<MjValue>|
+                  -> Result<MjValue, MjError> {
+                lookup_shim_impl(&cache, plugin, args)
+            },
+        );
+    }
     env
+}
+
+/// Per-run memoization for the controller-side lookups.
+///
+/// Wired in: `make_env()` constructs one `LookupCache` per
+/// `Environment`, then captures clones of the `Arc` into each
+/// minijinja function closure. Since rsansible builds exactly one
+/// `Environment` per `run()` (see `orchestrator::run`), every cache
+/// lives for the duration of one invocation and dies with it. There
+/// is no global state.
+///
+/// **Why cache at all.** Two `controller_shell_stdout('date +%s')`
+/// calls in the same `loop:` should agree. An expensive
+/// `controller_read_file('/etc/ssh/some.pub')` rendered once per host
+/// across a 50-host inventory should hit disk once, not fifty times.
+/// And — most importantly — a `lookup('pipe', 'pass show secret')`
+/// inside a `for_each:` shouldn't unlock the user's password store
+/// once per iteration.
+///
+/// **What we cache.** Only successful results. Errors re-run; the
+/// cost of re-erroring is bounded (each call is fast), and caching
+/// a stale error would be more confusing than the redundant work.
+///
+/// **What we don't cache.** Nothing across `run()` boundaries — the
+/// cache dies with the `Environment`. Nothing across processes.
+///
+/// **Divergence from Ansible.** Ansible's `file`/`pipe`/`env` lookups
+/// are not cached by default; ours are. This is intentional. The
+/// semantics rsansible users want from these lookups is "what is the
+/// value of this thing at the time the run started," not "what is
+/// the value at the moment of this particular render." If a playbook
+/// genuinely needs uncached re-evaluation (e.g. a timer), the right
+/// fix is a dedicated `now()`-style helper, not bypassing the cache.
+///
+/// **Race window.** The mutex is released between the cache check
+/// and the I/O, so two parallel host-renderings can both miss and
+/// both execute. The cache write itself doesn't race (Mutex), but
+/// the side-effecting work might fire twice in the worst case. For
+/// pure reads (file, env) that's harmless; for `shell_stdout` with
+/// side effects it's a real but small footgun. A proper single-flight
+/// (lock-per-key) implementation is overkill for v1 — if this bites,
+/// switch to a `HashMap<K, Arc<OnceCell<V>>>` pattern.
+type LookupCache = Arc<Mutex<HashMap<CacheKey, MjValue>>>;
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+enum CacheKey {
+    ReadFile(String),
+    ShellStdout(String),
+    Env(String),
+}
+
+fn cache_get(cache: &LookupCache, key: &CacheKey) -> Option<MjValue> {
+    cache.lock().expect("LookupCache poisoned").get(key).cloned()
+}
+
+fn cache_put(cache: &LookupCache, key: CacheKey, value: MjValue) {
+    cache
+        .lock()
+        .expect("LookupCache poisoned")
+        .insert(key, value);
 }
 
 /// `value | mandatory` — pass through if defined, raise otherwise.
@@ -295,7 +397,16 @@ fn regex_replace_filter(
 /// loudly on missing files, permission denied, or non-UTF-8 content
 /// (use `controller_read_file_b64` — not yet implemented — when we
 /// need binary blobs in templates).
-fn controller_read_file(path: String) -> Result<MjValue, MjError> {
+///
+/// Results are memoized per-run; see LookupCache.
+fn controller_read_file_impl(
+    cache: &LookupCache,
+    path: String,
+) -> Result<MjValue, MjError> {
+    let key = CacheKey::ReadFile(path.clone());
+    if let Some(v) = cache_get(cache, &key) {
+        return Ok(v);
+    }
     let bytes = std::fs::read(&path).map_err(|e| {
         MjError::new(
             MjKind::InvalidOperation,
@@ -308,7 +419,9 @@ fn controller_read_file(path: String) -> Result<MjValue, MjError> {
             format!("controller_read_file({path:?}): not valid UTF-8: {e}"),
         )
     })?;
-    Ok(MjValue::from(s))
+    let v = MjValue::from(s);
+    cache_put(cache, key, v.clone());
+    Ok(v)
 }
 
 /// Run a command on the controller via `sh -c` and capture stdout.
@@ -319,7 +432,19 @@ fn controller_read_file(path: String) -> Result<MjValue, MjError> {
 /// discarded. There's no stdin and no timeout — if you need either,
 /// reach for `shell:` on the target instead, or factor the command
 /// into a `set_fact:` once.
-fn controller_shell_stdout(cmd: String) -> Result<MjValue, MjError> {
+///
+/// Results are memoized per-run; see LookupCache. This is the most
+/// important cache target: a `lookup('pipe', 'pass show secret')`
+/// inside a `loop:` should not re-prompt the user's password agent
+/// once per iteration.
+fn controller_shell_stdout_impl(
+    cache: &LookupCache,
+    cmd: String,
+) -> Result<MjValue, MjError> {
+    let key = CacheKey::ShellStdout(cmd.clone());
+    if let Some(v) = cache_get(cache, &key) {
+        return Ok(v);
+    }
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -350,9 +475,11 @@ fn controller_shell_stdout(cmd: String) -> Result<MjValue, MjError> {
     // Ansible trims a single trailing newline; we trim any run of
     // \r/\n — same observable result for the common case, less
     // surprising for `printf 'foo\n\n'`.
-    Ok(MjValue::from(
+    let v = MjValue::from(
         stdout.trim_end_matches(['\r', '\n']).to_string(),
-    ))
+    );
+    cache_put(cache, key, v.clone());
+    Ok(v)
 }
 
 /// Read an environment variable from the controller's process env.
@@ -361,10 +488,20 @@ fn controller_shell_stdout(cmd: String) -> Result<MjValue, MjError> {
 /// the empty string if the var is unset — same as Ansible's lenient
 /// default. Use `controller_env('FOO') | mandatory` to force a
 /// missing-var to error.
-fn controller_env(name: String) -> Result<MjValue, MjError> {
+///
+/// Memoized per-run. Process env doesn't change mid-run in practice
+/// (and shouldn't), so caching here is a small win on lookup volume
+/// rather than a correctness fix.
+fn controller_env_impl(cache: &LookupCache, name: String) -> Result<MjValue, MjError> {
+    let key = CacheKey::Env(name.clone());
+    if let Some(v) = cache_get(cache, &key) {
+        return Ok(v);
+    }
     // std::env::var errors on non-UTF-8 or missing; Ansible's behavior
     // is "missing = empty string, non-UTF-8 = empty string." Match it.
-    Ok(MjValue::from(std::env::var(&name).unwrap_or_default()))
+    let v = MjValue::from(std::env::var(&name).unwrap_or_default());
+    cache_put(cache, key, v.clone());
+    Ok(v)
 }
 
 /// Ansible-compat shim for `lookup(plugin, ...args)`.
@@ -374,8 +511,14 @@ fn controller_env(name: String) -> Result<MjValue, MjError> {
 /// logic lives here. Fresh rsansible playbooks should reach for the
 /// canonical names directly.
 ///
+/// Caching happens inside each canonical, so calls via the shim get
+/// the same memoization as direct calls — and identical underlying
+/// operations cache-hit each other regardless of which spelling the
+/// playbook used.
+///
 /// Unknown plugin names error loudly with the supported list.
-fn lookup_shim(
+fn lookup_shim_impl(
+    cache: &LookupCache,
     plugin: String,
     args: minijinja::value::Rest<MjValue>,
 ) -> Result<MjValue, MjError> {
@@ -400,9 +543,9 @@ fn lookup_shim(
             .map(|s| s.to_string())
     };
     match plugin.as_str() {
-        "file" => controller_read_file(arg0_str("path")?),
-        "pipe" => controller_shell_stdout(arg0_str("command")?),
-        "env" => controller_env(arg0_str("name")?),
+        "file" => controller_read_file_impl(cache, arg0_str("path")?),
+        "pipe" => controller_shell_stdout_impl(cache, arg0_str("command")?),
+        "env" => controller_env_impl(cache, arg0_str("name")?),
         other => Err(MjError::new(
             MjKind::InvalidOperation,
             format!("lookup({other:?}): unknown plugin ({supported})"),
@@ -1095,6 +1238,132 @@ mod tests {
             err.contains("path") && err.contains("missing"),
             "unexpected error: {err}"
         );
+    }
+
+    // ---------- per-run lookup cache ----------
+
+    #[test]
+    fn controller_shell_stdout_caches_within_one_env() {
+        // The command appends a line to a counter file each time it
+        // runs and prints the resulting line count. If caching works,
+        // five calls in one render should produce ONE appended line
+        // and one observed count (the first one).
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("counter");
+        std::fs::write(&counter, b"").unwrap();
+        // Quote the path safely into the shell command.
+        let cmd = format!(
+            r#"sh -c 'echo x >> {p}; wc -l < {p} | tr -d " "'"#,
+            p = counter.to_str().unwrap()
+        );
+        let env = make_env();
+        // Render five identical invocations; expect all five to print
+        // the SAME number (cached) and the counter file to have one
+        // line (only one real shell-out happened).
+        let src = format!(
+            "{{{{ controller_shell_stdout({cmd:?}) }}}}-\
+             {{{{ controller_shell_stdout({cmd:?}) }}}}-\
+             {{{{ controller_shell_stdout({cmd:?}) }}}}-\
+             {{{{ controller_shell_stdout({cmd:?}) }}}}-\
+             {{{{ controller_shell_stdout({cmd:?}) }}}}",
+            cmd = cmd
+        );
+        let tmpl = env.template_from_str(&src).unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "1-1-1-1-1", "expected five identical cached hits");
+        let lines = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(
+            lines.lines().count(),
+            1,
+            "shell command ran more than once: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn controller_shell_stdout_cache_distinguishes_commands() {
+        // Different command strings get different cache slots.
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(
+                r#"{{ controller_shell_stdout("printf one") }};{{ controller_shell_stdout("printf two") }}"#,
+            )
+            .unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "one;two");
+    }
+
+    #[test]
+    fn controller_read_file_caches_after_mutation() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mut.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"first")
+            .unwrap();
+        let env = make_env();
+        let path_s = path.to_str().unwrap();
+        let src = format!(
+            r#"{{{{ controller_read_file({path:?}) }}}}/{{{{ controller_read_file({path:?}) }}}}"#,
+            path = path_s
+        );
+        let tmpl = env.template_from_str(&src).unwrap();
+        // Read once, mutate, read again. The cached value wins.
+        let _ = tmpl.render(context! {}).unwrap(); // populate cache
+        std::fs::write(&path, b"second").unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "first/first", "expected cached value");
+    }
+
+    #[test]
+    fn lookup_cache_shared_with_canonical() {
+        // `lookup("pipe", cmd)` and `controller_shell_stdout(cmd)`
+        // should hit the same cache slot when given the same command.
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("c");
+        std::fs::write(&counter, b"").unwrap();
+        let cmd = format!(
+            r#"sh -c 'echo x >> {p}; wc -l < {p} | tr -d " "'"#,
+            p = counter.to_str().unwrap()
+        );
+        let env = make_env();
+        let src = format!(
+            r#"{{{{ controller_shell_stdout({cmd:?}) }}}};{{{{ lookup("pipe", {cmd:?}) }}}}"#,
+            cmd = cmd
+        );
+        let tmpl = env.template_from_str(&src).unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "1;1", "shim should hit the canonical's cache");
+        let lines = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(lines.lines().count(), 1);
+    }
+
+    #[test]
+    fn lookup_cache_separate_per_make_env() {
+        // Each make_env() builds a fresh cache. Two independent Envs
+        // calling the same command should each execute it once.
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("c");
+        std::fs::write(&counter, b"").unwrap();
+        let cmd = format!(
+            r#"sh -c 'echo x >> {p}; wc -l < {p} | tr -d " "'"#,
+            p = counter.to_str().unwrap()
+        );
+
+        let render_once = || {
+            let env = make_env();
+            let src = format!(r#"{{{{ controller_shell_stdout({cmd:?}) }}}}"#);
+            env.template_from_str(&src)
+                .unwrap()
+                .render(context! {})
+                .unwrap()
+        };
+        let a = render_once();
+        let b = render_once();
+        assert_eq!(a, "1");
+        assert_eq!(b, "2", "second env should NOT see the first env's cache");
+        let lines = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(lines.lines().count(), 2);
     }
 
     #[test]

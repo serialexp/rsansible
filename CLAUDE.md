@@ -54,6 +54,42 @@ the docs.
 - The pair is symmetric: same verb, one word changes, and the word
   that changes is the one that matters.
 
+## Controller-side I/O: memoize per `run()`
+
+`controller_*` functions that touch the outside world
+(`controller_read_file`, `controller_shell_stdout`, `controller_env`)
+MUST memoize results within a single `rsansible run`. The cache lives
+on the `Environment` (one per `run()`), is keyed by call args, and
+dies when the run ends.
+
+Why this matters:
+
+- Templates render many times per playbook — once per host, plus
+  once per iteration inside a `loop:`, plus once per `when:` eval.
+  Without caching, a `controller_shell_stdout('pass show secret')`
+  re-prompts the password store on every render.
+- Identical lookups across a 50-host inventory should hit disk
+  (or the shell, or the env) once.
+- Two `controller_shell_stdout('date +%s')` in the same render
+  should agree. Caching is what makes that true.
+
+Rules:
+
+- Cache only successful results. Errors re-run — caching a stale
+  error is more confusing than the redundant work.
+- Cache per-`Environment` (i.e. per `run()`), never globally. The
+  `Arc<Mutex<HashMap>>` gets cloned into each minijinja function
+  closure at `make_env` time.
+- When adding a new `controller_*` function, add a `CacheKey`
+  variant for it and use the same `cache_get` / `cache_put` shape.
+  Tests that verify cache behavior should observe a side effect
+  (e.g. "command appended to file once across N renders").
+
+This is intentional divergence from Ansible (its `lookup` plugins
+don't cache by default). The semantics rsansible users want from
+controller-side lookups is "what is the value at the start of this
+run," not "what is the value at this exact render moment."
+
 ## Ansible-compat layer: thin shims, never god functions
 
 Where Ansible exposes one symbol with dispatch-by-string (the
