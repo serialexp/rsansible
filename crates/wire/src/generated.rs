@@ -2293,6 +2293,79 @@ impl From<OpAsyncStatusOutput> for OpAsyncStatusInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpReadFileInput {
+    pub path: std::string::String,
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpReadFileOutput {
+    pub kind: u8,
+    pub path: std::string::String,
+    pub max_bytes: u32,
+}
+
+pub type OpReadFile = OpReadFileOutput;
+
+impl OpReadFileInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(18);
+        encoder.write_u16_le(self.path.len() as u16);
+        let string_bytes: &[u8] = self.path.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u32_le(self.max_bytes);
+        Ok(())
+    }
+
+}
+
+impl OpReadFileOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 18u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 18, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let path = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let max_bytes = decoder.read_u32_le()?;
+        Ok(Self {
+            kind,
+            path,
+            max_bytes,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpReadFileInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpReadFileInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpReadFileOutput> for OpReadFileInput {
+    fn from(o: OpReadFileOutput) -> Self {
+        Self {
+            path: o.path,
+            max_bytes: o.max_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
@@ -2312,6 +2385,7 @@ pub enum Op {
     OpGetUrl(OpGetUrlOutput),
     OpAsyncStart(OpAsyncStartOutput),
     OpAsyncStatus(OpAsyncStatusOutput),
+    OpReadFile(OpReadFileOutput),
 }
 
 impl Op {
@@ -2800,6 +2874,15 @@ impl Op {
                 encoder.write_uint8(v.kind);
                 encoder.write_uint32(v.job_id, Endianness::LittleEndian);
             }
+            Op::OpReadFile(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.path.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.path.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint32(v.max_bytes, Endianness::LittleEndian);
+            }
         }
         Ok(())
     }
@@ -2848,6 +2931,8 @@ impl Op {
             Ok(Op::OpAsyncStart(OpAsyncStartOutput::decode_with_decoder(decoder)?))
         } else if value == 17 {
             Ok(Op::OpAsyncStatus(OpAsyncStatusOutput::decode_with_decoder(decoder)?))
+        } else if value == 18 {
+            Ok(Op::OpReadFile(OpReadFileOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }

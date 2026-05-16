@@ -532,6 +532,14 @@ pub fn op_async_status(job_id: u32) -> Op {
     })
 }
 
+pub fn op_read_file(path: String, max_bytes: u32) -> Op {
+    Op::OpReadFile(OpReadFileOutput {
+        kind: 18,
+        path,
+        max_bytes,
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

@@ -566,6 +566,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_read_file() {
+        roundtrip(msg::task_dispatch(
+            86,
+            false,
+            msg::op_read_file("/etc/etcd/server.key".into(), 65_536),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_read_file_no_cap() {
+        // max_bytes=0 sentinel for "no cap" should survive the wire.
+        roundtrip(msg::task_dispatch(
+            87,
+            false,
+            msg::op_read_file("/var/lib/pki/ca.pem".into(), 0),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_progress() {
         roundtrip(msg::task_progress(42, 0, b"line of output\n".to_vec())).await;
     }

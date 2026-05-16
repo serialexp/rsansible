@@ -359,6 +359,15 @@
       ],
     },
 
+    OpReadFile: {
+      description: "Read the contents of a file on the agent host. Always streams the bytes back base64-encoded in a single stdout envelope shaped like Ansible's `slurp` module: `{content: \"<base64>\", source: \"<path>\", encoding: \"base64\"}`. `max_bytes` is a safety cap; 0 means no cap (the default in the controller is generous but finite — see ReadFileOp in ctl). If the file's length exceeds `max_bytes` the agent emits TaskError(BAD_REQUEST) without sending content. Missing path → TaskError(NOT_FOUND); permission denied → TaskError(PERMISSION_DENIED). Symlinks are followed (matches Ansible slurp). Wire kind=18.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 18 },
+        { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "max_bytes", type: "uint32" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -384,6 +393,7 @@
         { type: "OpGetUrl", when: "value === 15" },
         { type: "OpAsyncStart", when: "value === 16" },
         { type: "OpAsyncStatus", when: "value === 17" },
+        { type: "OpReadFile", when: "value === 18" },
       ],
     },
 
