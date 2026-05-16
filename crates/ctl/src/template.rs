@@ -169,8 +169,10 @@ type LookupCache = Arc<Mutex<HashMap<CacheKey, MjValue>>>;
 #[derive(Hash, Eq, PartialEq, Clone)]
 enum CacheKey {
     ReadFile(String),
-    ShellStdout(String),
     Env(String),
+    // NOTE: no ShellStdout variant. `controller_shell_stdout` is
+    // intentionally NOT cached — see its doc comment. If we add an
+    // opt-in caching flag later, the variant goes here.
 }
 
 fn cache_get(cache: &LookupCache, key: &CacheKey) -> Option<MjValue> {
@@ -433,18 +435,25 @@ fn controller_read_file_impl(
 /// reach for `shell:` on the target instead, or factor the command
 /// into a `set_fact:` once.
 ///
-/// Results are memoized per-run; see LookupCache. This is the most
-/// important cache target: a `lookup('pipe', 'pass show secret')`
-/// inside a `loop:` should not re-prompt the user's password agent
-/// once per iteration.
+/// **NOT cached.** Unlike `controller_read_file` / `controller_env`,
+/// shell commands can be intentionally non-deterministic — `uuidgen`,
+/// `date +%s%N`, `openssl rand`, `mktemp` are all real usage patterns
+/// that depend on a fresh value every call. Silently caching would
+/// break those playbooks subtly and divergently from Ansible.
+///
+/// If you want one-shot semantics ("expensive lookup, reuse the
+/// result"), hoist it into `set_fact:` at the top of the play. That's
+/// the Ansible idiom and stays visible at the call site.
+///
+/// The `cache` parameter is retained for signature uniformity with
+/// the other two canonicals (the closures in `make_env` capture it
+/// either way) and so that if we later add an opt-in caching flag —
+/// e.g. `controller_shell_stdout(cmd, cache=true)` — the plumbing
+/// is already there.
 fn controller_shell_stdout_impl(
-    cache: &LookupCache,
+    _cache: &LookupCache,
     cmd: String,
 ) -> Result<MjValue, MjError> {
-    let key = CacheKey::ShellStdout(cmd.clone());
-    if let Some(v) = cache_get(cache, &key) {
-        return Ok(v);
-    }
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -475,11 +484,9 @@ fn controller_shell_stdout_impl(
     // Ansible trims a single trailing newline; we trim any run of
     // \r/\n — same observable result for the common case, less
     // surprising for `printf 'foo\n\n'`.
-    let v = MjValue::from(
+    Ok(MjValue::from(
         stdout.trim_end_matches(['\r', '\n']).to_string(),
-    );
-    cache_put(cache, key, v.clone());
-    Ok(v)
+    ))
 }
 
 /// Read an environment variable from the controller's process env.
@@ -1243,53 +1250,35 @@ mod tests {
     // ---------- per-run lookup cache ----------
 
     #[test]
-    fn controller_shell_stdout_caches_within_one_env() {
-        // The command appends a line to a counter file each time it
-        // runs and prints the resulting line count. If caching works,
-        // five calls in one render should produce ONE appended line
-        // and one observed count (the first one).
+    fn controller_shell_stdout_does_not_cache() {
+        // Shell commands may be intentionally non-deterministic
+        // (`uuidgen`, `date +%s%N`, etc.). Caching would silently
+        // break those use cases — and diverge from Ansible's
+        // `lookup('pipe', ...)` default. This test pins the no-cache
+        // contract: a counter-incrementing command must produce
+        // different outputs across calls in the same render.
         let dir = tempfile::tempdir().unwrap();
         let counter = dir.path().join("counter");
         std::fs::write(&counter, b"").unwrap();
-        // Quote the path safely into the shell command.
         let cmd = format!(
             r#"sh -c 'echo x >> {p}; wc -l < {p} | tr -d " "'"#,
             p = counter.to_str().unwrap()
         );
         let env = make_env();
-        // Render five identical invocations; expect all five to print
-        // the SAME number (cached) and the counter file to have one
-        // line (only one real shell-out happened).
         let src = format!(
             "{{{{ controller_shell_stdout({cmd:?}) }}}}-\
-             {{{{ controller_shell_stdout({cmd:?}) }}}}-\
-             {{{{ controller_shell_stdout({cmd:?}) }}}}-\
              {{{{ controller_shell_stdout({cmd:?}) }}}}-\
              {{{{ controller_shell_stdout({cmd:?}) }}}}",
             cmd = cmd
         );
         let tmpl = env.template_from_str(&src).unwrap();
         let out = tmpl.render(context! {}).unwrap();
-        assert_eq!(out, "1-1-1-1-1", "expected five identical cached hits");
-        let lines = std::fs::read_to_string(&counter).unwrap();
         assert_eq!(
-            lines.lines().count(),
-            1,
-            "shell command ran more than once: {lines:?}"
+            out, "1-2-3",
+            "shell_stdout MUST NOT cache; each call must re-run"
         );
-    }
-
-    #[test]
-    fn controller_shell_stdout_cache_distinguishes_commands() {
-        // Different command strings get different cache slots.
-        let env = make_env();
-        let tmpl = env
-            .template_from_str(
-                r#"{{ controller_shell_stdout("printf one") }};{{ controller_shell_stdout("printf two") }}"#,
-            )
-            .unwrap();
-        let out = tmpl.render(context! {}).unwrap();
-        assert_eq!(out, "one;two");
+        let lines = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(lines.lines().count(), 3);
     }
 
     #[test]
@@ -1316,54 +1305,68 @@ mod tests {
     }
 
     #[test]
-    fn lookup_cache_shared_with_canonical() {
-        // `lookup("pipe", cmd)` and `controller_shell_stdout(cmd)`
-        // should hit the same cache slot when given the same command.
+    fn lookup_file_shares_cache_with_canonical_read_file() {
+        // `lookup("file", path)` and `controller_read_file(path)`
+        // should hit the same cache slot — same logical operation,
+        // different spelling. We verify by reading once via the
+        // canonical, mutating the file, then reading via the shim:
+        // the shim should see the cached (original) content.
         let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("c");
-        std::fs::write(&counter, b"").unwrap();
-        let cmd = format!(
-            r#"sh -c 'echo x >> {p}; wc -l < {p} | tr -d " "'"#,
-            p = counter.to_str().unwrap()
-        );
+        let path = dir.path().join("shared.txt");
+        std::fs::write(&path, b"original").unwrap();
+        let path_s = path.to_str().unwrap();
         let env = make_env();
-        let src = format!(
-            r#"{{{{ controller_shell_stdout({cmd:?}) }}}};{{{{ lookup("pipe", {cmd:?}) }}}}"#,
-            cmd = cmd
-        );
-        let tmpl = env.template_from_str(&src).unwrap();
-        let out = tmpl.render(context! {}).unwrap();
-        assert_eq!(out, "1;1", "shim should hit the canonical's cache");
-        let lines = std::fs::read_to_string(&counter).unwrap();
-        assert_eq!(lines.lines().count(), 1);
+        // Populate the cache through the canonical.
+        let _: String = env
+            .template_from_str(&format!(r#"{{{{ controller_read_file({path_s:?}) }}}}"#))
+            .unwrap()
+            .render(context! {})
+            .unwrap();
+        // Mutate underneath.
+        std::fs::write(&path, b"mutated").unwrap();
+        // The shim should return the cached original, not the mutated value.
+        let out = env
+            .template_from_str(&format!(r#"{{{{ lookup("file", {path_s:?}) }}}}"#))
+            .unwrap()
+            .render(context! {})
+            .unwrap();
+        assert_eq!(out, "original", "shim should hit the canonical's cache");
     }
 
     #[test]
     fn lookup_cache_separate_per_make_env() {
-        // Each make_env() builds a fresh cache. Two independent Envs
-        // calling the same command should each execute it once.
+        // Each make_env() builds a fresh cache for the cached
+        // canonicals. Two independent Envs reading the same file
+        // should each see the current contents at *their* first read.
+        use std::io::Write as _;
         let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("c");
-        std::fs::write(&counter, b"").unwrap();
-        let cmd = format!(
-            r#"sh -c 'echo x >> {p}; wc -l < {p} | tr -d " "'"#,
-            p = counter.to_str().unwrap()
-        );
+        let path = dir.path().join("vary.txt");
+        let path_s = path.to_str().unwrap().to_string();
 
-        let render_once = || {
-            let env = make_env();
-            let src = format!(r#"{{{{ controller_shell_stdout({cmd:?}) }}}}"#);
-            env.template_from_str(&src)
-                .unwrap()
-                .render(context! {})
-                .unwrap()
-        };
-        let a = render_once();
-        let b = render_once();
-        assert_eq!(a, "1");
-        assert_eq!(b, "2", "second env should NOT see the first env's cache");
-        let lines = std::fs::read_to_string(&counter).unwrap();
-        assert_eq!(lines.lines().count(), 2);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"first-run")
+            .unwrap();
+        let env_a = make_env();
+        let out_a = env_a
+            .template_from_str(&format!(r#"{{{{ controller_read_file({path_s:?}) }}}}"#))
+            .unwrap()
+            .render(context! {})
+            .unwrap();
+
+        std::fs::write(&path, b"second-run").unwrap();
+        let env_b = make_env();
+        let out_b = env_b
+            .template_from_str(&format!(r#"{{{{ controller_read_file({path_s:?}) }}}}"#))
+            .unwrap()
+            .render(context! {})
+            .unwrap();
+
+        assert_eq!(out_a, "first-run");
+        assert_eq!(
+            out_b, "second-run",
+            "second env should NOT see the first env's cache"
+        );
     }
 
     #[test]

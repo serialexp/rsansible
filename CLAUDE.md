@@ -54,24 +54,23 @@ the docs.
 - The pair is symmetric: same verb, one word changes, and the word
   that changes is the one that matters.
 
-## Controller-side I/O: memoize per `run()`
+## Controller-side I/O: cache only when it's safe to
 
-`controller_*` functions that touch the outside world
-(`controller_read_file`, `controller_shell_stdout`, `controller_env`)
-MUST memoize results within a single `rsansible run`. The cache lives
-on the `Environment` (one per `run()`), is keyed by call args, and
-dies when the run ends.
+Per-run memoization is on the `Environment` (one per `run()`), keyed
+by call args, dies when the run ends. But **not every `controller_*`
+function caches** — the rule is per-function and depends on whether
+caching would change observable semantics.
 
-Why this matters:
+| Function | Cache? | Why |
+|---|---|---|
+| `controller_read_file` | yes | Files referenced from a playbook are inputs to the run, not state that mutates during the run. The "snapshot at first read" mental model is what users have. |
+| `controller_env` | yes | Process env is stable mid-run absent something pathological. |
+| `controller_shell_stdout` | **no** | Commands can be intentionally non-deterministic (`uuidgen`, `date +%s%N`, `openssl rand`, `mktemp`). Caching silently breaks those use cases. Match Ansible — let users hoist into `set_fact:` if they want one-shot. |
 
-- Templates render many times per playbook — once per host, plus
-  once per iteration inside a `loop:`, plus once per `when:` eval.
-  Without caching, a `controller_shell_stdout('pass show secret')`
-  re-prompts the password store on every render.
-- Identical lookups across a 50-host inventory should hit disk
-  (or the shell, or the env) once.
-- Two `controller_shell_stdout('date +%s')` in the same render
-  should agree. Caching is what makes that true.
+The asymmetry is the point. Don't reach for "cache everything for
+consistency" — the cost of silently caching a deliberately
+non-deterministic call is much higher than the cost of an extra fs
+read.
 
 Rules:
 
@@ -80,15 +79,23 @@ Rules:
 - Cache per-`Environment` (i.e. per `run()`), never globally. The
   `Arc<Mutex<HashMap>>` gets cloned into each minijinja function
   closure at `make_env` time.
-- When adding a new `controller_*` function, add a `CacheKey`
-  variant for it and use the same `cache_get` / `cache_put` shape.
-  Tests that verify cache behavior should observe a side effect
-  (e.g. "command appended to file once across N renders").
+- When adding a new `controller_*` function, decide up front whether
+  the operation is "stable input to the run" (cache) or "potentially
+  fresh each call" (don't). Add a `CacheKey` variant only if you're
+  caching. Document the choice and the rationale in the function's
+  doc comment.
+- Tests for caching behavior must observe a side effect — read a
+  file before/after mutation, or count append-only writes. Tests
+  for non-caching must do the same in reverse (e.g. counter
+  command must produce `1-2-3` across three calls, not `1-1-1`).
 
-This is intentional divergence from Ansible (its `lookup` plugins
-don't cache by default). The semantics rsansible users want from
-controller-side lookups is "what is the value at the start of this
-run," not "what is the value at this exact render moment."
+For caching choices: the file-read and env-var caches are
+intentional divergence from Ansible (Ansible's `lookup` plugins
+don't cache). The semantics rsansible users want from a file or env
+lookup is "what is the value at the start of this run," not "what
+is the value at this exact render moment." Shell pipe matches
+Ansible exactly (no cache) because non-determinism is a feature
+there.
 
 ## Ansible-compat layer: thin shims, never god functions
 
