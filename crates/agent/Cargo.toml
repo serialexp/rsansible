@@ -17,13 +17,21 @@ anyhow.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+# Direct (non-workspace) dep so we can disable `env-filter`. The
+# workspace dep enables env-filter for the controller; that feature
+# pulls `matchers` → `regex-automata` (~165 KiB of .text). The pushed
+# agent uses a plain LevelFilter (see main.rs::init_tracing) so we
+# don't need env-filter here.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "smallvec", "tracing-log"] }
 serde_json.workspace = true
 sha2.workspace = true
 # regex — OpLineInFile / OpBlockInFile match the user-supplied pattern
-# inside the agent. Rust regex syntax is close enough to Ansible's
-# Python re for the cases gothab uses.
-regex = { workspace = true }
+# inside the agent against single lines of config-file text. Slim
+# feature set: drop the DFA/onepass/backtrack engines, drop unicode
+# class tables. Pattern compilation goes through the NFA-only meta
+# engine which is plenty fast for one-line matches and saves ~400 KiB
+# of .text on the pushed agent binary.
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 
 # rustix for getuid/getgid/uname without dropping `forbid(unsafe_code)` and
 # without dragging in libc-link headaches on musl.

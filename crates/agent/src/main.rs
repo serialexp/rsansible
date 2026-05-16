@@ -128,11 +128,22 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("RSANSIBLE_AGENT_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    // Plain level filter, not `EnvFilter`. `EnvFilter` parses
+    // `module=level` directives which pulls `regex_automata` /
+    // `regex_syntax` / `matchers` into the agent — ~165 KiB of .text
+    // for a knob nobody uses on a pushed binary. Take only a level name
+    // (`trace`/`debug`/`info`/`warn`/`error`) from the env var; default
+    // to `warn`. If anyone ever needs per-module filtering on the
+    // agent (vs the controller, which keeps full EnvFilter), they can
+    // turn this back on at the cost of ~165 KiB.
+    use std::str::FromStr;
+    use tracing::level_filters::LevelFilter;
+    let level = std::env::var("RSANSIBLE_AGENT_LOG")
+        .ok()
+        .and_then(|s| LevelFilter::from_str(s.trim()).ok())
+        .unwrap_or(LevelFilter::WARN);
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_max_level(level)
         .with_writer(std::io::stderr) // critical: stdout is wire-protocol-only
         .with_target(false)
         .init();
