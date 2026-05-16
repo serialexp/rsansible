@@ -25,6 +25,28 @@ use crate::playbook::{
     AssertTask, ExecOp, LoopSpec, Playbook, ShellOp, Task, TaskBody, TaskOp, WriteFileOp,
 };
 
+/// Ansible-style `omit` sentinel.
+///
+/// When `default(omit)` is used in a template like
+/// `mode: "{{ my_mode | default(omit) }}"`, Ansible substitutes a magic
+/// placeholder string that the engine then strips post-render — the
+/// effect is "if `my_mode` is undefined, drop this field entirely
+/// rather than passing an empty value through to the module."
+///
+/// rsansible follows the same trick. `omit` is registered as a global
+/// in the minijinja environment whose value is this sentinel; after
+/// rendering a string, `render_str` (in `orchestrator.rs`) checks for
+/// an exact match and collapses it to an empty string. Since most
+/// rsansible task-op fields already treat empty as "absent", this
+/// gives the right semantics without per-field plumbing.
+///
+/// The string is intentionally weird-looking and non-repeating so it
+/// never collides with real user content. It is NOT a security
+/// boundary — anyone authoring a playbook with this exact literal in
+/// their YAML can confuse the engine. They shouldn't.
+pub const OMIT_SENTINEL: &str =
+    "__rsansible_omit_placeholder_8c0a9f2d4b1e3a6d5c7f8b9a0c1d2e3f__";
+
 /// Build a fresh minijinja `Environment` configured for our use.
 pub fn make_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
@@ -44,6 +66,10 @@ pub fn make_env<'a>() -> Environment<'a> {
     // under `tojson`, this adds the Ansible alias.
     env.add_filter("to_json", to_json_filter);
     env.add_filter("regex_replace", regex_replace_filter);
+    // `omit` global: see OMIT_SENTINEL doc above. Ansible playbooks rely
+    // on the spelling `default(omit)` to make optional fields truly
+    // optional rather than getting a stringified empty value.
+    env.add_global("omit", MjValue::from(OMIT_SENTINEL));
     env
 }
 

@@ -3259,6 +3259,13 @@ fn render_str(
     let out = tmpl
         .render(view)
         .map_err(|e| anyhow!("template render: {e}"))?;
+    // Ansible-style `default(omit)` support: if the entire rendered
+    // result is exactly the omit sentinel, collapse to empty string.
+    // Most task-op fields treat empty as "absent" — see
+    // template::OMIT_SENTINEL for rationale.
+    if out == crate::template::OMIT_SENTINEL {
+        return Ok(String::new());
+    }
     Ok(out)
 }
 
@@ -3984,6 +3991,33 @@ mod tests {
         let spec = LoopSpec::Expr("{{ xs }}".into());
         let items = resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).unwrap();
         assert_eq!(items, vec![JsonValue::from(1), JsonValue::from(2), JsonValue::from(3)]);
+    }
+
+    #[test]
+    fn render_op_omit_collapses_to_empty_string() {
+        // `default(omit)` on an undefined var should erase the field.
+        // For string-carrier fields ("" = absent), that means we render
+        // to an empty string.
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into()); // no `who` fact
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_str(&env, "{{ who | default(omit) }}", &view).unwrap();
+        assert_eq!(out, "", "expected omit to collapse to empty, got {out:?}");
+    }
+
+    #[test]
+    fn render_op_omit_does_not_collapse_partial_strings() {
+        // If the sentinel is embedded mid-string (rare but possible),
+        // we deliberately do NOT strip it — only an exact-match
+        // collapses. This matches Ansible's behavior: `omit` is meant
+        // for whole-field substitution, not interpolation.
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into());
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_str(&env, "before {{ omit }} after", &view).unwrap();
+        assert!(out.contains("rsansible_omit_placeholder"));
+        assert!(out.starts_with("before "));
+        assert!(out.ends_with(" after"));
     }
 
     #[test]
