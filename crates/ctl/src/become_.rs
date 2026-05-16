@@ -128,6 +128,10 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         // honoured by the surrounding sudo wrapping the agent itself
         // (for write-permission to dest), not by mutating any argv.
         | TaskOp::GetUrl(_)
+        // slurp: agent reads the file in-process. `become:` is honoured
+        // by the surrounding sudo wrapping the agent itself (for read
+        // permission on protected files), not by mutating any argv.
+        | TaskOp::Slurp(_)
         | TaskOp::PostgresqlQuery(_)
         | TaskOp::PostgresqlExt(_) => {}
     }

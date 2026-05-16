@@ -25,7 +25,7 @@ pub use task_op::{
     classify_sql_readonly, AssertTask, BlockInFileOp, BlockInFileState, CopyOp, ExecOp, FailTask,
     FileOp, FileState, GetUrlOp, IncludeRoleSpec, LineInFileOp, LineInFileState, LoopControl,
     LoopSpec, MetaAction, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageManager, PackageOp,
-    PackageState, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, StatOp, SystemdOp,
+    PackageState, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp, StatOp, SystemdOp,
     SystemdState, Task, TaskBody, TaskOp, TemplateOp, UfwOp, UfwOpKind, UriOp, WaitForOp,
     WaitForState, WriteFileOp, X509CertificatePipeOp,
 };

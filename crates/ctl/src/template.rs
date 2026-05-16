@@ -514,6 +514,10 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("get_url.headers[{k}]: {e}"))?;
             }
         }
+        TaskOp::Slurp(s) => {
+            env.template_from_str(&s.src)
+                .map_err(|e| anyhow!("slurp.src: {e}"))?;
+        }
     }
     Ok(())
 }

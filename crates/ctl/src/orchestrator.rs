@@ -43,8 +43,8 @@ use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, BlockInFileOp, CopyOp, ExecOp, FailTask, FileOp, GetUrlOp, HostSelector,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
-    Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, StatOp, Strategy,
-    SystemdOp, Task, TaskBody, TaskOp, UfwOp, UriOp, WaitForOp, WriteFileOp,
+    Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp, StatOp,
+    Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, UriOp, WaitForOp, WriteFileOp,
     X509CertificatePipeOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
@@ -1883,6 +1883,13 @@ async fn run_op_body(
             if matches!(op, TaskOp::GetUrl(_)) {
                 lift_get_url_envelope(&mut rv);
             }
+            // slurp envelope: `content` (base64), `source` (path),
+            // `encoding` ("base64") — Ansible's slurp contract lifts
+            // these to the top level so playbooks can do
+            // `register.content | b64decode`.
+            if matches!(op, TaskOp::Slurp(_)) {
+                lift_slurp_envelope(&mut rv);
+            }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
                 let changed = exec.done.changed != 0;
@@ -2519,6 +2526,27 @@ fn lift_get_url_envelope(rv: &mut RegisterValue) {
     }
 }
 
+fn lift_slurp_envelope(rv: &mut RegisterValue) {
+    // Identical shape to get_url's lifter: top-level keys move out of
+    // `rv.json` into `rv.extra` so accessors like `register.content` /
+    // `register.source` / `register.encoding` resolve as Ansible does.
+    let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
+        return;
+    };
+    let envelope = obj.clone();
+    rv.json = None;
+    for (k, v) in envelope {
+        if matches!(
+            k.as_str(),
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+                | "failed"
+        ) {
+            continue;
+        }
+        rv.extra.insert(k, v);
+    }
+}
+
 fn lift_uri_envelope(rv: &mut RegisterValue) {
     let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
         return;
@@ -2937,6 +2965,10 @@ fn render_op(
                 ca_path: render_if(&g.ca_path)?,
             })
         }
+        TaskOp::Slurp(s) => TaskOp::Slurp(SlurpOp {
+            src: render_str(env, &s.src, &view)?,
+            max_bytes: s.max_bytes,
+        }),
     })
 }
 
