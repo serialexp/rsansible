@@ -6,10 +6,12 @@ use rsansible_wire::{msg, Op};
 
 use crate::writer::Sender;
 
+mod async_job;
 mod blockinfile;
 mod exec;
 mod file;
 mod gather_facts;
+mod get_url;
 mod lineinfile;
 mod package;
 mod postgresql;
@@ -24,11 +26,18 @@ mod write_file;
 /// additions (fact caches, working directories, etc.) live here too.
 pub struct Context {
     pub writer: Sender,
+    /// Background-job table for OpAsyncStart/OpAsyncStatus. Lives only
+    /// for the duration of the agent process; on disconnect everything
+    /// goes away with the agent.
+    pub jobs: async_job::JobTable,
 }
 
 impl Context {
     pub fn new(writer: Sender) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            jobs: async_job::JobTable::new(),
+        }
     }
 
     /// Send a Message, swallowing channel-closed errors (the writer task has
@@ -41,24 +50,40 @@ impl Context {
 /// Top-level dispatch. Returns Ok even on module-level failure — the failure
 /// is communicated to the controller via TaskError. An Err result indicates an
 /// agent-internal bug (channel closed, etc.).
-pub async fn dispatch(ctx: &Context, seq: u32, op: Op, check_mode: bool) -> anyhow::Result<()> {
-    match op {
-        Op::OpExec(o) => exec::run_exec(ctx, seq, o, check_mode).await,
-        Op::OpShell(o) => exec::run_shell(ctx, seq, o, check_mode).await,
-        Op::OpWriteFile(o) => write_file::run(ctx, seq, o, check_mode).await,
-        Op::OpGatherFacts(_) => gather_facts::run(ctx, seq, check_mode).await,
-        Op::OpStat(o) => stat::run(ctx, seq, o, check_mode).await,
-        Op::OpFile(o) => file::run(ctx, seq, o, check_mode).await,
-        Op::OpWaitFor(o) => wait_for::run(ctx, seq, o, check_mode).await,
-        Op::OpLineInFile(o) => lineinfile::run(ctx, seq, o, check_mode).await,
-        Op::OpBlockInFile(o) => blockinfile::run(ctx, seq, o, check_mode).await,
-        Op::OpSystemd(o) => systemd::run(ctx, seq, o, check_mode).await,
-        Op::OpPackage(o) => package::run(ctx, seq, o, check_mode).await,
-        Op::OpUfw(o) => ufw::run(ctx, seq, o, check_mode).await,
-        Op::OpUri(o) => uri::run(ctx, seq, o, check_mode).await,
-        Op::OpPostgresqlQuery(o) => postgresql::run_query(ctx, seq, o, check_mode).await,
-        Op::OpPostgresqlExt(o) => postgresql::run_ext(ctx, seq, o, check_mode).await,
-    }
+///
+/// Returns a boxed future rather than `async fn` so the recursive
+/// edge (`dispatch` → `async_job::run_start` → `tokio::spawn(dispatch(…))`)
+/// has a concretely-named `Send` return type. Without the box the type
+/// system bottoms out trying to prove `impl Future: Send` for both ends
+/// of the cycle simultaneously.
+pub fn dispatch<'a>(
+    ctx: &'a Context,
+    seq: u32,
+    op: Op,
+    check_mode: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        match op {
+            Op::OpExec(o) => exec::run_exec(ctx, seq, o, check_mode).await,
+            Op::OpShell(o) => exec::run_shell(ctx, seq, o, check_mode).await,
+            Op::OpWriteFile(o) => write_file::run(ctx, seq, o, check_mode).await,
+            Op::OpGatherFacts(_) => gather_facts::run(ctx, seq, check_mode).await,
+            Op::OpStat(o) => stat::run(ctx, seq, o, check_mode).await,
+            Op::OpFile(o) => file::run(ctx, seq, o, check_mode).await,
+            Op::OpWaitFor(o) => wait_for::run(ctx, seq, o, check_mode).await,
+            Op::OpLineInFile(o) => lineinfile::run(ctx, seq, o, check_mode).await,
+            Op::OpBlockInFile(o) => blockinfile::run(ctx, seq, o, check_mode).await,
+            Op::OpSystemd(o) => systemd::run(ctx, seq, o, check_mode).await,
+            Op::OpPackage(o) => package::run(ctx, seq, o, check_mode).await,
+            Op::OpUfw(o) => ufw::run(ctx, seq, o, check_mode).await,
+            Op::OpUri(o) => uri::run(ctx, seq, o, check_mode).await,
+            Op::OpPostgresqlQuery(o) => postgresql::run_query(ctx, seq, o, check_mode).await,
+            Op::OpPostgresqlExt(o) => postgresql::run_ext(ctx, seq, o, check_mode).await,
+            Op::OpGetUrl(o) => get_url::run(ctx, seq, o, check_mode).await,
+            Op::OpAsyncStart(o) => async_job::run_start(ctx, seq, o, check_mode).await,
+            Op::OpAsyncStatus(o) => async_job::run_status(ctx, seq, o, check_mode).await,
+        }
+    })
 }
 
 /// Convenience: emit a TaskError with the given code and message. Used by

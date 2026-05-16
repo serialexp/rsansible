@@ -471,6 +471,67 @@ pub fn op_postgresql_ext(
     })
 }
 
+/// Checksum algorithm prefixes for OpGetUrl's `checksum` string.
+/// The format is `<algo>:<hex>` where algo is one of these, lowercased.
+pub mod get_url_algo {
+    pub const SHA256: &str = "sha256";
+    pub const SHA1: &str = "sha1";
+    pub const MD5: &str = "md5";
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_get_url(
+    url: String,
+    dest: String,
+    checksum: String,
+    mode: u32,
+    owner: String,
+    group: String,
+    header_keys: Vec<String>,
+    header_values: Vec<String>,
+    timeout_ms: u32,
+    force: bool,
+    validate_certs: bool,
+    follow_redirects: u8,
+    client_cert_pem: Vec<u8>,
+    client_key_pem: Vec<u8>,
+    ca_bundle_pem: Vec<u8>,
+) -> Op {
+    Op::OpGetUrl(OpGetUrlOutput {
+        kind: 15,
+        url,
+        dest,
+        checksum,
+        mode,
+        owner,
+        group,
+        header_keys,
+        header_values,
+        timeout_ms,
+        force: if force { 1 } else { 0 },
+        validate_certs: if validate_certs { 1 } else { 0 },
+        follow_redirects,
+        client_cert_pem,
+        client_key_pem,
+        ca_bundle_pem,
+    })
+}
+
+pub fn op_async_start(timeout_ms: u32, inner: Op) -> Op {
+    Op::OpAsyncStart(OpAsyncStartOutput {
+        kind: 16,
+        timeout_ms,
+        inner: Box::new(inner),
+    })
+}
+
+pub fn op_async_status(job_id: u32) -> Op {
+    Op::OpAsyncStatus(OpAsyncStatusOutput {
+        kind: 17,
+        job_id,
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

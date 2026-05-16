@@ -308,6 +308,57 @@
       ],
     },
 
+    OpGetUrl: {
+      description: "HTTP file download. Maps Ansible's `ansible.builtin.get_url` (subset). Downloads `url` to `dest`, optionally verifying a checksum and applying mode/owner/group. Idempotency: if `dest` already exists and `force=0`, the agent compares `checksum` (if given) against the existing file's hash; on match it returns `changed=0` without contacting the network. If `checksum` is empty and `dest` exists with `force=0`, the file is considered up-to-date and the download is skipped. With `force=1` the download always runs. Download is staged at `{dest}.rsansible.partial` next to `dest` (atomic rename on success; tmp removed on failure). `checksum` is `<algo>:<hex>` where algo ∈ {sha256, sha1, md5}; empty string disables verification. Post-download checksum mismatch surfaces as TaskError BAD_REQUEST and the tmp file is unlinked. `mode`/`owner`/`group` apply to the final dest path; mode=0 (i.e. no mode bits) means \"don't touch\"; owner/group empty mean \"don't touch\". `header_keys`/`header_values` are parallel arrays of request headers. `timeout_ms=0` means no timeout. `validate_certs=0` disables TLS verification (rustls dangerous_configuration). `follow_redirects` mirrors OpUri: 0=none, 1=safe (GET only, ≤10 hops), 2=all. mTLS bundle empty = no client cert. Envelope on stdout: {url, dest, checksum_src, checksum_dest, size, status_code, msg}. `checksum_src` is the operator-supplied target checksum (empty if none). `checksum_dest` is the actual sha256 of the final on-disk file (always computed, even when only a stat-skip happened, so the register has something to assert against). `changed=1` iff a new file was written (rename happened). `status_code` is 0 when no request was made (stat-skip path). Wire kind=15.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 15 },
+        { name: "url", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "dest", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "checksum", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "mode", type: "uint32" },
+        { name: "owner", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "group", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        {
+          name: "header_keys",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+        {
+          name: "header_values",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+        { name: "timeout_ms", type: "uint32" },
+        { name: "force", type: "uint8" },
+        { name: "validate_certs", type: "uint8" },
+        { name: "follow_redirects", type: "uint8" },
+        { name: "client_cert_pem", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "client_key_pem", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        { name: "ca_bundle_pem", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+      ],
+    },
+
+    OpAsyncStart: {
+      description: "Fire-and-forget wrapper. Maps Ansible's `async: N, poll: 0` pattern. The agent spawns the inner op as a background task on the same process, records it in an in-memory job table keyed by the dispatch `seq`, and immediately returns TaskDone with envelope `{ansible_job_id: <seq>, started: 1, finished: 0, results_file: \"\"}`. The job's eventual stdout/stderr/exit_code is captured into the table entry and surfaced later via OpAsyncStatus. `timeout_ms=0` means no timeout; non-zero kills the inner task after the deadline and marks it as finished with a TIMEOUT error. The job table lives only for the agent process lifetime — controller-side polling must complete before the agent disconnects. Wire kind=16.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 16 },
+        { name: "timeout_ms", type: "uint32" },
+        { name: "inner", type: "Op" },
+      ],
+    },
+
+    OpAsyncStatus: {
+      description: "Poll an async job started by OpAsyncStart. `job_id` is the original dispatch seq returned in the start envelope. Envelope on stdout: {ansible_job_id, started, finished, stdout, stderr, rc, results_file, msg, <inner envelope fields when finished and inner produced JSON>}. `finished=1` iff the inner task has terminated (success, error, or timeout). When `finished=1`, `rc` is the inner exit_code. When `finished=0`, only the ansible_job_id/started/finished fields are populated. Unknown job_id surfaces as TaskError NOT_FOUND. The agent does NOT delete completed jobs on first read — operators can poll repeatedly during a controller-side wait loop. Wire kind=17.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 17 },
+        { name: "job_id", type: "uint32" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -330,6 +381,9 @@
         { type: "OpUri", when: "value === 12" },
         { type: "OpPostgresqlQuery", when: "value === 13" },
         { type: "OpPostgresqlExt", when: "value === 14" },
+        { type: "OpGetUrl", when: "value === 15" },
+        { type: "OpAsyncStart", when: "value === 16" },
+        { type: "OpAsyncStatus", when: "value === 17" },
       ],
     },
 

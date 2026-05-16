@@ -1940,6 +1940,359 @@ impl From<OpPostgresqlExtOutput> for OpPostgresqlExtInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpGetUrlInput {
+    pub url: std::string::String,
+    pub dest: std::string::String,
+    pub checksum: std::string::String,
+    pub mode: u32,
+    pub owner: std::string::String,
+    pub group: std::string::String,
+    pub header_keys: Vec<std::string::String>,
+    pub header_values: Vec<std::string::String>,
+    pub timeout_ms: u32,
+    pub force: u8,
+    pub validate_certs: u8,
+    pub follow_redirects: u8,
+    pub client_cert_pem: Vec<u8>,
+    pub client_key_pem: Vec<u8>,
+    pub ca_bundle_pem: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpGetUrlOutput {
+    pub kind: u8,
+    pub url: std::string::String,
+    pub dest: std::string::String,
+    pub checksum: std::string::String,
+    pub mode: u32,
+    pub owner: std::string::String,
+    pub group: std::string::String,
+    pub header_keys: Vec<std::string::String>,
+    pub header_values: Vec<std::string::String>,
+    pub timeout_ms: u32,
+    pub force: u8,
+    pub validate_certs: u8,
+    pub follow_redirects: u8,
+    pub client_cert_pem: Vec<u8>,
+    pub client_key_pem: Vec<u8>,
+    pub ca_bundle_pem: Vec<u8>,
+}
+
+pub type OpGetUrl = OpGetUrlOutput;
+
+impl OpGetUrlInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(15);
+        encoder.write_u16_le(self.url.len() as u16);
+        let string_bytes: &[u8] = self.url.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.dest.len() as u16);
+        let string_bytes: &[u8] = self.dest.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.checksum.len() as u16);
+        let string_bytes: &[u8] = self.checksum.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u32_le(self.mode);
+        encoder.write_u16_le(self.owner.len() as u16);
+        let string_bytes: &[u8] = self.owner.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.group.len() as u16);
+        let string_bytes: &[u8] = self.group.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.header_keys.len() as u16);
+        for item in &self.header_keys {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_u16_le(self.header_values.len() as u16);
+        for item in &self.header_values {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_u32_le(self.timeout_ms);
+        encoder.write_byte(self.force);
+        encoder.write_byte(self.validate_certs);
+        encoder.write_byte(self.follow_redirects);
+        encoder.write_u32_le(self.client_cert_pem.len() as u32);
+        for item in &self.client_cert_pem {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_le(self.client_key_pem.len() as u32);
+        for item in &self.client_key_pem {
+            encoder.write_byte(*item);
+        }
+        encoder.write_u32_le(self.ca_bundle_pem.len() as u32);
+        for item in &self.ca_bundle_pem {
+            encoder.write_byte(*item);
+        }
+        Ok(())
+    }
+
+}
+
+impl OpGetUrlOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 15u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 15, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let url = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let dest = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let checksum = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let mode = decoder.read_u32_le()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let owner = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let group = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let mut header_keys = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            header_keys.push(item);
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let mut header_values = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            header_values.push(item);
+        }
+        let timeout_ms = decoder.read_u32_le()?;
+        let force = decoder.read_byte()?;
+        let validate_certs = decoder.read_byte()?;
+        let follow_redirects = decoder.read_byte()?;
+        let length = decoder.read_u32_le()? as usize;
+        let mut client_cert_pem = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            client_cert_pem.push(item);
+        }
+        let length = decoder.read_u32_le()? as usize;
+        let mut client_key_pem = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            client_key_pem.push(item);
+        }
+        let length = decoder.read_u32_le()? as usize;
+        let mut ca_bundle_pem = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = decoder.read_byte()?;
+            ca_bundle_pem.push(item);
+        }
+        Ok(Self {
+            kind,
+            url,
+            dest,
+            checksum,
+            mode,
+            owner,
+            group,
+            header_keys,
+            header_values,
+            timeout_ms,
+            force,
+            validate_certs,
+            follow_redirects,
+            client_cert_pem,
+            client_key_pem,
+            ca_bundle_pem,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpGetUrlInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpGetUrlInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpGetUrlOutput> for OpGetUrlInput {
+    fn from(o: OpGetUrlOutput) -> Self {
+        Self {
+            url: o.url,
+            dest: o.dest,
+            checksum: o.checksum,
+            mode: o.mode,
+            owner: o.owner,
+            group: o.group,
+            header_keys: o.header_keys,
+            header_values: o.header_values,
+            timeout_ms: o.timeout_ms,
+            force: o.force,
+            validate_certs: o.validate_certs,
+            follow_redirects: o.follow_redirects,
+            client_cert_pem: o.client_cert_pem,
+            client_key_pem: o.client_key_pem,
+            ca_bundle_pem: o.ca_bundle_pem,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAsyncStartInput {
+    pub timeout_ms: u32,
+    pub inner: Box<Op>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAsyncStartOutput {
+    pub kind: u8,
+    pub timeout_ms: u32,
+    pub inner: Box<Op>,
+}
+
+pub type OpAsyncStart = OpAsyncStartOutput;
+
+impl OpAsyncStartInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(16);
+        encoder.write_u32_le(self.timeout_ms);
+        self.inner.encode_into(encoder)?;
+        Ok(())
+    }
+
+}
+
+impl OpAsyncStartOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 16u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 16, got {}", kind)));
+        }
+        let timeout_ms = decoder.read_u32_le()?;
+        let inner = Op::decode_with_decoder(decoder)?;
+        Ok(Self {
+            kind,
+            timeout_ms,
+            inner: Box::new(inner),
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpAsyncStartInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpAsyncStartInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpAsyncStartOutput> for OpAsyncStartInput {
+    fn from(o: OpAsyncStartOutput) -> Self {
+        Self {
+            timeout_ms: o.timeout_ms,
+            inner: o.inner,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAsyncStatusInput {
+    pub job_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAsyncStatusOutput {
+    pub kind: u8,
+    pub job_id: u32,
+}
+
+pub type OpAsyncStatus = OpAsyncStatusOutput;
+
+impl OpAsyncStatusInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(17);
+        encoder.write_u32_le(self.job_id);
+        Ok(())
+    }
+
+}
+
+impl OpAsyncStatusOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 17u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 17, got {}", kind)));
+        }
+        let job_id = decoder.read_u32_le()?;
+        Ok(Self {
+            kind,
+            job_id,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpAsyncStatusInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpAsyncStatusInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpAsyncStatusOutput> for OpAsyncStatusInput {
+    fn from(o: OpAsyncStatusOutput) -> Self {
+        Self {
+            job_id: o.job_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
@@ -1956,6 +2309,9 @@ pub enum Op {
     OpUri(OpUriOutput),
     OpPostgresqlQuery(OpPostgresqlQueryOutput),
     OpPostgresqlExt(OpPostgresqlExtOutput),
+    OpGetUrl(OpGetUrlOutput),
+    OpAsyncStart(OpAsyncStartOutput),
+    OpAsyncStatus(OpAsyncStatusOutput),
 }
 
 impl Op {
@@ -2376,6 +2732,74 @@ impl Op {
                 }
                 encoder.write_uint16(v.login_port, Endianness::LittleEndian);
             }
+            Op::OpGetUrl(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.url.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.url.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.dest.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.dest.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.checksum.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.checksum.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint32(v.mode, Endianness::LittleEndian);
+                encoder.write_uint16(v.owner.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.owner.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.group.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.group.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.header_keys.len() as u16, Endianness::LittleEndian);
+                for item in &v.header_keys {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint16(v.header_values.len() as u16, Endianness::LittleEndian);
+                for item in &v.header_values {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint32(v.timeout_ms, Endianness::LittleEndian);
+                encoder.write_uint8(v.force);
+                encoder.write_uint8(v.validate_certs);
+                encoder.write_uint8(v.follow_redirects);
+                encoder.write_uint32(v.client_cert_pem.len() as u32, Endianness::LittleEndian);
+                for item in &v.client_cert_pem {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint32(v.client_key_pem.len() as u32, Endianness::LittleEndian);
+                for item in &v.client_key_pem {
+                    encoder.write_uint8(*item);
+                }
+                encoder.write_uint32(v.ca_bundle_pem.len() as u32, Endianness::LittleEndian);
+                for item in &v.ca_bundle_pem {
+                    encoder.write_uint8(*item);
+                }
+            }
+            Op::OpAsyncStart(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint32(v.timeout_ms, Endianness::LittleEndian);
+                v.inner.encode_into(encoder)?;
+            }
+            Op::OpAsyncStatus(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint32(v.job_id, Endianness::LittleEndian);
+            }
         }
         Ok(())
     }
@@ -2418,6 +2842,12 @@ impl Op {
             Ok(Op::OpPostgresqlQuery(OpPostgresqlQueryOutput::decode_with_decoder(decoder)?))
         } else if value == 14 {
             Ok(Op::OpPostgresqlExt(OpPostgresqlExtOutput::decode_with_decoder(decoder)?))
+        } else if value == 15 {
+            Ok(Op::OpGetUrl(OpGetUrlOutput::decode_with_decoder(decoder)?))
+        } else if value == 16 {
+            Ok(Op::OpAsyncStart(OpAsyncStartOutput::decode_with_decoder(decoder)?))
+        } else if value == 17 {
+            Ok(Op::OpAsyncStatus(OpAsyncStatusOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }

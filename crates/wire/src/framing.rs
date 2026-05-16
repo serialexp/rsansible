@@ -520,6 +520,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_get_url() {
+        roundtrip(msg::task_dispatch(
+            83,
+            false,
+            msg::op_get_url(
+                "https://example.com/payload.tar.gz".into(),
+                "/var/cache/payload.tar.gz".into(),
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                0o644,
+                "root".into(),
+                "root".into(),
+                vec!["Authorization".into(), "User-Agent".into()],
+                vec!["Bearer xyz".into(), "rsansible/0.0.1".into()],
+                30_000,
+                /*force=*/ false,
+                /*validate_certs=*/ true,
+                /*follow_redirects=*/ 1,
+                vec![],
+                vec![],
+                vec![],
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_async_start_wraps_inner_op() {
+        // OpAsyncStart carries a nested Op. Roundtrip a wrapped shell op
+        // to exercise the recursive Op codec.
+        roundtrip(msg::task_dispatch(
+            84,
+            false,
+            msg::op_async_start(
+                300_000,
+                msg::op_shell("sleep 5 && echo done".into(), 0),
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_async_status() {
+        roundtrip(msg::task_dispatch(85, false, msg::op_async_status(84))).await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_progress() {
         roundtrip(msg::task_progress(42, 0, b"line of output\n".to_vec())).await;
     }

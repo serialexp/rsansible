@@ -44,6 +44,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 # base64 for bytea column serialization in postgresql query results.
 base64 = "0.22"
+# OpGetUrl checksum verification. sha256 already lives in `sha2`; we
+# pull in sha1 + md5 for the Ansible-compat algorithm prefixes. All
+# three crates are pure Rust, musl-safe, and tiny.
+sha1 = "0.10"
+md-5 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "process", "io-util", "fs"] }
