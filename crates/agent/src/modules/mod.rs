@@ -15,6 +15,7 @@ mod get_url;
 mod lineinfile;
 mod package;
 mod postgresql;
+mod read_file;
 mod stat;
 mod systemd;
 mod ufw;
@@ -82,6 +83,7 @@ pub fn dispatch<'a>(
             Op::OpGetUrl(o) => get_url::run(ctx, seq, o, check_mode).await,
             Op::OpAsyncStart(o) => async_job::run_start(ctx, seq, o, check_mode).await,
             Op::OpAsyncStatus(o) => async_job::run_status(ctx, seq, o, check_mode).await,
+            Op::OpReadFile(o) => read_file::run(ctx, seq, o, check_mode).await,
         }
     })
 }
