@@ -587,6 +587,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_unarchive() {
+        roundtrip(msg::task_dispatch(
+            88,
+            false,
+            msg::op_unarchive(
+                "/srv/cache/etcd-v3.5.tar.gz".into(),
+                "/usr/local/bin".into(),
+                msg::unarchive_format::TAR_GZ,
+                "/usr/local/bin/etcd".into(),
+                1,
+                0o755,
+                "root".into(),
+                "root".into(),
+                /*keep_newer=*/ 1,
+                /*list_files=*/ 1,
+                /*include=*/ vec!["etcd".into(), "etcdctl".into()],
+                /*exclude=*/ vec!["README.md".into()],
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_unarchive_minimal() {
+        // Auto-format + no creates/owner/group/include/exclude. Every
+        // empty string + empty array still has to survive the wire.
+        roundtrip(msg::task_dispatch(
+            89,
+            false,
+            msg::op_unarchive(
+                "/tmp/x.zip".into(),
+                "/opt".into(),
+                msg::unarchive_format::AUTO,
+                String::new(),
+                0,
+                0,
+                String::new(),
+                String::new(),
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_progress() {
         roundtrip(msg::task_progress(42, 0, b"line of output\n".to_vec())).await;
     }

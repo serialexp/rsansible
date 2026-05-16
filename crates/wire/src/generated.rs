@@ -2366,6 +2366,189 @@ impl From<OpReadFileOutput> for OpReadFileInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpUnarchiveInput {
+    pub src: std::string::String,
+    pub dest: std::string::String,
+    pub format: u8,
+    pub creates: std::string::String,
+    pub has_mode: u8,
+    pub mode: u32,
+    pub owner: std::string::String,
+    pub group: std::string::String,
+    pub keep_newer: u8,
+    pub list_files: u8,
+    pub include: Vec<std::string::String>,
+    pub exclude: Vec<std::string::String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpUnarchiveOutput {
+    pub kind: u8,
+    pub src: std::string::String,
+    pub dest: std::string::String,
+    pub format: u8,
+    pub creates: std::string::String,
+    pub has_mode: u8,
+    pub mode: u32,
+    pub owner: std::string::String,
+    pub group: std::string::String,
+    pub keep_newer: u8,
+    pub list_files: u8,
+    pub include: Vec<std::string::String>,
+    pub exclude: Vec<std::string::String>,
+}
+
+pub type OpUnarchive = OpUnarchiveOutput;
+
+impl OpUnarchiveInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(19);
+        encoder.write_u16_le(self.src.len() as u16);
+        let string_bytes: &[u8] = self.src.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.dest.len() as u16);
+        let string_bytes: &[u8] = self.dest.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.format);
+        encoder.write_u16_le(self.creates.len() as u16);
+        let string_bytes: &[u8] = self.creates.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.has_mode);
+        encoder.write_u32_le(self.mode);
+        encoder.write_u16_le(self.owner.len() as u16);
+        let string_bytes: &[u8] = self.owner.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.group.len() as u16);
+        let string_bytes: &[u8] = self.group.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.keep_newer);
+        encoder.write_byte(self.list_files);
+        encoder.write_u16_le(self.include.len() as u16);
+        for item in &self.include {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_u16_le(self.exclude.len() as u16);
+        for item in &self.exclude {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        Ok(())
+    }
+
+}
+
+impl OpUnarchiveOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 19u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 19, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let src = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let dest = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let format = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let creates = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let has_mode = decoder.read_byte()?;
+        let mode = decoder.read_u32_le()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let owner = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let group = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let keep_newer = decoder.read_byte()?;
+        let list_files = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let mut include = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            include.push(item);
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let mut exclude = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            exclude.push(item);
+        }
+        Ok(Self {
+            kind,
+            src,
+            dest,
+            format,
+            creates,
+            has_mode,
+            mode,
+            owner,
+            group,
+            keep_newer,
+            list_files,
+            include,
+            exclude,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpUnarchiveInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpUnarchiveInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpUnarchiveOutput> for OpUnarchiveInput {
+    fn from(o: OpUnarchiveOutput) -> Self {
+        Self {
+            src: o.src,
+            dest: o.dest,
+            format: o.format,
+            creates: o.creates,
+            has_mode: o.has_mode,
+            mode: o.mode,
+            owner: o.owner,
+            group: o.group,
+            keep_newer: o.keep_newer,
+            list_files: o.list_files,
+            include: o.include,
+            exclude: o.exclude,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
@@ -2386,6 +2569,7 @@ pub enum Op {
     OpAsyncStart(OpAsyncStartOutput),
     OpAsyncStatus(OpAsyncStatusOutput),
     OpReadFile(OpReadFileOutput),
+    OpUnarchive(OpUnarchiveOutput),
 }
 
 impl Op {
@@ -2883,6 +3067,53 @@ impl Op {
                 }
                 encoder.write_uint32(v.max_bytes, Endianness::LittleEndian);
             }
+            Op::OpUnarchive(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.src.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.src.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.dest.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.dest.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.format);
+                encoder.write_uint16(v.creates.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.creates.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.has_mode);
+                encoder.write_uint32(v.mode, Endianness::LittleEndian);
+                encoder.write_uint16(v.owner.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.owner.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.group.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.group.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.keep_newer);
+                encoder.write_uint8(v.list_files);
+                encoder.write_uint16(v.include.len() as u16, Endianness::LittleEndian);
+                for item in &v.include {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint16(v.exclude.len() as u16, Endianness::LittleEndian);
+                for item in &v.exclude {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2933,6 +3164,8 @@ impl Op {
             Ok(Op::OpAsyncStatus(OpAsyncStatusOutput::decode_with_decoder(decoder)?))
         } else if value == 18 {
             Ok(Op::OpReadFile(OpReadFileOutput::decode_with_decoder(decoder)?))
+        } else if value == 19 {
+            Ok(Op::OpUnarchive(OpUnarchiveOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }

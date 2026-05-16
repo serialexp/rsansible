@@ -368,6 +368,37 @@
       ],
     },
 
+    OpUnarchive: {
+      description: "Extract an archive that already lives on the agent host (matches `unarchive` with `remote_src: yes`; controller-pushed archives must come via OpWriteFile / OpGetUrl in a previous task). `src` is the path to the archive on the agent. `dest` is the target directory (must exist; v1 does NOT auto-create). `format` selects the codec: 0=auto (infer from `src` extension), 1=tar.gz, 2=tar.bz2, 3=tar.xz, 4=tar, 5=zip. Unknown extensions in auto mode → BAD_REQUEST. `creates` is an idempotency marker: when non-empty and the path exists, extraction is skipped and TaskDone(changed=0) is emitted without touching the archive. `keep_newer=1` skips extracting any entry whose mtime is older than the on-disk file at the same dest path (matches Ansible's `keep_newer`). `include` (zip only) restricts extraction to listed paths; empty = extract everything. `exclude` skips listed paths in any format; empty = exclude nothing. Both lists match against the *archive entry path* exactly (no globbing in v1). `has_mode=1` applies the low 12 bits of `mode` (chmod) to every extracted file/dir after extraction. Empty `owner`/`group` mean don't chown; non-empty values resolve via /etc/passwd /etc/group (no NSS) and chown every extracted path. `list_files=1` populates the envelope's `files` array with the list of extracted entry paths (relative to `dest`). Envelope on stdout: `{dest, src, extract_results: {}, handler, files: [...]}` matching Ansible's unarchive return shape; `handler` is one of `TgzArchive`/`TarArchive`/`TarBzipArchive`/`TarXzArchive`/`ZipArchive`. `changed=1` iff at least one file was actually written (i.e. a non-skipped entry was extracted). Hard failures (corrupt archive, partial extract, unsupported entry types like char/block devices) surface as TaskError. Symlinks inside the archive are honoured but rejected if they'd escape `dest` (zip-slip protection); same for absolute paths or `..` components in entry names. Wire kind=19.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 19 },
+        { name: "src", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "dest", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "format", type: "uint8" },
+        { name: "creates", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "has_mode", type: "uint8" },
+        { name: "mode", type: "uint32" },
+        { name: "owner", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "group", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "keep_newer", type: "uint8" },
+        { name: "list_files", type: "uint8" },
+        {
+          name: "include",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+        {
+          name: "exclude",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -394,6 +425,7 @@
         { type: "OpAsyncStart", when: "value === 16" },
         { type: "OpAsyncStatus", when: "value === 17" },
         { type: "OpReadFile", when: "value === 18" },
+        { type: "OpUnarchive", when: "value === 19" },
       ],
     },
 

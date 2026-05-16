@@ -540,6 +540,49 @@ pub fn op_read_file(path: String, max_bytes: u32) -> Op {
     })
 }
 
+/// `unarchive` format selector — keep in sync with the schema docstring.
+/// 0=auto, 1=tar.gz, 2=tar.bz2, 3=tar.xz, 4=tar, 5=zip.
+pub mod unarchive_format {
+    pub const AUTO: u8 = 0;
+    pub const TAR_GZ: u8 = 1;
+    pub const TAR_BZ2: u8 = 2;
+    pub const TAR_XZ: u8 = 3;
+    pub const TAR: u8 = 4;
+    pub const ZIP: u8 = 5;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_unarchive(
+    src: String,
+    dest: String,
+    format: u8,
+    creates: String,
+    has_mode: u8,
+    mode: u32,
+    owner: String,
+    group: String,
+    keep_newer: u8,
+    list_files: u8,
+    include: Vec<String>,
+    exclude: Vec<String>,
+) -> Op {
+    Op::OpUnarchive(OpUnarchiveOutput {
+        kind: 19,
+        src,
+        dest,
+        format,
+        creates,
+        has_mode,
+        mode,
+        owner,
+        group,
+        keep_newer,
+        list_files,
+        include,
+        exclude,
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(
