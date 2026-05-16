@@ -126,6 +126,10 @@ pub fn make_env<'a>() -> Environment<'a> {
 
 /// Per-run memoization for the controller-side lookups.
 ///
+/// **See `ANSIBLE_COMPAT.md` §1.** rsansible caches `file` and `env`
+/// lookups per-run; Ansible does not cache its `lookup` plugins by
+/// default. `shell_stdout` is NOT cached (matches Ansible).
+///
 /// Wired in: `make_env()` constructs one `LookupCache` per
 /// `Environment`, then captures clones of the `Arc` into each
 /// minijinja function closure. Since rsansible builds exactly one
@@ -523,7 +527,9 @@ fn controller_env_impl(cache: &LookupCache, name: String) -> Result<MjValue, MjE
 /// operations cache-hit each other regardless of which spelling the
 /// playbook used.
 ///
-/// Unknown plugin names error loudly with the supported list.
+/// Unknown plugin names error loudly with the supported list — this
+/// is a deliberate divergence from Ansible's silent-undefined.
+/// See `ANSIBLE_COMPAT.md` §3.
 fn lookup_shim_impl(
     cache: &LookupCache,
     plugin: String,

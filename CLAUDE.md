@@ -5,6 +5,13 @@ any one session. If you're a future Claude session: read this before
 touching code that crosses the controller/agent boundary or adds
 user-facing names.
 
+## Companion docs
+
+- **`ANSIBLE_COMPAT.md`** — the canonical list of every place
+  rsansible deliberately differs from Ansible. **Every deliberate
+  divergence MUST be recorded there in the same commit that
+  introduces it.** See the rule at the bottom of this file.
+
 ## Naming: `controller_` / `target_` prefix for side-aware operations
 
 Any operation whose *location of execution* is a meaningful part of
@@ -135,6 +142,37 @@ fn lookup_shim(plugin: &str, args: &[MjValue]) -> Result<MjValue> {
 Same logic applies if/when we mirror other Ansible god functions
 (`query`, future plugin dispatchers): canonical names are the source
 of truth, Ansible spelling is the compat layer.
+
+## Documenting Ansible divergences
+
+rsansible is "run real Ansible playbooks with minimal fuss" by
+default, so matching Ansible's behavior is the baseline assumption
+everywhere. That makes deliberate divergence the interesting case —
+and the case future sessions will most often get wrong if it isn't
+written down.
+
+**The rule:** every place rsansible deliberately differs from Ansible
+in user-visible behavior gets an entry in `ANSIBLE_COMPAT.md` in the
+**same commit** that introduces the difference. If you find yourself
+thinking "the Ansible way is silly here, I'll do X instead" — stop,
+write the entry, then commit code + doc together.
+
+What counts as a deliberate divergence:
+
+- A playbook author would observe a difference (different result,
+  different error, different validation outcome) for the same input.
+- The difference is on purpose, not an unimplemented-yet gap.
+- The decision was discussed and a direction chosen.
+
+What does NOT go in `ANSIBLE_COMPAT.md`:
+
+- Internal naming conventions (those go here, in CLAUDE.md).
+- "Will match Ansible once we implement X" — that's a TODO.
+- Performance differences with identical user-visible behavior.
+
+When you add a divergence: the function's own doc comment should
+say `see ANSIBLE_COMPAT.md §N` so a developer reading the code
+knows the choice was deliberate and where to find the rationale.
 
 ## When you add a new convention here
 

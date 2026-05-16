@@ -2685,6 +2685,7 @@ impl<'de> Deserialize<'de> for CommandOp {
         // Reject `executable:` explicitly — Ansible silently ignores it
         // for `command:`; we'd rather be loud so users get pointed at
         // `shell:` if they actually need a different interpreter.
+        // See `ANSIBLE_COMPAT.md` §2.
         if map.contains_key("executable") {
             return Err(D::Error::custom(
                 "command.executable: not supported — use `shell:` to pick a different interpreter",
