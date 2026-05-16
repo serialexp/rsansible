@@ -12,6 +12,7 @@ mod file;
 mod gather_facts;
 mod lineinfile;
 mod package;
+mod postgresql;
 mod stat;
 mod systemd;
 mod ufw;
@@ -55,6 +56,8 @@ pub async fn dispatch(ctx: &Context, seq: u32, op: Op, check_mode: bool) -> anyh
         Op::OpPackage(o) => package::run(ctx, seq, o, check_mode).await,
         Op::OpUfw(o) => ufw::run(ctx, seq, o, check_mode).await,
         Op::OpUri(o) => uri::run(ctx, seq, o, check_mode).await,
+        Op::OpPostgresqlQuery(o) => postgresql::run_query(ctx, seq, o, check_mode).await,
+        Op::OpPostgresqlExt(o) => postgresql::run_ext(ctx, seq, o, check_mode).await,
     }
 }
 

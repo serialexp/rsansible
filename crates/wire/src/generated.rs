@@ -1607,6 +1607,339 @@ impl From<OpUriOutput> for OpUriInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpPostgresqlQueryInput {
+    pub query: std::string::String,
+    pub db: std::string::String,
+    pub login_user: std::string::String,
+    pub login_password: std::string::String,
+    pub login_unix_socket: std::string::String,
+    pub login_host: std::string::String,
+    pub login_port: u16,
+    pub autocommit: u8,
+    pub positional_args: Vec<std::string::String>,
+    pub read_only: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpPostgresqlQueryOutput {
+    pub kind: u8,
+    pub query: std::string::String,
+    pub db: std::string::String,
+    pub login_user: std::string::String,
+    pub login_password: std::string::String,
+    pub login_unix_socket: std::string::String,
+    pub login_host: std::string::String,
+    pub login_port: u16,
+    pub autocommit: u8,
+    pub positional_args: Vec<std::string::String>,
+    pub read_only: u8,
+}
+
+pub type OpPostgresqlQuery = OpPostgresqlQueryOutput;
+
+impl OpPostgresqlQueryInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(13);
+        encoder.write_u32_le(self.query.len() as u32);
+        let string_bytes: &[u8] = self.query.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.db.len() as u16);
+        let string_bytes: &[u8] = self.db.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_user.len() as u16);
+        let string_bytes: &[u8] = self.login_user.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_password.len() as u16);
+        let string_bytes: &[u8] = self.login_password.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_unix_socket.len() as u16);
+        let string_bytes: &[u8] = self.login_unix_socket.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_host.len() as u16);
+        let string_bytes: &[u8] = self.login_host.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_port);
+        encoder.write_byte(self.autocommit);
+        encoder.write_u16_le(self.positional_args.len() as u16);
+        for item in &self.positional_args {
+            encoder.write_u32_le(item.len() as u32);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_byte(self.read_only);
+        Ok(())
+    }
+
+}
+
+impl OpPostgresqlQueryOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 13u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 13, got {}", kind)));
+        }
+        let length = decoder.read_u32_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let query = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let db = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_user = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_password = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_unix_socket = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_host = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let login_port = decoder.read_u16_le()?;
+        let autocommit = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let mut positional_args = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u32_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            positional_args.push(item);
+        }
+        let read_only = decoder.read_byte()?;
+        Ok(Self {
+            kind,
+            query,
+            db,
+            login_user,
+            login_password,
+            login_unix_socket,
+            login_host,
+            login_port,
+            autocommit,
+            positional_args,
+            read_only,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpPostgresqlQueryInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpPostgresqlQueryInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpPostgresqlQueryOutput> for OpPostgresqlQueryInput {
+    fn from(o: OpPostgresqlQueryOutput) -> Self {
+        Self {
+            query: o.query,
+            db: o.db,
+            login_user: o.login_user,
+            login_password: o.login_password,
+            login_unix_socket: o.login_unix_socket,
+            login_host: o.login_host,
+            login_port: o.login_port,
+            autocommit: o.autocommit,
+            positional_args: o.positional_args,
+            read_only: o.read_only,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpPostgresqlExtInput {
+    pub name: std::string::String,
+    pub state: u8,
+    pub version: std::string::String,
+    pub ext_schema: std::string::String,
+    pub cascade: u8,
+    pub db: std::string::String,
+    pub login_user: std::string::String,
+    pub login_password: std::string::String,
+    pub login_unix_socket: std::string::String,
+    pub login_host: std::string::String,
+    pub login_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpPostgresqlExtOutput {
+    pub kind: u8,
+    pub name: std::string::String,
+    pub state: u8,
+    pub version: std::string::String,
+    pub ext_schema: std::string::String,
+    pub cascade: u8,
+    pub db: std::string::String,
+    pub login_user: std::string::String,
+    pub login_password: std::string::String,
+    pub login_unix_socket: std::string::String,
+    pub login_host: std::string::String,
+    pub login_port: u16,
+}
+
+pub type OpPostgresqlExt = OpPostgresqlExtOutput;
+
+impl OpPostgresqlExtInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(14);
+        encoder.write_u16_le(self.name.len() as u16);
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.state);
+        encoder.write_u16_le(self.version.len() as u16);
+        let string_bytes: &[u8] = self.version.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.ext_schema.len() as u16);
+        let string_bytes: &[u8] = self.ext_schema.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.cascade);
+        encoder.write_u16_le(self.db.len() as u16);
+        let string_bytes: &[u8] = self.db.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_user.len() as u16);
+        let string_bytes: &[u8] = self.login_user.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_password.len() as u16);
+        let string_bytes: &[u8] = self.login_password.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_unix_socket.len() as u16);
+        let string_bytes: &[u8] = self.login_unix_socket.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_host.len() as u16);
+        let string_bytes: &[u8] = self.login_host.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.login_port);
+        Ok(())
+    }
+
+}
+
+impl OpPostgresqlExtOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 14u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 14, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let state = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let version = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let ext_schema = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let cascade = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let db = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_user = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_password = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_unix_socket = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let login_host = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let login_port = decoder.read_u16_le()?;
+        Ok(Self {
+            kind,
+            name,
+            state,
+            version,
+            ext_schema,
+            cascade,
+            db,
+            login_user,
+            login_password,
+            login_unix_socket,
+            login_host,
+            login_port,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpPostgresqlExtInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpPostgresqlExtInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpPostgresqlExtOutput> for OpPostgresqlExtInput {
+    fn from(o: OpPostgresqlExtOutput) -> Self {
+        Self {
+            name: o.name,
+            state: o.state,
+            version: o.version,
+            ext_schema: o.ext_schema,
+            cascade: o.cascade,
+            db: o.db,
+            login_user: o.login_user,
+            login_password: o.login_password,
+            login_unix_socket: o.login_unix_socket,
+            login_host: o.login_host,
+            login_port: o.login_port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     OpExec(OpExecOutput),
     OpShell(OpShellOutput),
@@ -1621,6 +1954,8 @@ pub enum Op {
     OpPackage(OpPackageOutput),
     OpUfw(OpUfwOutput),
     OpUri(OpUriOutput),
+    OpPostgresqlQuery(OpPostgresqlQueryOutput),
+    OpPostgresqlExt(OpPostgresqlExtOutput),
 }
 
 impl Op {
@@ -1952,6 +2287,95 @@ impl Op {
                     encoder.write_uint8(*item);
                 }
             }
+            Op::OpPostgresqlQuery(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint32(v.query.len() as u32, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.query.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.db.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.db.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_user.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_user.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_password.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_password.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_unix_socket.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_unix_socket.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_host.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_host.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_port, Endianness::LittleEndian);
+                encoder.write_uint8(v.autocommit);
+                encoder.write_uint16(v.positional_args.len() as u16, Endianness::LittleEndian);
+                for item in &v.positional_args {
+                    encoder.write_uint32(item.len() as u32, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint8(v.read_only);
+            }
+            Op::OpPostgresqlExt(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.name.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.name.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint16(v.version.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.version.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.ext_schema.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.ext_schema.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.cascade);
+                encoder.write_uint16(v.db.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.db.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_user.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_user.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_password.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_password.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_unix_socket.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_unix_socket.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_host.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.login_host.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.login_port, Endianness::LittleEndian);
+            }
         }
         Ok(())
     }
@@ -1990,6 +2414,10 @@ impl Op {
             Ok(Op::OpUfw(OpUfwOutput::decode_with_decoder(decoder)?))
         } else if value == 12 {
             Ok(Op::OpUri(OpUriOutput::decode_with_decoder(decoder)?))
+        } else if value == 13 {
+            Ok(Op::OpPostgresqlQuery(OpPostgresqlQueryOutput::decode_with_decoder(decoder)?))
+        } else if value == 14 {
+            Ok(Op::OpPostgresqlExt(OpPostgresqlExtOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }

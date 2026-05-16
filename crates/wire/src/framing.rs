@@ -477,6 +477,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_postgresql_query() {
+        roundtrip(msg::task_dispatch(
+            81,
+            false,
+            msg::op_postgresql_query(
+                "SELECT pid, state FROM pg_stat_activity WHERE state = $1".into(),
+                "postgres".into(),
+                "".into(),
+                "".into(),
+                "/var/run/postgresql".into(),
+                "".into(),
+                0,
+                false,
+                vec!["active".into()],
+                /*read_only=*/ true,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_postgresql_ext() {
+        roundtrip(msg::task_dispatch(
+            82,
+            false,
+            msg::op_postgresql_ext(
+                "pg_stat_statements".into(),
+                msg::postgresql_ext_state::PRESENT,
+                "".into(),
+                "public".into(),
+                false,
+                "postgres".into(),
+                "".into(),
+                "".into(),
+                "/var/run/postgresql".into(),
+                "".into(),
+                0,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_progress() {
         roundtrip(msg::task_progress(42, 0, b"line of output\n".to_vec())).await;
     }

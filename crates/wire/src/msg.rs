@@ -407,6 +407,70 @@ pub fn op_uri(
     })
 }
 
+/// `state:` byte values for `OpPostgresqlExt`.
+pub mod postgresql_ext_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_postgresql_query(
+    query: String,
+    db: String,
+    login_user: String,
+    login_password: String,
+    login_unix_socket: String,
+    login_host: String,
+    login_port: u16,
+    autocommit: bool,
+    positional_args: Vec<String>,
+    read_only: bool,
+) -> Op {
+    Op::OpPostgresqlQuery(OpPostgresqlQueryOutput {
+        kind: 13,
+        query,
+        db,
+        login_user,
+        login_password,
+        login_unix_socket,
+        login_host,
+        login_port,
+        autocommit: if autocommit { 1 } else { 0 },
+        positional_args,
+        read_only: if read_only { 1 } else { 0 },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_postgresql_ext(
+    name: String,
+    state: u8,
+    version: String,
+    ext_schema: String,
+    cascade: bool,
+    db: String,
+    login_user: String,
+    login_password: String,
+    login_unix_socket: String,
+    login_host: String,
+    login_port: u16,
+) -> Op {
+    Op::OpPostgresqlExt(OpPostgresqlExtOutput {
+        kind: 14,
+        name,
+        state,
+        version,
+        ext_schema,
+        cascade: if cascade { 1 } else { 0 },
+        db,
+        login_user,
+        login_password,
+        login_unix_socket,
+        login_host,
+        login_port,
+    })
+}
+
 // ── Message constructors ────────────────────────────────────────────
 
 pub fn hello(

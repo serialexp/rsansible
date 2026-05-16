@@ -267,6 +267,47 @@
       ],
     },
 
+    OpPostgresqlQuery: {
+      description: "PostgreSQL query execution. Maps Ansible's `community.postgresql.postgresql_query` (subset). Connection: `login_unix_socket` non-empty selects UNIX-socket peer auth (current uid; Patroni clusters listen on /var/run/postgresql); empty falls back to TCP at `login_host:login_port` (host empty=localhost, port 0=5432). `login_user`/`login_password` empty means trust/peer auth (no credentials sent). `db` empty defaults to `postgres`. `autocommit=0` (default) wraps the query in BEGIN/COMMIT; `autocommit=1` runs it outside any transaction (required for VACUUM, CREATE INDEX CONCURRENTLY, etc.). `positional_args` carries query parameters as UTF-8 text — postgres-side casts handle typing (e.g. `WHERE id = $1::int`). Envelope shape on stdout: {query_result: [<row>...], rowcount: uint, statusmessage: string}. Each row is a JSON object keyed by column name; values are JSON-typed per pg oid (int → number, bool → bool, jsonb → nested, bytea → base64 string, everything else → string). `changed` is 1 unless the controller pre-classified the SQL as read-only (SELECT/SHOW/EXPLAIN/VALUES/WITH/TABLE) — the controller flips that classification into `changed=0` at register-lift time. Wire kind=13.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 13 },
+        { name: "query", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        { name: "db", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_user", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_password", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_unix_socket", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_host", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_port", type: "uint16" },
+        { name: "autocommit", type: "uint8" },
+        {
+          name: "positional_args",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
+        },
+        { name: "read_only", type: "uint8" },
+      ],
+    },
+
+    OpPostgresqlExt: {
+      description: "PostgreSQL extension management. Maps Ansible's `community.postgresql.postgresql_ext`. `state` is a uint8: 0=present, 1=absent. `cascade=1` adds CASCADE to CREATE/DROP. `version` empty = default; `schema` empty = default. Idempotency: agent first queries `pg_extension` for the named extension; if state already matches, returns `changed=0` without DDL. Connection fields mirror OpPostgresqlQuery. Envelope shape: {extension: string, state: \"present\"|\"absent\", changed: bool, prior_version: string|null, version: string|null}. Wire kind=14.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 14 },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "state", type: "uint8" },
+        { name: "version", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "ext_schema", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "cascade", type: "uint8" },
+        { name: "db", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_user", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_password", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_unix_socket", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_host", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "login_port", type: "uint16" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -287,6 +328,8 @@
         { type: "OpPackage", when: "value === 10" },
         { type: "OpUfw", when: "value === 11" },
         { type: "OpUri", when: "value === 12" },
+        { type: "OpPostgresqlQuery", when: "value === 13" },
+        { type: "OpPostgresqlExt", when: "value === 14" },
       ],
     },
 
