@@ -655,6 +655,24 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
         TaskBody::Meta(_) => {
             // `meta: flush_handlers` has no body fields to compile.
         }
+        TaskBody::Block(b) => {
+            // Recurse into each sub-list so Jinja in inner tasks
+            // (when:, loop:, body fields) precompiles too. The block
+            // container's own `when:` / `loop:` were handled above as
+            // task-level fields.
+            for (i, child) in b.tasks.iter().enumerate() {
+                check_task(env, child)
+                    .map_err(|e| anyhow!("block.tasks[{i}] {:?}: {e}", child.name))?;
+            }
+            for (i, child) in b.rescue.iter().enumerate() {
+                check_task(env, child)
+                    .map_err(|e| anyhow!("rescue[{i}] {:?}: {e}", child.name))?;
+            }
+            for (i, child) in b.always.iter().enumerate() {
+                check_task(env, child)
+                    .map_err(|e| anyhow!("always[{i}] {:?}: {e}", child.name))?;
+            }
+        }
     }
     Ok(())
 }
@@ -951,6 +969,16 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("unarchive.exclude[{i}]: {e}"))?;
             }
         }
+        TaskOp::Tempfile(t) => {
+            env.template_from_str(&t.prefix)
+                .map_err(|e| anyhow!("tempfile.prefix: {e}"))?;
+            env.template_from_str(&t.suffix)
+                .map_err(|e| anyhow!("tempfile.suffix: {e}"))?;
+            if let Some(p) = &t.path {
+                env.template_from_str(p)
+                    .map_err(|e| anyhow!("tempfile.path: {e}"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -960,9 +988,9 @@ fn check_assert(env: &Environment, a: &AssertTask) -> Result<()> {
         env.compile_expression(expr)
             .map_err(|e| anyhow!("assert.that[{i}]: {e}"))?;
     }
-    if let Some(msg) = &a.msg {
+    if let Some(msg) = &a.fail_msg {
         env.template_from_str(msg)
-            .map_err(|e| anyhow!("assert.msg: {e}"))?;
+            .map_err(|e| anyhow!("assert.fail_msg: {e}"))?;
     }
     Ok(())
 }

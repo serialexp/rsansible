@@ -41,11 +41,12 @@ use crate::become_;
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, BlockInFileOp, CopyOp, DebugTask, ExecOp, FailTask, FileOp, GetUrlOp, HostSelector,
+    AssertTask, BlockInFileOp, BlockSpec, CopyOp, DebugTask, ExecOp, FailTask, FileOp, GetUrlOp,
+    HostSelector,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
     Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp, StatOp,
-    Strategy, SystemdOp, Task, TaskBody, TaskOp, UfwOp, UnarchiveOp, UriOp, WaitForOp,
-    WriteFileOp, X509CertificatePipeOp,
+    Strategy, SystemdOp, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, UfwOp, UnarchiveOp,
+    UriOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
 };
 use crate::ssh::{self, AgentConn, ConnectOptions};
 use crate::template;
@@ -128,6 +129,12 @@ pub struct RunSpec {
     /// tasks; per-task `check_mode: true` forces check mode for that
     /// task even when the CLI flag is unset.
     pub check_mode: bool,
+    /// Absolute path to the directory containing the playbook source file.
+    /// Surfaced to templates as `{{ playbook_dir }}` (matches Ansible).
+    pub playbook_dir: Option<String>,
+    /// Absolute path to the directory containing the inventory source file.
+    /// Surfaced to templates as `{{ inventory_dir }}`.
+    pub inventory_dir: Option<String>,
 }
 
 impl RunSpec {
@@ -144,6 +151,8 @@ impl RunSpec {
             limit: Vec::new(),
             wire_strategy: crate::wire_cost::WireStrategy::default(),
             check_mode: false,
+            playbook_dir: None,
+            inventory_dir: None,
         }
     }
 }
@@ -188,6 +197,8 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         limit,
         wire_strategy,
         check_mode,
+        playbook_dir,
+        inventory_dir,
     } = spec;
     // Plumbed through to per-task dispatch so privkey (and any future
     // composite-dispatch op) can override the auto heuristic. Cheap to
@@ -221,7 +232,12 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
 
     // Build the per-host inventory_vars views + the shared WorldVars
     // once at startup. Both are stable for the run.
-    let world = Arc::new(build_world_vars(&inventory, &inventory_vars));
+    let world = Arc::new({
+        let mut w = build_world_vars(&inventory, &inventory_vars);
+        w.playbook_dir = playbook_dir.clone();
+        w.inventory_dir = inventory_dir.clone();
+        w
+    });
 
     // Connect phase host set: union of every play's host set,
     // intersected with --limit. We don't dial hosts that `--limit` is
@@ -250,7 +266,10 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         })
         .collect();
 
-    // Connect phase — parallel-bounded.
+    // Connect phase — parallel-bounded. Per-host transport is decided
+    // up front by scanning the playbook for `connection: local` plays;
+    // SSH is the default. See `resolve_host_connection_modes`.
+    let conn_modes = resolve_host_connection_modes(&playbook, &inventory, &target_hosts)?;
     let mut conns_raw: BTreeMap<String, AgentConn> = BTreeMap::new();
     let semaphore = Arc::new(Semaphore::new(max_concurrent_hosts.max(1)));
     let mut set: JoinSet<(String, Result<AgentConn>)> = JoinSet::new();
@@ -263,12 +282,22 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         let bin = agent_binary.clone();
         let sem = semaphore.clone();
         let name_owned = name.clone();
+        let mode = *conn_modes.get(name).unwrap_or(&ConnMode::Ssh);
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore not closed");
-            let opts = ConnectOptions::from_host(&host);
-            let r = ssh::connect_and_push(&opts, &bin)
-                .await
-                .with_context(|| format!("connecting to {name_owned}"));
+            let r = match mode {
+                ConnMode::Ssh => {
+                    let opts = ConnectOptions::from_host(&host);
+                    ssh::connect_and_push(&opts, &bin)
+                        .await
+                        .with_context(|| format!("connecting to {name_owned}"))
+                }
+                ConnMode::Local => crate::local::connect_local(name_owned.clone(), &bin)
+                    .await
+                    .with_context(|| {
+                        format!("spawning local agent for {name_owned}")
+                    }),
+            };
             (name_owned, r)
         });
     }
@@ -553,6 +582,8 @@ fn build_world_vars(inv: &Inventory, vars: &InventoryVars) -> WorldVars {
     WorldVars {
         groups: inv.groups.clone(),
         hostvars,
+        playbook_dir: None,
+        inventory_dir: None,
     }
 }
 
@@ -590,6 +621,8 @@ fn build_world_vars_for_play(base: &WorldVars, play: &Play) -> WorldVars {
     WorldVars {
         groups: base.groups.clone(),
         hostvars,
+        playbook_dir: base.playbook_dir.clone(),
+        inventory_dir: base.inventory_dir.clone(),
     }
 }
 
@@ -690,6 +723,9 @@ fn make_gather_facts_task() -> Task {
         retries: None,
         delay: None,
         until: None,
+        changed_when: None,
+        failed_when: None,
+        no_log: None,
     }
 }
 
@@ -774,7 +810,7 @@ async fn gather_facts_for_play(
                 debug!(host = %r.name, "facts gathered");
             }
             HostTaskOutcome::Skipped => {}
-            HostTaskOutcome::Failed { reason } => {
+            HostTaskOutcome::Failed { reason, .. } => {
                 warn!(
                     host = %r.name,
                     "gather_facts failed (continuing; play.gather_facts is best-effort): {reason}"
@@ -1154,7 +1190,7 @@ async fn run_play_per_play(
                         ctx = r.ctx;
                         match &r.outcome {
                             HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {}
-                            HostTaskOutcome::Failed { reason } => {
+                            HostTaskOutcome::Failed { reason, .. } => {
                                 if first_failure.is_none() {
                                     first_failure = Some((task.name.clone(), reason.clone()));
                                 }
@@ -1182,7 +1218,7 @@ async fn run_play_per_play(
                 ctx = r.ctx;
                 match &r.outcome {
                     HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {}
-                    HostTaskOutcome::Failed { reason } => {
+                    HostTaskOutcome::Failed { reason, .. } => {
                         if first_failure.is_none() {
                             first_failure = Some((task.name.clone(), reason.clone()));
                         }
@@ -1276,8 +1312,9 @@ fn clone_outcome(o: &HostTaskOutcome) -> HostTaskOutcome {
             skipped: *skipped,
         },
         HostTaskOutcome::Skipped => HostTaskOutcome::Skipped,
-        HostTaskOutcome::Failed { reason } => HostTaskOutcome::Failed {
+        HostTaskOutcome::Failed { reason, register } => HostTaskOutcome::Failed {
             reason: reason.clone(),
+            register: register.clone(),
         },
     }
 }
@@ -1304,6 +1341,17 @@ enum HostTaskOutcome {
     Skipped,
     Failed {
         reason: String,
+        /// Register-shape result of the failing task (if any). The
+        /// `block:` executor uses this to populate
+        /// `ansible_failed_result` during rescue arm execution so
+        /// recovery tasks can branch on the failed task's exit code,
+        /// stderr, etc. (`{{ ansible_failed_result.rc }}` etc.).
+        ///
+        /// `None` for failures with no register payload — e.g.
+        /// `when:` render errors, `delegate_to:` render errors,
+        /// loop-spec render errors. The rescue arm still runs in
+        /// those cases; `ansible_failed_result` is simply Undefined.
+        register: Option<RegisterValue>,
     },
 }
 
@@ -1354,10 +1402,29 @@ async fn run_task_on_one_host(
             return PerHostTaskResult {
                 name,
                 ctx,
-                outcome: HostTaskOutcome::Failed { reason },
+                outcome: HostTaskOutcome::Failed { reason, register: None },
                 conn_alive: true,
             };
         }
+    }
+
+    // Block dispatch: a `block:` task is a controller-side grouping,
+    // not a body to dispatch. Hand off to the block driver, which
+    // handles loop expansion + the block→rescue→always state machine.
+    // (when: was already evaluated above; loop is the block driver's
+    // job since the block-level loop iterates the whole triple per
+    // item.)
+    //
+    // We Box::pin the recursive call because Rust requires
+    // recursive async functions to introduce indirection — without
+    // it the compiler can't size the returned Future (it would
+    // contain itself transitively via run_block_on_one_host →
+    // run_task_list_on_host → run_task_on_one_host → here).
+    if let TaskBody::Block(block) = &task.body {
+        return Box::pin(run_block_on_one_host(
+            task, block, own_conn, conns_map, ctx, next_seq, env, world,
+        ))
+        .await;
     }
 
     // Resolve loop items (None → run once with no iter_item).
@@ -1369,6 +1436,7 @@ async fn run_task_on_one_host(
                 ctx,
                 outcome: HostTaskOutcome::Failed {
                     reason: format!("loop: {e:#}"),
+                    register: None,
                 },
                 conn_alive: true,
             };
@@ -1406,12 +1474,13 @@ async fn run_task_on_one_host(
                 return PerHostTaskResult {
                     name,
                     ctx,
-                    outcome: HostTaskOutcome::Failed { reason },
+                    outcome: HostTaskOutcome::Failed { reason, register: None },
                     conn_alive: true,
                 };
             }
         };
-        let exec = run_body_once(task, &target, &mut ctx, &env, &world, &next_seq).await;
+        let exec =
+            run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
         let outcome = match exec {
             BodyResult::Ok { register, changed, skipped } => {
                 if let Some(reg_name) = &task.register {
@@ -1421,10 +1490,16 @@ async fn run_task_on_one_host(
                 HostTaskOutcome::Ok { changed, skipped }
             }
             BodyResult::Failed { reason, register, conn_alive } => {
-                if let Some(reg_name) = &task.register {
-                    if let Some(rv) = register {
-                        ctx.record_register(reg_name, rv);
-                    }
+                // Bind `register` to the failed task's register-shape
+                // result if any. We need to record it onto the host's
+                // register dict (when `task.register` is set) AND
+                // surface it back to the per-host result so the
+                // block-rescue arm can populate `ansible_failed_result`
+                // (the rescue runner reads it off HostTaskOutcome::
+                // Failed.register regardless of whether the failing
+                // task had a `register:` clause of its own).
+                if let (Some(reg_name), Some(rv)) = (&task.register, &register) {
+                    ctx.record_register(reg_name, rv.clone());
                 }
                 ctx.failed = true;
                 // Conn liveness only flips own_conn_alive when the dead
@@ -1433,7 +1508,7 @@ async fn run_task_on_one_host(
                 if !conn_alive && task.delegate_to.is_none() {
                     own_conn_alive = false;
                 }
-                HostTaskOutcome::Failed { reason }
+                HostTaskOutcome::Failed { reason, register }
             }
         };
         let outcome = maybe_ignore_failure(task, outcome, &name);
@@ -1474,7 +1549,8 @@ async fn run_task_on_one_host(
                 continue;
             }
         };
-        let exec = run_body_once(task, &target, &mut ctx, &env, &world, &next_seq).await;
+        let exec =
+            run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
         match exec {
             BodyResult::Ok { register, changed: _, skipped: _ } => {
                 iter_registers.push(register);
@@ -1505,6 +1581,7 @@ async fn run_task_on_one_host(
         results: Some(iter_registers),
         ..Default::default()
     };
+    let aggregate_for_failure = aggregate.clone();
     if let Some(reg_name) = &task.register {
         ctx.record_register(reg_name, aggregate);
     }
@@ -1515,7 +1592,13 @@ async fn run_task_on_one_host(
         }
         Some(reason) => {
             ctx.failed = true;
-            HostTaskOutcome::Failed { reason }
+            // Surface the per-iteration aggregate as the register on
+            // the failure outcome so block-rescue can populate
+            // `ansible_failed_result.results[*]` (and `.failed`).
+            HostTaskOutcome::Failed {
+                reason,
+                register: Some(aggregate_for_failure),
+            }
         }
     };
     let outcome = maybe_ignore_failure(task, outcome, &name);
@@ -1524,6 +1607,292 @@ async fn run_task_on_one_host(
         ctx,
         outcome,
         conn_alive: own_conn_alive,
+    }
+}
+
+// ---------- block / rescue / always driver ----------
+
+/// Result of walking a task list on one host. Returned by
+/// `run_task_list_on_host`; consumed by the block driver to decide
+/// whether to fire `rescue` and to thread `ansible_failed_*` into the
+/// rescue arm.
+struct TaskListResult {
+    /// Per-host state after every task in the list ran (or after the
+    /// first failure caused an early break).
+    ctx: HostCtx,
+    /// False if any task within the list left this host's connection
+    /// dead. Caller (block driver) propagates outward.
+    conn_alive: bool,
+    /// First non-recoverable failure observed in the list: the failing
+    /// task's name, its reason string, and its register-shape result
+    /// (if any). `None` means every task either succeeded, was
+    /// skipped, or had its failure absorbed by an inner
+    /// `ignore_errors:`. The block driver uses this to populate
+    /// `ansible_failed_task` / `ansible_failed_result` before the
+    /// rescue arm.
+    first_failure: Option<(String, String, Option<RegisterValue>)>,
+}
+
+/// Walk a list of tasks on one host, sequentially. Used by the block
+/// driver to execute `block.tasks`, `block.rescue`, and `block.always`.
+///
+/// Stops at the first non-recoverable failure (i.e. one that wasn't
+/// converted to `Ok` by per-task `ignore_errors:`); subsequent tasks
+/// in the list are not run. The caller — `run_block_on_one_host` —
+/// decides whether to recover via the rescue arm.
+///
+/// Meta tasks (`flush_handlers`) inside a block are not supported in
+/// v1: they're silently skipped here. The handler queue is play-level
+/// concern, not block-local. Note in CLAUDE.md.
+async fn run_task_list_on_host(
+    tasks: &[Task],
+    own_conn: ConnHandle,
+    conns_map: Arc<BTreeMap<String, ConnHandle>>,
+    mut ctx: HostCtx,
+    next_seq: Arc<AtomicU32>,
+    env: Arc<Environment<'static>>,
+    world: Arc<WorldVars>,
+) -> TaskListResult {
+    let mut conn_alive = true;
+    let mut first_failure: Option<(String, String, Option<RegisterValue>)> = None;
+
+    for task in tasks {
+        // Meta tasks inside a block aren't dispatched. Tag filtering
+        // is also play-level (block-inner tasks inherit the block's
+        // tags via the load-time pass; the play-level filter has
+        // already decided whether the whole block runs).
+        if matches!(&task.body, TaskBody::Meta(_)) {
+            continue;
+        }
+
+        let r = run_task_on_one_host(
+            task,
+            own_conn.clone(),
+            conns_map.clone(),
+            ctx,
+            next_seq.clone(),
+            env.clone(),
+            world.clone(),
+        )
+        .await;
+        ctx = r.ctx;
+        if !r.conn_alive {
+            conn_alive = false;
+        }
+        match r.outcome {
+            HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {
+                // Continue to next task. ignore_errors was already
+                // applied inside run_task_on_one_host, so a failed
+                // task with ignore_errors=true shows up here as Ok.
+            }
+            HostTaskOutcome::Failed { reason, register } => {
+                first_failure = Some((task.name.clone(), reason, register));
+                break;
+            }
+        }
+        if !conn_alive {
+            // Conn died — no point continuing the list.
+            break;
+        }
+    }
+
+    TaskListResult {
+        ctx,
+        conn_alive,
+        first_failure,
+    }
+}
+
+/// Drive a `block:` on one host: run `tasks`, fall to `rescue` on
+/// failure (with `ansible_failed_*` in scope), then always run
+/// `always`. Returns a `PerHostTaskResult` shaped the same way
+/// `run_task_on_one_host` does for non-block bodies, so the calling
+/// strategy code doesn't have to special-case blocks.
+///
+/// Loop semantics: the block-level `loop:` iterates the whole
+/// block→rescue→always triple per item, with `item` (or
+/// `loop_control.loop_var`) in scope for every child task. A failure
+/// in iteration N doesn't stop iteration N+1 from running — each
+/// iteration is independent.
+async fn run_block_on_one_host(
+    block_task: &Task,
+    block: &BlockSpec,
+    own_conn: ConnHandle,
+    conns_map: Arc<BTreeMap<String, ConnHandle>>,
+    mut ctx: HostCtx,
+    next_seq: Arc<AtomicU32>,
+    env: Arc<Environment<'static>>,
+    world: Arc<WorldVars>,
+) -> PerHostTaskResult {
+    let name = ctx.host_name.clone();
+
+    // Resolve loop items (None → single iteration with no iter_item).
+    let single_shot = block_task.loop_spec.is_none();
+    let items: Vec<JsonValue> = if single_shot {
+        Vec::new()
+    } else {
+        match resolve_loop_items(&env, block_task.loop_spec.as_ref(), &ctx, &world) {
+            Ok(items) => items,
+            Err(e) => {
+                return PerHostTaskResult {
+                    name,
+                    ctx,
+                    outcome: HostTaskOutcome::Failed {
+                        reason: format!("loop: {e:#}"),
+                        register: None,
+                    },
+                    conn_alive: true,
+                };
+            }
+        }
+    };
+    let loop_var = block_task
+        .loop_control
+        .as_ref()
+        .and_then(|lc| lc.loop_var.clone())
+        .unwrap_or_else(|| "item".to_string());
+
+    let mut overall_failure: Option<(String, String, Option<RegisterValue>)> = None;
+    let mut conn_alive = true;
+
+    // Build the iteration set: one None for single-shot, or one
+    // Some(item) per loop item. Keeps the per-iteration body
+    // uniform between the two cases.
+    let iter_set: Vec<Option<JsonValue>> = if single_shot {
+        vec![None]
+    } else {
+        items.into_iter().map(Some).collect()
+    };
+
+    for maybe_item in iter_set {
+        if let Some(item) = maybe_item {
+            ctx.iter_item = Some((loop_var.clone(), item));
+        }
+
+        // 1. Run block.tasks
+        let body_r = run_task_list_on_host(
+            &block.tasks,
+            own_conn.clone(),
+            conns_map.clone(),
+            ctx,
+            next_seq.clone(),
+            env.clone(),
+            world.clone(),
+        )
+        .await;
+        ctx = body_r.ctx;
+        if !body_r.conn_alive {
+            conn_alive = false;
+        }
+
+        let recovered;
+        if let Some((failed_name, _failed_reason, failed_register)) = &body_r.first_failure {
+            // 2. On failure with non-empty rescue, set
+            // ansible_failed_* and run rescue. Save/restore in case
+            // we're inside a nested block's rescue.
+            if block.rescue.is_empty() {
+                recovered = false;
+            } else {
+                let saved_task = ctx.ansible_failed_task.take();
+                let saved_result = ctx.ansible_failed_result.take();
+                ctx.ansible_failed_task = Some(failed_name.clone());
+                ctx.ansible_failed_result = failed_register.clone();
+
+                let rescue_r = run_task_list_on_host(
+                    &block.rescue,
+                    own_conn.clone(),
+                    conns_map.clone(),
+                    ctx,
+                    next_seq.clone(),
+                    env.clone(),
+                    world.clone(),
+                )
+                .await;
+                ctx = rescue_r.ctx;
+                if !rescue_r.conn_alive {
+                    conn_alive = false;
+                }
+
+                ctx.ansible_failed_task = saved_task;
+                ctx.ansible_failed_result = saved_result;
+
+                recovered = rescue_r.first_failure.is_none();
+                // If rescue itself failed, surface that as the overall
+                // failure for this iteration (rescue's failure wins
+                // over the original block failure — same as Ansible).
+                if let Some(rf) = rescue_r.first_failure {
+                    if overall_failure.is_none() {
+                        overall_failure = Some(rf);
+                    }
+                }
+            }
+        } else {
+            recovered = true;
+        }
+
+        // 3. always: runs regardless of recovery state.
+        if !block.always.is_empty() {
+            let always_r = run_task_list_on_host(
+                &block.always,
+                own_conn.clone(),
+                conns_map.clone(),
+                ctx,
+                next_seq.clone(),
+                env.clone(),
+                world.clone(),
+            )
+            .await;
+            ctx = always_r.ctx;
+            if !always_r.conn_alive {
+                conn_alive = false;
+            }
+            if let Some(af) = always_r.first_failure {
+                if overall_failure.is_none() {
+                    overall_failure = Some(af);
+                }
+            }
+        }
+
+        // 4. If the original block.tasks failed and rescue didn't
+        // recover, surface that as the overall failure.
+        if !recovered {
+            if let Some(bf) = body_r.first_failure {
+                if overall_failure.is_none() {
+                    overall_failure = Some(bf);
+                }
+            }
+        }
+
+        ctx.iter_item = None;
+
+        // Stop iterating if conn is gone — there's no point.
+        if !conn_alive {
+            break;
+        }
+    }
+
+    let outcome = match overall_failure {
+        None => HostTaskOutcome::Ok {
+            // We intentionally don't track block-aggregate `changed`
+            // for now. `register:`/`notify:` on a block are rejected
+            // at parse time, so the changed flag isn't observable —
+            // and a per-iteration aggregate would be misleading once
+            // looped blocks land. Revisit if/when notify-on-block is
+            // implemented.
+            changed: false,
+            skipped: false,
+        },
+        Some((_, reason, register)) => {
+            ctx.failed = true;
+            HostTaskOutcome::Failed { reason, register }
+        }
+    };
+    let outcome = maybe_ignore_failure(block_task, outcome, &name);
+    PerHostTaskResult {
+        name,
+        ctx,
+        outcome,
+        conn_alive,
     }
 }
 
@@ -1542,7 +1911,7 @@ fn maybe_ignore_failure(
     host: &str,
 ) -> HostTaskOutcome {
     match (&task.ignore_errors, &outcome) {
-        (Some(true), HostTaskOutcome::Failed { reason }) => {
+        (Some(true), HostTaskOutcome::Failed { reason, .. }) => {
             info!(
                 host = %host,
                 task = %task.name,
@@ -1585,6 +1954,50 @@ fn enqueue_notifies(
         };
         ctx.pending_handlers.insert(rendered);
     }
+}
+
+/// Render `task.retries` (a templated int-or-string) against the current
+/// host view. Returns the parsed retry-count, or an error string suitable
+/// for surfacing as a BodyResult::Failed reason.
+///
+/// Plain integer literals short-circuit the template render (gothab has
+/// many `retries: 5`-style sites; we don't want to spin up a jinja
+/// template for those). Negative values are not rejected here — the
+/// retry-policy code clamps to 0.
+fn render_int_field(
+    env: &Environment<'static>,
+    src: &str,
+    ctx: &HostCtx,
+    world: &WorldVars,
+) -> Result<i64> {
+    if let Ok(n) = src.trim().parse::<i64>() {
+        return Ok(n);
+    }
+    let view = build_template_ctx(ctx, world);
+    let rendered = render_str(env, src, &view)?;
+    rendered
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| anyhow!("expected integer after rendering, got {rendered:?}: {e}"))
+}
+
+/// Same as `render_int_field` but for float-valued fields (currently
+/// just `delay:`). Accepts `5`, `5.0`, `"5"`, `"{{ poll_interval }}"`.
+fn render_float_field(
+    env: &Environment<'static>,
+    src: &str,
+    ctx: &HostCtx,
+    world: &WorldVars,
+) -> Result<f64> {
+    if let Ok(n) = src.trim().parse::<f64>() {
+        return Ok(n);
+    }
+    let view = build_template_ctx(ctx, world);
+    let rendered = render_str(env, src, &view)?;
+    rendered
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| anyhow!("expected number after rendering, got {rendered:?}: {e}"))
 }
 
 /// One execution of a task body (no loop expansion here). Updates `ctx`
@@ -1649,7 +2062,205 @@ async fn run_body_once(
                 conn_alive: true,
             }
         }
+        TaskBody::Block(_) => {
+            // Block bodies are handled at the loop level by the block
+            // driver, not by run_body_once. Reaching here means a bug
+            // in the orchestrator's block dispatch (the per-host driver
+            // should have intercepted and called into run_block_on_one_host).
+            // Until the block executor lands (step 5), the load-time
+            // pipeline accepts `block:` tasks but the executor will
+            // surface this error if it tries to dispatch one.
+            BodyResult::Failed {
+                reason: "internal: block task dispatched to body-runner \
+                         (block executor not yet wired up)"
+                    .into(),
+                register: None,
+                conn_alive: true,
+            }
+        }
     }
+}
+
+/// Drive `run_body_once` under `retries:` / `until:` / `delay:` semantics.
+///
+/// Decision table (matches Ansible's `task_executor.py` exactly):
+///
+/// | task.retries | task.until | total attempts | exit condition       |
+/// |--------------|------------|----------------|----------------------|
+/// | None         | None       | 1              | n/a (no retry loop)  |
+/// | None         | Some(_)    | 4 (3 retries)  | `until` truthy       |
+/// | Some(n)      | None       | 1 + max(0, n)  | body returned Ok     |
+/// | Some(n)      | Some(_)    | 1 + max(0, n)  | `until` truthy       |
+///
+/// Per-attempt details:
+/// - On each attempt, if `task.register` is set, the resulting register
+///   is stashed on `ctx` so the `until` expression can see it as
+///   `{{ register_name.* }}`. It's overwritten on every attempt.
+/// - `delay:` (default 5s, clamped to >= 1s if negative) is awaited
+///   between attempts via `tokio::time::sleep`. No sleep after the
+///   final attempt.
+/// - When retry semantics were active (total attempts > 1), the final
+///   register's `attempts` field is set to the number of attempts
+///   actually made. With only one attempt (no retry semantics) the
+///   field stays at 0 — single-attempt tasks don't surface
+///   `register.attempts` at all (see `RegisterValue::to_json`).
+///
+/// Note: `until` and `failed_when` (when we ship the latter) are
+/// independent. `failed_when` would post-process the body's Ok/Failed
+/// outcome BEFORE this function decides whether to break — the
+/// integration point is to apply `failed_when` to `result` right after
+/// each `run_body_once` call returns. Not in scope here.
+async fn run_body_with_retries(
+    task: &Task,
+    target_conn: &ConnHandle,
+    ctx: &mut HostCtx,
+    env: &Environment<'static>,
+    world: &WorldVars,
+    next_seq: &Arc<AtomicU32>,
+) -> BodyResult {
+    // Compute total_attempts. Render `task.retries` against the host
+    // view; a render or parse failure is fatal for the task and shows
+    // up before any body is dispatched.
+    let parsed_retries: Option<u32> = match task.retries.as_deref() {
+        None => None,
+        Some(src) => match render_int_field(env, src, ctx, world) {
+            Ok(n) => Some(n.max(0) as u32),
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!("retries: {e:#}"),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        },
+    };
+    let total_attempts: u32 = match parsed_retries {
+        Some(n) => 1 + n,
+        None if task.until.is_some() => 4, // Ansible default: 3 retries
+        None => 1,
+    };
+    let retry_active = total_attempts > 1;
+
+    // Single-attempt fast path — no delay parsing, no extra logic. This
+    // is the hot path for every task that doesn't use retries.
+    if !retry_active {
+        return run_body_once(task, target_conn, ctx, env, world, next_seq).await;
+    }
+
+    // Delay (only consulted when retries are active).
+    let delay_secs: f64 = match task.delay.as_deref() {
+        None => 5.0,
+        Some(src) => match render_float_field(env, src, ctx, world) {
+            Ok(d) => {
+                if d < 0.0 {
+                    1.0
+                } else {
+                    d
+                }
+            }
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!("delay: {e:#}"),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        },
+    };
+
+    let host_name = ctx.host_name.clone();
+    let mut last_result: BodyResult;
+    let mut attempts_made: u32 = 0;
+    let mut exhausted_without_exit = false;
+    loop {
+        attempts_made += 1;
+        let result = run_body_once(task, target_conn, ctx, env, world, next_seq).await;
+
+        // Stash register on ctx so `until` can see it. Even on a Failed
+        // attempt we record under the user's register name when there's
+        // a register-shape payload — the final attempt's value ends up
+        // there too, matching the natural single-shot flow.
+        if let Some(reg_name) = &task.register {
+            let rv_for_ctx = match &result {
+                BodyResult::Ok { register, .. } => Some(register.clone()),
+                BodyResult::Failed { register, .. } => register.clone(),
+            };
+            if let Some(rv) = rv_for_ctx {
+                ctx.record_register(reg_name, rv);
+            }
+        }
+
+        // Exit condition: `until` if set (evaluated after register is
+        // recorded), otherwise "body returned Ok". Note: a truthy
+        // `until` exits even on a Failed attempt — `until` controls
+        // when to stop retrying, NOT whether to flag the task failed.
+        let should_break = if let Some(until_expr) = task.until.as_deref() {
+            match eval_when(env, Some(until_expr), ctx, world) {
+                Ok(b) => b,
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!("until: {e:#}"),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            }
+        } else {
+            matches!(&result, BodyResult::Ok { .. })
+        };
+
+        if should_break {
+            last_result = result;
+            break;
+        }
+        if attempts_made >= total_attempts {
+            last_result = result;
+            exhausted_without_exit = true;
+            break;
+        }
+
+        info!(
+            host = %host_name,
+            task = %task.name,
+            attempt = attempts_made,
+            total_attempts,
+            delay_secs,
+            "retry condition not met; sleeping before next attempt"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs_f64(delay_secs)).await;
+    }
+
+    // Ansible parity: when retries exhaust without the exit condition
+    // ever being satisfied, the task is flagged failed even if the
+    // last attempt's body succeeded. This only changes the outcome
+    // when `until:` was set and never became truthy (without `until`,
+    // the exit condition IS "body succeeded", so an exhausted loop
+    // already ends on a Failed body).
+    if exhausted_without_exit {
+        if let BodyResult::Ok { register, .. } = last_result {
+            last_result = BodyResult::Failed {
+                reason: format!(
+                    "task did not satisfy `until:` after {attempts_made} attempts"
+                ),
+                register: Some(register),
+                conn_alive: true,
+            };
+        }
+    }
+
+    // Annotate `attempts` on the register so templates can read
+    // `{{ result.attempts }}`.
+    match &mut last_result {
+        BodyResult::Ok { register, .. } => {
+            register.attempts = attempts_made;
+        }
+        BodyResult::Failed { register, .. } => {
+            if let Some(rv) = register.as_mut() {
+                rv.attempts = attempts_made;
+            }
+        }
+    }
+    last_result
 }
 
 // ---------- body kinds ----------
@@ -1724,6 +2335,9 @@ async fn run_op_body(
         }
         TaskOp::X509CertificatePipe(c) => {
             return synth_cert_pipe(c);
+        }
+        TaskOp::Tempfile(t) => {
+            return synth_tempfile(t);
         }
         _ => {}
     }
@@ -2270,9 +2884,13 @@ fn synth_csr_pipe_from_pem(c: &OpenSslCsrPipeOp, pem: Vec<u8>) -> BodyResult {
     let csr_pem = match crate::x509::generate_csr(&crate::x509::CsrParams {
         privkey_pem: pem,
         common_name: c.common_name.clone(),
+        country_name: c.country_name.clone(),
+        organization_name: c.organization_name.clone(),
+        organizational_unit_name: c.organizational_unit_name.clone(),
         subject_alt_name: c.subject_alt_name.clone(),
         key_usage: c.key_usage.clone(),
         extended_key_usage: c.extended_key_usage.clone(),
+        basic_constraints: c.basic_constraints.clone(),
     }) {
         Ok(b) => b,
         Err(e) => {
@@ -2285,8 +2903,14 @@ fn synth_csr_pipe_from_pem(c: &OpenSslCsrPipeOp, pem: Vec<u8>) -> BodyResult {
     };
     let csr_str = String::from_utf8_lossy(&csr_pem).into_owned();
     let mut rv = RegisterValue::default();
+    // Ansible's `community.crypto.openssl_csr_pipe` returns the PEM
+    // under `.csr` (canonical Ansible spelling) and also under
+    // `.content` (for symmetry with other `_pipe` modules). We emit
+    // both so chained playbooks work regardless of which key they
+    // reference downstream.
     rv.extra
-        .insert("content".into(), JsonValue::String(csr_str));
+        .insert("content".into(), JsonValue::String(csr_str.clone()));
+    rv.extra.insert("csr".into(), JsonValue::String(csr_str));
     BodyResult::Ok {
         register: rv,
         changed: false,
@@ -2406,9 +3030,30 @@ fn synth_cert_pipe(c: &X509CertificatePipeOp) -> BodyResult {
             conn_alive: true,
         };
     }
+    // Resolve the privkey PEM from either `privatekey_content` (inline
+    // PEM, typically chained from a register) or `privatekey_path`
+    // (controller-side file read). The parser already enforced
+    // exactly-one-of, and render_op rendered both.
+    let privkey_pem: Vec<u8> = if !c.privatekey_path.is_empty() {
+        match std::fs::read(&c.privatekey_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!(
+                        "x509_certificate_pipe: reading privatekey_path {:?} failed: {e}",
+                        c.privatekey_path
+                    ),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        }
+    } else {
+        c.privatekey_content.as_bytes().to_vec()
+    };
     let cert_pem = match crate::x509::generate_selfsigned_cert(&crate::x509::SelfSignedCertParams {
         csr_pem: c.csr_content.as_bytes().to_vec(),
-        privkey_pem: c.privatekey_content.as_bytes().to_vec(),
+        privkey_pem,
         valid_for_days: c.valid_for_days,
     }) {
         Ok(b) => b,
@@ -2422,11 +3067,100 @@ fn synth_cert_pipe(c: &X509CertificatePipeOp) -> BodyResult {
     };
     let cert_str = String::from_utf8_lossy(&cert_pem).into_owned();
     let mut rv = RegisterValue::default();
+    // Ansible's `community.crypto.x509_certificate_pipe` returns both
+    // `.content` and `.certificate` keyed to the same PEM. Emit both
+    // so playbooks referencing either spelling work.
     rv.extra
-        .insert("content".into(), JsonValue::String(cert_str));
+        .insert("content".into(), JsonValue::String(cert_str.clone()));
+    rv.extra
+        .insert("certificate".into(), JsonValue::String(cert_str));
     BodyResult::Ok {
         register: rv,
         changed: false,
+        skipped: false,
+    }
+}
+
+/// `tempfile:` — create a temp file or directory on the **controller**
+/// filesystem and bind `register.path` to the absolute path. v1 is
+/// controller-side only; see ANSIBLE_COMPAT.md for the divergence (real
+/// Ansible runs this on the target host).
+///
+/// Random suffix uses 12 chars from a URL-safe alphabet — wide enough
+/// to avoid collisions in practice without bloating the path. Failure
+/// to create (parent dir absent, permission denied, etc.) is reported
+/// as a normal task failure with a useful reason; the register on
+/// success contains both `path` and `state` for Ansible parity.
+fn synth_tempfile(t: &TempfileOp) -> BodyResult {
+    use std::path::PathBuf;
+
+    let parent: PathBuf = match &t.path {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => std::env::temp_dir(),
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&t.prefix).suffix(&t.suffix);
+    // 12 hex chars (~48 bits of entropy) — plenty for uniqueness while
+    // keeping the filename short.
+    builder.rand_bytes(12);
+
+    let (full_path, state_str) = match t.state {
+        TempfileKind::File => {
+            let f = match builder.tempfile_in(&parent) {
+                Ok(f) => f,
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!(
+                            "tempfile: creating file under {parent:?} failed: {e}"
+                        ),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            };
+            // `keep()` detaches the NamedTempFile so the file survives
+            // drop — matches Ansible's contract that the path remains
+            // valid for downstream tasks to consume.
+            match f.keep() {
+                Ok((_file, path)) => (path, "file"),
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!("tempfile: persisting temp file failed: {e}"),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            }
+        }
+        TempfileKind::Directory => {
+            let d = match builder.tempdir_in(&parent) {
+                Ok(d) => d,
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!(
+                            "tempfile: creating directory under {parent:?} failed: {e}"
+                        ),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            };
+            // Same rationale as the file branch: detach so the dir
+            // outlives this scope.
+            (d.keep(), "directory")
+        }
+    };
+
+    let mut rv = RegisterValue::default();
+    rv.extra.insert(
+        "path".into(),
+        JsonValue::String(full_path.to_string_lossy().into_owned()),
+    );
+    rv.extra
+        .insert("state".into(), JsonValue::String(state_str.to_string()));
+    BodyResult::Ok {
+        register: rv,
+        changed: true,
         skipped: false,
     }
 }
@@ -2444,8 +3178,9 @@ fn run_assert_body(
                 Ok(v) if v.is_true() => continue,
                 Ok(_) => {
                     let reason = a
-                        .msg
-                        .clone()
+                        .fail_msg
+                        .as_ref()
+                        .map(|m| render_str(env, m, &view).unwrap_or_else(|_| m.clone()))
                         .unwrap_or_else(|| format!("assertion failed: {expr}"));
                     let mut rv = RegisterValue::default();
                     rv.failed = true;
@@ -2914,6 +3649,8 @@ fn render_op(
                 src: c.src.clone(),
                 dest,
                 mode: c.mode,
+                owner: c.owner.clone(),
+                group: c.group.clone(),
                 body: c.body.clone(),
             })
         }
@@ -3114,25 +3851,62 @@ fn render_op(
                 .iter()
                 .map(|s| render_str(env, s, &view))
                 .collect::<Result<Vec<_>>>()?;
+            // DN fields are typically literal but accept Jinja so things
+            // like `organization_name: "{{ org }}"` work without ceremony.
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            let country_name = render_if(&c.country_name)?;
+            let organization_name = render_if(&c.organization_name)?;
+            let organizational_unit_name = render_if(&c.organizational_unit_name)?;
+            // basic_constraints: the per-entry strings (`CA:TRUE`,
+            // `pathlen:0`) are typically literal but render them in
+            // case someone parameterizes (e.g.
+            // `pathlen:{{ chain_depth }}`).
+            let basic_constraints = c
+                .basic_constraints
+                .iter()
+                .map(|s| render_str(env, s, &view))
+                .collect::<Result<Vec<_>>>()?;
             TaskOp::OpenSslCsrPipe(OpenSslCsrPipeOp {
                 privatekey_path,
                 common_name,
+                country_name,
+                organization_name,
+                organizational_unit_name,
                 subject_alt_name,
                 key_usage,
                 extended_key_usage,
+                basic_constraints,
+                basic_constraints_critical: c.basic_constraints_critical,
+                key_usage_critical: c.key_usage_critical,
             })
         }
         TaskOp::X509CertificatePipe(c) => {
-            // CSR + key PEMs almost always come from previous-task
-            // registers via Jinja, so they MUST be rendered before
-            // we hand them to rcgen.
+            // CSR + key PEMs / paths almost always come from
+            // previous-task registers via Jinja, so they MUST be
+            // rendered before we hand them to rcgen / the filesystem.
             let csr_content = render_str(env, &c.csr_content, &view)?;
-            let privatekey_content = render_str(env, &c.privatekey_content, &view)?;
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            let privatekey_content = render_if(&c.privatekey_content)?;
+            let privatekey_path = render_if(&c.privatekey_path)?;
             TaskOp::X509CertificatePipe(X509CertificatePipeOp {
                 csr_content,
                 privatekey_content,
+                privatekey_path,
                 provider: c.provider.clone(),
                 valid_for_days: c.valid_for_days,
+                selfsigned_digest: c.selfsigned_digest.clone(),
             })
         }
         TaskOp::PostgresqlQuery(p) => {
@@ -3248,6 +4022,21 @@ fn render_op(
                 exclude,
             })
         }
+        TaskOp::Tempfile(t) => {
+            // Every string field is Jinja-templatable; the typical use
+            // is `suffix: "_{{ inventory_hostname }}"` or a Jinja-rendered
+            // parent `path:`.
+            let path = match &t.path {
+                Some(p) => Some(render_str(env, p, &view)?),
+                None => None,
+            };
+            TaskOp::Tempfile(TempfileOp {
+                state: t.state,
+                suffix: render_str(env, &t.suffix, &view)?,
+                prefix: render_str(env, &t.prefix, &view)?,
+                path,
+            })
+        }
     })
 }
 
@@ -3297,11 +4086,23 @@ fn resolve_loop_items(
 ) -> Result<Vec<JsonValue>> {
     let Some(spec) = spec else { return Ok(Vec::new()) };
     match spec {
-        LoopSpec::Items(items) => items
-            .iter()
-            .cloned()
-            .map(yaml_to_json)
-            .collect::<Result<Vec<_>>>(),
+        LoopSpec::Items(items) => {
+            // Each item is a raw YAML value from the playbook source. Render
+            // any Jinja inside string scalars (recursively into sequences and
+            // mappings) against the per-host template context — Ansible loop
+            // items get one render pass per evaluation, so `loop: ["{{ x }}",
+            // "{{ y }}"]` resolves before `src: "{{ item }}"` substitutes.
+            let view = build_template_ctx(ctx, world);
+            items
+                .iter()
+                .cloned()
+                .map(|item| {
+                    let mut json = yaml_to_json(item)?;
+                    render_json_strings(env, &mut json, &view)?;
+                    Ok(json)
+                })
+                .collect::<Result<Vec<_>>>()
+        }
         LoopSpec::Expr(s) => {
             let view = build_template_ctx(ctx, world);
             // Render as a template, then re-parse the resulting string
@@ -3323,6 +4124,38 @@ fn resolve_loop_items(
             }
         }
     }
+}
+
+/// Walk a JSON value, rendering every string scalar through the template
+/// engine in place. Used for loop items: `loop: ["{{ vars_file }}", ...]`
+/// must resolve to real paths *before* the per-iteration body renders
+/// `src: "{{ item }}"`. Without this, the body sees `item = "{{ vars_file }}"`
+/// and emits the literal template string downstream.
+fn render_json_strings(
+    env: &Environment<'static>,
+    value: &mut JsonValue,
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<()> {
+    match value {
+        JsonValue::String(s) => {
+            if s.contains("{{") || s.contains("{%") {
+                let rendered = render_str(env, s, view)?;
+                *s = rendered;
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                render_json_strings(env, item, view)?;
+            }
+        }
+        JsonValue::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                render_json_strings(env, v, view)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn mjvalue_to_json(v: &minijinja::Value) -> Result<JsonValue> {
@@ -3547,7 +4380,7 @@ async fn apply_per_host_result(
                 report.tasks_skipped += 1;
             }
         }
-        HostTaskOutcome::Failed { reason } => {
+        HostTaskOutcome::Failed { reason, .. } => {
             report.host_outcomes.insert(
                 name.clone(),
                 HostOutcome::Failed {
@@ -3682,7 +4515,7 @@ async fn run_handlers_one_host(
         .await;
         *ctx = r.ctx;
         ctx.pending_handlers.remove(&handler.name);
-        if let HostTaskOutcome::Failed { reason } = &r.outcome {
+        if let HostTaskOutcome::Failed { reason, .. } = &r.outcome {
             if first_failure.is_none() {
                 first_failure = Some((handler.name.clone(), reason.clone()));
             }
@@ -3695,6 +4528,78 @@ async fn run_handlers_one_host(
 }
 
 // ---------- helpers ----------
+
+/// Per-host transport choice for the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnMode {
+    /// Default: push agent over SSH using the host's inventory coords.
+    Ssh,
+    /// Run agent as a local subprocess on the controller. Picked when
+    /// any play targeting this host declares `connection: local`. The
+    /// host's `ansible_host`/`ansible_user` fields are ignored on this
+    /// path — we exec the agent binary in-process.
+    Local,
+}
+
+/// Resolve each targeted host's transport choice by scanning the
+/// playbook. A host is `Local` iff at least one play with
+/// `connection: local` targets it. Mixing `connection: local` and
+/// `connection: ssh` (or default) for the same host across plays is
+/// rejected at startup — that's a footgun where one play would
+/// silently shell out while another SSH'd, with no diagnostic in the
+/// middle.
+fn resolve_host_connection_modes(
+    playbook: &Playbook,
+    inv: &Inventory,
+    targets: &BTreeSet<String>,
+) -> Result<BTreeMap<String, ConnMode>> {
+    use crate::playbook::Connection;
+    let mut out: BTreeMap<String, ConnMode> = targets
+        .iter()
+        .map(|h| (h.clone(), ConnMode::Ssh))
+        .collect();
+    // Track whether we've ever seen an explicit non-local for each
+    // host so we can detect the conflict cleanly.
+    let mut seen_ssh: BTreeSet<String> = BTreeSet::new();
+    for play in &playbook.plays {
+        let play_mode = match play.connection {
+            Some(Connection::Local) => ConnMode::Local,
+            // `Some(Ssh)` and `None` both mean SSH for our purposes;
+            // we only need to flag the conflict when local was set
+            // elsewhere on the same host.
+            _ => ConnMode::Ssh,
+        };
+        let hosts = resolve_play_targets(&play.hosts, inv);
+        for h in hosts {
+            if !targets.contains(&h) {
+                continue;
+            }
+            match play_mode {
+                ConnMode::Local => {
+                    if seen_ssh.contains(&h) {
+                        anyhow::bail!(
+                            "host {h:?}: targeted by both `connection: local` \
+                             and `connection: ssh` plays in the same run; \
+                             pick one — mixed transport per host is not supported"
+                        );
+                    }
+                    out.insert(h, ConnMode::Local);
+                }
+                ConnMode::Ssh => {
+                    if out.get(&h) == Some(&ConnMode::Local) {
+                        anyhow::bail!(
+                            "host {h:?}: targeted by both `connection: local` \
+                             and `connection: ssh` plays in the same run; \
+                             pick one — mixed transport per host is not supported"
+                        );
+                    }
+                    seen_ssh.insert(h);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
 fn compute_all_targeted_hosts(playbook: &Playbook, inv: &Inventory) -> BTreeSet<String> {
     let mut acc = BTreeSet::new();
@@ -4066,7 +4971,7 @@ mod tests {
         ctx.set_facts.insert("x".into(), serde_json::json!(5));
         let a = AssertTask {
             that: vec!["x > 0".into(), "x < 10".into()],
-            msg: None,
+            fail_msg: None,
         };
         let r = run_assert_body(&a, &ctx, &env, &WorldVars::default());
         assert!(matches!(r, BodyResult::Ok { .. }));
@@ -4079,7 +4984,7 @@ mod tests {
         ctx.set_facts.insert("x".into(), serde_json::json!(0));
         let a = AssertTask {
             that: vec!["x > 0".into()],
-            msg: Some("x must be positive".into()),
+            fail_msg: Some("x must be positive".into()),
         };
         let r = run_assert_body(&a, &ctx, &env, &WorldVars::default());
         match r {
@@ -4232,6 +5137,9 @@ all:
             retries: None,
             delay: None,
             until: None,
+            changed_when: None,
+            failed_when: None,
+            no_log: None,
         }
     }
 
@@ -4240,6 +5148,7 @@ all:
         let task = shell_task_with_ignore(Some(true));
         let outcome = HostTaskOutcome::Failed {
             reason: "exit 1".into(),
+            register: None,
         };
         let got = maybe_ignore_failure(&task, outcome, "h1");
         assert!(matches!(got, HostTaskOutcome::Ok { .. }));
@@ -4251,6 +5160,7 @@ all:
         let task = shell_task_with_ignore(None);
         let outcome = HostTaskOutcome::Failed {
             reason: "exit 1".into(),
+            register: None,
         };
         let got = maybe_ignore_failure(&task, outcome, "h1");
         assert!(matches!(got, HostTaskOutcome::Failed { .. }));
@@ -4262,6 +5172,7 @@ all:
         let task = shell_task_with_ignore(Some(false));
         let outcome = HostTaskOutcome::Failed {
             reason: "exit 1".into(),
+            register: None,
         };
         let got = maybe_ignore_failure(&task, outcome, "h1");
         assert!(matches!(got, HostTaskOutcome::Failed { .. }));
@@ -4306,9 +5217,15 @@ all:
         let op = OpenSslCsrPipeOp {
             privatekey_path: "/etc/x/key.pem".into(),
             common_name: "test-cn".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
             subject_alt_name: vec!["DNS:test.example".into()],
             key_usage: vec![],
             extended_key_usage: vec![],
+            basic_constraints: vec![],
+            basic_constraints_critical: false,
+            key_usage_critical: false,
         };
         let result = synth_csr_pipe_from_pem(&op, key_pem);
         let rv = match result {
@@ -4337,9 +5254,15 @@ all:
         let op = OpenSslCsrPipeOp {
             privatekey_path: "/etc/missing.pem".into(),
             common_name: "x".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
             subject_alt_name: vec![],
             key_usage: vec![],
             extended_key_usage: vec![],
+            basic_constraints: vec![],
+            basic_constraints_critical: false,
+            key_usage_critical: false,
         };
         match synth_csr_pipe_from_pem(&op, b"not a pem file".to_vec()) {
             BodyResult::Failed { reason, .. } => {
@@ -4362,17 +5285,23 @@ all:
         let csr_pem = crate::x509::generate_csr(&crate::x509::CsrParams {
             privkey_pem: key_pem.clone(),
             common_name: "etcd-server".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
             subject_alt_name: vec!["DNS:etcd.local".into()],
             key_usage: vec![],
             extended_key_usage: vec![],
+            basic_constraints: vec![],
         })
         .expect("csr");
 
         let op = X509CertificatePipeOp {
             csr_content: String::from_utf8(csr_pem).unwrap(),
             privatekey_content: String::from_utf8(key_pem).unwrap(),
+            privatekey_path: String::new(),
             provider: "selfsigned".into(),
             valid_for_days: 30,
+            selfsigned_digest: String::new(),
         };
         let rv = match synth_cert_pipe(&op) {
             BodyResult::Ok { register, .. } => register,
@@ -4398,14 +5327,658 @@ all:
         let op = X509CertificatePipeOp {
             csr_content: "x".into(),
             privatekey_content: "y".into(),
+            privatekey_path: String::new(),
             provider: "ownca".into(),
             valid_for_days: 1,
+            selfsigned_digest: String::new(),
         };
         match synth_cert_pipe(&op) {
             BodyResult::Failed { reason, .. } => {
                 assert!(reason.contains("selfsigned"), "got: {reason}");
             }
             BodyResult::Ok { .. } => panic!("expected provider rejection"),
+        }
+    }
+
+    // ---------- block / rescue / always executor matrix ----------
+    //
+    // These tests exercise the block driver end-to-end (parser → load
+    // inheritance pass → `run_task_on_one_host` → `run_block_on_one_host`
+    // → `run_task_list_on_host` → controller-side bodies). They use
+    // only controller-side body kinds (`assert`, `fail`, `debug`,
+    // `set_fact`) so the dummy `ConnHandle` is never touched — no
+    // mocking required.
+
+    fn plain_task(name: &str, body: TaskBody) -> Task {
+        Task {
+            name: name.into(),
+            body,
+            when: None,
+            register: None,
+            loop_spec: None,
+            loop_control: None,
+            tags: Vec::new(),
+            delegate_to: None,
+            run_once: false,
+            notify: Vec::new(),
+            role_dir: None,
+            become_: None,
+            become_user: None,
+            ignore_errors: None,
+            check_mode: None,
+            async_seconds: None,
+            poll_seconds: None,
+            retries: None,
+            delay: None,
+            until: None,
+            changed_when: None,
+            failed_when: None,
+            no_log: None,
+        }
+    }
+
+    fn assert_true(name: &str) -> Task {
+        plain_task(
+            name,
+            TaskBody::Assert(AssertTask {
+                that: vec!["1 == 1".into()],
+                fail_msg: None,
+            }),
+        )
+    }
+
+    fn assert_false(name: &str) -> Task {
+        plain_task(
+            name,
+            TaskBody::Assert(AssertTask {
+                that: vec!["1 == 2".into()],
+                fail_msg: None,
+            }),
+        )
+    }
+
+    fn set_fact(name: &str, key: &str, val_yaml: &str) -> Task {
+        let mut m = BTreeMap::new();
+        m.insert(
+            key.to_string(),
+            serde_yaml::from_str::<serde_yaml::Value>(val_yaml).unwrap(),
+        );
+        plain_task(name, TaskBody::SetFact(SetFactMap(m)))
+    }
+
+    fn block_node(name: &str, tasks: Vec<Task>, rescue: Vec<Task>, always: Vec<Task>) -> Task {
+        plain_task(
+            name,
+            TaskBody::Block(BlockSpec {
+                tasks,
+                rescue,
+                always,
+            }),
+        )
+    }
+
+    /// Construct a dummy ConnHandle that's None — controller-side
+    /// bodies never touch it. Anything that tries to dispatch a wire
+    /// op via this conn would panic at unwrap; failure to use the
+    /// conn is part of the test contract for controller-side blocks.
+    fn dead_conn() -> ConnHandle {
+        Arc::new(TokioMutex::new(None))
+    }
+
+    async fn drive(task: &Task) -> PerHostTaskResult {
+        let conn = dead_conn();
+        let conns_map: Arc<BTreeMap<String, ConnHandle>> = Arc::new(BTreeMap::new());
+        let ctx = HostCtx::new("h1".into());
+        let env = Arc::new(template::make_env());
+        let world = WorldVars::empty();
+        let seq = Arc::new(AtomicU32::new(1));
+        run_task_on_one_host(task, conn, conns_map, ctx, seq, env, world).await
+    }
+
+    fn assert_ok(r: &PerHostTaskResult) {
+        match &r.outcome {
+            HostTaskOutcome::Ok { .. } => {}
+            other => panic!("expected Ok, got: {other:?}"),
+        }
+    }
+    fn assert_failed(r: &PerHostTaskResult, contains: &str) {
+        match &r.outcome {
+            HostTaskOutcome::Failed { reason, .. } => assert!(
+                reason.contains(contains),
+                "reason {reason:?} does not contain {contains:?}"
+            ),
+            other => panic!("expected Failed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_succeeds_when_all_inner_tasks_succeed() {
+        let block = block_node(
+            "outer",
+            vec![assert_true("t1"), set_fact("t2", "x", "1")],
+            vec![],
+            vec![],
+        );
+        let r = drive(&block).await;
+        assert_ok(&r);
+        // set_fact in t2 should have left a side effect on ctx.
+        assert_eq!(
+            r.ctx.set_facts.get("x"),
+            Some(&serde_json::json!(1))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_without_rescue_propagates_failure() {
+        let block = block_node(
+            "outer",
+            vec![assert_true("t1"), assert_false("t2")],
+            vec![],
+            vec![],
+        );
+        let r = drive(&block).await;
+        assert_failed(&r, "assertion failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_with_recovering_rescue_returns_ok() {
+        let block = block_node(
+            "outer",
+            vec![assert_true("t1"), assert_false("t2"), assert_true("t3")],
+            vec![set_fact("recover", "recovered", "true")],
+            vec![],
+        );
+        let r = drive(&block).await;
+        // Rescue recovered the failure — overall Ok.
+        assert_ok(&r);
+        // Rescue ran (side effect visible).
+        assert_eq!(
+            r.ctx.set_facts.get("recovered"),
+            Some(&serde_json::json!(true))
+        );
+        // t3 (after the failed t2) did NOT run — block list stops at
+        // first failure (Ansible behavior).
+        // No direct side effect to test, but the recovery semantic
+        // confirms the rescue path took over after t2.
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_with_failing_rescue_returns_failed_and_runs_always() {
+        let block = block_node(
+            "outer",
+            vec![assert_false("t1")],
+            vec![assert_false("r1")],
+            vec![set_fact("a1", "always_ran", "true")],
+        );
+        let r = drive(&block).await;
+        assert_failed(&r, "assertion failed");
+        // Always still ran despite both block and rescue failing.
+        assert_eq!(
+            r.ctx.set_facts.get("always_ran"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn always_runs_on_success() {
+        let block = block_node(
+            "outer",
+            vec![assert_true("t1")],
+            vec![],
+            vec![set_fact("a1", "always_ran", "true")],
+        );
+        let r = drive(&block).await;
+        assert_ok(&r);
+        assert_eq!(
+            r.ctx.set_facts.get("always_ran"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn always_runs_on_failure_without_rescue() {
+        let block = block_node(
+            "outer",
+            vec![assert_false("t1")],
+            vec![],
+            vec![set_fact("a1", "always_ran", "true")],
+        );
+        let r = drive(&block).await;
+        assert_failed(&r, "assertion failed");
+        assert_eq!(
+            r.ctx.set_facts.get("always_ran"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_block_inner_rescue_isolates_failure() {
+        // outer.tasks = [ inner-block (with rescue), set_fact ]
+        // inner block fails, inner rescue recovers → outer block
+        // continues to set_fact.
+        let inner = block_node(
+            "inner",
+            vec![assert_false("inner-fail")],
+            vec![set_fact("inner-recover", "inner_rec", "true")],
+            vec![],
+        );
+        let outer = block_node(
+            "outer",
+            vec![inner, set_fact("after-inner", "outer_continued", "true")],
+            vec![],
+            vec![],
+        );
+        let r = drive(&outer).await;
+        assert_ok(&r);
+        assert_eq!(
+            r.ctx.set_facts.get("inner_rec"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            r.ctx.set_facts.get("outer_continued"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_block_inner_failure_bubbles_when_no_rescue() {
+        let inner = block_node("inner", vec![assert_false("inner-fail")], vec![], vec![]);
+        let outer = block_node(
+            "outer",
+            vec![inner, set_fact("after-inner", "outer_continued", "true")],
+            vec![],
+            vec![],
+        );
+        let r = drive(&outer).await;
+        // Inner fail bubbles through to outer, which has no rescue.
+        assert_failed(&r, "assertion failed");
+        // The outer's next task (after the failing inner block)
+        // should NOT have run.
+        assert!(!r.ctx.set_facts.contains_key("outer_continued"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescue_sees_ansible_failed_task_var() {
+        // Rescue uses an `assert: { that: ['ansible_failed_task ==
+        // "inner-fail"'] }` to verify the var is exposed during
+        // rescue. If the var weren't set, the assert would fail and
+        // the overall outcome would be Failed.
+        let block = block_node(
+            "outer",
+            vec![assert_false("inner-fail")],
+            vec![plain_task(
+                "verify-failed-task",
+                TaskBody::Assert(AssertTask {
+                    that: vec!["ansible_failed_task == \"inner-fail\"".into()],
+                    fail_msg: Some("rescue did not see the right failed task name".into()),
+                }),
+            )],
+            vec![],
+        );
+        let r = drive(&block).await;
+        assert_ok(&r);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescue_sees_ansible_failed_result_register() {
+        // The failing assert task leaves a register-shape result
+        // with failed=true and rc=1. Rescue should see it.
+        let block = block_node(
+            "outer",
+            vec![assert_false("inner-fail")],
+            vec![plain_task(
+                "check-result",
+                TaskBody::Assert(AssertTask {
+                    that: vec![
+                        "ansible_failed_result.failed == true".into(),
+                        "ansible_failed_result.rc == 1".into(),
+                    ],
+                    fail_msg: None,
+                }),
+            )],
+            vec![],
+        );
+        let r = drive(&block).await;
+        assert_ok(&r);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ansible_failed_vars_cleared_after_rescue_ends() {
+        // After rescue completes and we move into `always`, the
+        // ansible_failed_* vars should be back to their pre-rescue
+        // state (None at top level — should be Undefined in templates).
+        let block = block_node(
+            "outer",
+            vec![assert_false("inner-fail")],
+            vec![assert_true("recover")],
+            vec![plain_task(
+                "after-rescue",
+                TaskBody::Assert(AssertTask {
+                    // minijinja: `is undefined` checks for undefined.
+                    that: vec!["ansible_failed_task is undefined".into()],
+                    fail_msg: Some("ansible_failed_task leaked past rescue".into()),
+                }),
+            )],
+        );
+        let r = drive(&block).await;
+        assert_ok(&r);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_ignore_errors_inherited_to_children_skips_rescue() {
+        // With ignore_errors:true on the block, the cascade pushes
+        // ignore_errors=true into the inner failing task. Its failure
+        // is converted to Ok inside run_task_on_one_host, so the
+        // block driver never sees a failure → rescue is not invoked.
+        // (This matches Ansible's behavior.)
+        //
+        // We bypass the load() pass here because plain_task() doesn't
+        // go through the inheritance pipeline; instead we set
+        // ignore_errors directly on the inner child to simulate the
+        // post-cascade state.
+        let mut inner = assert_false("inner-fail");
+        inner.ignore_errors = Some(true);
+        let block = block_node(
+            "outer",
+            vec![inner],
+            vec![set_fact("rescue-not-run", "rescue_fired", "true")],
+            vec![],
+        );
+        let r = drive(&block).await;
+        assert_ok(&r);
+        // Rescue should NOT have fired — the inner failure was
+        // ignored at child level.
+        assert!(!r.ctx.set_facts.contains_key("rescue_fired"));
+    }
+
+    // ---------- retries: / until: / delay: matrix ----------
+
+    fn fail_task(name: &str, msg: &str) -> Task {
+        plain_task(
+            name,
+            TaskBody::Fail(FailTask { msg: msg.into() }),
+        )
+    }
+
+    /// Drive a task with a pre-built `HostCtx` so tests can preload
+    /// host vars (used by the templating tests for retries/delay).
+    async fn drive_with_ctx(task: &Task, ctx: HostCtx) -> PerHostTaskResult {
+        let conn = dead_conn();
+        let conns_map: Arc<BTreeMap<String, ConnHandle>> = Arc::new(BTreeMap::new());
+        let env = Arc::new(template::make_env());
+        let world = WorldVars::empty();
+        let seq = Arc::new(AtomicU32::new(1));
+        run_task_on_one_host(task, conn, conns_map, ctx, seq, env, world).await
+    }
+
+    /// Pull the register a task wrote to its `register:` slot.
+    fn registered<'a>(r: &'a PerHostTaskResult, name: &str) -> &'a RegisterValue {
+        r.ctx
+            .registers
+            .get(name)
+            .unwrap_or_else(|| panic!("no register named {name:?} on host"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_retry_metadata_runs_once_and_attempts_field_absent() {
+        // assert_true succeeds; with no retries metadata it should run
+        // exactly once and the register's `attempts` should be 0
+        // (i.e. hidden from to_json).
+        let mut t = assert_true("once");
+        t.register = Some("r".into());
+        let r = drive(&t).await;
+        assert_ok(&r);
+        assert_eq!(registered(&r, "r").attempts, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retries_three_means_four_attempts_total() {
+        // Ansible semantics: `retries: 3` = 1 + 3 = 4 total attempts.
+        // We use `fail:` which always fails and no `until:`, so the
+        // loop runs to exhaustion.
+        let mut t = fail_task("always-fail", "boom");
+        t.retries = Some("3".into());
+        t.delay = Some("0".into());
+        let r = drive(&t).await;
+        assert_failed(&r, "boom");
+        // The Failed outcome carries the failing register; assert its
+        // attempts == 4.
+        match &r.outcome {
+            HostTaskOutcome::Failed { register, .. } => {
+                let rv = register.as_ref().expect("fail body provides a register");
+                assert_eq!(rv.attempts, 4);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn until_set_but_retries_unset_defaults_to_three_retries() {
+        // No `retries:` but `until:` set → Ansible default of 3 retries
+        // (4 total attempts). `until: "false"` is never truthy, so the
+        // loop exhausts.
+        let mut t = fail_task("flaky", "oops");
+        t.register = Some("r".into());
+        t.until = Some("false".into());
+        t.delay = Some("0".into());
+        let r = drive(&t).await;
+        assert_failed(&r, "oops");
+        assert_eq!(registered(&r, "r").attempts, 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_stops_on_first_success_without_until() {
+        // First attempt succeeds → break immediately, no retries
+        // consumed. `retries: 5` is the budget but only attempt 1 ran.
+        let mut t = assert_true("succeed");
+        t.register = Some("r".into());
+        t.retries = Some("5".into());
+        t.delay = Some("0".into());
+        let r = drive(&t).await;
+        assert_ok(&r);
+        assert_eq!(registered(&r, "r").attempts, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn until_truthy_breaks_loop_even_on_failed_attempt() {
+        // `until: "true"` exits immediately after attempt 1, regardless
+        // of whether the body succeeded. The task's outcome is the
+        // body's outcome (Failed here) — `until` controls retry
+        // termination, NOT success/failure classification.
+        let mut t = fail_task("fails-but-until-truthy", "nope");
+        t.register = Some("r".into());
+        t.until = Some("true".into());
+        t.retries = Some("5".into());
+        t.delay = Some("0".into());
+        let r = drive(&t).await;
+        assert_failed(&r, "nope");
+        match &r.outcome {
+            HostTaskOutcome::Failed { register, .. } => {
+                assert_eq!(register.as_ref().unwrap().attempts, 1);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn until_falsey_with_succeeded_attempt_keeps_retrying_then_fails() {
+        // set_fact (always succeeds) + impossible `until` → exhausts the
+        // full retry budget. Final outcome is Failed (Ansible parity:
+        // retries exhausted without `until:` ever truthy flags the
+        // task failed even when the body succeeded each time).
+        // `attempts == 1 + retries`.
+        let mut t = set_fact("incr", "v", "1");
+        t.register = Some("r".into());
+        t.until = Some("false".into());
+        t.retries = Some("2".into());
+        t.delay = Some("0".into());
+        let r = drive(&t).await;
+        assert_failed(&r, "did not satisfy `until:`");
+        assert_eq!(registered(&r, "r").attempts, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ignore_errors_applies_after_retries_exhaust() {
+        // Retries should run to exhaustion BEFORE ignore_errors flips
+        // the outcome — so we get the full retry budget AND an Ok
+        // outcome.
+        let mut t = fail_task("ignored-after-retries", "ignored");
+        t.register = Some("r".into());
+        t.retries = Some("2".into());
+        t.delay = Some("0".into());
+        t.ignore_errors = Some(true);
+        let r = drive(&t).await;
+        assert_ok(&r);
+        assert_eq!(registered(&r, "r").attempts, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retries_template_renders_from_host_vars() {
+        // `retries: "{{ count }}"` resolves to 2 against a host fact,
+        // yielding 3 total attempts (1 + 2).
+        let mut t = fail_task("templated", "kaboom");
+        t.register = Some("r".into());
+        t.retries = Some("{{ count }}".into());
+        t.delay = Some("0".into());
+
+        let mut ctx = HostCtx::new("h1".into());
+        ctx.set_facts.insert("count".into(), serde_json::json!(2));
+        let r = drive_with_ctx(&t, ctx).await;
+        assert_failed(&r, "kaboom");
+        assert_eq!(registered(&r, "r").attempts, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delay_template_renders_from_host_vars() {
+        // `delay: "{{ d }}"` rendering — combined with tokio pause, we
+        // verify the elapsed virtual time matches the rendered delay.
+        // 2 retries × 0.1s = 0.2s of sleep before the third (final)
+        // attempt completes.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut t = fail_task("timed", "tick");
+        t.retries = Some("2".into());
+        t.delay = Some("{{ d }}".into());
+        let mut ctx = HostCtx::new("h1".into());
+        ctx.set_facts.insert("d".into(), serde_json::json!(0.1));
+
+        let driver = drive_with_ctx(&t, ctx);
+        tokio::pin!(driver);
+        // Loop: poll the driver; whenever it parks on a sleep,
+        // advance virtual time. This is the standard tokio::time::pause
+        // pattern for measuring sleep-based delays without wall-clock
+        // dependence.
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                r = &mut driver => break r,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+        assert_failed(&outcome, "tick");
+        let elapsed = started.elapsed();
+        // 2 sleeps × 100ms each = 200ms minimum.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "expected >= 200ms virtual elapsed, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retries_render_failure_bubbles_as_body_failure() {
+        // `retries:` that fails to render (or parse to an int) →
+        // surfaces as a single Failed for the task with the render
+        // error as the reason. No body dispatch happens.
+        let mut t = assert_true("would-have-succeeded");
+        t.retries = Some("not a number".into());
+        let r = drive(&t).await;
+        assert_failed(&r, "retries:");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delay_template_render_failure_bubbles_as_body_failure() {
+        let mut t = fail_task("dummy", "x");
+        t.retries = Some("2".into());
+        t.delay = Some("nan-cake".into());
+        let r = drive(&t).await;
+        assert_failed(&r, "delay:");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn until_render_failure_bubbles_as_body_failure() {
+        // A bogus `until:` Jinja expression surfaces with the until:
+        // prefix so users can grep the error back to the task field.
+        let mut t = fail_task("u", "x");
+        t.register = Some("r".into());
+        t.until = Some("this is { not valid jinja".into());
+        t.retries = Some("1".into());
+        t.delay = Some("0".into());
+        let r = drive(&t).await;
+        assert_failed(&r, "until:");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn negative_delay_clamps_to_one_second() {
+        // delay: -3 → clamped to 1.0s. Use pause+advance to verify
+        // we awaited ~1s (between attempts 1 and 2 — only one sleep
+        // happens for retries: 1).
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut t = fail_task("neg-delay", "x");
+        t.retries = Some("1".into());
+        t.delay = Some("-3".into());
+        let driver = drive(&t);
+        tokio::pin!(driver);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                r = &mut driver => break r,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        };
+        assert_failed(&outcome, "x");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1000),
+            "expected >= 1000ms virtual elapsed (clamp), got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn looped_task_gets_per_iteration_retry_budget() {
+        // 3 loop items × (1 + retries:1) = 6 total body invocations.
+        // The aggregate register's `results` array should have 3
+        // entries, each with attempts == 2.
+        let mut t = fail_task("loop-with-retry", "boom on item {{ item }}");
+        t.register = Some("agg".into());
+        t.retries = Some("1".into());
+        t.delay = Some("0".into());
+        t.loop_spec = Some(LoopSpec::Items(vec![
+            serde_yaml::Value::String("a".into()),
+            serde_yaml::Value::String("b".into()),
+            serde_yaml::Value::String("c".into()),
+        ]));
+        let r = drive(&t).await;
+        // Outcome is Failed (every iteration failed); the looped path
+        // surfaces an aggregate register on the Failed outcome.
+        match &r.outcome {
+            HostTaskOutcome::Failed { register, .. } => {
+                let agg = register.as_ref().expect("loop failure carries aggregate register");
+                let results = agg.results.as_ref().expect("loop produces results array");
+                assert_eq!(results.len(), 3, "one register per loop item");
+                for (i, item_rv) in results.iter().enumerate() {
+                    assert_eq!(
+                        item_rv.attempts, 2,
+                        "iter {i} should have run 2 attempts, got {}",
+                        item_rv.attempts
+                    );
+                }
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 }

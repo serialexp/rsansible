@@ -22,13 +22,14 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
-    classify_sql_readonly, AssertTask, BlockInFileOp, BlockInFileState, CommandOp, CopyOp,
-    DebugTask, ExecOp,
+    classify_sql_readonly, AssertTask, BlockInFileOp, BlockInFileState, BlockSpec, CommandOp,
+    CopyOp, DebugTask, ExecOp,
     FailTask, FileOp, FileState, GetUrlOp, IncludeRoleSpec, LineInFileOp, LineInFileState,
     LoopControl, LoopSpec, MetaAction, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageManager,
     PackageOp, PackageState, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp,
-    StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp, UfwOp, UfwOpKind,
-    UnarchiveOp, UriOp, WaitForOp, WaitForState, WriteFileOp, X509CertificatePipeOp,
+    StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp, TempfileKind, TempfileOp,
+    UfwOp, UfwOpKind, UnarchiveOp, UriOp, WaitForOp, WaitForState, WriteFileOp,
+    X509CertificatePipeOp,
 };
 pub use validate::validate;
 
@@ -103,6 +104,72 @@ pub struct Play {
     /// run time; defaults to `"root"` when unset.
     #[serde(default)]
     pub become_user: Option<String>,
+    /// Play-level `connection:` setting (Ansible). Controls how the
+    /// controller reaches managed hosts:
+    ///
+    /// - `ssh` / `smart` — the rsansible default: push the agent over
+    ///   SSH and dispatch ops. We accept either spelling.
+    /// - `local` — run tasks against the controller's filesystem
+    ///   *without* SSH (skip the agent push). Honored only when the
+    ///   play also has `hosts: localhost` (or maps to it after
+    ///   inventory resolution); rejected otherwise to avoid the
+    ///   "silently runs on the wrong machine" Ansible footgun.
+    ///
+    /// Any other connection plugin (`paramiko_ssh`, `winrm`, `docker`,
+    /// …) is rejected at parse time with a "not supported" message.
+    /// `None` (the default) is equivalent to `ssh`.
+    ///
+    /// Runtime semantics for `local`: not yet wired — the parser
+    /// accepts the field so playbooks load, but the orchestrator
+    /// will surface a clear "controller-side execution not yet
+    /// implemented" error when it tries to dispatch.
+    #[serde(default, deserialize_with = "deserialize_connection")]
+    pub connection: Option<Connection>,
+    /// `serial:` — rolling-batch size. Ansible runs the play across
+    /// `serial` hosts at a time instead of all-at-once, draining each
+    /// batch before starting the next. Accepted forms:
+    ///   - integer `serial: 1` — exactly N hosts per batch
+    ///   - percentage `serial: "20%"` — N% of the targeted hosts
+    ///   - list `serial: [1, 5, "20%"]` — ramp up across batches
+    ///
+    /// **Parsed but not yet honored** — the orchestrator currently
+    /// runs every targeted host concurrently (modulo `--concurrency`
+    /// on the connect phase). When rolling batches land, this is the
+    /// field that drives them. Storing the raw YAML value avoids
+    /// committing to a representation before the runtime semantics
+    /// are pinned down.
+    #[serde(default)]
+    pub serial: Option<serde_yaml::Value>,
+}
+
+/// The two connection plugins rsansible recognizes. Mirrors Ansible's
+/// `connection:` setting; everything else (paramiko_ssh, winrm, docker,
+/// …) is rejected at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connection {
+    /// Push the agent over SSH and dispatch ops. The default.
+    Ssh,
+    /// Run on the controller without SSH. Requires `hosts: localhost`.
+    Local,
+}
+
+fn deserialize_connection<'de, D>(d: D) -> Result<Option<Connection>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: Option<String> = Option::deserialize(d)?;
+    match s.as_deref() {
+        None => Ok(None),
+        // `smart` is Ansible's pick-the-best-SSH-impl shim; for our
+        // purposes it's the same as `ssh`.
+        Some("ssh") | Some("smart") => Ok(Some(Connection::Ssh)),
+        Some("local") => Ok(Some(Connection::Local)),
+        Some(other) => Err(D::Error::custom(format!(
+            "connection: {other:?} is not supported by rsansible \
+             (accepted values: `ssh`, `smart`, `local`)"
+        ))),
+    }
 }
 
 fn default_gather_facts() -> bool {
@@ -215,6 +282,14 @@ pub fn load(path: &Path) -> Result<Playbook> {
     role::load_copy_files(&mut pb, base)
         .with_context(|| format!("loading copy sources in {}", path.display()))?;
     inherit_become_defaults(&mut pb);
+    // Push block-level metadata down into block children. Must run
+    // AFTER inherit_become_defaults so that block-level become/
+    // become_user values inherited from the play also cascade into
+    // the block's children.
+    for play in &mut pb.plays {
+        inherit_block_metadata(&mut play.tasks);
+        inherit_block_metadata(&mut play.handlers);
+    }
     Ok(pb)
 }
 
@@ -333,6 +408,112 @@ fn inherit_become_defaults(pb: &mut Playbook) {
                 task.become_user = play_become_user.clone();
             }
         }
+    }
+}
+
+/// Push block-level metadata down into each block's child tasks
+/// (`tasks`, `rescue`, `always`), recursively. Matches Ansible's
+/// inheritance semantics so block-level `become:` / `when:` / `tags:`
+/// etc. apply to every nested task without per-task duplication.
+///
+/// Per-field merge rules (parent = block-container task, child =
+/// inner task):
+/// - `when`: AND-join — `(parent) and (child)` if both set, else
+///   whichever is set, else None. Both sides preserve full Jinja.
+/// - `tags`: union (parent's tags are appended to child's, dedup'd).
+/// - `become`, `become_user`, `ignore_errors`, `check_mode`,
+///   `delegate_to`: child's explicit `Some(_)` wins; otherwise the
+///   parent's value cascades. (`become: false` on a child opts the
+///   child out of an inherited `become: true`.)
+/// - `loop_spec` / `loop_control`: NEVER pushed down. The block as
+///   a whole is the loop unit — the block executor iterates and
+///   sets `item` in scope for the children, but the children's own
+///   `loop:` (if any) is a separate per-child loop.
+/// - `register` / `notify` / `run_once` / `retries` / `until` /
+///   `delay` / `async` / `poll`: rejected at parse time on a block,
+///   so no merge logic is needed.
+///
+/// Called recursively on each block's children too, so nested blocks
+/// see the full inheritance chain at every depth.
+fn inherit_block_metadata(tasks: &mut Vec<Task>) {
+    for task in tasks.iter_mut() {
+        if matches!(&task.body, TaskBody::Block(_)) {
+            push_block_metadata_to_children(task);
+            // Recurse: the block's children may themselves be blocks
+            // (nested case) and need their own metadata pushed down.
+            if let TaskBody::Block(b) = &mut task.body {
+                inherit_block_metadata(&mut b.tasks);
+                inherit_block_metadata(&mut b.rescue);
+                inherit_block_metadata(&mut b.always);
+            }
+        }
+    }
+}
+
+fn push_block_metadata_to_children(block_task: &mut Task) {
+    // Snapshot the block container's metadata. We have to clone the
+    // Optional fields because we need to assign them into multiple
+    // children below, and `&mut self` aliasing rules force us to
+    // detach the snapshot from the block before borrowing children.
+    let parent_when = block_task.when.clone();
+    let parent_tags = block_task.tags.clone();
+    let parent_become = block_task.become_;
+    let parent_become_user = block_task.become_user.clone();
+    let parent_ignore_errors = block_task.ignore_errors;
+    let parent_check_mode = block_task.check_mode;
+    let parent_delegate_to = block_task.delegate_to.clone();
+
+    let block = match &mut block_task.body {
+        TaskBody::Block(b) => b,
+        _ => return,
+    };
+
+    let apply = |child: &mut Task| {
+        // when: AND-join (parent) and (child). Parentheses preserve
+        // operator-precedence safety — `a or b` AND `c` should bind
+        // as `(a or b) and (c)`, not `a or b and c`. (minijinja uses
+        // Python-style precedence where `and` binds tighter than
+        // `or`, so this matters.)
+        match (&parent_when, &child.when) {
+            (Some(p), Some(c)) => {
+                child.when = Some(format!("({p}) and ({c})"));
+            }
+            (Some(p), None) => {
+                child.when = Some(p.clone());
+            }
+            _ => {}
+        }
+        // tags: union, preserving child's order then parent's
+        // remainder. Dedup linearly — tag lists are short.
+        for t in &parent_tags {
+            if !child.tags.contains(t) {
+                child.tags.push(t.clone());
+            }
+        }
+        if child.become_.is_none() {
+            child.become_ = parent_become;
+        }
+        if child.become_user.is_none() {
+            child.become_user = parent_become_user.clone();
+        }
+        if child.ignore_errors.is_none() {
+            child.ignore_errors = parent_ignore_errors;
+        }
+        if child.check_mode.is_none() {
+            child.check_mode = parent_check_mode;
+        }
+        if child.delegate_to.is_none() {
+            child.delegate_to = parent_delegate_to.clone();
+        }
+    };
+
+    for child in block
+        .tasks
+        .iter_mut()
+        .chain(block.rescue.iter_mut())
+        .chain(block.always.iter_mut())
+    {
+        apply(child);
     }
 }
 
@@ -819,6 +1000,8 @@ all:
                 role_defaults: BTreeMap::new(),
                 become_: None,
                 become_user: None,
+                connection: None,
+                serial: None,
             }],
         };
         let err = validate(&pb, None).unwrap_err();
@@ -932,5 +1115,266 @@ all:
         // `ansible_become` at run time.
         assert_eq!(pb.plays[0].tasks[0].become_, None);
         assert_eq!(pb.plays[0].tasks[0].become_user, None);
+    }
+
+    // ---------- block-level metadata inheritance ----------
+
+    fn write_and_load(yaml: &str) -> Playbook {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pb_path = dir.path().join("pb.yml");
+        std::fs::write(&pb_path, yaml).unwrap();
+        let pb = load(&pb_path).unwrap();
+        // Keep the tempdir alive past load — leak it. Tests are small,
+        // and the tempdir cleanup at process exit is fine here.
+        std::mem::forget(dir);
+        pb
+    }
+
+    fn block_children(t: &Task) -> &BlockSpec {
+        match &t.body {
+            TaskBody::Block(b) => b,
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_pushes_when_down_to_children_with_and_join() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      when: outer_ok | bool
+      block:
+        - name: bare
+          shell: echo hi
+        - name: with-when
+          when: extra
+          shell: echo hi
+"#,
+        );
+        let b = block_children(&pb.plays[0].tasks[0]);
+        // Child without a `when:` of its own picks up the block's
+        // verbatim.
+        assert_eq!(b.tasks[0].when.as_deref(), Some("outer_ok | bool"));
+        // Child with its own `when:` gets the AND-joined form,
+        // parenthesized to preserve precedence.
+        assert_eq!(
+            b.tasks[1].when.as_deref(),
+            Some("(outer_ok | bool) and (extra)")
+        );
+    }
+
+    #[test]
+    fn block_pushes_become_down_unless_child_overrides() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      become: true
+      become_user: postgres
+      block:
+        - name: inherits
+          shell: echo hi
+        - name: opts-out
+          become: false
+          shell: echo hi
+        - name: overrides-user
+          become_user: www-data
+          shell: echo hi
+"#,
+        );
+        let b = block_children(&pb.plays[0].tasks[0]);
+        assert_eq!(b.tasks[0].become_, Some(true));
+        assert_eq!(b.tasks[0].become_user.as_deref(), Some("postgres"));
+        // Explicit `become: false` on child stays.
+        assert_eq!(b.tasks[1].become_, Some(false));
+        // become_user still inherits even when become is explicit-false
+        // (that's how Ansible does it — the user override is
+        // independent of the become flag).
+        assert_eq!(b.tasks[1].become_user.as_deref(), Some("postgres"));
+        // Explicit become_user on child stays; become inherits.
+        assert_eq!(b.tasks[2].become_, Some(true));
+        assert_eq!(b.tasks[2].become_user.as_deref(), Some("www-data"));
+    }
+
+    #[test]
+    fn block_pushes_tags_as_union() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      tags: [db, slow]
+      block:
+        - name: child-no-tags
+          shell: echo hi
+        - name: child-with-tags
+          tags: [migration, db]
+          shell: echo hi
+"#,
+        );
+        let b = block_children(&pb.plays[0].tasks[0]);
+        // Bare child gets the block's tags.
+        assert_eq!(b.tasks[0].tags, vec!["db", "slow"]);
+        // Child with its own tags gets the union (child order first,
+        // then parent's tags not already present — `db` is in both,
+        // appears once).
+        assert_eq!(b.tasks[1].tags, vec!["migration", "db", "slow"]);
+    }
+
+    #[test]
+    fn block_pushes_ignore_errors_and_check_mode_down() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      ignore_errors: true
+      check_mode: false
+      block:
+        - name: inherits
+          shell: echo hi
+        - name: opts-out-of-ignore
+          ignore_errors: false
+          shell: echo hi
+"#,
+        );
+        let b = block_children(&pb.plays[0].tasks[0]);
+        assert_eq!(b.tasks[0].ignore_errors, Some(true));
+        assert_eq!(b.tasks[0].check_mode, Some(false));
+        // Explicit false on child stays.
+        assert_eq!(b.tasks[1].ignore_errors, Some(false));
+        assert_eq!(b.tasks[1].check_mode, Some(false));
+    }
+
+    #[test]
+    fn block_pushes_delegate_to_down() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      delegate_to: localhost
+      block:
+        - name: inherits
+          shell: echo hi
+        - name: overrides
+          delegate_to: bastion
+          shell: echo hi
+"#,
+        );
+        let b = block_children(&pb.plays[0].tasks[0]);
+        assert_eq!(b.tasks[0].delegate_to.as_deref(), Some("localhost"));
+        assert_eq!(b.tasks[1].delegate_to.as_deref(), Some("bastion"));
+    }
+
+    #[test]
+    fn block_pushes_metadata_to_rescue_and_always_arms() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      become: true
+      tags: [db]
+      block:
+        - name: main
+          shell: echo hi
+      rescue:
+        - name: recover
+          shell: echo recover
+      always:
+        - name: cleanup
+          shell: echo cleanup
+"#,
+        );
+        let b = block_children(&pb.plays[0].tasks[0]);
+        assert_eq!(b.rescue[0].become_, Some(true));
+        assert_eq!(b.rescue[0].tags, vec!["db"]);
+        assert_eq!(b.always[0].become_, Some(true));
+        assert_eq!(b.always[0].tags, vec!["db"]);
+    }
+
+    #[test]
+    fn nested_block_inheritance_walks_recursively() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      become: true
+      tags: [outer-tag]
+      block:
+        - name: middle
+          when: middle_ok
+          block:
+            - name: inner
+              when: inner_ok
+              shell: echo hi
+"#,
+        );
+        let outer = block_children(&pb.plays[0].tasks[0]);
+        let middle = &outer.tasks[0];
+        // Middle inherits outer's metadata.
+        assert_eq!(middle.become_, Some(true));
+        assert!(middle.tags.contains(&"outer-tag".to_string()));
+        let middle_b = match &middle.body {
+            TaskBody::Block(b) => b,
+            other => panic!("expected nested Block, got {other:?}"),
+        };
+        let inner = &middle_b.tasks[0];
+        // Inner inherits the full chain: become from outer (via middle),
+        // tags from outer (via middle), when AND-joined through both
+        // levels.
+        assert_eq!(inner.become_, Some(true));
+        assert!(inner.tags.contains(&"outer-tag".to_string()));
+        // The when: chain — middle has `middle_ok`, inner has
+        // `inner_ok`, outer doesn't set when so middle's effective is
+        // just `middle_ok` (the AND-join only triggers when both sides
+        // exist). Then inner gets `(middle_ok) and (inner_ok)`.
+        assert_eq!(
+            inner.when.as_deref(),
+            Some("(middle_ok) and (inner_ok)")
+        );
+    }
+
+    #[test]
+    fn block_loop_not_pushed_down_to_children() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      loop: [a, b, c]
+      block:
+        - name: inner
+          shell: "echo {{ item }}"
+"#,
+        );
+        let outer = &pb.plays[0].tasks[0];
+        // Outer keeps the loop.
+        assert!(outer.loop_spec.is_some());
+        let b = block_children(outer);
+        // Inner does NOT get a loop_spec pushed down — the block
+        // itself iterates, with `item` in scope.
+        assert!(b.tasks[0].loop_spec.is_none());
     }
 }

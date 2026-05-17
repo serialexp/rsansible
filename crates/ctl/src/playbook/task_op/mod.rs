@@ -54,7 +54,10 @@ mod postgresql;
 mod get_url;
 mod slurp;
 mod unarchive;
+mod tempfile;
+mod block;
 
+pub use block::BlockSpec;
 pub use blockinfile::{BlockInFileOp, BlockInFileState};
 pub use command::CommandOp;
 pub use copy::CopyOp;
@@ -70,6 +73,7 @@ pub use slurp::SlurpOp;
 pub use stat::StatOp;
 pub use systemd::{SystemdOp, SystemdState};
 pub use template::TemplateOp;
+pub use tempfile::{TempfileKind, TempfileOp};
 pub use ufw::{UfwOp, UfwOpKind};
 pub use unarchive::UnarchiveOp;
 pub use uri::UriOp;
@@ -77,7 +81,7 @@ pub use wait_for::{WaitForOp, WaitForState};
 pub use write_file::WriteFileOp;
 
 use package::parse_package_body;
-use shared::{read_pem_if_set, take_int_or_template_string, take_optional_string};
+use shared::{read_pem_if_set, take_int_or_template_string, take_optional_string, take_string_or_bool};
 
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +183,32 @@ pub struct Task {
     /// the retry loop. Requires `register:` to also be set; see
     /// ANSIBLE_COMPAT.md §4.
     pub until: Option<String>,
+    /// `changed_when: <jinja expr>` — overrides the module's natural
+    /// "did this task change state" answer. The expression is
+    /// evaluated against the task's register after the body runs; a
+    /// truthy result marks the task `changed=true`, falsy `changed=false`.
+    ///
+    /// **Parsed but not yet honored** — the orchestrator does not
+    /// currently consult this field. Storing it now so playbooks parse
+    /// cleanly; the runtime hook is the same place `failed_when:` will
+    /// land (see `run_body_with_retries` doc comment in orchestrator.rs).
+    pub changed_when: Option<String>,
+    /// `failed_when: <jinja expr>` — overrides the module's natural
+    /// failure verdict. Same evaluation contract as `changed_when:`.
+    ///
+    /// **Parsed but not yet honored** — see CLAUDE.md "Retry loop"
+    /// section, rule 7, for the integration point.
+    pub failed_when: Option<String>,
+    /// `no_log: true|false` — when true, the task's args and output
+    /// must not be logged (used for secrets).
+    ///
+    /// **Parsed but not yet honored** — the orchestrator logs every
+    /// task uniformly. A load-time warning fires if any task sets
+    /// `no_log: true` so users running with secrets are not silently
+    /// surprised. Tracked separately from changed_when/failed_when
+    /// because the cost of getting it wrong is leaking secrets, not
+    /// just an incorrect changed flag.
+    pub no_log: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -211,6 +241,17 @@ pub enum TaskBody {
     /// Control-flow marker: e.g. `meta: flush_handlers` to force the
     /// pending-handler queue to drain mid-play.
     Meta(MetaAction),
+    /// `block:` — controller-side task grouping with optional `rescue:`
+    /// and `always:` arms. Block-level metadata on the outer Task
+    /// (when, tags, become, become_user, ignore_errors, check_mode,
+    /// delegate_to) is pushed down into every child task by the
+    /// load-time `inherit_block_metadata` pass in
+    /// `crates/ctl/src/playbook/mod.rs`. `loop:` stays on the outer
+    /// Task and the executor iterates the whole block→rescue→always
+    /// triple per item. `retries:` / `until:` / `delay:` are rejected
+    /// at parse time on a block — push them onto individual inner
+    /// tasks instead.
+    Block(BlockSpec),
 }
 
 /// Parsed body of an `include_role:` task. The optional `vars:` sits
@@ -362,6 +403,12 @@ pub enum TaskOp {
     /// (`remote_src: yes` flavour only). Extracts an archive that
     /// already lives on the agent host. Dispatched via `OpUnarchive`.
     Unarchive(UnarchiveOp),
+    /// `tempfile:` — Ansible's `ansible.builtin.tempfile`.
+    /// **Controller-side only** in v1; no wire dispatch. Creates a
+    /// temp file or directory on the controller filesystem and binds
+    /// `register.path` to the absolute path. See ANSIBLE_COMPAT.md for
+    /// the controller-vs-target divergence.
+    Tempfile(TempfileOp),
 }
 
 const BODY_KEYS: &[&str] = &[
@@ -390,6 +437,7 @@ const BODY_KEYS: &[&str] = &[
     "get_url",
     "slurp",
     "unarchive",
+    "tempfile",
     "assert",
     "fail",
     "debug",
@@ -397,7 +445,15 @@ const BODY_KEYS: &[&str] = &[
     "import_tasks",
     "include_role",
     "meta",
+    "block",
 ];
+
+// Note: `rescue` and `always` are siblings of `block:` on the task
+// mapping (not nested inside `block:`). The Task deserializer extracts
+// them by direct `map.remove("rescue")`/`map.remove("always")` before
+// the unknown-key check; the block body arm consumes them via
+// `.take()`. Non-block bodies that leave them Some get a clear
+// "rescue/always only valid alongside block" error.
 
 /// Top-level keys that don't select a body but do carry per-task metadata.
 const METADATA_KEYS: &[&str] = &[
@@ -419,12 +475,81 @@ const METADATA_KEYS: &[&str] = &[
     "retries",
     "delay",
     "until",
+    "changed_when",
+    "failed_when",
+    "no_log",
 ];
 
+
+/// FQCN prefixes we accept on task keys. Ansible playbooks routinely
+/// spell modules as `ansible.builtin.<name>`, `community.crypto.<name>`,
+/// etc. — we accept any of these prefixes and the key is treated as
+/// its bare canonical name (e.g. `ansible.builtin.shell` ↔ `shell`).
+///
+/// The collection-name part is informational: we don't validate that
+/// the FQCN's collection matches where the canonical module would live
+/// in Ansible. If a user writes `community.crypto.shell` we strip and
+/// accept it; the bare name carries the truth. This matches how Ansible
+/// itself works for the modules we ship — the collection prefix is a
+/// namespace hint, not a routing decision.
+///
+/// Unrecognized prefixes are left untouched and surface as unknown-field
+/// errors with the original FQCN spelling preserved, so users see the
+/// exact key they wrote in the error message.
+const FQCN_PREFIXES: &[&str] = &[
+    "ansible.builtin.",
+    "ansible.posix.",
+    "community.crypto.",
+    "community.general.",
+    "community.postgresql.",
+    "community.docker.",
+];
+
+/// Strip a recognized FQCN prefix, returning the bare name if any
+/// prefix matched. Returns None if no prefix applies — the caller
+/// keeps the original key as-is in that case.
+fn strip_fqcn(key: &str) -> Option<&str> {
+    for prefix in FQCN_PREFIXES {
+        if let Some(rest) = key.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    None
+}
 
 impl<'de> Deserialize<'de> for Task {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        // FQCN normalization: rewrite any `ansible.builtin.shell` /
+        // `community.crypto.openssl_privatekey` / etc. to its bare
+        // canonical spelling so the rest of the deserializer (which
+        // matches on bare names) works without per-call prefix-stripping.
+        //
+        // Collisions (both `shell:` and `ansible.builtin.shell:` set on
+        // the same task) are rejected — the YAML is ambiguous and the
+        // user should pick one spelling.
+        let fqcn_rewrites: Vec<(serde_yaml::Value, String)> = map
+            .iter()
+            .filter_map(|(k, _)| {
+                let s = k.as_str()?;
+                let bare = strip_fqcn(s)?;
+                Some((k.clone(), bare.to_string()))
+            })
+            .collect();
+        for (old_key, bare) in fqcn_rewrites {
+            let bare_yaml = serde_yaml::Value::String(bare.clone());
+            if map.contains_key(&bare_yaml) {
+                return Err(D::Error::custom(format!(
+                    "task has both `{}` and the FQCN spelling `{}` set; \
+                     pick one",
+                    bare,
+                    old_key.as_str().unwrap_or("<non-string-key>"),
+                )));
+            }
+            let val = map.remove(&old_key).expect("key was just observed");
+            map.insert(bare_yaml, val);
+        }
 
         let name = match map.remove("name") {
             Some(serde_yaml::Value::String(s)) => s,
@@ -538,6 +663,23 @@ impl<'de> Deserialize<'de> for Task {
                 "task {name:?}: `delay:` is only meaningful with `retries:` set"
             )));
         }
+        // changed_when / failed_when both accept either a Jinja-expression
+        // string OR a literal bool. The bool form is idiomatic shorthand
+        // — `changed_when: false` on a shell command says "this is
+        // idempotent, never flag changed." We canonicalize to a string:
+        // `"true"` / `"false"`, which minijinja evaluates to the same
+        // truthiness as the literal bool when the runtime hook lands.
+        let changed_when = take_string_or_bool(&mut map, "changed_when", &name)?;
+        let failed_when = take_string_or_bool(&mut map, "failed_when", &name)?;
+        let no_log = match map.remove("no_log") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::Bool(b)) => Some(b),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `no_log` must be a bool, got: {other:?}"
+                )));
+            }
+        };
         let run_once = match map.remove("run_once") {
             None => false,
             Some(serde_yaml::Value::Bool(b)) => b,
@@ -589,6 +731,15 @@ impl<'de> Deserialize<'de> for Task {
                 )));
             }
         };
+
+        // `rescue:` and `always:` are siblings of `block:` on the
+        // task mapping (not nested inside `block:`). Extract them
+        // here so the unknown-key check below doesn't trip; the
+        // `block` body arm consumes them via `.take()`. Any non-block
+        // body that leaves these Some after the arm runs is a hard
+        // error (the sibling has no meaning without the block).
+        let mut rescue_yaml: Option<serde_yaml::Value> = map.remove("rescue");
+        let mut always_yaml: Option<serde_yaml::Value> = map.remove("always");
 
         // Find exactly one body key.
         let mut chosen: Option<(&'static str, serde_yaml::Value)> = None;
@@ -713,6 +864,9 @@ impl<'de> Deserialize<'de> for Task {
             "unarchive" => TaskBody::Op(TaskOp::Unarchive(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
+            "tempfile" => TaskBody::Op(TaskOp::Tempfile(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
             "assert" => TaskBody::Assert(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             ),
@@ -798,6 +952,50 @@ impl<'de> Deserialize<'de> for Task {
                 })?;
                 TaskBody::Meta(action)
             }
+            "block" => {
+                // `block:` must be a non-empty list of tasks.
+                let tasks: Vec<Task> = match body_yaml {
+                    v @ serde_yaml::Value::Sequence(_) => serde_yaml::from_value(v)
+                        .map_err(|e| {
+                            D::Error::custom(format!("task {name:?}: block: {e}"))
+                        })?,
+                    other => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: `block` must be a list of tasks, got: {other:?}"
+                        )));
+                    }
+                };
+                if tasks.is_empty() {
+                    return Err(D::Error::custom(format!(
+                        "task {name:?}: `block` must not be empty"
+                    )));
+                }
+                let rescue: Vec<Task> = match rescue_yaml.take() {
+                    None => Vec::new(),
+                    Some(v @ serde_yaml::Value::Sequence(_)) => serde_yaml::from_value(v)
+                        .map_err(|e| {
+                            D::Error::custom(format!("task {name:?}: rescue: {e}"))
+                        })?,
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: `rescue` must be a list of tasks, got: {other:?}"
+                        )));
+                    }
+                };
+                let always: Vec<Task> = match always_yaml.take() {
+                    None => Vec::new(),
+                    Some(v @ serde_yaml::Value::Sequence(_)) => serde_yaml::from_value(v)
+                        .map_err(|e| {
+                            D::Error::custom(format!("task {name:?}: always: {e}"))
+                        })?,
+                    Some(other) => {
+                        return Err(D::Error::custom(format!(
+                            "task {name:?}: `always` must be a list of tasks, got: {other:?}"
+                        )));
+                    }
+                };
+                TaskBody::Block(BlockSpec { tasks, rescue, always })
+            }
             _ => unreachable!("body key not in BODY_KEYS dispatch"),
         };
 
@@ -809,6 +1007,61 @@ impl<'de> Deserialize<'de> for Task {
                 "task {name:?}: `vars:` is only supported on `include_role:` tasks; \
                  use set_fact or play-level vars for general task variables"
             )));
+        }
+        // `rescue:` and `always:` are consumed by the block body arm.
+        // If they're set on any other body kind, surface the error.
+        if rescue_yaml.is_some() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `rescue:` is only valid alongside `block:`"
+            )));
+        }
+        if always_yaml.is_some() {
+            return Err(D::Error::custom(format!(
+                "task {name:?}: `always:` is only valid alongside `block:`"
+            )));
+        }
+        // Block-on-{retries,until,delay,register,notify,run_once}
+        // rejections. These metadata fields don't have a defined
+        // meaning on a block container in Ansible (or have semantics
+        // that interact badly with rescue/always); push them onto
+        // individual inner tasks instead.
+        if matches!(body, TaskBody::Block(_)) {
+            if retries.is_some() {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `retries:` is not supported on a `block:` — \
+                     put `retries:` on the individual tasks inside the block instead"
+                )));
+            }
+            if until.is_some() {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `until:` is not supported on a `block:` — \
+                     put `until:` on the individual tasks inside the block instead"
+                )));
+            }
+            if delay.is_some() {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `delay:` is not supported on a `block:` — \
+                     put `delay:` on the individual tasks inside the block instead"
+                )));
+            }
+            if register.is_some() {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `register:` has no defined meaning on a `block:` — \
+                     put `register:` on the individual tasks inside the block instead"
+                )));
+            }
+            if !notify.is_empty() {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `notify:` is not supported on a `block:` — \
+                     put `notify:` on the individual tasks inside the block instead"
+                )));
+            }
+            if run_once {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `run_once:` is not supported on a `block:` — \
+                     put `run_once:` on the individual tasks inside the block instead"
+                )));
+            }
         }
         Ok(Task {
             name,
@@ -831,6 +1084,9 @@ impl<'de> Deserialize<'de> for Task {
             retries,
             delay,
             until,
+            changed_when,
+            failed_when,
+            no_log,
         })
     }
 }
@@ -878,7 +1134,13 @@ where
     parse_tags_value(v)
 }
 
-/// `assert: { that: ["x == 1", "y > 0"], msg: "..." }`
+/// `assert: { that: ["x == 1", "y > 0"], fail_msg: "..." }`
+///
+/// Ansible has two ways to spell the failure message: `fail_msg`
+/// (preferred / modern) and `msg` (legacy alias). We accept both and
+/// they map to the same field; we don't surface a "you used the old
+/// spelling" warning because lots of real playbooks still use `msg:`
+/// and it's not deprecated.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AssertTask {
@@ -886,8 +1148,10 @@ pub struct AssertTask {
     /// place of a list; honor that for ergonomics.
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     pub that: Vec<String>,
-    #[serde(default)]
-    pub msg: Option<String>,
+    /// Message printed when an assertion fails. Accepts `fail_msg:`
+    /// (Ansible's preferred name) or `msg:` (legacy alias).
+    #[serde(default, alias = "msg")]
+    pub fail_msg: Option<String>,
 }
 
 /// `fail: { msg: "..." }`
@@ -1030,6 +1294,16 @@ pub struct LoopControl {
     /// Defaults to `item` when absent.
     #[serde(default)]
     pub loop_var: Option<String>,
+    /// `label:` — a Jinja-templatable summary to print *instead of* the
+    /// full item value in loop progress output. Used in Ansible to hide
+    /// large or sensitive loop items from the run log (`loop_control:
+    /// { label: "{{ item.name }}" }`).
+    ///
+    /// **Parsed but not yet honored** — our progress output doesn't
+    /// print per-iteration item values at all yet, so there's nothing
+    /// to substitute. Stored so playbooks parse cleanly.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 impl TaskOp {
@@ -1224,6 +1498,9 @@ impl TaskOp {
             )),
             TaskOp::X509CertificatePipe(_) => Err(anyhow!(
                 "internal: TaskOp::X509CertificatePipe reached to_wire_op — this op is pure controller-side, should be intercepted earlier"
+            )),
+            TaskOp::Tempfile(_) => Err(anyhow!(
+                "internal: TaskOp::Tempfile reached to_wire_op — this op is pure controller-side, should be intercepted earlier"
             )),
             TaskOp::PostgresqlQuery(p) => Ok(op_postgresql_query(
                 p.query.clone(),
@@ -1511,7 +1788,7 @@ assert:
         match t.body {
             TaskBody::Assert(a) => {
                 assert_eq!(a.that, vec!["x == 1", "y > 0"]);
-                assert_eq!(a.msg.as_deref(), Some("not happy"));
+                assert_eq!(a.fail_msg.as_deref(), Some("not happy"));
             }
             other => panic!("expected assert, got {other:?}"),
         }
@@ -1788,18 +2065,22 @@ shell: "echo {{ i }}"
 
     #[test]
     fn rejects_unknown_loop_control_key() {
+        // `pause:` isn't a loop_control field we've implemented or
+        // accepted as parse-only — verifies deny_unknown_fields still
+        // catches genuinely unknown keys. (We deliberately accept
+        // `label:` now, see `LoopControl::label` doc.)
         let err = try_parse_task(
             r#"
 name: x
 loop: [1]
 loop_control:
-  label: "{{ item }}"
+  pause: 5
 shell: echo
 "#,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("label") || msg.contains("unknown"), "got: {msg}");
+        assert!(msg.contains("pause") || msg.contains("unknown"), "got: {msg}");
     }
 
     #[test]

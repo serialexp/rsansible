@@ -22,8 +22,20 @@ use serde::Deserialize;
 pub struct TemplateOp {
     pub src: String,
     pub dest: String,
-    #[serde(default = "default_template_mode")]
+    #[serde(default = "default_template_mode", deserialize_with = "super::shared::deserialize_file_mode_u32")]
     pub mode: u32,
+    /// File owner (POSIX user name). `None` keeps whatever owner the
+    /// agent's effective uid would assign on create — usually root when
+    /// the task runs under `become:`. **Parsed but not yet honored** —
+    /// the agent's `OpWriteFile` does not currently chown after writing.
+    /// Storing the field so playbooks parse cleanly; the runtime hook
+    /// lands when we extend `OpWriteFile` with owner/group bytes.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// File group (POSIX group name). See `owner:` for the not-yet-
+    /// honored caveat.
+    #[serde(default)]
+    pub group: Option<String>,
     /// Populated by the load-time template resolver. `None` until then.
     #[serde(skip, default)]
     pub body: Option<String>,

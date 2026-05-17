@@ -119,6 +119,31 @@ pub(super) fn take_optional_string<E: serde::de::Error>(
     }
 }
 
+/// Accept either a Jinja-expression string or a literal bool. Returns
+/// `Some(String)` either way — bool literals canonicalize to `"true"` /
+/// `"false"` so the runtime renders+evaluates one type.
+///
+/// Used by `changed_when:` and `failed_when:`. Both accept idiomatic
+/// `changed_when: false` shorthand alongside the more general
+/// `changed_when: "rc == 0"` Jinja form. The boolean literal is
+/// equivalent to `"true"` / `"false"` as a Jinja expression — the
+/// runtime evaluates both the same way.
+pub(super) fn take_string_or_bool<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    key: &str,
+    task_name: &str,
+) -> Result<Option<String>, E> {
+    match map.remove(key) {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
+        Some(serde_yaml::Value::Bool(b)) => Ok(Some(b.to_string())),
+        Some(other) => Err(E::custom(format!(
+            "task {task_name:?}: `{key}` must be a Jinja expression \
+             string or a bool, got: {other:?}"
+        ))),
+    }
+}
+
 /// Accept either a non-negative integer or a string (typically a Jinja
 /// expression). Returns `Some(String)` either way — integers are
 /// stringified so the runtime has one type to template-render and parse.
@@ -251,6 +276,35 @@ where
         )));
     }
     Ok(Some(n))
+}
+
+/// Same as `deserialize_file_mode`, but for required `u32` fields
+/// (i.e. ones with a `serde(default = ...)` instead of `Option<u32>`).
+/// Serde calls this only when the key is *present* in the YAML; the
+/// absent case is handled by the struct's `default = "..."`.
+pub(super) fn deserialize_file_mode_u32<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_yaml::Value::deserialize(d)?;
+    let n = match v {
+        serde_yaml::Value::Number(n) => n.as_u64().ok_or_else(|| {
+            D::Error::custom(format!("mode: expected non-negative integer, got: {n}"))
+        })? as u32,
+        serde_yaml::Value::String(s) => parse_mode_str(&s).map_err(D::Error::custom)?,
+        other => {
+            return Err(D::Error::custom(format!(
+                "mode: expected string or int, got: {other:?}"
+            )))
+        }
+    };
+    if n & !0o7777 != 0 {
+        return Err(D::Error::custom(format!(
+            "mode: only the low 12 bits are meaningful (got 0o{n:o})"
+        )));
+    }
+    Ok(n)
 }
 
 /// Strings like `"0755"` and `"755"` → 0o755. `"0o755"` and `"0755"`

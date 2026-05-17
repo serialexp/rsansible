@@ -9,9 +9,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, RsaKeySize, SanType, PKCS_ECDSA_P256_SHA256,
-    PKCS_ED25519, PKCS_RSA_SHA256,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+    IsCa, KeyPair, KeyUsagePurpose, RsaKeySize, SanType, PKCS_ECDSA_P256_SHA256, PKCS_ED25519,
+    PKCS_RSA_SHA256,
 };
 use std::str::FromStr;
 
@@ -82,6 +82,12 @@ const _ECDSA_HINT: &rcgen::SignatureAlgorithm = &PKCS_ECDSA_P256_SHA256;
 pub struct CsrParams {
     pub privkey_pem: Vec<u8>,
     pub common_name: String,
+    /// Subject Country (C). Empty string = omit from DN.
+    pub country_name: String,
+    /// Subject Organization (O). Empty string = omit from DN.
+    pub organization_name: String,
+    /// Subject Organizational Unit (OU). Empty string = omit from DN.
+    pub organizational_unit_name: String,
     /// Subject Alt Names in Ansible's `community.crypto` syntax:
     /// `DNS:foo.example`, `IP:1.2.3.4`, `email:ops@x`.
     pub subject_alt_name: Vec<String>,
@@ -91,6 +97,10 @@ pub struct CsrParams {
     /// Optional X509 ExtendedKeyUsage OIDs / names: `serverAuth`,
     /// `clientAuth`, `codeSigning`, etc.
     pub extended_key_usage: Vec<String>,
+    /// `basic_constraints:` from Ansible — list of strings in
+    /// `CA:TRUE`/`CA:FALSE`/`pathlen:N` syntax. Empty = omit
+    /// extension. Determines `IsCa`.
+    pub basic_constraints: Vec<String>,
 }
 
 /// Generate a CSR and return its PEM encoding.
@@ -106,7 +116,19 @@ pub fn generate_csr(p: &CsrParams) -> Result<Vec<u8>> {
 
     let mut params = CertificateParams::new(Vec::<String>::new())
         .context("building CSR template")?;
+    // DN order matters for some parsers; we follow conventional
+    // C → O → OU → CN. rcgen's DistinguishedName is append-only so
+    // we push in that order.
     let mut dn = DistinguishedName::new();
+    if !p.country_name.is_empty() {
+        dn.push(DnType::CountryName, &p.country_name);
+    }
+    if !p.organization_name.is_empty() {
+        dn.push(DnType::OrganizationName, &p.organization_name);
+    }
+    if !p.organizational_unit_name.is_empty() {
+        dn.push(DnType::OrganizationalUnitName, &p.organizational_unit_name);
+    }
     dn.push(DnType::CommonName, &p.common_name);
     params.distinguished_name = dn;
     for san in &p.subject_alt_name {
@@ -118,8 +140,11 @@ pub fn generate_csr(p: &CsrParams) -> Result<Vec<u8>> {
     for eku in &p.extended_key_usage {
         params.extended_key_usages.push(parse_extended_key_usage(eku)?);
     }
-    // CSR is *not* a CA; we never mint a CA via the _pipe path.
-    params.is_ca = IsCa::NoCa;
+    // basic_constraints: an Ansible list like ["CA:TRUE"] or
+    // ["CA:TRUE", "pathlen:0"]. Empty list = omit extension entirely
+    // (IsCa::NoCa). Order doesn't matter; we scan the list looking
+    // for the CA verdict and an optional pathlen.
+    params.is_ca = parse_basic_constraints(&p.basic_constraints)?;
 
     let csr = params
         .serialize_request(&kp)
@@ -172,6 +197,67 @@ pub fn generate_selfsigned_cert(p: &SelfSignedCertParams) -> Result<Vec<u8>> {
         .self_signed(&kp)
         .context("self-signing certificate")?;
     Ok(cert.pem().into_bytes())
+}
+
+/// Parse Ansible-style `basic_constraints:` list into `IsCa`.
+///
+/// Recognized tokens (case-insensitive on the keyword):
+///   - `CA:TRUE` / `CA:FALSE`
+///   - `pathlen:N` (only meaningful when CA:TRUE; capped at u8 by X.509)
+///
+/// Empty list → `IsCa::NoCa` (omit the extension entirely). Explicit
+/// `CA:FALSE` → `IsCa::ExplicitNoCa` (emit BC with CA:FALSE). Order of
+/// tokens doesn't matter.
+fn parse_basic_constraints(tokens: &[String]) -> Result<IsCa> {
+    if tokens.is_empty() {
+        return Ok(IsCa::NoCa);
+    }
+    let mut is_ca: Option<bool> = None;
+    let mut pathlen: Option<u8> = None;
+    for t in tokens {
+        let (kind, value) = t.split_once(':').ok_or_else(|| {
+            anyhow!("basic_constraints {t:?}: expected `CA:TRUE`/`CA:FALSE` or `pathlen:N`")
+        })?;
+        match kind.to_ascii_uppercase().as_str() {
+            "CA" => match value.to_ascii_uppercase().as_str() {
+                "TRUE" | "YES" => is_ca = Some(true),
+                "FALSE" | "NO" => is_ca = Some(false),
+                other => bail!("basic_constraints {t:?}: CA must be TRUE/FALSE, got {other:?}"),
+            },
+            "PATHLEN" => {
+                let n: u32 = value.parse().with_context(|| {
+                    format!("basic_constraints {t:?}: pathlen must be a non-negative integer")
+                })?;
+                if n > u8::MAX as u32 {
+                    bail!(
+                        "basic_constraints {t:?}: pathlen {n} exceeds X.509 max of {}",
+                        u8::MAX
+                    );
+                }
+                pathlen = Some(n as u8);
+            }
+            other => bail!(
+                "basic_constraints {t:?}: unknown directive {other:?}; \
+                 expected CA:TRUE/CA:FALSE or pathlen:N"
+            ),
+        }
+    }
+    match is_ca {
+        Some(true) => Ok(IsCa::Ca(match pathlen {
+            Some(n) => BasicConstraints::Constrained(n),
+            None => BasicConstraints::Unconstrained,
+        })),
+        Some(false) => {
+            if pathlen.is_some() {
+                bail!(
+                    "basic_constraints: pathlen is only meaningful with CA:TRUE, \
+                     remove it or set CA:TRUE"
+                );
+            }
+            Ok(IsCa::ExplicitNoCa)
+        }
+        None => bail!("basic_constraints: list does not contain `CA:TRUE` or `CA:FALSE`"),
+    }
 }
 
 fn parse_san(s: &str) -> Result<SanType> {
@@ -288,9 +374,13 @@ mod tests {
         let csr = generate_csr(&CsrParams {
             privkey_pem: pk,
             common_name: "etcd-peer-0".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
             subject_alt_name: vec!["DNS:etcd0.example".into(), "IP:10.0.0.1".into()],
             key_usage: vec!["digitalSignature".into(), "keyEncipherment".into()],
             extended_key_usage: vec!["serverAuth".into(), "clientAuth".into()],
+            basic_constraints: vec![],
         })
         .expect("CSR");
         let s = std::str::from_utf8(&csr).unwrap();
@@ -310,9 +400,13 @@ mod tests {
         let csr = generate_csr(&CsrParams {
             privkey_pem: pk.clone(),
             common_name: "x".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
             subject_alt_name: vec!["DNS:x.test".into()],
             key_usage: vec![],
             extended_key_usage: vec![],
+            basic_constraints: vec![],
         })
         .unwrap();
         let cert = generate_selfsigned_cert(&SelfSignedCertParams {

@@ -6,7 +6,10 @@
 //! Ansible's nomenclature) — they synthesize a register entry without
 //! any wire dispatch.
 
-use super::shared::{take_optional_ansible_bool, take_optional_string_list};
+use super::shared::{
+    take_optional_ansible_bool, take_optional_field_string, take_optional_mode,
+    take_optional_string_list,
+};
 use serde::{de::Error as _, Deserialize, Deserializer};
 
 /// `openssl_privatekey:` parsed form. Maps
@@ -75,19 +78,11 @@ impl<'de> Deserialize<'de> for OpenSslPrivkeyOp {
                 )));
             }
         };
-        let mode = match map.remove("mode") {
-            None | Some(serde_yaml::Value::Null) => default_privkey_mode(),
-            Some(serde_yaml::Value::Number(n)) => n.as_u64()
-                .and_then(|v| u32::try_from(v).ok())
-                .ok_or_else(|| D::Error::custom(format!(
-                    "openssl_privatekey.mode: expected a non-negative integer, got: {n}"
-                )))?,
-            Some(other) => {
-                return Err(D::Error::custom(format!(
-                    "openssl_privatekey.mode: expected an integer (octal in YAML), got: {other:?}"
-                )));
-            }
-        };
+        // Ansible writes mode as either an int (`0o600`) or a string
+        // (`"0600"`); accept both via the shared helper so we don't
+        // diverge from per-key Bucket-A behavior.
+        let mode = take_optional_mode::<D::Error>(&mut map, "mode")?
+            .unwrap_or_else(default_privkey_mode);
         let force_probe = take_optional_ansible_bool::<D::Error>(&mut map, "force_probe")?
             .unwrap_or(false);
         if !map.is_empty() {
@@ -116,6 +111,12 @@ pub struct OpenSslCsrPipeOp {
     pub privatekey_path: String,
     /// Subject CN. Jinja-templatable.
     pub common_name: String,
+    /// Subject Country (C). Optional. Jinja-templatable.
+    pub country_name: String,
+    /// Subject Organization (O). Optional. Jinja-templatable.
+    pub organization_name: String,
+    /// Subject Organizational Unit (OU). Optional. Jinja-templatable.
+    pub organizational_unit_name: String,
     /// Subject Alt Names, Ansible syntax: `DNS:foo`, `IP:1.2.3.4`,
     /// `email:ops@x`, `URI:https://x/`. Each entry is Jinja-templatable.
     pub subject_alt_name: Vec<String>,
@@ -123,6 +124,22 @@ pub struct OpenSslCsrPipeOp {
     pub key_usage: Vec<String>,
     /// Optional Extended KeyUsage names or dotted OIDs.
     pub extended_key_usage: Vec<String>,
+    /// `basic_constraints:` — list of strings in Ansible's syntax:
+    /// `CA:TRUE` / `CA:FALSE`, optional `pathlen:N`. Empty list means
+    /// "omit the basic-constraints extension" (matches Ansible's
+    /// default when the field is absent).
+    pub basic_constraints: Vec<String>,
+    /// `basic_constraints_critical:` — mark the BC extension critical.
+    /// Default false. **rsansible always emits BC as critical when
+    /// it's present** because rcgen doesn't expose the criticality bit
+    /// at this layer; setting `false` while `basic_constraints` is
+    /// non-empty is rejected. See ANSIBLE_COMPAT.md §6.
+    pub basic_constraints_critical: bool,
+    /// `key_usage_critical:` — mark the KeyUsage extension critical.
+    /// Default false. Same rcgen limitation as `basic_constraints_critical`:
+    /// when `key_usage` is non-empty rcgen always emits the extension
+    /// critical, so `false` here is rejected.
+    pub key_usage_critical: bool,
 }
 
 impl<'de> Deserialize<'de> for OpenSslCsrPipeOp {
@@ -146,42 +163,108 @@ impl<'de> Deserialize<'de> for OpenSslCsrPipeOp {
                 "openssl_csr_pipe.common_name: expected non-empty string, got: {other:?}"
             ))),
         };
+        let country_name = take_optional_field_string::<D::Error>(&mut map, "country_name")?
+            .unwrap_or_default();
+        let organization_name = take_optional_field_string::<D::Error>(&mut map, "organization_name")?
+            .unwrap_or_default();
+        let organizational_unit_name =
+            take_optional_field_string::<D::Error>(&mut map, "organizational_unit_name")?
+                .unwrap_or_default();
         let subject_alt_name = take_optional_string_list::<D::Error>(&mut map, "subject_alt_name")?
             .unwrap_or_default();
         let key_usage = take_optional_string_list::<D::Error>(&mut map, "key_usage")?
             .unwrap_or_default();
         let extended_key_usage = take_optional_string_list::<D::Error>(&mut map, "extended_key_usage")?
             .unwrap_or_default();
+        let basic_constraints = take_optional_string_list::<D::Error>(&mut map, "basic_constraints")?
+            .unwrap_or_default();
+        // rcgen 0.13 always emits BC/KU as critical when present.
+        // Accept `*_critical: true` (matches behavior); reject
+        // `*_critical: false` paired with a non-empty extension list
+        // to avoid silently lying about criticality. Absent → default
+        // false (matches Ansible). The error here is at parse time so
+        // a playbook author hits it on the first validate.
+        let basic_constraints_critical =
+            take_optional_ansible_bool::<D::Error>(&mut map, "basic_constraints_critical")?
+                .unwrap_or(false);
+        if !basic_constraints.is_empty() && !basic_constraints_critical {
+            return Err(D::Error::custom(
+                "openssl_csr_pipe.basic_constraints_critical: rsansible always \
+                 emits the BasicConstraints extension as critical (rcgen \
+                 limitation); set `basic_constraints_critical: true` when \
+                 supplying `basic_constraints:`. See ANSIBLE_COMPAT.md §6.",
+            ));
+        }
+        let key_usage_critical =
+            take_optional_ansible_bool::<D::Error>(&mut map, "key_usage_critical")?
+                .unwrap_or(false);
+        if !key_usage.is_empty() && !key_usage_critical {
+            return Err(D::Error::custom(
+                "openssl_csr_pipe.key_usage_critical: rsansible always emits \
+                 the KeyUsage extension as critical (rcgen limitation); set \
+                 `key_usage_critical: true` when supplying `key_usage:`. See \
+                 ANSIBLE_COMPAT.md §6.",
+            ));
+        }
         if !map.is_empty() {
             let unknown: Vec<String> = map.keys()
                 .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
                 .collect();
             return Err(D::Error::custom(format!(
                 "openssl_csr_pipe: unknown field(s): {unknown:?}; expected one of \
-                 [privatekey_path, common_name, subject_alt_name, key_usage, extended_key_usage]"
+                 [privatekey_path, common_name, country_name, organization_name, \
+                 organizational_unit_name, subject_alt_name, key_usage, \
+                 extended_key_usage, basic_constraints, basic_constraints_critical, \
+                 key_usage_critical]"
             )));
         }
         Ok(OpenSslCsrPipeOp {
-            privatekey_path, common_name, subject_alt_name, key_usage, extended_key_usage,
+            privatekey_path,
+            common_name,
+            country_name,
+            organization_name,
+            organizational_unit_name,
+            subject_alt_name,
+            key_usage,
+            extended_key_usage,
+            basic_constraints,
+            basic_constraints_critical,
+            key_usage_critical,
         })
     }
 }
 
 /// `x509_certificate_pipe:` parsed form. v1: self-signed only. The
-/// CSR and private key both flow in as PEM strings (typically from
-/// `{{ csr_result.content }}` / `{{ privkey_var }}` Jinja
-/// expressions), so this op is decoupled from the controller-side
-/// privkey cache.
+/// CSR flows in as a PEM string (typically from a previous
+/// `openssl_csr_pipe` register). The private key may flow in as a PEM
+/// string (`privatekey_content:`) OR as a controller-side path
+/// (`privatekey_path:`) — exactly one is required.
 #[derive(Debug, Clone, PartialEq)]
 pub struct X509CertificatePipeOp {
     /// CSR PEM string. Jinja-templatable.
     pub csr_content: String,
-    /// Private key PEM string used to self-sign. Jinja-templatable.
+    /// Private key PEM string used to self-sign. Empty when
+    /// `privatekey_path` is set instead. Jinja-templatable.
     pub privatekey_content: String,
+    /// Controller-side path to read the private key from. Empty when
+    /// `privatekey_content` is set instead. Jinja-templatable.
+    /// The PEM is read at dispatch time (not at parse time).
+    pub privatekey_path: String,
     /// Provider name. v1 accepts only "selfsigned".
     pub provider: String,
     /// Validity window in days from controller-now. Default 365.
+    /// Populated either from `valid_for_days:` directly or by parsing
+    /// `selfsigned_not_after:` (Ansible's duration spelling).
     pub valid_for_days: u32,
+    /// `selfsigned_digest:` — Ansible's signature digest selection
+    /// (sha256/sha384/sha512). **Parsed but currently honored only
+    /// indirectly:** rcgen picks the digest based on the signing key
+    /// (`RSA → SHA256`, `Ed25519 → Ed25519's built-in`, `ECDSA P-256
+    /// → SHA256`), which matches Ansible's default behavior. We store
+    /// the field so playbooks parse cleanly; mismatching the key's
+    /// natural digest would require rcgen plumbing we don't yet have.
+    /// See ANSIBLE_COMPAT.md §6.
+    pub selfsigned_digest: String,
 }
 
 fn default_cert_provider() -> String { "selfsigned".to_string() }
@@ -199,15 +282,24 @@ impl<'de> Deserialize<'de> for X509CertificatePipeOp {
                 "x509_certificate_pipe.csr_content: expected non-empty string, got: {other:?}"
             ))),
         };
-        let privatekey_content = match map.remove("privatekey_content") {
-            Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
-            None => return Err(D::Error::custom(
-                "x509_certificate_pipe: `privatekey_content` is required",
-            )),
-            other => return Err(D::Error::custom(format!(
-                "x509_certificate_pipe.privatekey_content: expected non-empty string, got: {other:?}"
-            ))),
-        };
+        let privatekey_content =
+            take_optional_field_string::<D::Error>(&mut map, "privatekey_content")?
+                .unwrap_or_default();
+        let privatekey_path =
+            take_optional_field_string::<D::Error>(&mut map, "privatekey_path")?
+                .unwrap_or_default();
+        if privatekey_content.is_empty() && privatekey_path.is_empty() {
+            return Err(D::Error::custom(
+                "x509_certificate_pipe: one of `privatekey_content` or \
+                 `privatekey_path` is required",
+            ));
+        }
+        if !privatekey_content.is_empty() && !privatekey_path.is_empty() {
+            return Err(D::Error::custom(
+                "x509_certificate_pipe: set exactly one of `privatekey_content` \
+                 or `privatekey_path`, not both",
+            ));
+        }
         let provider = match map.remove("provider") {
             None | Some(serde_yaml::Value::Null) => default_cert_provider(),
             Some(serde_yaml::Value::String(s)) => s,
@@ -224,28 +316,114 @@ impl<'de> Deserialize<'de> for X509CertificatePipeOp {
                  expected \"selfsigned\""
             )));
         }
-        let valid_for_days = match map.remove("valid_for_days") {
-            None | Some(serde_yaml::Value::Null) => default_cert_valid_days(),
-            Some(serde_yaml::Value::Number(n)) => n.as_u64()
-                .and_then(|v| u32::try_from(v).ok())
-                .ok_or_else(|| D::Error::custom(format!(
-                    "x509_certificate_pipe.valid_for_days: expected a positive integer, got: {n}"
-                )))?,
-            Some(other) => return Err(D::Error::custom(format!(
-                "x509_certificate_pipe.valid_for_days: expected an integer, got: {other:?}"
-            ))),
+        let valid_for_days_explicit = match map.remove("valid_for_days") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::Number(n)) => Some(
+                n.as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "x509_certificate_pipe.valid_for_days: expected a positive integer, got: {n}"
+                        ))
+                    })?,
+            ),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "x509_certificate_pipe.valid_for_days: expected an integer, got: {other:?}"
+                )))
+            }
         };
+        // selfsigned_not_after: Ansible's "+3650d" / "+1y" / etc.
+        // duration syntax. Parse to days and feed the same code path
+        // as valid_for_days. Mutually exclusive with valid_for_days
+        // — both setting the same window two ways is ambiguous.
+        let not_after =
+            take_optional_field_string::<D::Error>(&mut map, "selfsigned_not_after")?;
+        let valid_for_days = match (valid_for_days_explicit, &not_after) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "x509_certificate_pipe: set either `valid_for_days` or \
+                     `selfsigned_not_after`, not both",
+                ));
+            }
+            (Some(d), None) => d,
+            (None, Some(s)) => parse_relative_duration_days(s).map_err(D::Error::custom)?,
+            (None, None) => default_cert_valid_days(),
+        };
+        let selfsigned_digest =
+            take_optional_field_string::<D::Error>(&mut map, "selfsigned_digest")?
+                .unwrap_or_default();
         if !map.is_empty() {
             let unknown: Vec<String> = map.keys()
                 .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
                 .collect();
             return Err(D::Error::custom(format!(
                 "x509_certificate_pipe: unknown field(s): {unknown:?}; expected one of \
-                 [csr_content, privatekey_content, provider, valid_for_days]"
+                 [csr_content, privatekey_content, privatekey_path, provider, \
+                 valid_for_days, selfsigned_not_after, selfsigned_digest]"
             )));
         }
-        Ok(X509CertificatePipeOp { csr_content, privatekey_content, provider, valid_for_days })
+        Ok(X509CertificatePipeOp {
+            csr_content,
+            privatekey_content,
+            privatekey_path,
+            provider,
+            valid_for_days,
+            selfsigned_digest,
+        })
     }
+}
+
+/// Parse Ansible's `selfsigned_not_after: "+3650d"` / `"+1y"` style
+/// relative duration and return the resulting day count. Bare integers
+/// are interpreted as days (matching Ansible's loose handling). Years
+/// expand to 365 days each (no leap-day accounting — Ansible does the
+/// same).
+///
+/// Accepted suffixes: `s`, `m`, `h`, `d`, `w`, `y`. The leading `+`
+/// is required by Ansible for relative-from-now (the only mode v1
+/// supports); we accept it bare too because the YAML is unambiguous.
+fn parse_relative_duration_days(s: &str) -> Result<u32, String> {
+    let t = s.trim().strip_prefix('+').unwrap_or(s.trim());
+    if t.is_empty() {
+        return Err("selfsigned_not_after: empty string".to_string());
+    }
+    let (num_part, unit) = t
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|i| (&t[..i], &t[i..]))
+        .unwrap_or((t, "d"));
+    if num_part.is_empty() {
+        return Err(format!(
+            "selfsigned_not_after {s:?}: expected a number followed by an optional \
+             unit (s/m/h/d/w/y)"
+        ));
+    }
+    let n: u64 = num_part
+        .parse()
+        .map_err(|e| format!("selfsigned_not_after {s:?}: invalid number {num_part:?}: {e}"))?;
+    let days = match unit {
+        "" | "d" => n,
+        "w" => n.saturating_mul(7),
+        "y" => n.saturating_mul(365),
+        "s" => n / 86400,
+        "m" => n / 1440,
+        "h" => n / 24,
+        other => {
+            return Err(format!(
+                "selfsigned_not_after {s:?}: unknown unit {other:?}; \
+                 expected one of s/m/h/d/w/y"
+            ))
+        }
+    };
+    if days == 0 {
+        return Err(format!(
+            "selfsigned_not_after {s:?}: rounds down to 0 days; rsansible's \
+             cert validity is day-granular"
+        ));
+    }
+    u32::try_from(days).map_err(|_| {
+        format!("selfsigned_not_after {s:?}: {days} days exceeds u32 — pick a saner window")
+    })
 }
 
 #[cfg(test)]
@@ -310,6 +488,7 @@ openssl_csr_pipe:
     - "DNS:etcd.example.com"
     - "IP:10.0.0.10"
   key_usage: [digitalSignature, keyEncipherment]
+  key_usage_critical: true
   extended_key_usage: [serverAuth, clientAuth]
 "#,
         );
@@ -320,10 +499,57 @@ openssl_csr_pipe:
                 assert_eq!(c.subject_alt_name.len(), 2);
                 assert!(c.subject_alt_name[0].starts_with("DNS:"));
                 assert_eq!(c.key_usage, vec!["digitalSignature", "keyEncipherment"]);
+                assert!(c.key_usage_critical);
                 assert_eq!(c.extended_key_usage, vec!["serverAuth", "clientAuth"]);
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_openssl_csr_pipe_with_dn_and_basic_constraints() {
+        let t = parse_task(
+            r#"
+name: ca-csr
+openssl_csr_pipe:
+  privatekey_path: /tmp/ca.key
+  common_name: "rsansible test CA"
+  country_name: FI
+  organization_name: Gothab
+  organizational_unit_name: etcd-ca
+  basic_constraints: ["CA:TRUE"]
+  basic_constraints_critical: true
+  key_usage: ["keyCertSign", "cRLSign"]
+  key_usage_critical: true
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::OpenSslCsrPipe(c)) => {
+                assert_eq!(c.country_name, "FI");
+                assert_eq!(c.organization_name, "Gothab");
+                assert_eq!(c.organizational_unit_name, "etcd-ca");
+                assert_eq!(c.basic_constraints, vec!["CA:TRUE"]);
+                assert!(c.basic_constraints_critical);
+                assert!(c.key_usage_critical);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_key_usage_without_critical_true() {
+        let err = try_parse_task(
+            r#"
+name: csr
+openssl_csr_pipe:
+  privatekey_path: /tmp/k
+  common_name: x
+  key_usage: ["digitalSignature"]
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("key_usage_critical"), "got: {msg}");
     }
 
     #[test]
@@ -347,6 +573,94 @@ x509_certificate_pipe:
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_x509_certificate_pipe_with_path_and_relative_duration() {
+        let t = parse_task(
+            r#"
+name: ca
+x509_certificate_pipe:
+  csr_content: "{{ ca_csr.csr }}"
+  privatekey_path: "/tmp/ca.key"
+  provider: selfsigned
+  selfsigned_not_after: "+3650d"
+  selfsigned_digest: sha256
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::X509CertificatePipe(c)) => {
+                assert_eq!(c.privatekey_path, "/tmp/ca.key");
+                assert!(c.privatekey_content.is_empty());
+                assert_eq!(c.valid_for_days, 3650);
+                assert_eq!(c.selfsigned_digest, "sha256");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x509_pipe_relative_duration_year_unit() {
+        let t = parse_task(
+            r#"
+name: c
+x509_certificate_pipe:
+  csr_content: x
+  privatekey_content: y
+  selfsigned_not_after: "+1y"
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::X509CertificatePipe(c)) => {
+                assert_eq!(c.valid_for_days, 365);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x509_pipe_rejects_both_privkey_sources() {
+        let err = try_parse_task(
+            r#"
+name: c
+x509_certificate_pipe:
+  csr_content: x
+  privatekey_content: y
+  privatekey_path: /tmp/k
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("exactly one"));
+    }
+
+    #[test]
+    fn x509_pipe_rejects_neither_privkey_source() {
+        let err = try_parse_task(
+            r#"
+name: c
+x509_certificate_pipe:
+  csr_content: x
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("privatekey_content") || msg.contains("required"), "got: {msg}");
+    }
+
+    #[test]
+    fn x509_pipe_rejects_valid_for_days_and_not_after_together() {
+        let err = try_parse_task(
+            r#"
+name: c
+x509_certificate_pipe:
+  csr_content: x
+  privatekey_content: y
+  valid_for_days: 30
+  selfsigned_not_after: "+30d"
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not both"));
     }
 
     #[test]

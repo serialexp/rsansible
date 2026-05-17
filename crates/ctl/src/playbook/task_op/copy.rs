@@ -22,8 +22,15 @@ use serde::Deserialize;
 pub struct CopyOp {
     pub src: String,
     pub dest: String,
-    #[serde(default = "default_template_mode")]
+    #[serde(default = "default_template_mode", deserialize_with = "super::shared::deserialize_file_mode_u32")]
     pub mode: u32,
+    /// File owner (POSIX user name). See `TemplateOp::owner` doc — same
+    /// "parsed but not yet honored" caveat.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// File group (POSIX group name). Same caveat as `owner:`.
+    #[serde(default)]
+    pub group: Option<String>,
     /// Populated by the load-time copy resolver. `None` until then.
     #[serde(skip, default)]
     pub body: Option<Vec<u8>>,
@@ -108,6 +115,8 @@ copy:
             src: "blob.bin".into(),
             dest: "/etc/blob".into(),
             mode: 0o600,
+            owner: None,
+            group: None,
             // Non-UTF-8 bytes — would corrupt through a String roundtrip.
             body: Some(vec![0xff, 0x00, 0xfe, 0xfd, 0x7f]),
         });
@@ -125,6 +134,8 @@ copy:
             src: "blob.bin".into(),
             dest: "/etc/blob".into(),
             mode: 0o644,
+            owner: None,
+            group: None,
             body: None,
         });
         let err = t.to_wire_op().unwrap_err();

@@ -91,6 +91,20 @@ pub struct HostCtx {
     /// the CSR task fails loudly — v1 contract is "csr_pipe must
     /// run in the same play as the privkey it derives from."
     pub privkey_pem_cache: BTreeMap<String, Vec<u8>>,
+    /// Set during the rescue arm of a `block:` to the name of the
+    /// failing task in `block.tasks` that triggered the recovery.
+    /// Visible to rescue tasks as `{{ ansible_failed_task.name }}`
+    /// (Ansible exposes this as a dict — for now we surface just the
+    /// name; the full task struct isn't useful for templating).
+    /// Cleared on exit from the rescue arm. Nested blocks save and
+    /// restore around their own rescue.
+    pub ansible_failed_task: Option<String>,
+    /// Set during the rescue arm of a `block:` to the failing task's
+    /// register-shape result dict. Visible to rescue tasks as
+    /// `{{ ansible_failed_result.rc }}`, `.stderr`, etc. Cleared on
+    /// exit from the rescue arm. `None` when the failure had no
+    /// register payload (e.g. `when:` render error).
+    pub ansible_failed_result: Option<RegisterValue>,
 }
 
 impl HostCtx {
@@ -111,6 +125,8 @@ impl HostCtx {
             wire_strategy: WireStrategy::default(),
             check_mode: false,
             privkey_pem_cache: BTreeMap::new(),
+            ansible_failed_task: None,
+            ansible_failed_result: None,
         }
     }
 
@@ -138,6 +154,14 @@ pub struct RegisterValue {
     /// For tasks under `loop:`, the per-iteration results land here so
     /// `register: x` exposes `x.results = [...]`.
     pub results: Option<Vec<RegisterValue>>,
+    /// Number of attempts that were made under retry semantics
+    /// (`retries:` or `until:`). 0 when retry semantics were inactive
+    /// — only surfaced under `register.attempts` when nonzero, so
+    /// playbooks can safely write `{% if result.attempts > 1 %}`
+    /// without false hits on single-attempt tasks. Matches Ansible's
+    /// `utr.attempts` field; populated by `drive_with_retries` in
+    /// the orchestrator.
+    pub attempts: u32,
     /// Module-specific result fields that the orchestrator lifts to
     /// top-level keys on the register dict (matching Ansible's per-module
     /// result shape — e.g. `stat:` exposes `register.stat.exists`). Each
@@ -175,6 +199,9 @@ impl RegisterValue {
                 "results".into(),
                 JsonValue::Array(results.iter().map(|r| r.to_json()).collect()),
             );
+        }
+        if self.attempts > 0 {
+            m.insert("attempts".into(), JsonValue::from(self.attempts));
         }
         for (k, v) in &self.extra {
             m.insert(k.clone(), v.clone());
@@ -231,6 +258,7 @@ impl RegisterValue {
             skipped,
             failed: exit_code != 0 && !skipped,
             results: None,
+            attempts: 0,
             extra: BTreeMap::new(),
         }
     }
@@ -266,6 +294,14 @@ pub struct WorldVars {
     /// Does NOT include set_facts or registers (those are per-host
     /// transient state).
     pub hostvars: BTreeMap<String, BTreeMap<String, JsonValue>>,
+    /// Absolute path to the directory containing the playbook source.
+    /// Surfaced to templates as `{{ playbook_dir }}`, matching Ansible.
+    /// `None` only in synthetic/test contexts that build WorldVars by hand.
+    pub playbook_dir: Option<String>,
+    /// Absolute path to the directory containing the inventory source.
+    /// Surfaced to templates as `{{ inventory_dir }}`. Same caveats as
+    /// `playbook_dir`.
+    pub inventory_dir: Option<String>,
 }
 
 impl WorldVars {
@@ -344,8 +380,27 @@ pub fn build_template_ctx(
             .collect();
         out.insert("hostvars".into(), JsonValue::Object(hv_json));
     }
+    if let Some(dir) = &world.playbook_dir {
+        out.insert("playbook_dir".into(), JsonValue::String(dir.clone()));
+    }
+    if let Some(dir) = &world.inventory_dir {
+        out.insert("inventory_dir".into(), JsonValue::String(dir.clone()));
+    }
     if let Some((name, val)) = &ctx.iter_item {
         out.insert(name.clone(), val.clone());
+    }
+    // Block-rescue arm exposes `ansible_failed_task` (just the name
+    // for now) and `ansible_failed_result` (full register dict).
+    // These live in scope only while a rescue arm is running; the
+    // block driver sets+clears them before/after invoking rescue.
+    if let Some(name) = &ctx.ansible_failed_task {
+        out.insert(
+            "ansible_failed_task".into(),
+            JsonValue::String(name.clone()),
+        );
+    }
+    if let Some(rv) = &ctx.ansible_failed_result {
+        out.insert("ansible_failed_result".into(), rv.to_json());
     }
     out
 }
@@ -516,6 +571,25 @@ mod tests {
         assert_eq!(yaml_to_json(v).unwrap(), json!(true));
         let v = serde_yaml::from_str::<serde_yaml::Value>("[1, 2, 3]").unwrap();
         assert_eq!(yaml_to_json(v).unwrap(), json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn register_attempts_only_serialized_when_nonzero() {
+        // Default (single-attempt) register: no `attempts` key in JSON.
+        let rv = RegisterValue::from_exec(0, false, 1, b"", b"");
+        assert_eq!(rv.attempts, 0);
+        let j = rv.to_json();
+        assert!(
+            j.get("attempts").is_none(),
+            "attempts must be hidden when 0 so single-attempt tasks don't \
+             trigger `{{% if result.attempts > 1 %}}` style guards \
+             unexpectedly"
+        );
+        // Once retry semantics annotated the register, it shows up.
+        let mut rv = rv;
+        rv.attempts = 3;
+        let j = rv.to_json();
+        assert_eq!(j["attempts"], 3);
     }
 
     #[test]

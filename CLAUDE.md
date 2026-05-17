@@ -174,6 +174,125 @@ When you add a divergence: the function's own doc comment should
 say `see ANSIBLE_COMPAT.md §N` so a developer reading the code
 knows the choice was deliberate and where to find the rationale.
 
+## Recursive task lists: the executor pattern for grouped ops
+
+`block:` / `rescue:` / `always:` introduced the first task-op whose
+body contains *other tasks*. The pattern it established applies to
+every future "ops that group tasks" feature — `include_tasks:` with
+conditional logic, `import_tasks:` if it ever needs runtime
+behavior, anything else that recurses.
+
+The rules:
+
+1. **The task list is recursive at the type level**, not flattened
+   at load time. `TaskBody::Block(BlockSpec)` carries
+   `Vec<Task>` for each arm; the executor walks them on the fly. We
+   considered flattening into a synthetic linear sequence with
+   marker tasks ("BlockStart"/"BlockEnd") and rejected it — it
+   makes per-host state (registers, `ansible_failed_*`, loop scope)
+   much harder to reason about than just recursing.
+
+2. **Inheritance is a load-time push-down pass**, mirroring
+   `inherit_become_defaults`. By the time the executor sees inner
+   tasks they already carry the merged metadata (`when:`, `become:`,
+   `tags:`, `ignore_errors:`, `check_mode:`, `delegate_to:`).
+   `when:` joins with `({parent}) and ({child})`; `tags:` is union;
+   everything else is "child's explicit Some wins, else parent's."
+   See `inherit_block_metadata` in
+   `crates/ctl/src/playbook/mod.rs`.
+
+3. **The executor exposes two layered helpers**:
+   - `run_task_list_on_host(tasks, ...) -> TaskListResult` walks
+     a `&[Task]` sequentially on one host, stops at first failure,
+     returns `(failed_task_name, reason, register_snapshot)` plus
+     the mutated `HostCtx`.
+   - `run_task_on_one_host(task, ...)` dispatches a single task,
+     including `TaskBody::Block` which `Box::pin`s into
+     `run_block_on_one_host`. The recursion goes
+     `run_task_on_one_host` → `run_block_on_one_host` →
+     `run_task_list_on_host` → `run_task_on_one_host`, so async
+     recursion requires `Box::pin` at the dispatch point.
+
+4. **Per-host state survives the recursion**. `HostCtx` flows in
+   and out of every level; registers set inside a block are visible
+   after it, `ansible_failed_*` is set on rescue entry and cleared
+   on exit (and nested blocks save/restore around their own rescue
+   so the outer block's failed-task info is preserved).
+
+5. **`HostTaskOutcome::Failed` carries `register: Option<RegisterValue>`**
+   so the failing task's register-shape result can flow up to
+   wherever `ansible_failed_result` needs to be populated. Don't
+   strip this — future ops with retry/recovery semantics will need
+   it too.
+
+6. **Per-strategy integration is transparent**. Both
+   `run_play_per_task` and `run_play_per_play` call
+   `run_task_on_one_host` per top-level task and per host — they
+   don't need to know a block recurses internally. The recursion
+   happens behind `Box::pin`, so the strategy code stays flat.
+
+7. **Reject what we can't model yet at parse time, loudly.**
+   `retries:` / `until:` / `delay:` on a block, `register:` and
+   `notify:` on a block, `run_once:` on a block — all rejected
+   in `Task::deserialize` with a message that points to the
+   inner-task workaround. Better a clear parse error than a
+   silently-wrong semantic. Future ops should inherit this
+   discipline.
+
+## Retry loop: `retries:` / `until:` / `delay:`
+
+`run_body_with_retries` in `orchestrator.rs` wraps every body-once
+call inside `run_task_on_one_host` (both the single-shot path and
+each loop iteration — retries are per-iteration, not per-loop, which
+matches Ansible). The rules that proved non-obvious during
+implementation:
+
+1. **Ansible's `+1` semantic is sticky.** `retries: N` means N
+   retries on top of the initial attempt → N+1 total attempts. Default
+   when only `until:` is set: 4 total (3 retries). When neither is
+   set: 1 attempt, no retry loop entered at all.
+
+2. **`until:` controls termination, not classification.** A truthy
+   `until` exits the retry loop even when the underlying body
+   failed; an exhausted loop without `until` ever becoming truthy
+   flags the task `Failed` even when the body succeeded on every
+   attempt. The latter is the part everyone forgets — "if your
+   `until:` never converges, the task failed by definition." Catch:
+   we surface it as `"did not satisfy `until:` after N attempts"`
+   on the BodyResult::Failed.
+
+3. **The per-attempt register is recorded mid-loop on `HostCtx`** so
+   `until:` can reference it as `{{ register_name.rc }}`. Each
+   attempt overwrites; the natural single-shot record-after also
+   runs, so the final value lands in `ctx.registers` correctly.
+   Pair this with the parse-time rule that `until:` requires
+   `register:` (ANSIBLE_COMPAT §4) — the divergence isn't accidental,
+   it makes the rendering target self-documenting.
+
+4. **`RegisterValue.attempts` is only surfaced when nonzero.**
+   Single-attempt tasks (no retry semantics) keep `attempts: 0`
+   which `to_json` hides — playbooks can safely guard with
+   `{% if r.attempts is defined %}` or `{% if r.attempts > 1 %}`
+   without false hits on tasks that didn't retry.
+
+5. **`retries:` / `delay:` are int-or-Jinja-string at parse time.**
+   Render-and-parse helpers (`render_int_field`, `render_float_field`)
+   short-circuit literal numerics and only spin a template up when
+   the source contains Jinja. Render errors bubble as a single
+   `BodyResult::Failed` for the task — no attempts dispatch.
+
+6. **Block tasks reject `retries:` / `until:` / `delay:` at parse
+   time.** Users put them on inner tasks instead. Already enforced
+   in `Task::deserialize`. The same applies to future grouped ops
+   (`include_tasks:` etc.) — see the recursive-task-lists section
+   above for the discipline.
+
+7. **`failed_when:` is NOT yet implemented.** When it lands, the
+   integration point is right after each `run_body_once` returns —
+   apply `failed_when` to convert Ok→Failed (or leave alone),
+   THEN run the `until:` check. Documented in
+   `run_body_with_retries`'s doc comment.
+
 ## When you add a new convention here
 
 Keep entries short and rationale-first. The point of this file isn't

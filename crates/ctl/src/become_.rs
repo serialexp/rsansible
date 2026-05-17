@@ -137,6 +137,9 @@ pub fn apply(op: &mut TaskOp, eff: &EffectiveBecome) {
         // the surrounding sudo wrapping the agent itself (for write
         // permission to dest), not by mutating any argv.
         | TaskOp::Unarchive(_)
+        // tempfile: controller-side synth; no wire dispatch, no argv to
+        // wrap. `become:` on a tempfile task is meaningless.
+        | TaskOp::Tempfile(_)
         | TaskOp::PostgresqlQuery(_)
         | TaskOp::PostgresqlExt(_) => {}
     }
@@ -218,6 +221,9 @@ mod tests {
             retries: None,
             delay: None,
             until: None,
+            changed_when: None,
+            failed_when: None,
+            no_log: None,
         }
     }
 

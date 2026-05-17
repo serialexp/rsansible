@@ -528,6 +528,28 @@ fn first_sql_keyword(stmt: &str) -> Option<String> {
     Some(stmt[start..i].to_ascii_uppercase())
 }
 
+/// `db:` and `login_db:` are aliases in Ansible's
+/// `community.postgresql.*` modules. Accept either spelling; if both
+/// are set with the same value, that's fine; if both are set with
+/// *different* values, the YAML is ambiguous and we reject. Returns
+/// the resolved db name or empty string if neither is present.
+fn resolve_db_alias<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    module: &str,
+) -> Result<String, E> {
+    let a = take_optional_field_string::<E>(map, "db")?;
+    let b = take_optional_field_string::<E>(map, "login_db")?;
+    match (a, b) {
+        (Some(x), Some(y)) if x == y => Ok(x),
+        (Some(_), Some(_)) => Err(E::custom(format!(
+            "{module}: both `db:` and `login_db:` set with different values \
+             — they're aliases; pick one"
+        ))),
+        (Some(x), None) | (None, Some(x)) => Ok(x),
+        (None, None) => Ok(String::new()),
+    }
+}
+
 impl<'de> Deserialize<'de> for PostgresqlQueryOp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut map = serde_yaml::Mapping::deserialize(d)?;
@@ -539,7 +561,7 @@ impl<'de> Deserialize<'de> for PostgresqlQueryOp {
                 "postgresql_query.query: expected non-empty string, got: {other:?}"
             ))),
         };
-        let db = take_optional_field_string(&mut map, "db")?.unwrap_or_default();
+        let db = resolve_db_alias::<D::Error>(&mut map, "postgresql_query")?;
         let login_user = take_optional_field_string(&mut map, "login_user")?.unwrap_or_default();
         let login_password =
             take_optional_field_string(&mut map, "login_password")?.unwrap_or_default();
@@ -650,7 +672,7 @@ impl<'de> Deserialize<'de> for PostgresqlExtOp {
         let version = take_optional_field_string(&mut map, "version")?.unwrap_or_default();
         let ext_schema = take_optional_field_string(&mut map, "schema")?.unwrap_or_default();
         let cascade = take_optional_ansible_bool(&mut map, "cascade")?.unwrap_or(false);
-        let db = take_optional_field_string(&mut map, "db")?.unwrap_or_default();
+        let db = resolve_db_alias::<D::Error>(&mut map, "postgresql_ext")?;
         let login_user = take_optional_field_string(&mut map, "login_user")?.unwrap_or_default();
         let login_password =
             take_optional_field_string(&mut map, "login_password")?.unwrap_or_default();

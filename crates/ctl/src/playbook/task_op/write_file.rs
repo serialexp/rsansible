@@ -6,7 +6,8 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct WriteFileOp {
     pub path: String,
-    /// Octal in YAML (e.g. `0o644`) — serde-yaml parses that natively.
+    /// Octal in YAML (e.g. `0o644` literal, `"0644"` string, or 420 decimal).
+    #[serde(deserialize_with = "super::shared::deserialize_file_mode_u32")]
     pub mode: u32,
     pub content: String,
 }

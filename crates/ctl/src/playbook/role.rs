@@ -292,6 +292,9 @@ fn expand_one(
             retries: None,
             delay: None,
             until: None,
+            changed_when: None,
+            failed_when: None,
+            no_log: None,
         };
         spliced.insert(0, synthetic);
     }
@@ -507,14 +510,42 @@ fn resolve_role_dir(base_dir: &Path, name: &str) -> Result<PathBuf> {
     if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
         bail!("role name {name:?} must be a simple identifier (no slashes)");
     }
-    let dir = base_dir.join("roles").join(name);
-    if !dir.is_dir() {
-        bail!(
-            "role {name:?} not found: expected {} to exist",
-            dir.display()
-        );
+    // Two candidate layouts, checked in order:
+    //
+    //   1. `<base_dir>/roles/<name>/` — playbook at the project root,
+    //      roles alongside it. This is what `ansible-galaxy init` lays
+    //      down by default and what our own examples use.
+    //
+    //   2. `<base_dir>/../roles/<name>/` — playbook in a `playbooks/`
+    //      subdirectory, roles as a sibling of that subdirectory. This
+    //      is gothab's layout, and matches Ansible's default
+    //      `roles_path` resolution when `ansible-playbook` is run from
+    //      the project root (where `ansible.cfg` lives) with the
+    //      playbook nested one level down.
+    //
+    // We don't read `ansible.cfg` — its `roles_path` is a colon-
+    // separated list and the resolution rules drag in env vars
+    // (`ANSIBLE_ROLES_PATH`), the inventory directory, and several
+    // other sources. The two layouts above cover every real-world
+    // case we've seen; if a project needs something exotic, that's
+    // when we add a `--roles-path` CLI flag.
+    let candidates = [
+        base_dir.join("roles").join(name),
+        base_dir.join("..").join("roles").join(name),
+    ];
+    for dir in &candidates {
+        if dir.is_dir() {
+            return Ok(dir.clone());
+        }
     }
-    Ok(dir)
+    bail!(
+        "role {name:?} not found: searched {}",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
 }
 
 /// Load `<role_dir>/defaults/main.yml` if present. Returns `None` if

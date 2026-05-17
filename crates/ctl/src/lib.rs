@@ -10,6 +10,7 @@ pub mod extra_vars;
 pub mod host_pattern;
 pub mod inventory;
 pub mod limit;
+pub mod local;
 pub mod orchestrator;
 pub mod playbook;
 pub mod ssh;

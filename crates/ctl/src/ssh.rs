@@ -18,14 +18,28 @@
 //! once that lands.
 
 use anyhow::{anyhow, bail, Context, Result};
-use russh::client::{self, Handle, Msg};
+use russh::client::{self, Handle};
 use russh::keys::ssh_key::PublicKey;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
-use russh::{ChannelMsg, ChannelStream};
+use russh::ChannelMsg;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, info, warn};
+
+/// Trait alias bundling the duplex-stream traits we need for the
+/// orchestrator-to-agent pipe, plus `Send + Unpin` so it can flow
+/// through tokio's mutex / boxed-future plumbing. A blanket impl
+/// covers everything that already implements the four constituent
+/// traits (russh's `ChannelStream<Msg>`, the local-subprocess duplex
+/// from `local.rs`, mocks, …) so callers never have to implement it
+/// directly.
+pub trait AgentStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> AgentStream for T {}
+
+pub type BoxedAgentStream = Pin<Box<dyn AgentStream>>;
 
 use rsansible_wire::{
     msg::{now_unix_ns, ping},
@@ -63,7 +77,13 @@ pub struct AgentConn {
     pub remote_path: String,
     /// Reported by the agent's `Hello` frame.
     pub hello: rsansible_wire::generated::HelloOutput,
-    pub stream: ChannelStream<Msg>,
+    /// Duplex pipe to the agent. The orchestrator only reads/writes
+    /// length-prefixed frames against this — see `read_frame` /
+    /// `write_frame` in `rsansible_wire::framing`. Boxed as a trait
+    /// object so the same `AgentConn` shape works for both SSH-pushed
+    /// remote agents and locally-spawned subprocess agents (see
+    /// `local.rs`).
+    pub stream: BoxedAgentStream,
     /// Estimated offset between the agent's wall clock and the
     /// controller's, in nanoseconds. Positive iff the agent is ahead.
     /// Measured once with a single Ping/Pong right after Hello; stable
@@ -76,8 +96,24 @@ pub struct AgentConn {
     /// estimate: a measurement with RTT >> typical task latency is
     /// suspicious.
     pub clock_rtt_ns: u64,
-    /// Kept alive so the session doesn't drop while we're using `stream`.
-    _handle: Handle<Client>,
+    /// Transport-specific keep-alive payload. For SSH this is the
+    /// `russh::client::Handle` whose drop tears the session down. For
+    /// local subprocess transport it's the `tokio::process::Child`
+    /// handle (wrapped, see `local.rs`). The `AgentConn` doesn't
+    /// inspect it — it just needs to own the value until end-of-run
+    /// so the underlying transport isn't dropped out from under the
+    /// stream. `pub(crate)` so `local.rs` can construct one.
+    pub(crate) _keepalive: TransportKeepalive,
+}
+
+/// Opaque guard kept alive for the lifetime of an `AgentConn`.
+/// Variant per transport — the orchestrator never matches on this,
+/// it exists only so dropping the conn drops the right resource.
+pub enum TransportKeepalive {
+    Ssh(Handle<Client>),
+    /// Local subprocess child. We wait on it at conn-close time so
+    /// orphan agents don't accumulate.
+    Local(Box<tokio::process::Child>),
 }
 
 #[derive(Clone)]
@@ -198,10 +234,10 @@ pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Res
         label,
         remote_path,
         hello,
-        stream,
+        stream: Box::pin(stream),
         clock_offset_ns,
         clock_rtt_ns,
-        _handle: handle,
+        _keepalive: TransportKeepalive::Ssh(handle),
     })
 }
 
@@ -211,10 +247,13 @@ pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Res
 ///
 /// `offset = ((T2 - T1) + (T3 - T4)) / 2`  (positive iff agent ahead)
 /// `rtt    = (T4 - T1) - (T3 - T2)`        (always non-negative)
-async fn probe_clock_skew(
-    stream: &mut ChannelStream<Msg>,
+pub(crate) async fn probe_clock_skew<S>(
+    stream: &mut S,
     label: &str,
-) -> Result<(i64, u64)> {
+) -> Result<(i64, u64)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let t1 = now_unix_ns();
     write_frame(stream, &ping())
         .await

@@ -140,6 +140,115 @@ mid-run.
 
 ---
 
+## 5. `tempfile:` is controller-side in v1
+
+**rsansible's behavior.** `tempfile:` (Ansible's
+`ansible.builtin.tempfile`) creates the temp file or directory on the
+**controller** filesystem, regardless of the play's `connection:` or
+which host the task is targeting. The register's `.path` is a
+controller path.
+
+**Ansible's behavior.** `tempfile:` runs on the target host: a play
+against `hosts: db01 connection: ssh` creates `/tmp/<…>` on `db01`,
+and `register.path` is `db01`'s path.
+
+**Why we diverge.** The only Phase 1 consumer (gothab's
+`bootstrap-etcd-ca.yml`) runs `connection: local` against `localhost`,
+so the controller IS the target. Growing a target-side wire op
+(`OpTempfile` + agent handler + integration tests) is work we don't
+need yet. The parser-level shape stays identical for the future
+target-side variant, so playbooks don't need to know about the split.
+
+**When this bites you.** Using `tempfile:` against a remote SSH target
+today silently creates the path on the controller instead of the
+remote host — wrong, and surprising in a vendored playbook. Safe for
+`connection: local` / `hosts: localhost` / `delegate_to: localhost`.
+The restriction lifts the first time a Phase 1+ playbook needs
+target-side tempfiles; until then, the controller-side branch is the
+only path.
+
+**Code:** `crates/ctl/src/orchestrator.rs::synth_tempfile` — lives
+next to `synth_cert_pipe` because both share the "controller-side, no
+wire dispatch, synthesize register entry" shape. Parser is
+`crates/ctl/src/playbook/task_op/tempfile.rs::TempfileOp`; the parsed
+shape carries no connection-aware fields, so a future split adds an
+orchestrator dispatch arm without touching YAML semantics.
+
+---
+
+## 6. `openssl_csr_pipe` / `x509_certificate_pipe` quirks
+
+### 6a. KeyUsage / BasicConstraints are always critical
+
+**rsansible's behavior.** When `openssl_csr_pipe` emits a `KeyUsage`
+or `BasicConstraints` extension, it's always marked **critical**.
+Setting `key_usage_critical: false` while `key_usage:` is non-empty
+(or the equivalent BC pair) is rejected at parse time.
+
+**Ansible's behavior.** `community.crypto.openssl_csr` defaults
+`key_usage_critical` / `basic_constraints_critical` to `false` and
+emits the extensions non-critical unless you opt in.
+
+**Why we diverge.** rcgen 0.13 doesn't expose the critical bit per
+extension at this layer — KeyUsage and BasicConstraints are written
+critical by default when present, with no toggle. Silently accepting
+`critical: false` and producing a critical extension anyway would be
+worse than a parse-time error: a downstream peer that ignores
+non-critical extensions would behave differently against rsansible's
+output vs Ansible's. We surface the limitation up front.
+
+**Fix when porting an Ansible playbook.** Set
+`key_usage_critical: true` (and `basic_constraints_critical: true`
+when supplying BC). For the only Phase 1 consumer (gothab's etcd CA)
+this matches what the playbook already wants — a CA's KeyUsage *must*
+be critical for openssl's chain validator to accept it.
+
+### 6b. `selfsigned_digest` is parsed but advisory
+
+**rsansible's behavior.** `x509_certificate_pipe.selfsigned_digest:`
+is parsed and stored, but the actual signature digest is picked by
+rcgen based on the signing key (RSA → SHA-256, Ed25519 → its built-in,
+ECDSA P-256 → SHA-256). Asking for a non-default digest doesn't
+change the output.
+
+**Ansible's behavior.** `community.crypto.x509_certificate_pipe`
+honors `selfsigned_digest:` and rejects keys it can't sign with the
+requested digest.
+
+**Why we diverge.** For the keys we generate (RSA / Ed25519) the
+defaults rcgen picks line up with the Ansible defaults that any
+sane modern playbook would specify. Plumbing per-extension digest
+selection through rcgen is work we'd do when a playbook needs SHA-512
+or SHA-384, which gothab doesn't.
+
+**Fix when porting an Ansible playbook.** If the playbook depends on
+a non-default digest, this won't yet do what you want — file an issue
+with the failing case. Otherwise it's a no-op divergence.
+
+### 6c. CSR / cert registers carry both Ansible spellings
+
+**rsansible's behavior.** `openssl_csr_pipe` emits both
+`register.content` and `register.csr` with the CSR PEM;
+`x509_certificate_pipe` emits both `register.content` and
+`register.certificate`.
+
+**Ansible's behavior.** `openssl_csr_pipe` uses `.csr`,
+`x509_certificate_pipe` uses `.certificate`. `.content` is rsansible's
+own spelling.
+
+**Why we diverge.** v0 of rsansible only emitted `.content` (the spelling
+shared with `slurp` and other `_pipe` ops). Adding the Ansible spelling
+in parallel lets vendored playbooks reach `ca_csr.csr` or
+`ca_cert.certificate` without rewrites, while not breaking older
+rsansible-native playbooks that already used `.content`. Both keys
+point at the same string.
+
+**Fix when porting an Ansible playbook.** Nothing to fix — both work.
+When writing new rsansible-native code, prefer the Ansible spelling
+(`.csr` / `.certificate`) since it'll port back if you ever need to.
+
+---
+
 ## When you add a new divergence
 
 1. **Document it here first.** Add a `## N. <one-line summary>`

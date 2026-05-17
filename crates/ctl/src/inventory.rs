@@ -273,7 +273,7 @@ fn flatten_pre_hosts(raw: RawRoot) -> Result<PreHosts> {
 fn assemble_inventory(pre: PreHosts, disk: Option<&InventoryVars>) -> Result<Inventory> {
     let PreHosts {
         all_vars,
-        groups,
+        mut groups,
         group_inline_vars,
         hosts_raw,
     } = pre;
@@ -367,6 +367,39 @@ fn assemble_inventory(pre: PreHosts, disk: Option<&InventoryVars>) -> Result<Inv
                 member_of,
             },
         );
+    }
+
+    // Implicit `localhost`. Ansible always exposes a synthetic
+    // `localhost` host even when the inventory doesn't mention it,
+    // bound to `ansible_connection: local`. We mirror that — every
+    // bootstrap-style playbook (cert minting, inventory editing, …)
+    // assumes it can target `hosts: localhost`. The user-supplied
+    // entry wins if present; otherwise we inject a default
+    // pointing at 127.0.0.1 with the current process owner as the
+    // username (a SSH connection that never gets made for
+    // `connection: local`, but a real one if someone tries
+    // `connection: ssh` against localhost).
+    if !hosts.contains_key("localhost") {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "root".to_string());
+        hosts.insert(
+            "localhost".to_string(),
+            Host {
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                user,
+                key_path: None,
+                inline_vars: BTreeMap::new(),
+                member_of: vec!["all".to_string()],
+            },
+        );
+        // Keep the `all` group in sync. Append rather than rebuild
+        // — every other host already sits in declaration order.
+        let all_members = groups.entry("all".to_string()).or_default();
+        if !all_members.iter().any(|h| h == "localhost") {
+            all_members.push("localhost".to_string());
+        }
     }
 
     Ok(Inventory {
@@ -515,6 +548,48 @@ mod tests {
     }
 
     #[test]
+    fn implicit_localhost_is_added_when_absent() {
+        let inv = ok(parse(
+            r#"
+all:
+  vars:
+    ansible_user: deploy
+  children:
+    web:
+      hosts:
+        web1:
+          ansible_host: 10.0.0.1
+"#,
+        ));
+        let h = inv.hosts.get("localhost").expect("implicit localhost");
+        assert_eq!(h.host, "127.0.0.1");
+        assert_eq!(h.member_of, vec!["all".to_string()]);
+        assert!(inv.groups["all"].iter().any(|n| n == "localhost"));
+        // Real hosts still resolve normally.
+        assert_eq!(inv.hosts["web1"].host, "10.0.0.1");
+    }
+
+    #[test]
+    fn explicit_localhost_overrides_implicit() {
+        let inv = ok(parse(
+            r#"
+all:
+  vars:
+    ansible_user: deploy
+  children:
+    local:
+      hosts:
+        localhost:
+          ansible_host: 192.168.99.1
+"#,
+        ));
+        let h = &inv.hosts["localhost"];
+        // The operator-supplied entry wins — we don't clobber.
+        assert_eq!(h.host, "192.168.99.1");
+        assert!(h.member_of.iter().any(|g| g == "local"));
+    }
+
+    #[test]
     fn parses_minimal_inventory() {
         let inv = ok(parse(
             r#"
@@ -534,7 +609,9 @@ all:
         assert_eq!(h.user, "deploy");
         assert!(h.key_path.is_none());
         assert_eq!(h.member_of, vec!["all".to_string(), "web".to_string()]);
-        assert_eq!(inv.groups["all"], vec!["web1"]);
+        // `all` now also carries the implicit `localhost`; assert the
+        // real host is present without pinning the exact membership.
+        assert!(inv.groups["all"].iter().any(|n| n == "web1"));
         assert_eq!(inv.groups["web"], vec!["web1"]);
         assert_eq!(inv.all_vars.get("ansible_user").map(|v| v.as_str().unwrap()), Some("deploy"));
     }

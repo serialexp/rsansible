@@ -132,16 +132,45 @@ fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()>
                 );
             }
         }
-        // Notify references: literal (no `{{`) names must match a handler.
-        for n in &task.notify {
-            if !n.contains("{{") && !handler_names.contains(n) {
-                bail!(
-                    "{}: task[{ti}] {:?}: notify {:?} doesn't match any handler in this play",
-                    where_(),
-                    task.name,
-                    n
-                );
-            }
+        // Notify references: literal (no `{{`) names must match a
+        // handler. Walks into blocks recursively so inner tasks'
+        // notifies are validated too (the block container itself
+        // can't carry notify — rejected at parse time).
+        check_task_notifies(task, &handler_names, &where_(), ti)?;
+    }
+    Ok(())
+}
+
+/// Walk a task and (recursively) any inner block tasks, validating
+/// that each `notify:` reference resolves to a handler in this play.
+/// Literal names (no `{{ ... }}`) must match; templated names are
+/// validated at runtime.
+fn check_task_notifies(
+    task: &Task,
+    handler_names: &BTreeSet<String>,
+    where_: &str,
+    ti: usize,
+) -> Result<()> {
+    for n in &task.notify {
+        if !n.contains("{{") && !handler_names.contains(n) {
+            bail!(
+                "{}: task[{ti}] {:?}: notify {:?} doesn't match any handler in this play",
+                where_,
+                task.name,
+                n
+            );
+        }
+    }
+    if let TaskBody::Block(b) = &task.body {
+        let nested_where = format!("{} > block({:?})", where_, task.name);
+        for (i, child) in b.tasks.iter().enumerate() {
+            check_task_notifies(child, handler_names, &nested_where, i)?;
+        }
+        for (i, child) in b.rescue.iter().enumerate() {
+            check_task_notifies(child, handler_names, &format!("{nested_where} rescue"), i)?;
+        }
+        for (i, child) in b.always.iter().enumerate() {
+            check_task_notifies(child, handler_names, &format!("{nested_where} always"), i)?;
         }
     }
     Ok(())
@@ -301,6 +330,28 @@ fn validate_task(task: &Task, where_: &str, ti: usize) -> Result<()> {
                     where_,
                     task.name
                 );
+            }
+        }
+        TaskBody::Block(b) => {
+            // Recurse into each sub-list. The block container's own
+            // metadata (when, become, etc) was validated above; the
+            // children get the same per-task checks. Notify-name
+            // resolution is intentionally skipped here — the inner
+            // tasks may carry their own notifies, but the outer
+            // handler_names set is the play's handler list and is
+            // checked one level up (see validate_one_play). For now,
+            // run validate_task recursively; the play-level notify
+            // check in validate_one_play walks the block's children
+            // separately for that.
+            let nested_where = format!("{} > block({:?})", where_, task.name);
+            for (i, child) in b.tasks.iter().enumerate() {
+                validate_task(child, &nested_where, i)?;
+            }
+            for (i, child) in b.rescue.iter().enumerate() {
+                validate_task(child, &format!("{nested_where} rescue"), i)?;
+            }
+            for (i, child) in b.always.iter().enumerate() {
+                validate_task(child, &format!("{nested_where} always"), i)?;
             }
         }
     }

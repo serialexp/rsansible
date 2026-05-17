@@ -242,6 +242,17 @@ async fn cmd_run(
     spec.limit = limit;
     spec.wire_strategy = wire_strategy.into();
     spec.check_mode = check_mode;
+    // Surface playbook_dir / inventory_dir to templates. Canonicalize so
+    // `{{ playbook_dir }}/../foo` resolves cleanly regardless of how the
+    // user spelled the original path.
+    spec.playbook_dir = pb_path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
+    spec.inventory_dir = inv_path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
     if check_mode {
         eprintln!("*** running in check mode — no changes will be made ***");
     }
