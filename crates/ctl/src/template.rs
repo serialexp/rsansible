@@ -54,6 +54,18 @@ pub const OMIT_SENTINEL: &str =
 pub fn make_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    // Python-method compatibility shim. Ansible playbooks routinely call
+    // Python string/dict/list methods inside Jinja expressions —
+    // `s.strip()`, `s.split(",")`, `s.startswith("foo")`,
+    // `d.get("k")`, `d.items()` — because Ansible's Jinja eval runs in
+    // a Python context. minijinja by default rejects those as unknown
+    // methods (it has equivalents as filters: `| trim`, `| split(",")`,
+    // …). `pycompat::unknown_method_callback` from minijinja-contrib
+    // wires up the long tail in one call. Covers str.{strip, lstrip,
+    // rstrip, lower, upper, capitalize, title, count, find, rfind,
+    // replace, split, splitlines, startswith, endswith, join, format,
+    // is*}, dict.{get, keys, values, items}, list.count.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     // Preserve trailing newlines in rendered output — write_file.content
     // sources frequently end in `\n` and we don't want minijinja stripping
     // them silently. Matches Ansible's behavior.
@@ -1478,6 +1490,49 @@ mod tests {
         let v = serde_json::json!({"a": "round"});
         let out = tmpl.render(context! { v => v }).unwrap();
         assert_eq!(out, "round");
+    }
+
+    #[test]
+    fn pycompat_string_methods_available() {
+        // Smoke-test that the most common Python string methods Ansible
+        // playbooks reach for are recognized as Jinja methods. The
+        // long-tail catalog lives in `minijinja-contrib`; we just verify
+        // the callback is wired and the most-used ones round-trip.
+        let env = make_env();
+        let cases = [
+            (r#"{{ s.strip() }}"#, "  hello  ", "hello"),
+            (r#"{{ s.lower() }}"#, "HELLO", "hello"),
+            (r#"{{ s.upper() }}"#, "hello", "HELLO"),
+            (r#"{{ s.startswith('he') }}"#, "hello", "true"),
+            (r#"{{ s.endswith('lo') }}"#, "hello", "true"),
+            (r#"{{ s.replace('l', 'L') }}"#, "hello", "heLLo"),
+            (r#"{{ s.split(',') | length }}"#, "a,b,c", "3"),
+        ];
+        for (tpl, input, expected) in cases {
+            let t = env.template_from_str(tpl).unwrap();
+            let got = t.render(context! { s => input }).unwrap();
+            assert_eq!(got, expected, "template={tpl} input={input:?}");
+        }
+    }
+
+    #[test]
+    fn pycompat_until_expression_compiles() {
+        // The exact `until:` shape that surfaced this gap in gothab's
+        // drill-restore.yml: `drill_state.stdout.strip() != 'activating'`.
+        // We compile-and-eval as an expression here because that's how
+        // the orchestrator evaluates `until:` (see `eval_when`).
+        let env = make_env();
+        let expr = env
+            .compile_expression("drill_state.stdout.strip() != 'activating'")
+            .unwrap();
+        let view = context! {
+            drill_state => context! { stdout => "  inactive\n" }
+        };
+        assert!(expr.eval(view).unwrap().is_true());
+        let view = context! {
+            drill_state => context! { stdout => "activating" }
+        };
+        assert!(!expr.eval(view).unwrap().is_true());
     }
 
     #[test]

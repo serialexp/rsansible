@@ -1893,6 +1893,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "minijinja-contrib"
+version = "2.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45092d80391870622fcf3bd82f5d2af18f99533ea60debb4bc9db0c76f0e809a"
+dependencies = [
+ "minijinja",
+ "serde",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2754,6 +2764,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "minijinja",
+ "minijinja-contrib",
  "pbkdf2 0.12.2",
  "rcgen",
  "regex",

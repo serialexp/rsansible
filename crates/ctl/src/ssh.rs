@@ -19,7 +19,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use russh::client::{self, Handle};
-use russh::keys::ssh_key::PublicKey;
+use russh::keys::agent::client::AgentClient;
+use russh::keys::agent::AgentIdentity;
+use russh::keys::ssh_key::{HashAlg, PublicKey};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use std::path::{Path, PathBuf};
@@ -139,10 +141,6 @@ impl client::Handler for Client {
 /// Connect + auth + arch-probe + upload-agent + exec-agent + read-Hello.
 pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Result<AgentConn> {
     let label = format!("{}@{}:{}", opts.user, opts.host, opts.port);
-    let key_path = resolve_key_path(opts.key_path.as_deref())
-        .with_context(|| format!("resolving SSH key for {label}"))?;
-    let key = load_secret_key(&key_path, None)
-        .with_context(|| format!("loading SSH key {}", key_path.display()))?;
 
     let config = Arc::new(client::Config {
         // Half-hour idle is generous but a long playbook can sit waiting on
@@ -164,14 +162,8 @@ pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Res
         .await
         .with_context(|| format!("negotiating RSA hash alg with {label}"))?
         .flatten();
-    let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
-    let auth = handle
-        .authenticate_publickey(&opts.user, key_with_alg)
-        .await
-        .with_context(|| format!("ssh auth {label}"))?;
-    if !auth.success() {
-        bail!("ssh: publickey auth failed for {label}");
-    }
+
+    authenticate(&mut handle, opts, rsa_hash, &label).await?;
 
     // Arch probe. We don't gate the upload on this yet (v0 ships one agent
     // binary), but we log it for visibility and so a mismatched binary later
@@ -278,6 +270,116 @@ where
     let offset_ns =
         offset_ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     Ok((offset_ns, rtt_ns))
+}
+
+/// Authenticate an already-connected SSH session. Tries ssh-agent first
+/// (via `$SSH_AUTH_SOCK`), iterating every identity the agent offers; on
+/// failure (or no agent), falls back to loading the secret key from the
+/// configured/default key path.
+///
+/// We prefer agent auth because it handles passphrase-encrypted keys
+/// (operator unlocks once via `ssh-add`) and matches how the rest of the
+/// operator's tooling — `git`, `ssh`, `scp` — already behaves. The
+/// file-based fallback covers the cookbook case of running without an
+/// agent at all (CI workers, scripted bootstrap).
+async fn authenticate(
+    handle: &mut Handle<Client>,
+    opts: &ConnectOptions,
+    rsa_hash: Option<HashAlg>,
+    label: &str,
+) -> Result<()> {
+    // ssh-agent path: only attempted if SSH_AUTH_SOCK is set. Empty agent,
+    // unreachable socket, or every identity refused — we fall through to
+    // the file path and surface a combined error if that fails too.
+    let mut agent_err: Option<String> = None;
+    if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+        match try_agent_auth(handle, &opts.user, rsa_hash, label).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => agent_err = Some("ssh-agent: no identity accepted".to_string()),
+            Err(e) => agent_err = Some(format!("ssh-agent: {e:#}")),
+        }
+    }
+
+    // File-based fallback. `load_secret_key(_, None)` doesn't prompt for
+    // a passphrase — if the key is encrypted, this returns an error
+    // (which we combine with the agent-side error below for clarity).
+    let key_path = resolve_key_path(opts.key_path.as_deref())
+        .with_context(|| format!("resolving SSH key for {label}"))?;
+    let key = match load_secret_key(&key_path, None) {
+        Ok(k) => k,
+        Err(e) => {
+            let file_err = format!(
+                "loading SSH key {}: {e:#}",
+                key_path.display(),
+            );
+            match agent_err {
+                Some(ae) => bail!(
+                    "ssh auth {label} failed:\n  - {ae}\n  - {file_err}\n  \
+                     (hint: `ssh-add {}` to unlock and offer the key via agent)",
+                    key_path.display(),
+                ),
+                None => bail!("ssh auth {label}: {file_err}"),
+            }
+        }
+    };
+
+    let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
+    let auth = handle
+        .authenticate_publickey(&opts.user, key_with_alg)
+        .await
+        .with_context(|| format!("ssh auth {label}"))?;
+    if !auth.success() {
+        match agent_err {
+            Some(ae) => bail!(
+                "ssh auth {label}: publickey rejected via both agent and file:\n  - {ae}\n  - file {}: server rejected the key",
+                key_path.display(),
+            ),
+            None => bail!("ssh: publickey auth failed for {label}"),
+        }
+    }
+    Ok(())
+}
+
+/// Walk every identity offered by the local ssh-agent and try each one.
+/// Returns `Ok(true)` on the first success, `Ok(false)` if the agent had
+/// zero identities or all identities were rejected by the server, and
+/// `Err` for protocol-level errors talking to the agent.
+async fn try_agent_auth(
+    handle: &mut Handle<Client>,
+    user: &str,
+    rsa_hash: Option<HashAlg>,
+    label: &str,
+) -> Result<bool> {
+    let mut client = AgentClient::connect_env()
+        .await
+        .map_err(|e| anyhow!("connect to SSH_AUTH_SOCK: {e}"))?;
+    let identities = client
+        .request_identities()
+        .await
+        .map_err(|e| anyhow!("request_identities: {e}"))?;
+    if identities.is_empty() {
+        debug!(host = %label, "ssh-agent has no identities loaded");
+        return Ok(false);
+    }
+    for ident in identities {
+        let (pubkey, comment) = match &ident {
+            AgentIdentity::PublicKey { key, comment } => (key.clone(), comment.clone()),
+            AgentIdentity::Certificate { certificate, comment } => (
+                PublicKey::new(certificate.public_key().clone(), ""),
+                comment.clone(),
+            ),
+        };
+        debug!(host = %label, key = %comment, "trying ssh-agent identity");
+        let result = handle
+            .authenticate_publickey_with(user, pubkey, rsa_hash, &mut client)
+            .await
+            .map_err(|e| anyhow!("agent-signed auth attempt: {e}"))?;
+        if result.success() {
+            info!(host = %label, key = %comment, "authenticated via ssh-agent");
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Run a one-shot command on the remote, collecting stdout into a String.

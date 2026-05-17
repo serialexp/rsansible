@@ -31,6 +31,10 @@ russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "
 
 # templates
 minijinja = { version = "2", default-features = false, features = ["builtins", "loader", "serde"] }
+# Python-method compatibility shim for minijinja — enables `.strip()`,
+# `.split()`, `.replace()`, `.startswith()`, etc. as called from Ansible
+# playbooks. Wired up via `set_unknown_method_callback` in `make_env()`.
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 # base64 — controller-side Jinja filter (`b64encode` / `b64decode`).
 # rustcrypto-free, std-only.
 base64 = { version = "0.22", default-features = false, features = ["std"] }

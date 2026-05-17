@@ -23,6 +23,7 @@ tokio = { workspace = true }
 futures.workspace = true
 russh.workspace = true
 minijinja.workspace = true
+minijinja-contrib.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
