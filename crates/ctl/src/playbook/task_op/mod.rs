@@ -242,6 +242,22 @@ pub struct Task {
     /// `IncludeRoleSpec.vars` (Ansible's per-role-include override) and
     /// this field stays empty.
     pub vars: BTreeMap<String, serde_yaml::Value>,
+    /// `environment:` — task-level env var overlay applied when the
+    /// task body dispatches a `shell:` / `command:` / `exec:` op (or
+    /// any op whose wire form carries env_keys/env_values today —
+    /// currently OpExec and OpShell). Values are rendered through
+    /// Jinja at dispatch against the host's view, then handed to the
+    /// agent which overlays them on top of the agent's process env
+    /// (Ansible-compatible: additive on top of the connection env,
+    /// per-task scope).
+    ///
+    /// Empty for tasks that don't declare `environment:`. Keys are
+    /// always strings; values must be string-compatible scalars
+    /// (string / int / bool / float — coerced at parse time).
+    ///
+    /// Inheritance: `inherit_block_metadata` merges block-level env
+    /// INTO each child task's env. Child key wins on collision.
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -567,6 +583,7 @@ const METADATA_KEYS: &[&str] = &[
     "changed_when",
     "failed_when",
     "no_log",
+    "environment",
 ];
 
 
@@ -808,6 +825,43 @@ impl<'de> Deserialize<'de> for Task {
             Some(other) => {
                 return Err(D::Error::custom(format!(
                     "task {name:?}: `vars` must be a mapping, got: {other:?}"
+                )));
+            }
+        };
+
+        // `environment:` — task-level env var map. Strings only; we
+        // coerce a small set of scalar types (int / bool / float) to
+        // their string form so playbooks can write `MY_PORT: 5432`
+        // without surrounding quotes. Anything else (mapping, sequence,
+        // null) is rejected at parse time — silently dropping a
+        // structured value would produce a surprising "empty env".
+        let environment: BTreeMap<String, String> = match map.remove("environment") {
+            None => BTreeMap::new(),
+            Some(serde_yaml::Value::Mapping(m)) => {
+                let mut out = BTreeMap::new();
+                for (k, v) in m {
+                    let key = k.as_str().ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "task {name:?}: environment keys must be strings, got {k:?}"
+                        ))
+                    })?;
+                    let val = match v {
+                        serde_yaml::Value::String(s) => s,
+                        serde_yaml::Value::Number(n) => n.to_string(),
+                        serde_yaml::Value::Bool(b) => b.to_string(),
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "task {name:?}: environment[{key:?}] must be a string/int/bool, got {other:?}"
+                            )));
+                        }
+                    };
+                    out.insert(key.to_string(), val);
+                }
+                out
+            }
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `environment` must be a mapping, got: {other:?}"
                 )));
             }
         };
@@ -1257,6 +1311,7 @@ impl<'de> Deserialize<'de> for Task {
             failed_when,
             no_log,
             vars: task_level_vars,
+            environment,
         })
     }
 }
@@ -1641,7 +1696,12 @@ impl TaskOp {
     /// structural conversion.
     pub fn to_wire_op(&self) -> Result<Op> {
         match self {
-            TaskOp::Shell(s) => Ok(op_shell(s.command().to_string(), s.timeout_ms())),
+            TaskOp::Shell(s) => Ok(op_shell(
+                s.command().to_string(),
+                Vec::new(),
+                Vec::new(),
+                s.timeout_ms(),
+            )),
             TaskOp::Exec(e) => {
                 if e.argv.is_empty() {
                     return Err(anyhow!("exec.argv is empty"));
@@ -3127,5 +3187,51 @@ poll: "{{ poll_interval }}"
             Some("{{ (writer_duration_s | int) + 30 }}")
         );
         assert_eq!(t.poll_seconds.as_deref(), Some("{{ poll_interval }}"));
+    }
+
+    #[test]
+    fn parses_environment_string_int_bool_values() {
+        let t = parse_task(
+            r#"
+name: t
+shell: env
+environment:
+  PIPX_HOME: /opt/patroni
+  MAX_RETRIES: 3
+  VERBOSE: true
+"#,
+        );
+        assert_eq!(t.environment.get("PIPX_HOME").map(String::as_str), Some("/opt/patroni"));
+        assert_eq!(t.environment.get("MAX_RETRIES").map(String::as_str), Some("3"));
+        assert_eq!(t.environment.get("VERBOSE").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn rejects_environment_mapping_value() {
+        let yaml = r#"
+name: t
+shell: env
+environment:
+  NESTED: { not: "allowed" }
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("environment[\"NESTED\"]"),
+            "expected complaint about NESTED env value; got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_environment_non_mapping_root() {
+        let yaml = r#"
+name: t
+shell: env
+environment: "FOO=bar"
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("`environment` must be a mapping"),
+            "expected complaint about non-mapping env root; got: {err}"
+        );
     }
 }

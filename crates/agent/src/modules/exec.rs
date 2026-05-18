@@ -80,8 +80,29 @@ pub async fn run_shell(ctx: &Context, seq: u32, op: OpShellOutput, check_mode: b
         ctx.emit(msg::task_done(seq, 0, false, true, started_unix_ns, finished_unix_ns)).await;
         return Ok(());
     }
+    if op.env_keys.len() != op.env_values.len() {
+        emit_error(
+            ctx,
+            seq,
+            msg::err::BAD_REQUEST,
+            format!(
+                "OpShell.env_keys (len {}) and env_values (len {}) must match",
+                op.env_keys.len(),
+                op.env_values.len()
+            ),
+        )
+        .await;
+        return Ok(());
+    }
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(&op.command);
+    // OVERLAY semantics for shell — matches Ansible's `environment:` keyword
+    // (additive on top of the inherited connection env). Unlike OpExec we
+    // don't `env_clear()`: shell tasks frequently rely on PATH, HOME, LANG,
+    // etc. from the agent's environment to find binaries / locale.
+    for (k, v) in op.env_keys.iter().zip(op.env_values.iter()) {
+        cmd.env(k, v);
+    }
     run_command(ctx, seq, cmd, None, op.timeout_ms).await
 }
 

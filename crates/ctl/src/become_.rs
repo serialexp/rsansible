@@ -195,6 +195,7 @@ mod tests {
             failed_when: None,
             no_log: None,
             vars: std::collections::BTreeMap::new(),
+            environment: std::collections::BTreeMap::new(),
         }
     }
 

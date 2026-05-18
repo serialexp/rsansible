@@ -63,10 +63,24 @@
     },
 
     OpShell: {
-      description: "Run `sh -c <command>`. Same plumbing as OpExec for output.",
+      description: "Run `sh -c <command>`. Same plumbing as OpExec for output. `env_keys`/`env_values` mirror OpExec's CSR-style env so task-level `environment:` can be honored without falling back to in-band `KEY=val cmd` quoting tricks.",
       sequence: [
         { name: "kind", type: "uint8", const: 1 },
         { name: "command", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        {
+          name: "env_keys",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
+        {
+          name: "env_values",
+          type: "array",
+          kind: "length_prefixed",
+          length_type: "uint16",
+          items: { type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        },
         { name: "timeout_ms", type: "uint32" },
       ],
     },

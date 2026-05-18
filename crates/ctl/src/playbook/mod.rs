@@ -468,6 +468,7 @@ fn push_block_metadata_to_children(block_task: &mut Task) {
     let parent_ignore_errors = block_task.ignore_errors;
     let parent_check_mode = block_task.check_mode;
     let parent_delegate_to = block_task.delegate_to.clone();
+    let parent_environment = block_task.environment.clone();
 
     let block = match &mut block_task.body {
         TaskBody::Block(b) => b,
@@ -510,6 +511,16 @@ fn push_block_metadata_to_children(block_task: &mut Task) {
         }
         if child.delegate_to.is_none() {
             child.delegate_to = parent_delegate_to.clone();
+        }
+        // environment: merge parent INTO child. Child keys win on
+        // collision — same precedence as Ansible's block-vs-task env
+        // overlay. (Parent vars are unconditionally inserted only when
+        // the child hasn't already set the same key.)
+        for (k, v) in &parent_environment {
+            child
+                .environment
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
         }
     };
 
@@ -1284,6 +1295,40 @@ all:
         let b = block_children(&pb.plays[0].tasks[0]);
         assert_eq!(b.tasks[0].delegate_to.as_deref(), Some("localhost"));
         assert_eq!(b.tasks[1].delegate_to.as_deref(), Some("bastion"));
+    }
+
+    #[test]
+    fn block_pushes_environment_merged_with_child_winning_on_collision() {
+        let pb = write_and_load(
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: outer
+      environment:
+        PIPX_HOME: /opt/patroni
+        SHARED_FLAG: "1"
+      block:
+        - name: inherits-cleanly
+          shell: echo hi
+        - name: child-overrides-and-extends
+          environment:
+            SHARED_FLAG: "2"
+            EXTRA: from-child
+          shell: echo hi
+"#,
+        );
+        let b = block_children(&pb.plays[0].tasks[0]);
+        // Bare child picks up both block-level vars verbatim.
+        assert_eq!(b.tasks[0].environment.get("PIPX_HOME").map(String::as_str), Some("/opt/patroni"));
+        assert_eq!(b.tasks[0].environment.get("SHARED_FLAG").map(String::as_str), Some("1"));
+        // Child with its own env: keys: child wins on collision,
+        // parent fills in the rest, child-only keys stay.
+        let env = &b.tasks[1].environment;
+        assert_eq!(env.get("PIPX_HOME").map(String::as_str), Some("/opt/patroni"));
+        assert_eq!(env.get("SHARED_FLAG").map(String::as_str), Some("2"));
+        assert_eq!(env.get("EXTRA").map(String::as_str), Some("from-child"));
     }
 
     #[test]

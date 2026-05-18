@@ -52,7 +52,7 @@ async fn hello_then_shell_then_bye() {
     // Run `echo hello`.
     write_frame(
         &mut stdin,
-        &msg::task_dispatch(1, false, msg::op_shell("echo hello".into(), 0)),
+        &msg::task_dispatch(1, false, msg::op_shell("echo hello".into(), vec![], vec![], 0)),
     )
     .await
     .unwrap();
@@ -73,7 +73,7 @@ async fn hello_then_shell_then_bye() {
     // Non-zero exit propagates cleanly.
     write_frame(
         &mut stdin,
-        &msg::task_dispatch(2, false, msg::op_shell("exit 7".into(), 0)),
+        &msg::task_dispatch(2, false, msg::op_shell("exit 7".into(), vec![], vec![], 0)),
     )
     .await
     .unwrap();

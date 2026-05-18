@@ -120,7 +120,27 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_task_dispatch_shell() {
-        roundtrip(msg::task_dispatch(42, false, msg::op_shell("echo hi".into(), 0))).await;
+        roundtrip(msg::task_dispatch(
+            42,
+            false,
+            msg::op_shell("echo hi".into(), vec![], vec![], 0),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_shell_with_env() {
+        roundtrip(msg::task_dispatch(
+            42,
+            false,
+            msg::op_shell(
+                "echo $FOO".into(),
+                vec!["FOO".into(), "BAR".into()],
+                vec!["1".into(), "two".into()],
+                0,
+            ),
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -717,7 +737,7 @@ mod tests {
             false,
             msg::op_async_start(
                 300_000,
-                msg::op_shell("sleep 5 && echo done".into(), 0),
+                msg::op_shell("sleep 5 && echo done".into(), vec![], vec![], 0),
             ),
         ))
         .await;
@@ -820,7 +840,7 @@ mod tests {
         roundtrip(msg::task_dispatch(
             44,
             true,
-            msg::op_shell("echo dry-run".into(), 0),
+            msg::op_shell("echo dry-run".into(), vec![], vec![], 0),
         ))
         .await;
     }

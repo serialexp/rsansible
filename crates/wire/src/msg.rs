@@ -31,10 +31,17 @@ pub fn op_exec(
     })
 }
 
-pub fn op_shell(command: String, timeout_ms: u32) -> Op {
+pub fn op_shell(
+    command: String,
+    env_keys: Vec<String>,
+    env_values: Vec<String>,
+    timeout_ms: u32,
+) -> Op {
     Op::OpShell(OpShellOutput {
         kind: 1,
         command,
+        env_keys,
+        env_values,
         timeout_ms,
     })
 }

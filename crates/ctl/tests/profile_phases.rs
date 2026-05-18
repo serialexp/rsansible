@@ -110,7 +110,7 @@ async fn profile_three_host_run() -> Result<()> {
         rsansible_wire::msg::task_dispatch(
             1,
             false,
-            op_shell("printf 'hi from %s\\n' \"$(hostname)\"".into(), 5_000),
+            op_shell("printf 'hi from %s\\n' \"$(hostname)\"".into(), vec![], vec![], 5_000),
         ),
     )
     .await?;

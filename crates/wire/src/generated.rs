@@ -154,6 +154,8 @@ impl From<OpExecOutput> for OpExecInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpShellInput {
     pub command: std::string::String,
+    pub env_keys: Vec<std::string::String>,
+    pub env_values: Vec<std::string::String>,
     pub timeout_ms: u32,
 }
 
@@ -161,6 +163,8 @@ pub struct OpShellInput {
 pub struct OpShellOutput {
     pub kind: u8,
     pub command: std::string::String,
+    pub env_keys: Vec<std::string::String>,
+    pub env_values: Vec<std::string::String>,
     pub timeout_ms: u32,
 }
 
@@ -179,6 +183,20 @@ impl OpShellInput {
         let string_bytes: &[u8] = self.command.as_bytes();
         for &b in string_bytes.iter() {
             encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.env_keys.len() as u16);
+        for item in &self.env_keys {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_u16_le(self.env_values.len() as u16);
+        for item in &self.env_values {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
         }
         encoder.write_u32_le(self.timeout_ms);
         Ok(())
@@ -200,10 +218,28 @@ impl OpShellOutput {
         let length = decoder.read_u16_le()? as usize;
         let bytes = decoder.read_bytes_vec(length)?;
         let command = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let mut env_keys = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            env_keys.push(item);
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let mut env_values = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            env_values.push(item);
+        }
         let timeout_ms = decoder.read_u32_le()?;
         Ok(Self {
             kind,
             command,
+            env_keys,
+            env_values,
             timeout_ms,
         })
     }
@@ -219,6 +255,8 @@ impl From<OpShellOutput> for OpShellInput {
     fn from(o: OpShellOutput) -> Self {
         Self {
             command: o.command,
+            env_keys: o.env_keys,
+            env_values: o.env_values,
             timeout_ms: o.timeout_ms,
         }
     }
@@ -3464,6 +3502,20 @@ impl Op {
                 let string_bytes: &[u8] = v.command.as_bytes();
                 for &b in string_bytes.iter() {
                     encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.env_keys.len() as u16, Endianness::LittleEndian);
+                for item in &v.env_keys {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint16(v.env_values.len() as u16, Endianness::LittleEndian);
+                for item in &v.env_values {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
                 }
                 encoder.write_uint32(v.timeout_ms, Endianness::LittleEndian);
             }

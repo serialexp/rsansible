@@ -780,6 +780,7 @@ fn make_gather_facts_task() -> Task {
         failed_when: None,
         no_log: None,
         vars: std::collections::BTreeMap::new(),
+            environment: std::collections::BTreeMap::new(),
     }
 }
 
@@ -2817,7 +2818,7 @@ async fn run_op_body(
     // function. Argv wrapping (the old `sudo -n -u <user> --` prefix
     // on shell/exec/command) is gone; the agent for that BecomeKey
     // already runs with the right EUID. No mutation needed here.
-    let inner_wire_op = match rendered.to_wire_op() {
+    let mut inner_wire_op = match rendered.to_wire_op() {
         Ok(w) => w,
         Err(e) => {
             return BodyResult::Failed {
@@ -2827,6 +2828,66 @@ async fn run_op_body(
             };
         }
     };
+
+    // `environment:` overlay — render each value through Jinja against
+    // the host's current view, then splice the rendered (key, value)
+    // pairs into the wire op's env_keys/env_values. Today only OpExec
+    // and OpShell carry env on the wire; future ops that grow env
+    // slots can extend this match without touching task parsing or
+    // inheritance. If a task sets `environment:` on a body that has
+    // nowhere to put it, we treat that as a soft no-op rather than a
+    // hard error — matches Ansible (which lets `environment:` set on
+    // e.g. a `file:` task pass silently).
+    if !task.environment.is_empty() {
+        let view = build_template_ctx(ctx, world);
+        let mut rendered_env: Vec<(String, String)> =
+            Vec::with_capacity(task.environment.len());
+        for (k, v) in &task.environment {
+            let rendered_val = match render_str(env, v, &view) {
+                Ok(s) => s,
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!("render environment[{k:?}]: {e:#}"),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            };
+            rendered_env.push((k.clone(), rendered_val));
+        }
+        match &mut inner_wire_op {
+            rsansible_wire::Op::OpExec(e) => {
+                for (k, v) in rendered_env {
+                    // Child task `environment:` wins on collision with
+                    // anything baked into the body (e.g. an `exec:`
+                    // task that also declares `env:` inline). This
+                    // mirrors how Ansible merges its own `environment:`
+                    // on top of module-internal env handling.
+                    if let Some(idx) = e.env_keys.iter().position(|x| x == &k) {
+                        e.env_values[idx] = v;
+                    } else {
+                        e.env_keys.push(k);
+                        e.env_values.push(v);
+                    }
+                }
+            }
+            rsansible_wire::Op::OpShell(s) => {
+                for (k, v) in rendered_env {
+                    if let Some(idx) = s.env_keys.iter().position(|x| x == &k) {
+                        s.env_values[idx] = v;
+                    } else {
+                        s.env_keys.push(k);
+                        s.env_values.push(v);
+                    }
+                }
+            }
+            _ => {
+                // Soft no-op for ops without env slots. Could be made
+                // strict if it surprises users; today gothab only uses
+                // environment: on command/shell which DO carry env.
+            }
+        }
+    }
 
     // `async: N` (with N>0) wraps the inner op in OpAsyncStart so the
     // agent runs it as a background job. `async: 0` (or absent) is
@@ -6189,6 +6250,7 @@ all:
             failed_when: None,
             no_log: None,
             vars: std::collections::BTreeMap::new(),
+            environment: std::collections::BTreeMap::new(),
         }
     }
 
@@ -6424,6 +6486,7 @@ all:
             failed_when: None,
             no_log: None,
             vars: std::collections::BTreeMap::new(),
+            environment: std::collections::BTreeMap::new(),
         }
     }
 

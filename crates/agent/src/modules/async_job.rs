@@ -342,7 +342,7 @@ mod tests {
         let ctx = Context::new(crate::writer::Sender(tx));
 
         // Inner: `sh -c 'echo hi'`. Fast — no real timing dependency.
-        let inner = wmsg::op_shell("echo hi".into(), 0);
+        let inner = wmsg::op_shell("echo hi".into(), vec![], vec![], 0);
         let start_op = match wmsg::op_async_start(0, inner) {
             Op::OpAsyncStart(s) => s,
             _ => unreachable!(),
