@@ -208,20 +208,21 @@ playbook-level dependency surfaced after, NOT yet implemented:
    from the orchestrator when `async_wrap.is_some()` OR the inner op
    is `AsyncStatus`.
 
-3. **(FIXED for per_task strategy)** Cross-host `hostvars[<peer>].…`
+3. **(FIXED for both strategies)** Cross-host `hostvars[<peer>].…`
    access into the running play's per-host state (facts, set_facts,
-   registers, plus `inventory_hostname`). `merge_dynamic_hostvars`
-   rebuilds `world.hostvars` from every host's current `HostCtx`
-   before each task (and the implicit end-of-play flush). Since all
-   ctxs are back in the map at task boundaries — the fanout owns
-   them by-value mid-task and re-inserts via `apply_per_host_result`
-   — no locking is needed.
-   - **Open: per_play strategy** — each host walks the task list
-     independently with no natural barrier, so a snapshot point
-     would race with concurrent ctx mutations. Per_play hostvars
-     remain the static inventory snapshot for now; if a real
-     playbook hits it we plumb `Arc<RwLock<HostCtx>>` and snapshot
-     per-render.
+   registers, plus `inventory_hostname`).
+   - **per_task:** `merge_dynamic_hostvars` rebuilds `world.hostvars`
+     from every host's current `HostCtx` before each task (and the
+     implicit end-of-play flush). All ctxs are back in the map at
+     task boundaries — the fanout owns them by-value mid-task and
+     re-inserts via `apply_per_host_result` — so no locking is
+     needed. Barrier-consistent peer visibility.
+   - **per_play:** `merge_dynamic_hostvars_locked` reads from an
+     `Arc<TokioRwLock<HostCtx>>` per host, written by each walker
+     after every completed task. Peer views are
+     eventually-consistent ("the peer's last committed task"),
+     which matches per_play's no-barrier shape; documented in
+     CLAUDE.md.
 
 ## Test-infrastructure flake (pre-existing)
 

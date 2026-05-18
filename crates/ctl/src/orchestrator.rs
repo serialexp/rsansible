@@ -33,7 +33,7 @@ use rsansible_wire::{
     read_frame, write_frame, Op,
 };
 use serde_json::Value as JsonValue;
-use tokio::sync::{Mutex as TokioMutex, Notify, OnceCell, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, Notify, OnceCell, RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -673,10 +673,11 @@ fn build_world_vars_for_play(base: &WorldVars, play: &Play) -> WorldVars {
 /// per-task barrier semantics: hosts see each other's state as it
 /// was at the start of the current task, not mid-flight.
 ///
-/// **Not wired for `run_play_per_play`** — that strategy walks tasks
-/// per-host with no natural barrier, so a snapshot here would race
-/// with concurrent ctx mutations. Per_play hostvars remain the
-/// static inventory snapshot; documented at its call site.
+/// For `run_play_per_play` we publish a parallel snapshot
+/// (`Arc<RwLock<HostCtx>>` per host, written at each task barrier
+/// on the owning walker) and call [`merge_dynamic_hostvars_locked`]
+/// instead — the in-fanout ctxs map is not at-rest in that strategy
+/// so a direct snapshot here would race.
 fn merge_dynamic_hostvars(
     base: &WorldVars,
     ctxs: &BTreeMap<String, HostCtx>,
@@ -710,6 +711,75 @@ fn merge_dynamic_hostvars(
             "inventory_hostname".into(),
             JsonValue::String(ctx.host_name.clone()),
         );
+    }
+    WorldVars {
+        groups: base.groups.clone(),
+        hostvars,
+        playbook_dir: base.playbook_dir.clone(),
+        inventory_dir: base.inventory_dir.clone(),
+    }
+}
+
+/// Per-walker hostvars snapshot for the `per_play` strategy.
+///
+/// Each host's walker owns its working `HostCtx` by-value (as in
+/// per_task), but ALSO publishes a clone into a shared
+/// `Arc<RwLock<HostCtx>>` after each completed task. Peer reads
+/// happen here: this function read-locks every entry in
+/// `peer_views`, overlays the same field precedence as
+/// [`merge_dynamic_hostvars`], and returns a fresh `WorldVars`
+/// suitable for the next task render.
+///
+/// `self_name` / `self_ctx` lets the caller substitute the
+/// currently-running host's view with the live working ctx instead
+/// of the lagging snapshot. This matters when a task on host A
+/// references `hostvars['a'].x` — A wants its own freshest value,
+/// not what it last published.
+///
+/// Semantics differ slightly from per_task: peer views reflect the
+/// peer's most-recently-completed task, not "all-hosts at start of
+/// task K." Eventual rather than barrier-consistent. Documented in
+/// CLAUDE.md under "Dynamic hostvars".
+async fn merge_dynamic_hostvars_locked(
+    base: &WorldVars,
+    peer_views: &BTreeMap<String, Arc<TokioRwLock<HostCtx>>>,
+    self_name: &str,
+    self_ctx: &HostCtx,
+) -> WorldVars {
+    let mut hostvars = base.hostvars.clone();
+    for (name, view_lock) in peer_views {
+        let view = hostvars
+            .entry(name.clone())
+            .or_insert_with(BTreeMap::new);
+        // Inline overlay so the borrow of `self_ctx` / `view_lock.read()`
+        // lives only as long as needed without juggling Option<RwLockReadGuard>.
+        let overlay = |ctx: &HostCtx, view: &mut BTreeMap<String, JsonValue>| {
+            for (k, v) in &ctx.facts {
+                view.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &ctx.play_vars {
+                view.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &ctx.set_facts {
+                view.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &ctx.registers {
+                view.insert(k.clone(), v.to_json());
+            }
+            for (k, v) in &ctx.extra_vars {
+                view.insert(k.clone(), v.clone());
+            }
+            view.insert(
+                "inventory_hostname".into(),
+                JsonValue::String(ctx.host_name.clone()),
+            );
+        };
+        if name == self_name {
+            overlay(self_ctx, view);
+        } else {
+            let guard = view_lock.read().await;
+            overlay(&*guard, view);
+        }
     }
     WorldVars {
         groups: base.groups.clone(),
@@ -1236,6 +1306,20 @@ async fn run_play_per_play(
     // re-executing the body.
     let coord = RunOnceCoord::allocate(&play.tasks);
 
+    // Per-host snapshot map for dynamic `hostvars[<peer>]` lookups.
+    // Each walker publishes its working ctx into its own slot at every
+    // task barrier; peer walkers read-lock these slots when building
+    // their next-task world. See `merge_dynamic_hostvars_locked` for
+    // the semantic (eventual peer consistency under per_play).
+    let peer_views: Arc<BTreeMap<String, Arc<TokioRwLock<HostCtx>>>> = Arc::new(
+        live.iter()
+            .map(|n| {
+                let initial = ctxs.get(n).cloned().unwrap_or_else(|| HostCtx::new(n.clone()));
+                (n.clone(), Arc::new(TokioRwLock::new(initial)))
+            })
+            .collect(),
+    );
+
     let on_failure = play.on_failure;
     let handlers: Arc<Vec<Task>> = Arc::new(play.handlers.clone());
     let mut set: JoinSet<PerPlayHostResult> = JoinSet::new();
@@ -1244,7 +1328,7 @@ async fn run_play_per_play(
         let play_name = play.name.clone();
         let seq_src = next_seq.clone();
         let env = env.clone();
-        let world = world.clone();
+        let base_world = world.clone();
         let pools_for = pools.clone();
         let own_pool = pools.get(name).expect("live host has pool").clone();
         let ctx = ctxs
@@ -1255,6 +1339,7 @@ async fn run_play_per_play(
         let handlers = handlers.clone();
         let live_names = live.clone();
         let tag_filter = tag_filter.clone();
+        let peer_views = peer_views.clone();
         set.spawn(async move {
             let mut ctx = ctx;
             let mut first_failure: Option<(String, String)> = None;
@@ -1262,6 +1347,20 @@ async fn run_play_per_play(
             let mut slot_counter: u32 = 0;
             for (i, task) in tasks.iter().enumerate() {
                 let _ = i; // index retained for diagnostics if needed
+                // Refresh the per-walker `WorldVars` from the published
+                // peer snapshots before every task. This is per_play's
+                // analogue of per_task's between-task barrier refresh,
+                // but eventual: peer slots reflect their owner's most
+                // recently completed task, not a global barrier.
+                let local_world = Arc::new(
+                    merge_dynamic_hostvars_locked(
+                        &base_world,
+                        &peer_views,
+                        &name_owned,
+                        &ctx,
+                    )
+                    .await,
+                );
                 // Every task in the tree owns a coord slot; advance
                 // through skipped/meta/tag-filtered tasks so the
                 // counter stays in lockstep with hosts that didn't
@@ -1281,7 +1380,7 @@ async fn run_play_per_play(
                         &mut ctx,
                         seq_src.clone(),
                         env.clone(),
-                        world.clone(),
+                        local_world.clone(),
                         &play_name,
                     )
                     .await;
@@ -1322,13 +1421,21 @@ async fn run_play_per_play(
                     ctx,
                     seq_src.clone(),
                     env.clone(),
-                    world.clone(),
+                    local_world.clone(),
                     coord_for_host.clone(),
                     &mut slot_counter,
                     is_runner,
                 )
                 .await;
                 ctx = r.ctx;
+                // Publish working ctx to this host's RwLock so peer
+                // walkers see the post-task state on their next refresh.
+                {
+                    if let Some(slot) = peer_views.get(&name_owned) {
+                        let mut guard = slot.write().await;
+                        *guard = ctx.clone();
+                    }
+                }
                 match &r.outcome {
                     HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {}
                     HostTaskOutcome::Failed { reason, .. } => {
@@ -1358,6 +1465,15 @@ async fn run_play_per_play(
             if first_failure.is_none()
                 || matches!(on_failure, OnFailure::Continue)
             {
+                let flush_world = Arc::new(
+                    merge_dynamic_hostvars_locked(
+                        &base_world,
+                        &peer_views,
+                        &name_owned,
+                        &ctx,
+                    )
+                    .await,
+                );
                 if let Some((hn, reason)) = run_handlers_one_host(
                     &handlers,
                     own_pool.clone(),
@@ -1365,7 +1481,7 @@ async fn run_play_per_play(
                     &mut ctx,
                     seq_src.clone(),
                     env.clone(),
-                    world.clone(),
+                    flush_world,
                     &play_name,
                 )
                 .await
@@ -5834,6 +5950,97 @@ mod tests {
                 report.host_outcomes.get(n),
                 Some(&HostOutcome::Ok),
                 "host {n} should be Ok; report = {report:?}"
+            );
+        }
+    }
+
+    /// Same shape as the per_task cross-host test, but under
+    /// `strategy: per_play`. Verifies the published-snapshot path in
+    /// `run_play_per_play`: host `a`'s `set_fact` on task 1 must be
+    /// visible to host `b`'s `assert` on task 2 via
+    /// `hostvars['a'].my_role`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_play_per_play_makes_cross_host_set_facts_visible_via_hostvars() {
+        use crate::pool::{AgentPool, PoolTransport};
+        use tokio::sync::Mutex as TokioMutex;
+
+        let pb = playbook::parse(
+            r#"
+- name: dyn-hostvars-per-play
+  hosts: all
+  gather_facts: false
+  strategy: per_play
+  tasks:
+    - name: stamp role per host
+      set_fact:
+        my_role: "{{ inventory_hostname }}"
+    - name: cross-host assertion
+      assert:
+        that: "hostvars['a'].my_role == 'a'"
+"#,
+        )
+        .expect("playbook parses");
+        let play = &pb.plays[0];
+
+        let targets: Vec<String> = vec!["a".into(), "b".into()];
+        let base_world = static_world_for(&[("a", &[]), ("b", &[])]);
+
+        let mut pools_map: BTreeMap<String, PoolHandle> = BTreeMap::new();
+        for name in &targets {
+            let p = AgentPool::new(name.clone(), PoolTransport::Mock);
+            pools_map.insert(name.clone(), Arc::new(TokioMutex::new(p)));
+        }
+        let pools = Arc::new(pools_map);
+
+        let mut ctxs: BTreeMap<String, HostCtx> = BTreeMap::new();
+        for name in &targets {
+            ctxs.insert(name.clone(), HostCtx::new(name.clone()));
+        }
+
+        let mut report = RunReport {
+            host_outcomes: targets
+                .iter()
+                .map(|n| (n.clone(), HostOutcome::Ok))
+                .collect(),
+            stopped_early: false,
+            check_mode: false,
+            tasks_changed: 0,
+            tasks_skipped: 0,
+            tasks_ok: 0,
+        };
+        let next_seq = Arc::new(AtomicU32::new(1));
+        let env = Arc::new(template::make_env());
+        let world = Arc::new(base_world);
+        let tag_filter = Arc::new(crate::tags::TagFilter::from_cli(&[], &[]).unwrap());
+
+        // Bound the test so a regression (peer-publish skipped → host
+        // `b`'s assert hangs waiting on a value that never appears, or
+        // simply fails) surfaces as a clear failure instead of a
+        // mysterious hang.
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_play_per_play(
+                play,
+                &targets,
+                &pools,
+                &mut ctxs,
+                &mut report,
+                &next_seq,
+                &env,
+                &world,
+                &tag_filter,
+            ),
+        )
+        .await
+        .expect("per_play did not deadlock")
+        .expect("per_play runs");
+
+        assert!(!stopped, "play should not have stopped early");
+        for n in &targets {
+            assert_eq!(
+                report.host_outcomes.get(n),
+                Some(&HostOutcome::Ok),
+                "host {n} should be Ok under per_play; report = {report:?}"
             );
         }
     }

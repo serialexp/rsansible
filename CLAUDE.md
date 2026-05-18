@@ -515,12 +515,30 @@ window pinned to **task barriers** rather than per-render.
    `hostvars[<peer>]` lookups; references to in-flight values within
    task N return the prior-task snapshot.
 
-5. **`run_play_per_play` is NOT YET wired.** Each host walks the
-   task list independently with no natural barrier, so a snapshot
-   point would race with concurrent ctx mutations. Per_play
-   hostvars remain the static inventory snapshot. Documented at the
-   call site; if a real playbook needs dynamic hostvars under
-   per_play we plumb `Arc<RwLock<HostCtx>>` and snapshot per-render.
+5. **`run_play_per_play` is wired with eventual peer consistency.**
+   No global barrier exists, so we publish a parallel snapshot per
+   host: a `BTreeMap<String, Arc<RwLock<HostCtx>>>` built at play
+   entry, with each walker write-locking its own slot after every
+   completed task to overwrite it with a clone of its working ctx.
+   Before each task, the walker calls
+   [`merge_dynamic_hostvars_locked`] which read-locks every peer
+   slot and assembles a fresh `WorldVars`. Self's slot is bypassed
+   in favor of the live working ctx (one task fresher than the
+   published copy), so `hostvars[self]` never lags.
+
+   Semantics differ from per_task: peer views reflect the peer's
+   most-recently-COMPLETED task, not "all hosts at start of task
+   K." Eventual rather than barrier-consistent. This is the right
+   behavior for per_play — the strategy explicitly opts out of
+   cross-host synchronization, so users already expect peer state
+   to be "whatever the other host last committed." A host that
+   needs strict cross-host ordering should be under per_task
+   instead.
+
+   The RwLock-per-host design lets multiple peers read the same
+   peer slot concurrently and only contends a slot when its owner
+   writes — once per task. The amortized cost is dwarfed by
+   network round-trips.
 
 ### Why a snapshot per task and not lazy per-render
 
