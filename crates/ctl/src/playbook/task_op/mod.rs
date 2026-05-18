@@ -96,7 +96,7 @@ pub use wait_for::{WaitForOp, WaitForState};
 pub use write_file::WriteFileOp;
 
 use package::parse_package_body;
-use shared::{read_pem_if_set, take_int_or_template_string, take_optional_string, take_string_or_bool};
+use shared::{read_pem_if_set, take_int_or_template_string, take_optional_string, take_string_or_bool, take_when_field};
 
 
 #[derive(Debug, Clone, PartialEq)]
@@ -668,7 +668,7 @@ impl<'de> Deserialize<'de> for Task {
         };
 
         // Extract metadata fields.
-        let when = take_optional_string(&mut map, "when", &name)?;
+        let when = take_when_field(&mut map, &name)?;
         let register = take_optional_string(&mut map, "register", &name)?;
         let loop_spec = match map.remove("loop") {
             None => None,
@@ -3232,6 +3232,57 @@ environment: "FOO=bar"
         assert!(
             err.contains("`environment` must be a mapping"),
             "expected complaint about non-mapping env root; got: {err}"
+        );
+    }
+
+    /// `when:` as a YAML sequence is Ansible-idiomatic for "AND
+    /// all of these." We canonicalize at parse time so the runtime
+    /// evaluates a single Jinja expression instead of N.
+    #[test]
+    fn parses_when_sequence_as_and_joined_string() {
+        let yaml = r#"
+name: t
+shell: echo
+when:
+  - not (skip_failback | bool)
+  - drill_mode != 'graceful'
+"#;
+        let task: Task = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(
+            task.when.as_deref(),
+            Some("(not (skip_failback | bool)) and (drill_mode != 'graceful')"),
+            "got: {:?}",
+            task.when
+        );
+    }
+
+    /// Empty sequence → no condition (matches Ansible: `when: []`
+    /// runs unconditionally).
+    #[test]
+    fn parses_empty_when_sequence_as_none() {
+        let yaml = r#"
+name: t
+shell: echo
+when: []
+"#;
+        let task: Task = serde_yaml::from_str(yaml).expect("parses");
+        assert!(task.when.is_none(), "got: {:?}", task.when);
+    }
+
+    /// Sequence with a non-string entry surfaces a clear error.
+    #[test]
+    fn rejects_when_sequence_with_non_string_entry() {
+        let yaml = r#"
+name: t
+shell: echo
+when:
+  - "x == 1"
+  - 42
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("`when[1]` must be a string"),
+            "got: {err}"
         );
     }
 }

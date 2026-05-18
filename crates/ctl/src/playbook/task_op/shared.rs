@@ -119,6 +119,53 @@ pub(super) fn take_optional_string<E: serde::de::Error>(
     }
 }
 
+/// `when:` accepts either a scalar string ("x == 1") or a YAML
+/// sequence of strings (AND-joined). The sequence form is idiomatic
+/// Ansible for "must satisfy all of these":
+///
+/// ```yaml
+/// when:
+///   - not (skip_failback | bool)
+///   - drill_mode != 'graceful'
+/// ```
+///
+/// We canonicalize the sequence to `(a) and (b)` so the runtime only
+/// needs to evaluate one Jinja expression. Empty sequence → `None`
+/// (matches Ansible: a `when: []` task is unconditional).
+pub(super) fn take_when_field<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    task_name: &str,
+) -> Result<Option<String>, E> {
+    match map.remove("when") {
+        None => Ok(None),
+        Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
+        Some(serde_yaml::Value::Bool(b)) => Ok(Some(if b { "true".into() } else { "false".into() })),
+        Some(serde_yaml::Value::Sequence(seq)) => {
+            if seq.is_empty() {
+                return Ok(None);
+            }
+            let mut parts = Vec::with_capacity(seq.len());
+            for (i, item) in seq.into_iter().enumerate() {
+                match item {
+                    serde_yaml::Value::String(s) => parts.push(format!("({s})")),
+                    serde_yaml::Value::Bool(b) => {
+                        parts.push(format!("({})", if b { "true" } else { "false" }))
+                    }
+                    other => {
+                        return Err(E::custom(format!(
+                            "task {task_name:?}: `when[{i}]` must be a string, got: {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Some(parts.join(" and ")))
+        }
+        Some(other) => Err(E::custom(format!(
+            "task {task_name:?}: `when` must be a string, bool, or list of strings, got: {other:?}"
+        ))),
+    }
+}
+
 /// Accept either a Jinja-expression string or a literal bool. Returns
 /// `Some(String)` either way — bool literals canonicalize to `"true"` /
 /// `"false"` so the runtime renders+evaluates one type.
