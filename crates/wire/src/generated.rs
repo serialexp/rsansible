@@ -988,6 +988,8 @@ pub struct OpPackageInput {
     pub autoremove: u8,
     pub default_release: std::string::String,
     pub allow_unauthenticated: u8,
+    pub virtualenv: std::string::String,
+    pub virtualenv_command: std::string::String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1002,6 +1004,8 @@ pub struct OpPackageOutput {
     pub autoremove: u8,
     pub default_release: std::string::String,
     pub allow_unauthenticated: u8,
+    pub virtualenv: std::string::String,
+    pub virtualenv_command: std::string::String,
 }
 
 pub type OpPackage = OpPackageOutput;
@@ -1034,6 +1038,16 @@ impl OpPackageInput {
             encoder.write_byte(b);
         }
         encoder.write_byte(self.allow_unauthenticated);
+        encoder.write_u16_le(self.virtualenv.len() as u16);
+        let string_bytes: &[u8] = self.virtualenv.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.virtualenv_command.len() as u16);
+        let string_bytes: &[u8] = self.virtualenv_command.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
         Ok(())
     }
 
@@ -1068,6 +1082,12 @@ impl OpPackageOutput {
         let bytes = decoder.read_bytes_vec(length)?;
         let default_release = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let allow_unauthenticated = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let virtualenv = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let virtualenv_command = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         Ok(Self {
             kind,
             manager,
@@ -1079,6 +1099,8 @@ impl OpPackageOutput {
             autoremove,
             default_release,
             allow_unauthenticated,
+            virtualenv,
+            virtualenv_command,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -1101,6 +1123,8 @@ impl From<OpPackageOutput> for OpPackageInput {
             autoremove: o.autoremove,
             default_release: o.default_release,
             allow_unauthenticated: o.allow_unauthenticated,
+            virtualenv: o.virtualenv,
+            virtualenv_command: o.virtualenv_command,
         }
     }
 }
@@ -3620,6 +3644,16 @@ impl Op {
                     encoder.write_uint8(b);
                 }
                 encoder.write_uint8(v.allow_unauthenticated);
+                encoder.write_uint16(v.virtualenv.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.virtualenv.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.virtualenv_command.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.virtualenv_command.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
             }
             Op::OpUfw(v) => {
                 encoder.write_uint8(v.kind);

@@ -188,7 +188,6 @@ fn split_line(line: &str, split: &SplitSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -241,14 +240,7 @@ END {{ if (!found) exit 2 }}
 "#,
                 db = db.display()
             );
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&bin)
-                .unwrap();
-            f.write_all(script.as_bytes()).unwrap();
-            f.sync_all().unwrap();
+            std::fs::write(&bin, script.as_bytes()).unwrap();
             let mut perms = std::fs::metadata(&bin).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&bin, perms).unwrap();

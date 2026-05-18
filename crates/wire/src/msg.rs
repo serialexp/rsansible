@@ -267,6 +267,8 @@ pub mod package_manager {
     pub const PACMAN: u8 = 5;
     /// SUSE `zypper` (reserved).
     pub const ZYPPER: u8 = 6;
+    /// Python `pip` (with optional `virtualenv:`).
+    pub const PIP: u8 = 7;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -280,6 +282,8 @@ pub fn op_package(
     autoremove: bool,
     default_release: String,
     allow_unauthenticated: bool,
+    virtualenv: String,
+    virtualenv_command: String,
 ) -> Op {
     Op::OpPackage(OpPackageOutput {
         kind: 10,
@@ -292,6 +296,8 @@ pub fn op_package(
         autoremove: if autoremove { 1 } else { 0 },
         default_release,
         allow_unauthenticated: if allow_unauthenticated { 1 } else { 0 },
+        virtualenv,
+        virtualenv_command,
     })
 }
 

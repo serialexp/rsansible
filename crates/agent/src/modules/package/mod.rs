@@ -20,6 +20,7 @@ use rsansible_wire::msg::{self, err, now_unix_ns};
 use super::{emit_error, Context};
 
 pub(crate) mod apt;
+pub(crate) mod pip;
 
 // Manager-byte constants, mirrored from `rsansible_wire::msg::package_manager`.
 // We keep a local copy so the dispatch table reads naturally; if it
@@ -31,6 +32,7 @@ const MANAGER_APT: u8 = 1;
 // const MANAGER_APK: u8 = 4;  // reserved
 // const MANAGER_PACMAN: u8 = 5;  // reserved
 // const MANAGER_ZYPPER: u8 = 6;  // reserved
+const MANAGER_PIP: u8 = 7;
 
 pub async fn run(ctx: &Context, seq: u32, op: OpPackageOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
@@ -73,6 +75,12 @@ pub async fn run(ctx: &Context, seq: u32, op: OpPackageOutput, check_mode: bool)
             tokio::task::spawn_blocking(move || apt::apply(&op, check_mode))
                 .await
                 .map_err(|e| anyhow::anyhow!("package apt join: {e}"))?
+        }
+        MANAGER_PIP => {
+            let op = op.clone();
+            tokio::task::spawn_blocking(move || pip::apply(&op, check_mode))
+                .await
+                .map_err(|e| anyhow::anyhow!("package pip join: {e}"))?
         }
         other => {
             emit_error(

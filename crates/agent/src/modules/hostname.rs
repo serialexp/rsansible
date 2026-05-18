@@ -181,7 +181,6 @@ fn which(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -264,14 +263,7 @@ echo "$2" > "$F"
     }
 
     fn write_script(p: &Path, body: &str) {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(p)
-            .unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        f.sync_all().unwrap();
+        std::fs::write(p, body.as_bytes()).unwrap();
         let mut perms = std::fs::metadata(p).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(p, perms).unwrap();

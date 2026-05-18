@@ -27,6 +27,14 @@ pub struct PackageOp {
     pub default_release: String,
     /// Apt-only: adds `--allow-unauthenticated`.
     pub allow_unauthenticated: bool,
+    /// Pip-only: install target virtualenv directory. Empty = system pip
+    /// (no venv). If the directory doesn't exist the agent creates it
+    /// via `virtualenv_command`.
+    pub virtualenv: String,
+    /// Pip-only: command used to materialise a missing virtualenv.
+    /// Empty = default `python3 -m venv`. Tokenised on whitespace at
+    /// the agent (shell metacharacters NOT honored).
+    pub virtualenv_command: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +62,7 @@ impl PackageState {
 pub enum PackageManager {
     Auto,
     Apt,
+    Pip,
     // Reserved for future backends — wire bytes already allocated in
     // rsansible_wire::msg::package_manager. Uncomment + add to wire_byte
     // when the agent gains a backend for them.
@@ -69,6 +78,7 @@ impl PackageManager {
         match self {
             PackageManager::Auto => 0,
             PackageManager::Apt => 1,
+            PackageManager::Pip => 7,
         }
     }
 
@@ -79,6 +89,7 @@ impl PackageManager {
         match self {
             PackageManager::Auto => "package",
             PackageManager::Apt => "apt",
+            PackageManager::Pip => "pip",
         }
     }
 
@@ -89,26 +100,73 @@ impl PackageManager {
     fn accepts_apt_knobs(self) -> bool {
         matches!(self, PackageManager::Apt)
     }
+
+    /// Which pip-specific knobs (`virtualenv:`, `virtualenv_command:`)
+    /// the backend honors. `package:` (Auto) refuses them — we can't
+    /// promise the auto-detected backend is pip.
+    fn accepts_pip_knobs(self) -> bool {
+        matches!(self, PackageManager::Pip)
+    }
 }
 
-/// Parse a `PackageOp` from a YAML body under a per-manager YAML key
-/// (`apt:`, `package:`, ...). `manager` is pinned by the caller — the
-/// YAML key, not the body, determines which backend will run, so each
-/// per-manager key reuses this function with its own fixed value.
+/// Parse a `PackageOp` from a YAML body. `pinned_manager` is set by
+/// the per-manager YAML shims (`apt:`, `pip:`, …) and is None under
+/// the canonical `package:` key, in which case `manager:` is read
+/// from the body (default `Auto`). When pinned, an explicit
+/// `manager:` in the body must agree with the pin or parsing fails.
 ///
 /// Per-manager surface differences:
 ///   * `apt:` accepts apt-specific knobs (`cache_valid_time`, `purge`,
 ///     `default_release`, `allow_unauthenticated`)
-///   * `package:` (manager=Auto) rejects those knobs — we can't
-///     promise the auto-detected backend will honor them
+///   * `pip:` accepts pip-specific knobs (`virtualenv`,
+///     `virtualenv_command`)
+///   * `package:` with `manager:` left at `Auto` rejects both sets —
+///     we can't promise the auto-detected backend honors them
 ///
 /// `force_apt_get` and `install_recommends` are accepted-and-discarded
 /// under apt for Ansible compatibility (we always use apt-get; we keep
 /// recommends ON which matches Ansible's default).
 pub(super) fn parse_package_body<E: serde::de::Error>(
-    manager: PackageManager,
+    pinned_manager: Option<PackageManager>,
     mut map: serde_yaml::Mapping,
 ) -> Result<PackageOp, E> {
+    // Resolve the manager: either pinned by the shim, or read from
+    // the body (default Auto). Body must agree with the pin if both
+    // are present — this lets a playbook keep an explicit `manager:`
+    // line for self-documentation under `apt: { manager: apt, ... }`
+    // without triggering a false conflict.
+    let body_manager = match map.remove("manager") {
+        None => None,
+        Some(serde_yaml::Value::String(s)) => Some(match s.to_ascii_lowercase().as_str() {
+            "auto" | "package" => PackageManager::Auto,
+            "apt" => PackageManager::Apt,
+            "pip" => PackageManager::Pip,
+            other => {
+                return Err(E::custom(format!(
+                    "package.manager: unsupported value {other:?}; expected one of [auto, apt, pip]"
+                )))
+            }
+        }),
+        Some(other) => {
+            return Err(E::custom(format!(
+                "package.manager must be a string, got: {other:?}"
+            )))
+        }
+    };
+    let manager = match (pinned_manager, body_manager) {
+        (None, None) => PackageManager::Auto,
+        (None, Some(m)) => m,
+        (Some(p), None) => p,
+        (Some(p), Some(m)) if p == m => p,
+        (Some(p), Some(m)) => {
+            return Err(E::custom(format!(
+                "{}: body sets `manager: {}` which conflicts with the pinned manager `{}`",
+                p.label(),
+                m.label(),
+                p.label()
+            )))
+        }
+    };
     let label = manager.label();
 
     // `name:` is required and may be a string or a list of strings.
@@ -205,9 +263,7 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
             let _ = map.remove("install_recommends");
             (cache_valid_time, purge, default_release, allow_unauthenticated)
         } else {
-            // `package:` (auto): refuse apt-only knobs explicitly rather
-            // than silently dropping them. If a user wants apt-specific
-            // behavior, they should use `apt:`.
+            // `package:` (auto) / `pip:` etc. refuse apt-only knobs.
             for k in [
                 "cache_valid_time",
                 "purge",
@@ -219,12 +275,53 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
                 if map.contains_key(serde_yaml::Value::String(k.to_string())) {
                     return Err(E::custom(format!(
                         "{label}: field `{k}` is only valid under `apt:` (manager-specific). \
-                         Use `apt:` instead of `package:` to set it."
+                         Use `apt:` instead to set it."
                     )));
                 }
             }
             (0, false, String::new(), false)
         };
+
+    // Pip-specific knobs: only consumed under `pip:` (manager=Pip) or
+    // `package: manager: pip`. Refused under apt / auto.
+    let (virtualenv, virtualenv_command) = if manager.accepts_pip_knobs() {
+        let virtualenv =
+            take_optional_field_string::<E>(&mut map, "virtualenv")?.unwrap_or_default();
+        let virtualenv_command =
+            take_optional_field_string::<E>(&mut map, "virtualenv_command")?.unwrap_or_default();
+        if virtualenv.is_empty() && !virtualenv_command.is_empty() {
+            return Err(E::custom(
+                "pip.virtualenv_command requires pip.virtualenv to be set",
+            ));
+        }
+        // Pip fields we don't honour yet — refuse rather than silently
+        // drop them.
+        for k in [
+            "virtualenv_site_packages",
+            "virtualenv_python",
+            "executable",
+            "chdir",
+            "editable",
+            "extra_args",
+            "umask",
+        ] {
+            if map.contains_key(serde_yaml::Value::String(k.to_string())) {
+                return Err(E::custom(format!(
+                    "{label}.{k}: not yet implemented (file an issue / PR if you need it)"
+                )));
+            }
+        }
+        (virtualenv, virtualenv_command)
+    } else {
+        for k in ["virtualenv", "virtualenv_command"] {
+            if map.contains_key(serde_yaml::Value::String(k.to_string())) {
+                return Err(E::custom(format!(
+                    "{label}: field `{k}` is only valid under `pip:` (or `package: manager: pip`)"
+                )));
+            }
+        }
+        (String::new(), String::new())
+    };
 
     if !map.is_empty() {
         let unknown: Vec<String> = map
@@ -233,6 +330,8 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
             .collect();
         let allowed = if manager.accepts_apt_knobs() {
             "[name, pkg, state, update_cache, cache_valid_time, purge, autoremove, default_release, allow_unauthenticated, install_recommends, force_apt_get]"
+        } else if manager.accepts_pip_knobs() {
+            "[name, pkg, state, update_cache, autoremove, virtualenv, virtualenv_command]"
         } else {
             "[name, pkg, state, update_cache, autoremove]"
         };
@@ -267,6 +366,8 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
         autoremove,
         default_release,
         allow_unauthenticated,
+        virtualenv,
+        virtualenv_command,
     })
 }
 
@@ -390,6 +491,8 @@ apt:
             autoremove: true,
             default_release: "bookworm-backports".into(),
             allow_unauthenticated: false,
+            virtualenv: String::new(),
+            virtualenv_command: String::new(),
         });
         let wire = t.to_wire_op().unwrap();
         let rsansible_wire::generated::Op::OpPackage(o) = wire else {
@@ -498,6 +601,8 @@ package:
             autoremove: false,
             default_release: String::new(),
             allow_unauthenticated: false,
+            virtualenv: String::new(),
+            virtualenv_command: String::new(),
         });
         let wire = t.to_wire_op().unwrap();
         let rsansible_wire::generated::Op::OpPackage(o) = wire else {

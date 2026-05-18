@@ -383,6 +383,8 @@ mod tests {
                 true,
                 String::new(),
                 false,
+                String::new(),
+                String::new(),
             ),
         ))
         .await;
@@ -399,6 +401,8 @@ mod tests {
                 false,
                 "bookworm-backports".into(),
                 true,
+                String::new(),
+                String::new(),
             ),
         ))
         .await;
@@ -416,6 +420,27 @@ mod tests {
                 false,
                 String::new(),
                 false,
+                String::new(),
+                String::new(),
+            ),
+        ))
+        .await;
+        // Pip with a virtualenv.
+        roundtrip(msg::task_dispatch(
+            117,
+            false,
+            msg::op_package(
+                msg::package_manager::PIP,
+                vec!["redis>=5.0".into()],
+                msg::package_state::PRESENT,
+                false,
+                0,
+                false,
+                false,
+                String::new(),
+                false,
+                "/opt/drill-valkey-venv".into(),
+                "/usr/bin/python3 -m venv".into(),
             ),
         ))
         .await;

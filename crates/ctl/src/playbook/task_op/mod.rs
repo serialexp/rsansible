@@ -504,6 +504,7 @@ const BODY_KEYS: &[&str] = &[
     "systemd",
     "service",
     "apt",
+    "pip",
     "package",
     "repository",
     "apt_repository",
@@ -911,24 +912,34 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "apt" => {
-                // `apt:` pins manager=Apt; reuses the shared package
-                // body parser.
+                // Ansible-compat shim. Pins `manager: Apt`; body may not
+                // contradict it. See `RSANSIBLE_IDIOMS.md §3`.
                 let map: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
                 TaskBody::Op(TaskOp::Package(parse_package_body::<D::Error>(
-                    PackageManager::Apt,
+                    Some(PackageManager::Apt),
+                    map,
+                )?))
+            }
+            "pip" => {
+                // Ansible-compat shim. Pins `manager: Pip`; body may not
+                // contradict it. See `RSANSIBLE_IDIOMS.md §3`.
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Package(parse_package_body::<D::Error>(
+                    Some(PackageManager::Pip),
                     map,
                 )?))
             }
             "package" => {
-                // `package:` uses manager=Auto — the agent picks at run
-                // time based on what's on PATH / gathered facts. Refuses
-                // apt-only knobs since we can't promise the picked
-                // backend honors them.
+                // Canonical rsansible spelling. `manager:` is read from
+                // the body; defaults to `Auto`. Per-manager knobs are
+                // accepted only under the matching pin. See
+                // `RSANSIBLE_IDIOMS.md §3`.
                 let map: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
                 TaskBody::Op(TaskOp::Package(parse_package_body::<D::Error>(
-                    PackageManager::Auto,
+                    None,
                     map,
                 )?))
             }
@@ -1753,6 +1764,8 @@ impl TaskOp {
                 p.autoremove,
                 p.default_release.clone(),
                 p.allow_unauthenticated,
+                p.virtualenv.clone(),
+                p.virtualenv_command.clone(),
             )),
             TaskOp::Repository(r) => Ok(op_repository(
                 r.manager.wire_byte(),

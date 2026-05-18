@@ -467,6 +467,8 @@ done
             autoremove: 0,
             default_release: String::new(),
             allow_unauthenticated: 0,
+            virtualenv: String::new(),
+            virtualenv_command: String::new(),
         }
     }
 

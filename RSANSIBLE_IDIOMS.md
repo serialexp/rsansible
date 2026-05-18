@@ -82,6 +82,59 @@ auto-detect step on the agent serves both ops.
 
 ---
 
+## 3. Python packages: `package: manager: pip` over `pip:`
+
+| Canonical | Compat shim |
+|---|---|
+| `package:` with `manager: pip` | `pip:` (forwards with `manager: pip`) |
+
+Canonical shape:
+
+```yaml
+- package:
+    manager: pip
+    name:
+      - "requests==2.31.0"
+      - "ruff"
+    state: present
+    virtualenv: /opt/myapp/venv          # optional; absent → system pip
+    virtualenv_command: python3.11 -m venv  # optional; default `python3 -m venv`
+```
+
+Compat shim (existing Ansible playbooks port unchanged):
+
+```yaml
+- pip:
+    name:
+      - "requests==2.31.0"
+      - "ruff"
+    state: present
+    virtualenv: /opt/myapp/venv
+# → forwards to package: { manager: pip, ... }
+# A body field `manager:` that contradicts the YAML key (e.g.
+# `pip: { manager: apt }`) is rejected at parse time.
+```
+
+**Why prefer the canonical:** same rationale as `repository:` vs
+`apt_repository:` — `package:` is the cross-manager spelling that
+already covers apt today and will cover dnf/zypper/etc. as backends
+land. Python-via-pip is just one more `manager:` value; making it a
+peer of system packages keeps multi-manager playbooks readable
+(`package: { manager: pip, ... }` next to `package: { manager: apt,
+... }`) and stops the awkward shape where every backend has its own
+top-level task name. The shim keeps existing Ansible `pip:` tasks
+working unmodified.
+
+**Supported fields under `manager: pip`:** `name`, `state` (present /
+absent / latest), `virtualenv`, `virtualenv_command`. Other pip
+knobs that Ansible exposes (`virtualenv_site_packages`,
+`virtualenv_python`, `executable`, `chdir`, `editable`, `extra_args`,
+`umask`) are rejected at parse time with BAD_REQUEST — they aren't
+implemented yet, and silently ignoring them would let playbooks
+think they got the behavior they asked for.
+
+---
+
 ## When you add an entry here
 
 Two-column "canonical vs compat" table at minimum, plus one paragraph

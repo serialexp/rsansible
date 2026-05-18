@@ -901,6 +901,14 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 env.template_from_str(&p.default_release)
                     .map_err(|e| anyhow!("{label}.default_release: {e}"))?;
             }
+            if !p.virtualenv.is_empty() {
+                env.template_from_str(&p.virtualenv)
+                    .map_err(|e| anyhow!("{label}.virtualenv: {e}"))?;
+            }
+            if !p.virtualenv_command.is_empty() {
+                env.template_from_str(&p.virtualenv_command)
+                    .map_err(|e| anyhow!("{label}.virtualenv_command: {e}"))?;
+            }
         }
         TaskOp::Repository(r) => {
             env.template_from_str(&r.repo)

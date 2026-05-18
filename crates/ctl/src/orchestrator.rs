@@ -4425,10 +4425,12 @@ fn render_op(
             for n in &p.names {
                 names.push(render_str(env, n, &view)?);
             }
-            let default_release = if p.default_release.is_empty() {
-                String::new()
-            } else {
-                render_str(env, &p.default_release, &view)?
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
             };
             TaskOp::Package(PackageOp {
                 manager: p.manager,
@@ -4438,8 +4440,10 @@ fn render_op(
                 cache_valid_time: p.cache_valid_time,
                 purge: p.purge,
                 autoremove: p.autoremove,
-                default_release,
+                default_release: render_if(&p.default_release)?,
                 allow_unauthenticated: p.allow_unauthenticated,
+                virtualenv: render_if(&p.virtualenv)?,
+                virtualenv_command: render_if(&p.virtualenv_command)?,
             })
         }
         TaskOp::Repository(r) => {
