@@ -7,11 +7,13 @@ use rsansible_wire::{msg, Op};
 use crate::writer::Sender;
 
 mod async_job;
+mod authorized_key;
 mod blockinfile;
 mod exec;
 mod file;
 mod gather_facts;
 mod get_url;
+mod group;
 mod iptables;
 mod lineinfile;
 mod package;
@@ -23,6 +25,7 @@ mod systemd;
 mod ufw;
 mod unarchive;
 mod uri;
+mod user;
 mod wait_for;
 mod write_file;
 
@@ -90,6 +93,9 @@ pub fn dispatch<'a>(
             Op::OpUnarchive(o) => unarchive::run(ctx, seq, o, check_mode).await,
             Op::OpIptables(o) => iptables::run(ctx, seq, o, check_mode).await,
             Op::OpRepository(o) => repository::run(ctx, seq, o, check_mode).await,
+            Op::OpGroup(o) => group::run(ctx, seq, o, check_mode).await,
+            Op::OpUser(o) => user::run(ctx, seq, o, check_mode).await,
+            Op::OpAuthorizedKey(o) => authorized_key::run(ctx, seq, o, check_mode).await,
         }
     })
 }

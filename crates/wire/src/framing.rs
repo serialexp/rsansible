@@ -454,6 +454,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_group() {
+        roundtrip(msg::task_dispatch(
+            130,
+            false,
+            msg::op_group("etcd".into(), msg::identity_state::PRESENT, true),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            131,
+            false,
+            msg::op_group("docker".into(), msg::identity_state::ABSENT, false),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_user() {
+        // Present, system, full optional surface.
+        roundtrip(msg::task_dispatch(
+            132,
+            false,
+            msg::op_user(
+                "etcd".into(),
+                msg::identity_state::PRESENT,
+                true,
+                Some("/usr/sbin/nologin".into()),
+                Some("/var/lib/etcd".into()),
+                true,
+                "etcd".into(),
+                vec!["ssl-cert".into(), "wheel".into()],
+                true,
+            ),
+        ))
+        .await;
+        // Absent, minimal surface (None shell/home, no supplementary groups).
+        roundtrip(msg::task_dispatch(
+            133,
+            false,
+            msg::op_user(
+                "olduser".into(),
+                msg::identity_state::ABSENT,
+                false,
+                None,
+                None,
+                false,
+                String::new(),
+                Vec::new(),
+                false,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_authorized_key() {
+        roundtrip(msg::task_dispatch(
+            134,
+            false,
+            msg::op_authorized_key(
+                "bart".into(),
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI bart@laptop".into(),
+                msg::identity_state::PRESENT,
+                false,
+            ),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            135,
+            false,
+            msg::op_authorized_key(
+                "bart".into(),
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI bart@laptop".into(),
+                msg::identity_state::ABSENT,
+                true,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,

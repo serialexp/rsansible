@@ -44,7 +44,8 @@ use crate::playbook::{
     AssertTask, AsyncStatusOp, BlockInFileOp, BlockSpec, CopyOp, DebugTask, ExecOp, FailTask,
     FileOp, GetUrlOp, HostSelector, IptablesOp,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
-    PauseTask, Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, RepositoryOp, SetFactMap, ShellOp, SlurpOp,
+    AuthorizedKeyOp, GroupOp, PauseTask, Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp,
+    RepositoryOp, SetFactMap, ShellOp, SlurpOp, UserOp,
     StatOp, Strategy, SystemdOp, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, UfwOp,
     UnarchiveOp, UriOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
 };
@@ -4420,6 +4421,47 @@ fn render_op(
                 update_cache: r.update_cache,
             })
         }
+        TaskOp::Group(g) => TaskOp::Group(GroupOp {
+            name: render_str(env, &g.name, &view)?,
+            state: g.state,
+            system: g.system,
+        }),
+        TaskOp::User(u) => {
+            let render_opt = |o: &Option<String>| -> Result<Option<String>> {
+                match o {
+                    None => Ok(None),
+                    Some(s) => Ok(Some(render_str(env, s, &view)?)),
+                }
+            };
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            let mut groups = Vec::with_capacity(u.groups.len());
+            for g in &u.groups {
+                groups.push(render_str(env, g, &view)?);
+            }
+            TaskOp::User(UserOp {
+                name: render_str(env, &u.name, &view)?,
+                state: u.state,
+                system: u.system,
+                shell: render_opt(&u.shell)?,
+                home: render_opt(&u.home)?,
+                create_home: u.create_home,
+                primary_group: render_if(&u.primary_group)?,
+                groups,
+                append: u.append,
+            })
+        }
+        TaskOp::AuthorizedKey(a) => TaskOp::AuthorizedKey(AuthorizedKeyOp {
+            user: render_str(env, &a.user, &view)?,
+            key: render_str(env, &a.key, &view)?,
+            state: a.state,
+            exclusive: a.exclusive,
+        }),
         TaskOp::Ufw(u) => {
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {

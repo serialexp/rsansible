@@ -1716,6 +1716,334 @@ impl From<OpRepositoryOutput> for OpRepositoryInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpGroupInput {
+    pub name: std::string::String,
+    pub state: u8,
+    pub system: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpGroupOutput {
+    pub kind: u8,
+    pub name: std::string::String,
+    pub state: u8,
+    pub system: u8,
+}
+
+pub type OpGroup = OpGroupOutput;
+
+impl OpGroupInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(23);
+        encoder.write_u16_le(self.name.len() as u16);
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.state);
+        encoder.write_byte(self.system);
+        Ok(())
+    }
+
+}
+
+impl OpGroupOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 23u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 23, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let state = decoder.read_byte()?;
+        let system = decoder.read_byte()?;
+        Ok(Self {
+            kind,
+            name,
+            state,
+            system,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpGroupInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpGroupInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpGroupOutput> for OpGroupInput {
+    fn from(o: OpGroupOutput) -> Self {
+        Self {
+            name: o.name,
+            state: o.state,
+            system: o.system,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpUserInput {
+    pub name: std::string::String,
+    pub state: u8,
+    pub system: u8,
+    pub has_shell: u8,
+    pub shell: std::string::String,
+    pub has_home: u8,
+    pub home: std::string::String,
+    pub create_home: u8,
+    pub primary_group: std::string::String,
+    pub groups: Vec<std::string::String>,
+    pub append: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpUserOutput {
+    pub kind: u8,
+    pub name: std::string::String,
+    pub state: u8,
+    pub system: u8,
+    pub has_shell: u8,
+    pub shell: std::string::String,
+    pub has_home: u8,
+    pub home: std::string::String,
+    pub create_home: u8,
+    pub primary_group: std::string::String,
+    pub groups: Vec<std::string::String>,
+    pub append: u8,
+}
+
+pub type OpUser = OpUserOutput;
+
+impl OpUserInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(22);
+        encoder.write_u16_le(self.name.len() as u16);
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.state);
+        encoder.write_byte(self.system);
+        encoder.write_byte(self.has_shell);
+        encoder.write_u16_le(self.shell.len() as u16);
+        let string_bytes: &[u8] = self.shell.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.has_home);
+        encoder.write_u16_le(self.home.len() as u16);
+        let string_bytes: &[u8] = self.home.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.create_home);
+        encoder.write_u16_le(self.primary_group.len() as u16);
+        let string_bytes: &[u8] = self.primary_group.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.groups.len() as u16);
+        for item in &self.groups {
+            encoder.write_u16_le(item.len() as u16);
+            for b in item.as_bytes() {
+                encoder.write_byte(*b);
+            }
+        }
+        encoder.write_byte(self.append);
+        Ok(())
+    }
+
+}
+
+impl OpUserOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 22u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 22, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let state = decoder.read_byte()?;
+        let system = decoder.read_byte()?;
+        let has_shell = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let shell = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let has_home = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let home = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let create_home = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let primary_group = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let mut groups = Vec::with_capacity(length);
+        for _ in 0..length {
+            let str_len = decoder.read_u16_le()? as usize;
+            let str_bytes = decoder.read_bytes_vec(str_len)?;
+            let item = std::string::String::from_utf8(str_bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+            groups.push(item);
+        }
+        let append = decoder.read_byte()?;
+        Ok(Self {
+            kind,
+            name,
+            state,
+            system,
+            has_shell,
+            shell,
+            has_home,
+            home,
+            create_home,
+            primary_group,
+            groups,
+            append,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpUserInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpUserInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpUserOutput> for OpUserInput {
+    fn from(o: OpUserOutput) -> Self {
+        Self {
+            name: o.name,
+            state: o.state,
+            system: o.system,
+            has_shell: o.has_shell,
+            shell: o.shell,
+            has_home: o.has_home,
+            home: o.home,
+            create_home: o.create_home,
+            primary_group: o.primary_group,
+            groups: o.groups,
+            append: o.append,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAuthorizedKeyInput {
+    pub user: std::string::String,
+    pub key: std::string::String,
+    pub state: u8,
+    pub exclusive: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAuthorizedKeyOutput {
+    pub kind: u8,
+    pub user: std::string::String,
+    pub key: std::string::String,
+    pub state: u8,
+    pub exclusive: u8,
+}
+
+pub type OpAuthorizedKey = OpAuthorizedKeyOutput;
+
+impl OpAuthorizedKeyInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(24);
+        encoder.write_u16_le(self.user.len() as u16);
+        let string_bytes: &[u8] = self.user.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.key.len() as u16);
+        let string_bytes: &[u8] = self.key.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.state);
+        encoder.write_byte(self.exclusive);
+        Ok(())
+    }
+
+}
+
+impl OpAuthorizedKeyOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 24u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 24, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let user = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let key = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let state = decoder.read_byte()?;
+        let exclusive = decoder.read_byte()?;
+        Ok(Self {
+            kind,
+            user,
+            key,
+            state,
+            exclusive,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpAuthorizedKeyInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpAuthorizedKeyInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpAuthorizedKeyOutput> for OpAuthorizedKeyInput {
+    fn from(o: OpAuthorizedKeyOutput) -> Self {
+        Self {
+            user: o.user,
+            key: o.key,
+            state: o.state,
+            exclusive: o.exclusive,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpUriInput {
     pub method: u8,
     pub url: std::string::String,
@@ -2892,6 +3220,9 @@ pub enum Op {
     OpUnarchive(OpUnarchiveOutput),
     OpIptables(OpIptablesOutput),
     OpRepository(OpRepositoryOutput),
+    OpUser(OpUserOutput),
+    OpGroup(OpGroupOutput),
+    OpAuthorizedKey(OpAuthorizedKeyOutput),
 }
 
 impl Op {
@@ -3519,6 +3850,67 @@ impl Op {
                 encoder.write_uint32(v.mode, Endianness::LittleEndian);
                 encoder.write_uint8(v.update_cache);
             }
+            Op::OpUser(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.name.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.name.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint8(v.system);
+                encoder.write_uint8(v.has_shell);
+                encoder.write_uint16(v.shell.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.shell.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.has_home);
+                encoder.write_uint16(v.home.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.home.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.create_home);
+                encoder.write_uint16(v.primary_group.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.primary_group.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.groups.len() as u16, Endianness::LittleEndian);
+                for item in &v.groups {
+                    encoder.write_uint16(item.len() as u16, Endianness::LittleEndian);
+                    for b in item.as_bytes() {
+                        encoder.write_uint8(*b);
+                    }
+                }
+                encoder.write_uint8(v.append);
+            }
+            Op::OpGroup(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.name.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.name.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint8(v.system);
+            }
+            Op::OpAuthorizedKey(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.user.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.user.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.key.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.key.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint8(v.exclusive);
+            }
         }
         Ok(())
     }
@@ -3575,6 +3967,12 @@ impl Op {
             Ok(Op::OpIptables(OpIptablesOutput::decode_with_decoder(decoder)?))
         } else if value == 21 {
             Ok(Op::OpRepository(OpRepositoryOutput::decode_with_decoder(decoder)?))
+        } else if value == 22 {
+            Ok(Op::OpUser(OpUserOutput::decode_with_decoder(decoder)?))
+        } else if value == 23 {
+            Ok(Op::OpGroup(OpGroupOutput::decode_with_decoder(decoder)?))
+        } else if value == 24 {
+            Ok(Op::OpAuthorizedKey(OpAuthorizedKeyOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }

@@ -617,6 +617,43 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::Group(g) => {
+            if g.name.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: group.name is empty",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
+        TaskOp::User(u) => {
+            if u.name.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: user.name is empty",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
+        TaskOp::AuthorizedKey(a) => {
+            if a.user.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: authorized_key.user is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if a.key.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: authorized_key.key is empty",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
         TaskOp::Ufw(_) => {
             // Cross-field constraints already enforced at parse time;
             // nothing else to check.

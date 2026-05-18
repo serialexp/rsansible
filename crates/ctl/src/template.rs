@@ -910,6 +910,36 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("repository.filename: {e}"))?;
             }
         }
+        TaskOp::Group(g) => {
+            env.template_from_str(&g.name)
+                .map_err(|e| anyhow!("group.name: {e}"))?;
+        }
+        TaskOp::User(u) => {
+            env.template_from_str(&u.name)
+                .map_err(|e| anyhow!("user.name: {e}"))?;
+            if let Some(s) = &u.shell {
+                env.template_from_str(s)
+                    .map_err(|e| anyhow!("user.shell: {e}"))?;
+            }
+            if let Some(h) = &u.home {
+                env.template_from_str(h)
+                    .map_err(|e| anyhow!("user.home: {e}"))?;
+            }
+            if !u.primary_group.is_empty() {
+                env.template_from_str(&u.primary_group)
+                    .map_err(|e| anyhow!("user.group: {e}"))?;
+            }
+            for (i, g) in u.groups.iter().enumerate() {
+                env.template_from_str(g)
+                    .map_err(|e| anyhow!("user.groups[{i}]: {e}"))?;
+            }
+        }
+        TaskOp::AuthorizedKey(a) => {
+            env.template_from_str(&a.user)
+                .map_err(|e| anyhow!("authorized_key.user: {e}"))?;
+            env.template_from_str(&a.key)
+                .map_err(|e| anyhow!("authorized_key.key: {e}"))?;
+        }
         TaskOp::Ufw(u) => {
             // Most ufw fields are rendered as raw strings (proto, direction
             // are gated by parse-time allowlists; rule/state are tokens).

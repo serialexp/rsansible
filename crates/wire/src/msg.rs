@@ -337,6 +337,68 @@ pub fn op_repository(
     })
 }
 
+/// `state:` byte values for `OpGroup` / `OpUser` / `OpAuthorizedKey`.
+/// Two values — both ops share the same set, so we keep one module.
+pub mod identity_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+}
+
+pub fn op_group(name: String, state: u8, system: bool) -> Op {
+    Op::OpGroup(OpGroupOutput {
+        kind: 23,
+        name,
+        state,
+        system: if system { 1 } else { 0 },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_user(
+    name: String,
+    state: u8,
+    system: bool,
+    shell: Option<String>,
+    home: Option<String>,
+    create_home: bool,
+    primary_group: String,
+    groups: Vec<String>,
+    append: bool,
+) -> Op {
+    let (has_shell, shell) = match shell {
+        Some(s) => (1u8, s),
+        None => (0, String::new()),
+    };
+    let (has_home, home) = match home {
+        Some(h) => (1u8, h),
+        None => (0, String::new()),
+    };
+    Op::OpUser(OpUserOutput {
+        kind: 22,
+        name,
+        state,
+        system: if system { 1 } else { 0 },
+        has_shell,
+        shell,
+        has_home,
+        home,
+        create_home: if create_home { 1 } else { 0 },
+        primary_group,
+        groups,
+        append: if append { 1 } else { 0 },
+    })
+}
+
+pub fn op_authorized_key(user: String, key: String, state: u8, exclusive: bool) -> Op {
+    Op::OpAuthorizedKey(OpAuthorizedKeyOutput {
+        kind: 24,
+        user,
+        key,
+        state,
+        exclusive: if exclusive { 1 } else { 0 },
+    })
+}
+
 /// `op:` byte values for `OpUfw`.
 pub mod ufw_op {
     pub const RULE: u8 = 0;

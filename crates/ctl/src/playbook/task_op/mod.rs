@@ -24,8 +24,9 @@ use anyhow::{anyhow, Result};
 use rsansible_wire::{
     msg::{
         op_async_status, op_blockinfile, op_exec, op_file, op_gather_facts, op_get_url,
-        op_iptables, op_lineinfile, op_package, op_postgresql_ext, op_postgresql_query,
-        op_repository, op_shell, op_stat, op_systemd, op_ufw, op_uri, op_wait_for, op_write_file,
+        op_authorized_key, op_group, op_iptables, op_lineinfile, op_package, op_postgresql_ext,
+        op_postgresql_query, op_repository, op_shell, op_stat, op_systemd, op_ufw, op_uri,
+        op_user, op_wait_for, op_write_file,
     },
     Op,
 };
@@ -46,8 +47,11 @@ mod wait_for;
 mod lineinfile;
 mod blockinfile;
 mod systemd;
+mod authorized_key;
+mod group;
 mod package;
 mod repository;
+mod user;
 mod iptables;
 mod ufw;
 mod uri;
@@ -68,8 +72,11 @@ pub use file::{FileOp, FileState};
 pub use get_url::GetUrlOp;
 pub use lineinfile::{LineInFileOp, LineInFileState};
 pub use openssl::{OpenSslCsrPipeOp, OpenSslPrivkeyOp, X509CertificatePipeOp};
+pub use authorized_key::{AuthorizedKeyOp, AuthorizedKeyState};
+pub use group::{GroupOp, GroupState};
 pub use package::{PackageManager, PackageOp, PackageState};
 pub use repository::{RepositoryManager, RepositoryOp, RepositoryState};
+pub use user::{UserOp, UserState};
 pub use postgresql::{classify_sql_readonly, PostgresqlExtOp, PostgresqlQueryOp};
 pub use shell::ShellOp;
 pub use slurp::SlurpOp;
@@ -368,6 +375,19 @@ pub enum TaskOp {
     /// `RSANSIBLE_IDIOMS.md §2` for why `repository:` is the preferred
     /// spelling.
     Repository(RepositoryOp),
+    /// `group:` — create/delete a unix group via `groupadd`/`groupdel`,
+    /// idempotent via a `getent group` probe.
+    Group(GroupOp),
+    /// `user:` — create/update/delete a unix user via `useradd` /
+    /// `usermod` / `userdel`, idempotent via a `getent passwd` probe.
+    /// Only deltas are applied to an existing user (no churn on
+    /// re-runs).
+    User(UserOp),
+    /// `authorized_key:` — idempotent line management for
+    /// `~<user>/.ssh/authorized_keys`. The agent computes a key
+    /// fingerprint (type + key body) to match existing entries so an
+    /// updated comment doesn't double-add.
+    AuthorizedKey(AuthorizedKeyOp),
     /// `ufw:` — Uncomplicated Firewall control. One op covers one of
     /// rule / enable / disable / reset / default / reload / logging.
     Ufw(UfwOp),
@@ -475,6 +495,9 @@ const BODY_KEYS: &[&str] = &[
     "package",
     "repository",
     "apt_repository",
+    "user",
+    "group",
+    "authorized_key",
     "async_status",
     "iptables",
     "ufw",
@@ -914,6 +937,23 @@ impl<'de> Deserialize<'de> for Task {
                         Some(RepositoryManager::Apt),
                         map,
                     )?,
+                ))
+            }
+            "group" => {
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Group(group::parse_group_body::<D::Error>(map)?))
+            }
+            "user" => {
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::User(user::parse_user_body::<D::Error>(map)?))
+            }
+            "authorized_key" => {
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::AuthorizedKey(
+                    authorized_key::parse_authorized_key_body::<D::Error>(map)?,
                 ))
             }
             "iptables" => TaskBody::Op(TaskOp::Iptables(
@@ -1695,6 +1735,24 @@ impl TaskOp {
                 r.filename.clone(),
                 r.mode,
                 r.update_cache,
+            )),
+            TaskOp::Group(g) => Ok(op_group(g.name.clone(), g.state.wire_byte(), g.system)),
+            TaskOp::User(u) => Ok(op_user(
+                u.name.clone(),
+                u.state.wire_byte(),
+                u.system,
+                u.shell.clone(),
+                u.home.clone(),
+                u.create_home,
+                u.primary_group.clone(),
+                u.groups.clone(),
+                u.append,
+            )),
+            TaskOp::AuthorizedKey(a) => Ok(op_authorized_key(
+                a.user.clone(),
+                a.key.clone(),
+                a.state.wire_byte(),
+                a.exclusive,
             )),
             TaskOp::AsyncStatus(a) => {
                 // `jid` has already been rendered to its final string
