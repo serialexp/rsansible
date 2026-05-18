@@ -224,6 +224,56 @@ playbook-level dependency surfaced after, NOT yet implemented:
      which matches per_play's no-barrier shape; documented in
      CLAUDE.md.
 
+## Gothab live-fire results (2026-05-18, commit 14107b8)
+
+Tried `rsansible validate` against every gothab playbook + one live run.
+
+- [x] **bootstrap-etcd-ca.yml** parses AND runs end-to-end on localhost.
+  Correctly bailed at the "refuse to overwrite" assert because the CA
+  is already provisioned. Tasks exercised: slurp+loop, assert with
+  fail_msg, b64decode in jinja, set_fact. Matches Ansible semantics.
+
+- [x] **drill-failover.yml** (24 tasks) — parses cleanly. Not run
+  (hits production).
+
+- [x] **drill-restore.yml** (7 tasks) — parses cleanly. Not run
+  (triggers a real drill on app-1).
+
+- [ ] **drill-valkey-failover.yml** parse error: `when:` accepts a
+  YAML sequence in Ansible (AND-joins entries), rsansible rejects
+  it as "`when` must be a string." Fix at `Task::deserialize` —
+  detect Sequence and join with `(a) and (b)`. Small.
+
+- [ ] **pgbackrest.yml** parse error: `copy:` with the `content:`
+  form (inline content rather than `src:`). Need to add a `content`
+  field to `CopyOp` and let `src` be optional when `content` is
+  set. Small.
+
+- [ ] **site.yml** parse error: `community.general.timezone` module
+  unsupported. The FQCN stripping works fine (it's the bare
+  `timezone` that's unknown). Easiest path: implement a `timezone:`
+  module that writes `/etc/timezone` + `timedatectl set-timezone`
+  via the existing exec channel. Medium.
+
+- [ ] **Doubled log output**: every tracing line prints twice when
+  running `rsansible run` (e.g. "agent up host=…" appears 2×).
+  `tracing_subscriber::fmt().init()` only happens once in main.rs;
+  suspect a duplicate `set_global_default` somewhere or a fmt layer
+  being added twice. Cosmetic, but distracting in real-world output.
+
+- [ ] **Other unsupported FQCN modules surfaced by `grep -roE`** in
+  gothab roles (not yet hit because site.yml fails earlier, but will
+  block once we land timezone):
+  - `community.docker.docker_image`
+  - `community.general.counter`
+  - `community.general.ufw` — we have `ufw` already; verify FQCN
+    routes there
+  - `community.postgresql.postgresql_db`
+  - `community.postgresql.postgresql_membership`
+  - `community.postgresql.postgresql_user`
+  - `community.crypto.x` — likely truncated grep, probably
+    `x509_certificate_pipe` which we already have
+
 ## Test-infrastructure flake (pre-existing)
 
 - [ ] **ETXTBSY race in stub-script tests.** A handful of agent tests
