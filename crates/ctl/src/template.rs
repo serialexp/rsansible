@@ -940,6 +940,20 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(&a.key)
                 .map_err(|e| anyhow!("authorized_key.key: {e}"))?;
         }
+        TaskOp::Getent(g) => {
+            env.template_from_str(&g.database)
+                .map_err(|e| anyhow!("getent.database: {e}"))?;
+            env.template_from_str(&g.key)
+                .map_err(|e| anyhow!("getent.key: {e}"))?;
+            if !g.split.is_empty() {
+                env.template_from_str(&g.split)
+                    .map_err(|e| anyhow!("getent.split: {e}"))?;
+            }
+        }
+        TaskOp::Hostname(h) => {
+            env.template_from_str(&h.name)
+                .map_err(|e| anyhow!("hostname.name: {e}"))?;
+        }
         TaskOp::Ufw(u) => {
             // Most ufw fields are rendered as raw strings (proto, direction
             // are gated by parse-time allowlists; rule/state are tokens).

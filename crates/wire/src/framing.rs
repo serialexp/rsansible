@@ -508,6 +508,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_getent() {
+        roundtrip(msg::task_dispatch(
+            136,
+            false,
+            msg::op_getent("passwd".into(), "postgres".into(), true, String::new()),
+        ))
+        .await;
+        roundtrip(msg::task_dispatch(
+            137,
+            false,
+            msg::op_getent("hosts".into(), "10.0.0.1".into(), false, " ".into()),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrip_task_dispatch_hostname() {
+        roundtrip(msg::task_dispatch(
+            138,
+            false,
+            msg::op_hostname("pg1.local".into()),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_authorized_key() {
         roundtrip(msg::task_dispatch(
             134,

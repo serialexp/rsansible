@@ -42,7 +42,7 @@ use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, 
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
     AssertTask, AsyncStatusOp, BlockInFileOp, BlockSpec, CopyOp, DebugTask, ExecOp, FailTask,
-    FileOp, GetUrlOp, HostSelector, IptablesOp,
+    FileOp, GetUrlOp, GetentOp, HostSelector, HostnameOp, IptablesOp,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
     AuthorizedKeyOp, GroupOp, PauseTask, Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp,
     RepositoryOp, SetFactMap, ShellOp, SlurpOp, UserOp,
@@ -3030,6 +3030,15 @@ async fn run_op_body(
             if async_wrap.is_some() || matches!(op, TaskOp::AsyncStatus(_)) {
                 lift_async_envelope(&mut rv);
             }
+            // getent envelope: agent emits {database, <key>: [...]}.
+            // Ansible's contract is `register.getent_<database>` (a map
+            // from key → list-of-fields) AND `ansible_facts.getent_<db>`
+            // for cross-task lookup. Lift to the register-side
+            // `getent_<database>: {<key>: [...]}` and (separately)
+            // set the fact when `register:` isn't used.
+            if matches!(op, TaskOp::Getent(_)) {
+                lift_getent_envelope(&mut rv);
+            }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
                 let changed = exec.done.changed != 0;
@@ -4095,6 +4104,35 @@ fn lift_slurp_envelope(rv: &mut RegisterValue) {
 /// `register.finished`, `register.started`, etc. — direct top-level
 /// access, not nested under `register.json`. Matches how
 /// ansible.builtin.async / async_status return shape work.
+/// Lift the getent envelope to Ansible's register shape. The agent
+/// emits `{database, <key>: [...]}`. Ansible's contract is
+/// `register.getent_<database>` (a map keyed by `<key>` whose value
+/// is the field list). Build that map and place it at the top level.
+fn lift_getent_envelope(rv: &mut RegisterValue) {
+    let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
+        return;
+    };
+    let envelope = obj.clone();
+    rv.json = None;
+    // Pull the database name out so we know the lift target.
+    let database = match envelope.get("database").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    // Build {<key>: [...fields...]} from the rest of the envelope.
+    let mut map = serde_json::Map::new();
+    for (k, v) in envelope {
+        if k == "database" {
+            continue;
+        }
+        map.insert(k, v);
+    }
+    rv.extra.insert(
+        format!("getent_{database}"),
+        JsonValue::Object(map),
+    );
+}
+
 fn lift_async_envelope(rv: &mut RegisterValue) {
     let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
         return;
@@ -4461,6 +4499,19 @@ fn render_op(
             key: render_str(env, &a.key, &view)?,
             state: a.state,
             exclusive: a.exclusive,
+        }),
+        TaskOp::Getent(g) => TaskOp::Getent(GetentOp {
+            database: render_str(env, &g.database, &view)?,
+            key: render_str(env, &g.key, &view)?,
+            fail_key: g.fail_key,
+            split: if g.split.is_empty() {
+                String::new()
+            } else {
+                render_str(env, &g.split, &view)?
+            },
+        }),
+        TaskOp::Hostname(h) => TaskOp::Hostname(HostnameOp {
+            name: render_str(env, &h.name, &view)?,
         }),
         TaskOp::Ufw(u) => {
             let render_if = |s: &str| -> Result<String> {

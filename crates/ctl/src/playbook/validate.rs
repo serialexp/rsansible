@@ -654,6 +654,33 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             Ok(())
         }
+        TaskOp::Getent(g) => {
+            if g.database.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: getent.database is empty",
+                    where_,
+                    task.name
+                );
+            }
+            if g.key.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: getent.key is empty",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
+        TaskOp::Hostname(h) => {
+            if h.name.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: hostname.name is empty",
+                    where_,
+                    task.name
+                );
+            }
+            Ok(())
+        }
         TaskOp::Ufw(_) => {
             // Cross-field constraints already enforced at parse time;
             // nothing else to check.

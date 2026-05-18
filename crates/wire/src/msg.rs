@@ -399,6 +399,20 @@ pub fn op_authorized_key(user: String, key: String, state: u8, exclusive: bool) 
     })
 }
 
+pub fn op_getent(database: String, key: String, fail_key: bool, split: String) -> Op {
+    Op::OpGetent(OpGetentOutput {
+        kind: 25,
+        database,
+        key,
+        fail_key: if fail_key { 1 } else { 0 },
+        split,
+    })
+}
+
+pub fn op_hostname(name: String) -> Op {
+    Op::OpHostname(OpHostnameOutput { kind: 26, name })
+}
+
 /// `op:` byte values for `OpUfw`.
 pub mod ufw_op {
     pub const RULE: u8 = 0;

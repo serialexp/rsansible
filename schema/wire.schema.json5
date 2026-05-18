@@ -302,6 +302,25 @@
       ],
     },
 
+    OpGetent: {
+      description: "Look up a single NSS database entry. Maps Ansible's `ansible.builtin.getent` (subset). `database` is the NSS database name (`passwd`, `group`, `hosts`, `services`, `shadow`, …) and is required. `key` is the lookup key (user name, group name, hostname, port name, …) and is required — we do NOT support the all-entries form (omitted-key returns every record), which Ansible permits but our scope hasn't needed. `fail_key=1` (the Ansible default) means TaskError on lookup miss; `fail_key=0` records `<key>: null` in the envelope and reports `changed=0`. `split` is the field separator; empty string defers to the database default (`:` for passwd/group/shadow, whitespace for hosts/services). Envelope on success: `{ \"database\": <name>, \"<key>\": [field1, field2, …] }` — the second key is dynamic, matching Ansible's `getent_<database>[<key>]` shape after the orchestrator lifts it to the register. Read-only, never reports `changed=1`. Wire kind=25.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 25 },
+        { name: "database", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "key", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "fail_key", type: "uint8" },
+        { name: "split", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+      ],
+    },
+
+    OpHostname: {
+      description: "Set the system hostname. Maps Ansible's `ansible.builtin.hostname` (subset). `name` is required. Idempotency: read the current hostname via `hostname` (or `/etc/hostname`); no-op if already equal. Otherwise: when `hostnamectl` is on PATH (systemd-init systems) call `hostnamectl set-hostname <name>` — that handles `/etc/hostname` and the kernel `sethostname()` in one shot. On non-systemd hosts fall back to rewriting `/etc/hostname` (mode 0644) and calling the `hostname` binary to update the running kernel value. `use:` is NOT supported on the wire today (we always auto-detect via hostnamectl-vs-fallback); pass-through of Ansible's `use:` is parse-time rejected. Wire kind=26.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 26 },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+      ],
+    },
+
     OpUri: {
       description: "HTTP client. Maps Ansible's `ansible.builtin.uri` (subset). `method` is a uint8: 0=GET, 1=POST, 2=PUT, 3=PATCH, 4=DELETE, 5=HEAD. `header_keys` / `header_values` are parallel arrays carrying the request headers (case preserved on the wire; reqwest canonicalises at send time). `body_format` is a uint8: 0=raw (body shipped verbatim, no Content-Type touched), 1=json (body shipped as-is — controller pre-serialises any YAML map at parse time; Content-Type set to application/json when not already in headers), 2=form (body shipped verbatim; Content-Type set to application/x-www-form-urlencoded when not already in headers — caller does the k=v&k=v encoding). `status_codes` is the list of accepted HTTP statuses; the agent emits TaskDone with exit_code=0 when the response status is in this list, exit_code=1 otherwise. The envelope is shipped on stdout in both cases for diagnostics. `follow_redirects` is a uint8: 0=none, 1=safe (follow up to 10 hops iff the original method was GET/HEAD), 2=all (follow up to 10 hops regardless of method). `validate_certs=0` disables TLS cert/hostname verification. `return_content=1` includes the response body as a UTF-8 string in the envelope's `content` field. Envelope shape: {status: uint16, url: string, headers: map<string,string> (response headers, keys lowercased), content?: string (only if return_content), content_length: uint, content_type: string, json?: <parsed body if Content-Type indicates JSON>, elapsed_ms: uint, redirected: bool}. `changed` is 1 for any successful non-GET/HEAD request (Ansible's contract: mutating verbs report changed even if the server didn't actually change), 0 for GET/HEAD or for any failed status. Pre-status errors (connect refused, DNS, TLS handshake, timeout) surface as TaskError BAD_HOST/BAD_REQUEST without an envelope. Wire kind=12.",
       sequence: [
@@ -511,6 +530,8 @@
         { type: "OpUser", when: "value === 22" },
         { type: "OpGroup", when: "value === 23" },
         { type: "OpAuthorizedKey", when: "value === 24" },
+        { type: "OpGetent", when: "value === 25" },
+        { type: "OpHostname", when: "value === 26" },
       ],
     },
 

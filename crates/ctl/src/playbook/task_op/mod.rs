@@ -23,10 +23,10 @@
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
     msg::{
-        op_async_status, op_blockinfile, op_exec, op_file, op_gather_facts, op_get_url,
-        op_authorized_key, op_group, op_iptables, op_lineinfile, op_package, op_postgresql_ext,
-        op_postgresql_query, op_repository, op_shell, op_stat, op_systemd, op_ufw, op_uri,
-        op_user, op_wait_for, op_write_file,
+        op_async_status, op_authorized_key, op_blockinfile, op_exec, op_file, op_gather_facts,
+        op_get_url, op_getent, op_group, op_hostname, op_iptables, op_lineinfile, op_package,
+        op_postgresql_ext, op_postgresql_query, op_repository, op_shell, op_stat, op_systemd,
+        op_ufw, op_uri, op_user, op_wait_for, op_write_file,
     },
     Op,
 };
@@ -48,7 +48,9 @@ mod lineinfile;
 mod blockinfile;
 mod systemd;
 mod authorized_key;
+mod getent;
 mod group;
+mod hostname;
 mod package;
 mod repository;
 mod user;
@@ -73,7 +75,9 @@ pub use get_url::GetUrlOp;
 pub use lineinfile::{LineInFileOp, LineInFileState};
 pub use openssl::{OpenSslCsrPipeOp, OpenSslPrivkeyOp, X509CertificatePipeOp};
 pub use authorized_key::{AuthorizedKeyOp, AuthorizedKeyState};
+pub use getent::GetentOp;
 pub use group::{GroupOp, GroupState};
+pub use hostname::HostnameOp;
 pub use package::{PackageManager, PackageOp, PackageState};
 pub use repository::{RepositoryManager, RepositoryOp, RepositoryState};
 pub use user::{UserOp, UserState};
@@ -388,6 +392,14 @@ pub enum TaskOp {
     /// fingerprint (type + key body) to match existing entries so an
     /// updated comment doesn't double-add.
     AuthorizedKey(AuthorizedKeyOp),
+    /// `getent:` — look up a single NSS database entry. Read-only;
+    /// always reports `changed=0`. The envelope shape matches
+    /// Ansible's `getent_<database>[<key>]` so vendored templates
+    /// resolve unchanged after the orchestrator lifts the result.
+    Getent(GetentOp),
+    /// `hostname:` — set the system hostname. Idempotent: reads the
+    /// running hostname before mutating.
+    Hostname(HostnameOp),
     /// `ufw:` — Uncomplicated Firewall control. One op covers one of
     /// rule / enable / disable / reset / default / reload / logging.
     Ufw(UfwOp),
@@ -498,6 +510,8 @@ const BODY_KEYS: &[&str] = &[
     "user",
     "group",
     "authorized_key",
+    "getent",
+    "hostname",
     "async_status",
     "iptables",
     "ufw",
@@ -954,6 +968,18 @@ impl<'de> Deserialize<'de> for Task {
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
                 TaskBody::Op(TaskOp::AuthorizedKey(
                     authorized_key::parse_authorized_key_body::<D::Error>(map)?,
+                ))
+            }
+            "getent" => {
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Getent(getent::parse_getent_body::<D::Error>(map)?))
+            }
+            "hostname" => {
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Hostname(
+                    hostname::parse_hostname_body::<D::Error>(map)?,
                 ))
             }
             "iptables" => TaskBody::Op(TaskOp::Iptables(
@@ -1754,6 +1780,13 @@ impl TaskOp {
                 a.state.wire_byte(),
                 a.exclusive,
             )),
+            TaskOp::Getent(g) => Ok(op_getent(
+                g.database.clone(),
+                g.key.clone(),
+                g.fail_key,
+                g.split.clone(),
+            )),
+            TaskOp::Hostname(h) => Ok(op_hostname(h.name.clone())),
             TaskOp::AsyncStatus(a) => {
                 // `jid` has already been rendered to its final string
                 // form by the orchestrator's render_op pass; we just

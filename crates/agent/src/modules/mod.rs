@@ -13,7 +13,9 @@ mod exec;
 mod file;
 mod gather_facts;
 mod get_url;
+mod getent;
 mod group;
+mod hostname;
 mod iptables;
 mod lineinfile;
 mod package;
@@ -96,6 +98,8 @@ pub fn dispatch<'a>(
             Op::OpGroup(o) => group::run(ctx, seq, o, check_mode).await,
             Op::OpUser(o) => user::run(ctx, seq, o, check_mode).await,
             Op::OpAuthorizedKey(o) => authorized_key::run(ctx, seq, o, check_mode).await,
+            Op::OpGetent(o) => getent::run(ctx, seq, o, check_mode).await,
+            Op::OpHostname(o) => hostname::run(ctx, seq, o, check_mode).await,
         }
     })
 }
