@@ -48,6 +48,10 @@ impl<'de> Deserialize<'de> for SystemdOp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut map = serde_yaml::Mapping::deserialize(d)?;
 
+        // `name` is required for state/enabled/masked operations, but
+        // optional for a `daemon_reload`-only task (Ansible accepts it
+        // without a unit). We defer the required-when check until
+        // after we've parsed `daemon_reload` and friends below.
         let name = match map.remove("name") {
             Some(serde_yaml::Value::String(s)) => s,
             Some(other) => {
@@ -55,7 +59,7 @@ impl<'de> Deserialize<'de> for SystemdOp {
                     "systemd.name must be a string, got: {other:?}"
                 )))
             }
-            None => return Err(D::Error::custom("systemd: missing required field `name`")),
+            None => String::new(),
         };
 
         let state = match map.remove("state") {
@@ -113,6 +117,20 @@ impl<'de> Deserialize<'de> for SystemdOp {
         {
             return Err(D::Error::custom(
                 "systemd: must specify at least one of [state, enabled, masked, daemon_reload]",
+            ));
+        }
+
+        // `name:` is required for anything that operates on a unit.
+        // `daemon_reload: true` alone (with no state/enabled/masked) is
+        // unit-agnostic, so we let that case through with an empty name
+        // — the agent's apply() will skip unit-targeted blocks
+        // automatically.
+        let needs_unit = !matches!(state, SystemdState::None)
+            || enabled.is_some()
+            || masked.is_some();
+        if needs_unit && name.is_empty() {
+            return Err(D::Error::custom(
+                "systemd: `name` is required when state/enabled/masked is set",
             ));
         }
 
@@ -186,6 +204,45 @@ systemd:
             }
             _ => panic!(),
         }
+    }
+
+    /// `daemon_reload: true` alone (no unit) is Ansible-idiomatic for
+    /// "reload after a unit-file change in a handler." We accept it
+    /// with an empty `name:` — the agent treats name as optional in
+    /// the daemon-reload-only path.
+    #[test]
+    fn parses_systemd_daemon_reload_only_without_name() {
+        let t = parse_task(
+            r#"
+name: t
+systemd:
+  daemon_reload: true
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Systemd(s)) => {
+                assert_eq!(s.name, "");
+                assert!(s.daemon_reload);
+                assert_eq!(s.state, SystemdState::None);
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// State/enabled/masked still requires `name:`.
+    #[test]
+    fn systemd_rejects_state_without_name() {
+        let yaml = r#"
+name: t
+systemd:
+  state: restarted
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`name` is required"),
+            "got: {msg}"
+        );
     }
 
     #[test]

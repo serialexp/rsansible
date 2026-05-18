@@ -41,12 +41,18 @@ const STATE_RELOADED: u8 = 4;
 pub async fn run(ctx: &Context, seq: u32, op: OpSystemdOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
-    if op.name.trim().is_empty() {
+    // `name` is required for any operation that targets a unit
+    // (state/enabled/masked). `daemon_reload: true` alone is
+    // unit-agnostic — Ansible accepts that form, so we do too.
+    let needs_unit = op.state != STATE_NONE
+        || op.has_enabled != 0
+        || op.has_masked != 0;
+    if needs_unit && op.name.trim().is_empty() {
         emit_error(
             ctx,
             seq,
             err::BAD_REQUEST,
-            "systemd: `name` is required",
+            "systemd: `name` is required for state/enabled/masked",
         )
         .await;
         return Ok(());

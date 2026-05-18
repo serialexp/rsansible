@@ -832,11 +832,16 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             }
         }
         TaskOp::Copy(c) => {
-            // `src:` is resolved at load time; `body` is raw bytes that
-            // ship verbatim and need no Jinja compilation. Only `dest:`
-            // is templatable.
+            // `src:` form — body is raw bytes from disk, no Jinja.
+            // `content:` form — content is a Jinja-renderable string,
+            // pre-compile it so syntax errors surface at validate time
+            // rather than at first dispatch.
             env.template_from_str(&c.dest)
                 .map_err(|e| anyhow!("copy.dest: {e}"))?;
+            if let Some(content) = c.content.as_deref() {
+                env.template_from_str(content)
+                    .map_err(|e| anyhow!("copy.content: {e}"))?;
+            }
         }
         TaskOp::GatherFacts => {
             // Implicit op — no user-supplied fields to compile.

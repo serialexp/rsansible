@@ -184,9 +184,33 @@ pub(super) fn take_string_or_bool<E: serde::de::Error>(
         None | Some(serde_yaml::Value::Null) => Ok(None),
         Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
         Some(serde_yaml::Value::Bool(b)) => Ok(Some(b.to_string())),
+        // Ansible accepts a YAML sequence here too — AND-joined. Same
+        // shape as `when:` (see `take_when_field`); we canonicalize to
+        // a single `(a) and (b) and ...` expression so the runtime
+        // path stays uniform. Empty sequence → no condition.
+        Some(serde_yaml::Value::Sequence(seq)) => {
+            if seq.is_empty() {
+                return Ok(None);
+            }
+            let mut parts = Vec::with_capacity(seq.len());
+            for (i, item) in seq.into_iter().enumerate() {
+                match item {
+                    serde_yaml::Value::String(s) => parts.push(format!("({s})")),
+                    serde_yaml::Value::Bool(b) => {
+                        parts.push(format!("({})", if b { "true" } else { "false" }))
+                    }
+                    other => {
+                        return Err(E::custom(format!(
+                            "task {task_name:?}: `{key}[{i}]` must be a string, got: {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Some(parts.join(" and ")))
+        }
         Some(other) => Err(E::custom(format!(
             "task {task_name:?}: `{key}` must be a Jinja expression \
-             string or a bool, got: {other:?}"
+             string, a bool, or a list of strings, got: {other:?}"
         ))),
     }
 }

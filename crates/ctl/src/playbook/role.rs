@@ -436,7 +436,12 @@ fn resolve_copy_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
     let TaskBody::Op(TaskOp::Copy(c)) = &mut task.body else {
         return Ok(());
     };
-    let candidates = file_search_paths(&c.src, task.role_dir.as_deref(), base_dir, "files");
+    // `content:` form is resolved at dispatch (Jinja-render inline
+    // content), nothing to load from disk here.
+    let Some(src) = c.src.as_deref() else {
+        return Ok(());
+    };
+    let candidates = file_search_paths(src, task.role_dir.as_deref(), base_dir, "files");
     for path in &candidates {
         if path.is_file() {
             let bytes = std::fs::read(path)
@@ -453,7 +458,7 @@ fn resolve_copy_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
     Err(anyhow!(
         "task {:?}: couldn't locate copy src {:?}; tried:\n{candidate_list}",
         task.name,
-        c.src
+        src
     ))
 }
 

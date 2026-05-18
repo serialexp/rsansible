@@ -4570,25 +4570,42 @@ fn render_op(
             })
         }
         TaskOp::Copy(c) => {
-            // Resolved bytes live on `c.body`; we just render `dest`
-            // and keep the variant intact through dispatch. `to_wire_op`
-            // emits the actual `OpWriteFile` with the bytes shipped
-            // verbatim — going through `TaskOp::WriteFile` here would
-            // force a lossy String roundtrip for binary content.
-            if c.body.is_none() {
-                return Err(anyhow!(
-                    "copy src {:?} was not loaded — playbook::load() didn't resolve it (validate should have caught this)",
-                    c.src
-                ));
-            }
+            // Two forms:
+            //   - `src:` form — bytes were loaded at parse time into
+            //     `c.body`; we just clone them through. Variant stays
+            //     `TaskOp::Copy` rather than desugaring to WriteFile so
+            //     binary content survives (WriteFileOp.content is String).
+            //   - `content:` form — Jinja-render the inline content
+            //     against the per-host view and populate `body` here.
+            //     This is semantically `template:` with inline source,
+            //     but kept under `TaskOp::Copy` for uniformity.
             let dest = render_str(env, &c.dest, &view)?;
+            let body = match (&c.src, &c.content) {
+                (Some(_), _) => c.body.clone().ok_or_else(|| {
+                    anyhow!(
+                        "copy src {:?} was not loaded — playbook::load() didn't resolve it (validate should have caught this)",
+                        c.src
+                    )
+                })?,
+                (None, Some(template)) => {
+                    let rendered = render_str(env, template, &view)?;
+                    rendered.into_bytes()
+                }
+                (None, None) => {
+                    return Err(anyhow!(
+                        "internal: copy task dest {:?} has neither src nor content (should have been caught at parse)",
+                        c.dest
+                    ));
+                }
+            };
             TaskOp::Copy(CopyOp {
                 src: c.src.clone(),
+                content: c.content.clone(),
                 dest,
                 mode: c.mode,
                 owner: c.owner.clone(),
                 group: c.group.clone(),
-                body: c.body.clone(),
+                body: Some(body),
             })
         }
         TaskOp::GatherFacts => TaskOp::GatherFacts,
@@ -6418,6 +6435,34 @@ mod tests {
         let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
         match rendered {
             TaskOp::Shell(s) => assert_eq!(s.command(), "echo alice"),
+            _ => panic!(),
+        }
+    }
+
+    /// `copy: content:` Jinja-renders at dispatch time. The rendered
+    /// string becomes the on-wire body; the resulting CopyOp must have
+    /// `body: Some(rendered_bytes)`. Regression-guards the "render
+    /// inline content" branch of `render_op`'s `TaskOp::Copy` arm.
+    #[test]
+    fn render_op_copy_content_form_renders_jinja_into_body() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.set_facts.insert("name".into(), serde_json::json!("world"));
+        let op = TaskOp::Copy(CopyOp {
+            src: None,
+            content: Some("hello {{ name }}\n".into()),
+            dest: "/etc/greeting".into(),
+            mode: 0o644,
+            owner: None,
+            group: None,
+            body: None,
+        });
+        let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
+        match rendered {
+            TaskOp::Copy(c) => {
+                assert_eq!(c.body.as_deref(), Some(b"hello world\n".as_ref()));
+                assert_eq!(c.dest, "/etc/greeting");
+            }
             _ => panic!(),
         }
     }
