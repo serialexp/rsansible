@@ -295,6 +295,7 @@ fn expand_one(
             changed_when: None,
             failed_when: None,
             no_log: None,
+            vars: std::collections::BTreeMap::new(),
         };
         spliced.insert(0, synthetic);
     }

@@ -16,10 +16,21 @@ use serde::{de::Error as _, Deserialize, Deserializer};
 /// `shell:` if you need to choose the interpreter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOp {
-    /// Argv after shlex-splitting (when the string form is used) or
-    /// taken verbatim from the YAML list form. Always non-empty after
-    /// successful parse.
+    /// Argv. Populated at parse time from the `argv:`-list form, OR
+    /// at render time by shlex-splitting `raw_cmd` *after* Jinja has
+    /// already expanded any `{{ var }}` it contained. Empty at parse
+    /// time when the user used the string-shorthand / `cmd:` form
+    /// (because we can't safely shlex-split a string with unrendered
+    /// Jinja — `{{`, `var`, and `}}` would each become their own
+    /// token and `{{` alone is a syntax error when template-validated).
     pub argv: Vec<String>,
+    /// The raw command string from `command: "..."` or
+    /// `command: { cmd: "..." }`. `None` when the user provided
+    /// `argv:` directly. When `Some(...)`, this string is what gets
+    /// compiled as a Jinja template (instead of the per-element argv
+    /// path) and what gets re-shlex-split at dispatch time after
+    /// rendering. See ANSIBLE_COMPAT.md §10.
+    pub raw_cmd: Option<String>,
     /// Working directory on the agent. Empty = "use the agent's cwd".
     pub chdir: String,
     /// Idempotency: if this path exists on the agent at task time,
@@ -40,15 +51,24 @@ impl<'de> Deserialize<'de> for CommandOp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = serde_yaml::Value::deserialize(d)?;
         // String shorthand: `command: ssh-keygen -t ed25519 -f ...`
+        //
+        // Splitting is deferred until after Jinja renders the string
+        // at runtime — see CommandOp.raw_cmd for why. We still do a
+        // best-effort parse here to catch shlex errors that don't
+        // involve Jinja (unterminated quotes etc.) so playbook authors
+        // get a clean parse-time failure on obvious mistakes.
         if let serde_yaml::Value::String(s) = &v {
-            let argv = shlex_split_or_err::<D::Error>(s)?;
-            if argv.is_empty() {
-                return Err(D::Error::custom(
-                    "command: empty command string after shlex-split",
-                ));
+            if s.trim().is_empty() {
+                return Err(D::Error::custom("command: empty command string"));
+            }
+            if !s.contains("{{") {
+                // Catch shlex parse errors at parse time when there's
+                // no Jinja to defer for.
+                let _ = shlex_split_or_err::<D::Error>(s)?;
             }
             return Ok(CommandOp {
-                argv,
+                argv: Vec::new(),
+                raw_cmd: Some(s.clone()),
                 chdir: String::new(),
                 creates: String::new(),
                 removes: String::new(),
@@ -92,26 +112,29 @@ impl<'de> Deserialize<'de> for CommandOp {
                 )))
             }
         };
-        let argv = match (cmd, argv_list) {
+        let (argv, raw_cmd) = match (cmd, argv_list) {
             (Some(_), Some(_)) => {
                 return Err(D::Error::custom(
                     "command: cmd and argv are mutually exclusive",
                 ))
             }
             (Some(s), None) => {
-                let v = shlex_split_or_err::<D::Error>(&s)?;
-                if v.is_empty() {
-                    return Err(D::Error::custom(
-                        "command.cmd: empty after shlex-split",
-                    ));
+                if s.trim().is_empty() {
+                    return Err(D::Error::custom("command.cmd: empty"));
                 }
-                v
+                // Same deferred-shlex contract as the string-shorthand
+                // path above; we still surface obvious shlex syntax
+                // errors at parse time when there's no Jinja to defer.
+                if !s.contains("{{") {
+                    let _ = shlex_split_or_err::<D::Error>(&s)?;
+                }
+                (Vec::new(), Some(s))
             }
             (None, Some(v)) => {
                 if v.is_empty() {
                     return Err(D::Error::custom("command.argv: must be non-empty"));
                 }
-                v
+                (v, None)
             }
             (None, None) => {
                 return Err(D::Error::custom(
@@ -194,6 +217,7 @@ impl<'de> Deserialize<'de> for CommandOp {
 
         Ok(CommandOp {
             argv,
+            raw_cmd,
             chdir,
             creates,
             removes,
@@ -228,9 +252,12 @@ mod tests {
         let TaskBody::Op(TaskOp::Command(c)) = body else {
             panic!("expected Command, got {body:?}");
         };
+        // Splitting is deferred until after Jinja render; argv stays
+        // empty at parse time. raw_cmd preserves the user input.
+        assert!(c.argv.is_empty());
         assert_eq!(
-            c.argv,
-            vec!["/usr/bin/echo", "hello", "quoted arg"]
+            c.raw_cmd.as_deref(),
+            Some(r#"/usr/bin/echo hello "quoted arg""#)
         );
     }
 
@@ -247,7 +274,8 @@ mod tests {
         let TaskBody::Op(TaskOp::Command(c)) = &tasks[0].body else {
             panic!()
         };
-        assert_eq!(c.argv, vec!["/usr/bin/echo", "hi"]);
+        assert!(c.argv.is_empty());
+        assert_eq!(c.raw_cmd.as_deref(), Some("/usr/bin/echo hi"));
         assert_eq!(c.chdir, "/tmp");
         assert_eq!(c.timeout_ms, 5_000);
     }
@@ -263,7 +291,31 @@ mod tests {
         let TaskBody::Op(TaskOp::Command(c)) = &tasks[0].body else {
             panic!()
         };
+        // argv-list form stays verbatim and raw_cmd remains None.
         assert_eq!(c.argv, vec!["/bin/sh", "-c", "echo 'spaces stay'"]);
+        assert!(c.raw_cmd.is_none());
+    }
+
+    #[test]
+    fn command_cmd_with_jinja_defers_shlex_split() {
+        // The exact case from gothab/drill-failover that motivated the
+        // deferred-split design: `{{ var }}` arguments would shlex into
+        // three separate `{{`, `var`, `}}` tokens, and `{{` alone fails
+        // template precompile with "unexpected end of input".
+        let yaml = r#"
+- name: t
+  command:
+    cmd: "/usr/bin/echo --id {{ drill_id }}"
+"#;
+        let tasks: Vec<Task> = serde_yaml::from_str(yaml).unwrap();
+        let TaskBody::Op(TaskOp::Command(c)) = &tasks[0].body else {
+            panic!()
+        };
+        assert!(c.argv.is_empty());
+        assert_eq!(
+            c.raw_cmd.as_deref(),
+            Some("/usr/bin/echo --id {{ drill_id }}")
+        );
     }
 
     #[test]
@@ -310,7 +362,7 @@ mod tests {
         let TaskBody::Op(TaskOp::Command(c)) = &tasks[0].body else {
             panic!()
         };
-        assert_eq!(c.argv, vec!["/usr/bin/echo", "hi"]);
+        assert_eq!(c.raw_cmd.as_deref(), Some("/usr/bin/echo hi"));
     }
 
     #[test]
@@ -330,6 +382,7 @@ mod tests {
     fn command_to_wire_maps_to_op_exec() {
         let t = TaskOp::Command(CommandOp {
             argv: vec!["/bin/echo".into(), "hi".into()],
+            raw_cmd: None,
             chdir: "/tmp".into(),
             creates: String::new(),
             removes: String::new(),
@@ -350,6 +403,7 @@ mod tests {
     fn command_with_creates_rejected_at_to_wire() {
         let t = TaskOp::Command(CommandOp {
             argv: vec!["/bin/echo".into()],
+            raw_cmd: None,
             chdir: String::new(),
             creates: "/tmp/marker".into(),
             removes: String::new(),

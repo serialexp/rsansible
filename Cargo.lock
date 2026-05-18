@@ -2766,6 +2766,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "pbkdf2 0.12.2",
+ "rand 0.9.4",
  "rcgen",
  "regex",
  "rsansible-wire",

@@ -8,9 +8,24 @@ user-facing names.
 ## Companion docs
 
 - **`ANSIBLE_COMPAT.md`** — the canonical list of every place
-  rsansible deliberately differs from Ansible. **Every deliberate
-  divergence MUST be recorded there in the same commit that
-  introduces it.** See the rule at the bottom of this file.
+  rsansible's behavior **differs** from Ansible's given identical
+  input. Reach for this when a playbook ported from Ansible
+  misbehaves under rsansible — the entry will tell you whether the
+  difference is deliberate and what the rsansible-side semantics
+  are. **Every deliberate divergence MUST be recorded there in the
+  same commit that introduces it.** See the rule at the bottom of
+  this file.
+
+- **`RSANSIBLE_IDIOMS.md`** — the list of places where rsansible
+  offers a **canonical spelling** alongside a thin compat shim that
+  keeps the Ansible spelling working. Behavior matches Ansible (the
+  shim makes it so), but new playbooks should reach for the
+  canonical form. Reach for this when authoring fresh, or when
+  you're about to add a second "god function with a string-dispatch
+  selector" and need to remember to split it into canonical +
+  shim. The two docs are mutually exclusive: if a shim makes
+  behavior match, it goes in `RSANSIBLE_IDIOMS.md`; if behavior
+  genuinely differs, it goes in `ANSIBLE_COMPAT.md`.
 
 ## Naming: `controller_` / `target_` prefix for side-aware operations
 
@@ -169,10 +184,19 @@ What does NOT go in `ANSIBLE_COMPAT.md`:
 - Internal naming conventions (those go here, in CLAUDE.md).
 - "Will match Ansible once we implement X" — that's a TODO.
 - Performance differences with identical user-visible behavior.
+- **Canonical-vs-compat-shim pairs where behavior matches.** A
+  preferred rsansible spelling that has a thin compat shim
+  forwarding to it (so the Ansible spelling still works) is not a
+  divergence — it's an idiom preference. Those go in
+  `RSANSIBLE_IDIOMS.md` instead. The litmus test: if a playbook
+  using the Ansible spelling produces identical observable results,
+  it's an idiom, not a divergence.
 
 When you add a divergence: the function's own doc comment should
 say `see ANSIBLE_COMPAT.md §N` so a developer reading the code
 knows the choice was deliberate and where to find the rationale.
+For canonical/shim pairs, the canonical function's doc comment
+should say `see RSANSIBLE_IDIOMS.md §N` for the same reason.
 
 ## Recursive task lists: the executor pattern for grouped ops
 
@@ -239,6 +263,87 @@ The rules:
    silently-wrong semantic. Future ops should inherit this
    discipline.
 
+## `run_once:` on tasks nested inside a `block:`
+
+`run_once: true` is honored at *any* depth in the task tree — including
+on tasks inside `block:` / `rescue:` / `always:`. Implementation pattern:
+
+1. **Pre-walk the task tree once** at strategy entry and allocate a
+   shared `RunOnceCoord`: a pre-order DFS visits every task in the
+   subtree, assigning slot `i` to the `i`th visited task. Coord
+   carries one `Arc<OnceCell<RunOnceResult>>` per slot plus a
+   `subtree_sizes[i]` field (size of the subtree rooted at slot `i`,
+   inclusive). Per-strategy allocation point:
+   - **`per_play`** → one coord covering all of `play.tasks` at play
+     start, shared across every per-host walker (line ~1147 of
+     `orchestrator.rs`, `RunOnceCoord::allocate(&play.tasks)`).
+   - **`per_task` fanout** → one coord per fanned-out task at the
+     spawn site (sized to `count_tasks_in_tree(&[task.clone()])`).
+     Cheap (typical playbook tasks are leaves; only block-tasks
+     produce a non-trivial subtree).
+
+2. **Per-host walkers each carry a local `slot_counter: u32`**. They
+   walk the task tree in the same pre-order as the coord allocation,
+   incrementing the counter as they visit each task. Two walkers
+   that visit the same task therefore see the same slot index. The
+   coord is `Arc<...>` shared; the counter is per-host.
+
+3. **`dispatch_one_task` is the SOLE entry point** for dispatching a
+   task that owns a coord slot. It increments the counter past the
+   task's own slot **before** calling `run_task_on_one_host`, so that
+   when a block recurses internally the inner walker starts at the
+   first inner slot (not the block's own slot). The body of
+   `run_task_on_one_host` does NOT touch the counter — only
+   `dispatch_one_task` does. **Every call site that dispatches a
+   task at the entry of a recursion (per_task fanout, test drive
+   helpers, future strategy implementations) MUST go through
+   `dispatch_one_task`, never `run_task_on_one_host` directly.**
+   Calling `run_task_on_one_host` with a fresh `slot_counter=0` on a
+   block task means the inner walker treats slot 0 as the first
+   inner task — exactly the wrong cell. (gather_facts /
+   `run_task_once_per_task` / handler dispatch are exceptions: their
+   tasks are always leaves with no inner subtree to recurse into.
+   They take the empty-coord path and the counter is unused.)
+
+4. **Runner identity is per-host, picked at spawn time.** `is_runner
+   = (host_name == live_hosts[0])` — the first live host in the
+   target set. Same host is the runner for every `run_once` task it
+   encounters during its walk; non-runners await each cell in turn
+   and apply the broadcast (`register` / `set_facts` / `notify`)
+   without re-executing the body.
+
+5. **The counter MUST stay synchronized across hosts.** The trap is
+   tasks that short-circuit (`when: false`, `vars:`/`when:`/render
+   error, loop-spec error) — they return from `run_task_on_one_host`
+   without recursing into a block subtree, so the counter only
+   advances by 1 (the task itself) rather than by `subtree_size`.
+   Hosts that DID recurse fully would be ahead. The fix lives at
+   the END of `dispatch_one_task`: `if *slot_counter < slot +
+   subtree_size { *slot_counter = slot + subtree_size; }`. Belt
+   and suspenders: `run_task_list_on_host` also advances the
+   counter past any tasks it didn't visit due to early-exit on
+   first-failure, using `coord.subtree_size(slot)` per skipped task.
+
+6. **Looped blocks don't coordinate run_once internally.** A block
+   with a `loop:` re-walks its arms on every iteration; the
+   OnceCells filled on iteration 1 would deadlock iteration 2's
+   non-runner hosts. For now `run_block_on_one_host` swaps to
+   `RunOnceCoord::empty()` for the inner walks when `loop_spec` is
+   set, so `run_once` on tasks inside a looped block silently falls
+   back to "execute on every host every iteration." If a real
+   playbook needs run_once inside a looped block, the right fix is
+   per-iteration fresh OnceCells (allocate inside the loop body) —
+   not yet implemented.
+
+7. **`HostTaskOutcome` is broadcast verbatim to non-runners.** A
+   non-runner reads the runner's `outcome` from the cell and uses
+   it as its own outcome. If the runner's body failed, every
+   non-runner reports Failed too, and the block-rescue arm fires
+   symmetrically on all hosts. That's the right semantics: a
+   `run_once` failure isn't "a failure on one host" — it's a
+   failure of the only attempt that was supposed to happen, so
+   every host that depended on it is in the same broken state.
+
 ## Retry loop: `retries:` / `until:` / `delay:`
 
 `run_body_with_retries` in `orchestrator.rs` wraps every body-once
@@ -292,6 +397,120 @@ implementation:
    apply `failed_when` to convert Ok→Failed (or leave alone),
    THEN run the `until:` check. Documented in
    `run_body_with_retries`'s doc comment.
+
+## Agent-pool become routing: one process per `(host, become-config)`
+
+`become:` is honored at the **transport** layer, not by wrapping argv
+inside a single shared agent. Every host has an [`AgentPool`] keyed
+by [`BecomeKey`], with slots lazily populated on first reference:
+
+- `BecomeKey::None` — the agent spawned at connect time, running as
+  the SSH user (or controller user, for `connection: local`).
+- `BecomeKey::As(user)` — an agent process spawned under
+  `sudo -n -u <user> -- <agent_path>` the first time a task with
+  effective `become: true` hits this user on this host.
+
+Once a task's `EffectiveBecome` is computed, its wire ops dispatch
+against the matching pool slot — so `systemd`, `copy`, `file`,
+`lineinfile`, … all run with the correct EUID by virtue of *which
+agent process is on the other end of the pipe*. No per-op argv
+wrapping, no double-sudo, no "this op happens to honor become and
+this one silently doesn't."
+
+### The rules
+
+1. **`become_::effective` resolves precedence and renders
+   `become_user`.** Task `become:` → inventory `ansible_become` →
+   default `false`. `become_user` is rendered as a Jinja template
+   against the per-host context — so `become_user: "{{ db_user }}"`
+   works. This happens *before* the key is constructed; the pool
+   never sees an unrendered Jinja expression.
+
+2. **`BecomeKey` is `Hash + Eq + Ord` and used as the pool's map
+   key.** Two tasks with the same effective become share a long-lived
+   agent process; tasks with different keys get independent processes.
+
+3. **One SSH session per host carries N channels** — one per pool
+   slot. Channels are opened lazily via `spawn_agent_channel`.
+   `connection: local` mirrors the pattern: one `LocalSession` per
+   host, N `Command::spawn` children.
+
+4. **Pool resolution is per-body-call inside `run_task_on_one_host`,
+   not pre-hoisted at the dispatcher level.** Loop iterations
+   re-resolve become per item, so `become_user: "{{ item }}"` routes
+   each iteration to its matching slot. The `resolve_target!` macro
+   in `run_task_on_one_host` does the lookup in three steps:
+   compute `BecomeKey`, pick target pool (own or delegate_to'd),
+   `get_or_spawn` on the pool to get the `ConnHandle`. The pool
+   mutex is held only across `get_or_spawn` — released before the
+   body dispatches.
+
+5. **Pool growth is monotonic per run.** No eviction policy in v1.
+   A host with three distinct become users peaks at 4 agents
+   (None + 3); each is ~3.7 MiB. Acceptable for run-scoped pools;
+   reopen the discussion if a long-lived multi-tenant controller
+   emerges.
+
+6. **`PoolTransport::Mock`** is the controller-only test pool. It
+   vends a dead handle (`Arc<Mutex<None>>`) on every `get_or_spawn`,
+   so unit tests for controller-side bodies (set_fact, fail, assert,
+   debug, block dispatch) never need to construct a real agent.
+   Tests that *should* dispatch a wire op surface "agent conn is
+   dead" cleanly instead of needing fixtures.
+
+### What `ANSIBLE_COMPAT.md §7` covers vs. what's here
+
+- `ANSIBLE_COMPAT.md §7` documents the user-facing divergence
+  (sudo-only `become_method`, NOPASSWD requirement, ignored
+  `become_flags` / `become_exe`).
+- This section documents the **internal pattern** — the type names,
+  the lazy-spawn discipline, where in the dispatch flow resolution
+  happens. Future work that adds a second pool dimension (e.g. an
+  `--ask-become-pass` mode, a `become_method: doas` alt-transport)
+  should slot in here without breaking the existing keys.
+
+[`AgentPool`]: ./crates/ctl/src/pool.rs
+[`BecomeKey`]: ./crates/ctl/src/become_.rs
+
+## Every bug fix ships with a regression test
+
+If you fix a bug, you write a test that **fails against the old code
+and passes against the new code** in the same commit. No exceptions —
+"the live drill passed" is not a substitute. The live exercise tells
+us the symptom is gone today; the regression test is what keeps it
+gone six months from now when someone refactors the area without
+remembering the original failure mode.
+
+The test has to actually exercise the broken codepath. Two ways
+this goes wrong in practice:
+
+1. **Testing the post-fix shape instead of the failure sequence.**
+   The deadlock that motivated this rule was that
+   `OnceCell::get_or_init(|| pending().await)` locked the cell so
+   `cell.set(...)` from another task silently failed and the waiter
+   hung forever. The existing tests pre-`set` the cell BEFORE the
+   non-runner enters `get_or_init`, so they hit the "cell already
+   initialized → return immediately" fast path. The bug only
+   manifested in the wait-first / publish-later sequence, which no
+   test covered until we wrote one. When you fix a concurrency or
+   ordering bug, write down "what's the timing that broke this?"
+   and reproduce that exact timing in the test (spawn the waiter
+   first, sleep, then publish — not the other way around).
+
+2. **Letting a hang look like a pass.** A regression test for a
+   deadlock fix must use `tokio::time::timeout` (or equivalent) with
+   a short bound and a clear failure message ("deadlock regressed?").
+   Without the timeout, a re-introduced deadlock just hangs the test
+   process — CI eventually kills it but the operator-facing failure
+   is "test runner timed out," not "deadlock came back." With the
+   timeout the test fails in 2 seconds with a message that points
+   at the original bug.
+
+The rule applies to controller bugs, agent bugs, and parse-time
+validation gaps alike. If the bug surfaced because something user-
+visible misbehaved, there's a unit-level shape that demonstrates it
+— find that shape and lock it down. The fix isn't done until both
+the production symptom AND the unit-level reproduction are green.
 
 ## When you add a new convention here
 

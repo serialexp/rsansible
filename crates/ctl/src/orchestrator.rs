@@ -33,22 +33,23 @@ use rsansible_wire::{
     read_frame, write_frame, Op,
 };
 use serde_json::Value as JsonValue;
-use tokio::sync::{Mutex as TokioMutex, OnceCell, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, Notify, OnceCell, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::become_;
+use crate::become_::{self, BecomeKey};
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, BlockInFileOp, BlockSpec, CopyOp, DebugTask, ExecOp, FailTask, FileOp, GetUrlOp,
-    HostSelector,
+    AssertTask, AsyncStatusOp, BlockInFileOp, BlockSpec, CopyOp, DebugTask, ExecOp, FailTask,
+    FileOp, GetUrlOp, HostSelector, IptablesOp,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
-    Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp, StatOp,
-    Strategy, SystemdOp, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, UfwOp, UnarchiveOp,
-    UriOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
+    PauseTask, Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp, RepositoryOp, SetFactMap, ShellOp, SlurpOp,
+    StatOp, Strategy, SystemdOp, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, UfwOp,
+    UnarchiveOp, UriOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
 };
-use crate::ssh::{self, AgentConn, ConnectOptions};
+use crate::pool::{AgentPool, PoolHandle};
+use crate::ssh::{AgentConn, ConnectOptions};
 use crate::template;
 
 /// Shared handle to a host's agent connection.
@@ -268,11 +269,14 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
 
     // Connect phase — parallel-bounded. Per-host transport is decided
     // up front by scanning the playbook for `connection: local` plays;
-    // SSH is the default. See `resolve_host_connection_modes`.
+    // SSH is the default. See `resolve_host_connection_modes`. Each
+    // host gets one `AgentPool` whose `BecomeKey::None` slot is
+    // seeded by the initial connect; further slots (one per distinct
+    // `BecomeKey::As(user)`) spawn lazily at dispatch time.
     let conn_modes = resolve_host_connection_modes(&playbook, &inventory, &target_hosts)?;
-    let mut conns_raw: BTreeMap<String, AgentConn> = BTreeMap::new();
+    let mut pools_raw: BTreeMap<String, (AgentPool, ConnHandle)> = BTreeMap::new();
     let semaphore = Arc::new(Semaphore::new(max_concurrent_hosts.max(1)));
-    let mut set: JoinSet<(String, Result<AgentConn>)> = JoinSet::new();
+    let mut set: JoinSet<(String, Result<(AgentPool, ConnHandle)>)> = JoinSet::new();
     for name in &target_hosts {
         let host = inventory
             .hosts
@@ -288,11 +292,11 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
             let r = match mode {
                 ConnMode::Ssh => {
                     let opts = ConnectOptions::from_host(&host);
-                    ssh::connect_and_push(&opts, &bin)
+                    AgentPool::open_ssh(&opts, &bin)
                         .await
                         .with_context(|| format!("connecting to {name_owned}"))
                 }
-                ConnMode::Local => crate::local::connect_local(name_owned.clone(), &bin)
+                ConnMode::Local => AgentPool::open_local(name_owned.clone(), &bin)
                     .await
                     .with_context(|| {
                         format!("spawning local agent for {name_owned}")
@@ -304,9 +308,9 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     while let Some(joined) = set.join_next().await {
         let (name, r) = joined.context("connect task panicked")?;
         match r {
-            Ok(c) => {
+            Ok(pair) => {
                 info!(host = %name, "connected");
-                conns_raw.insert(name, c);
+                pools_raw.insert(name, pair);
             }
             Err(e) => {
                 warn!(host = %name, error = %format!("{e:#}"), "connect failed");
@@ -320,29 +324,34 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         }
     }
 
-    // Wrap each AgentConn in Arc<Mutex<Option<…>>> so any task future can
-    // borrow any host's conn for `delegate_to`. The map itself never
-    // mutates after this point; liveness lives in the inner Option.
-    let conns: Arc<BTreeMap<String, ConnHandle>> = Arc::new(
-        conns_raw
+    // Wrap each pool in Arc<Mutex<…>> so per-host task futures can
+    // borrow it for `get_or_spawn` (and so `delegate_to` can reach
+    // other hosts' pools). The map itself never mutates after this
+    // point.
+    let mut none_handles: BTreeMap<String, ConnHandle> = BTreeMap::new();
+    let pools: Arc<BTreeMap<String, PoolHandle>> = Arc::new(
+        pools_raw
             .into_iter()
-            .map(|(n, c)| (n, Arc::new(TokioMutex::new(Some(c)))))
+            .map(|(n, (pool, none_handle))| {
+                none_handles.insert(n.clone(), none_handle);
+                (n, Arc::new(TokioMutex::new(pool)))
+            })
             .collect(),
     );
 
     // Build per-host execution contexts. Lives across the whole run so
     // set_facts and registers persist across plays (Ansible-faithful).
     let mut ctxs: BTreeMap<String, HostCtx> = BTreeMap::new();
-    for (name, conn_handle) in conns.iter() {
+    for (name, _pool_handle) in pools.iter() {
         let host = inventory.hosts.get(name).expect("conn host in inventory");
         let mut ctx = make_initial_ctx(name, host, &world, &extra_vars);
         // Seed wire-cost from the measured Ping/Pong RTT on this host's
-        // SSH channel, capped to u32::MAX ms (60s+ would already be
-        // disastrous). Bandwidth comes from an optional inventory var
-        // `wire_bandwidth_bytes_per_s`; missing/invalid → keep the
-        // conservative default seeded by HostCtx::new.
-        {
-            let guard = conn_handle.lock().await;
+        // initial agent channel, capped to u32::MAX ms (60s+ would
+        // already be disastrous). Bandwidth comes from an optional
+        // inventory var `wire_bandwidth_bytes_per_s`; missing/invalid
+        // → keep the conservative default seeded by HostCtx::new.
+        if let Some(none_handle) = none_handles.get(name) {
+            let guard = none_handle.lock().await;
             if let Some(conn) = guard.as_ref() {
                 let rtt_ms = (conn.clock_rtt_ns / 1_000_000).min(u32::MAX as u64) as u32;
                 ctx.wire_cost.rtt_ms = rtt_ms;
@@ -384,7 +393,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
             .apply(&inventory, &resolve_play_targets(&play.hosts, &inventory))
             .into_iter()
             .filter(|n| {
-                conns.contains_key(n)
+                pools.contains_key(n)
                     && matches!(report.host_outcomes.get(n), Some(HostOutcome::Ok))
             })
             .collect();
@@ -405,7 +414,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         gather_facts_for_play(
             play,
             &play_targets,
-            &conns,
+            &pools,
             &mut ctxs,
             &mut report,
             &next_seq,
@@ -435,7 +444,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                 run_play_per_task(
                     play,
                     &play_targets,
-                    &conns,
+                    &pools,
                     &mut ctxs,
                     &mut report,
                     &next_seq,
@@ -449,7 +458,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                 run_play_per_play(
                     play,
                     &play_targets,
-                    &conns,
+                    &pools,
                     &mut ctxs,
                     &mut report,
                     &next_seq,
@@ -467,16 +476,26 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         }
     }
 
-    // Best-effort Bye. Iterate the map; lock each handle, take the conn
-    // out, send Bye, drop. Hosts whose conn was dropped earlier (failed
-    // under mark_host_failed) have inner = None and are skipped.
-    for (name, handle) in conns.iter() {
-        let mut guard = handle.lock().await;
-        if let Some(mut conn) = guard.take() {
-            if let Err(e) = write_frame(&mut conn.stream, &bye()).await {
-                warn!(host = %name, "Bye send failed: {e:#}");
-            } else {
-                debug!(host = %name, "Bye sent");
+    // Best-effort Bye. Iterate every host's pool; for each slot,
+    // lock its handle, take the conn out, send Bye, drop. Hosts /
+    // slots whose conn was dropped earlier (failed under
+    // mark_host_failed) have inner = None and are skipped.
+    for (name, pool_handle) in pools.iter() {
+        let pool = pool_handle.lock().await;
+        for key in pool.keys().cloned().collect::<Vec<_>>() {
+            // Each slot owns its own ConnHandle inside the pool.
+            // The pool API exposes get_or_spawn (which would re-spawn
+            // a missing slot) — for Bye we don't want that, so we
+            // re-lookup via the keys() snapshot.
+            if let Some(slot_handle) = pool.slot(&key) {
+                let mut guard = slot_handle.lock().await;
+                if let Some(mut conn) = guard.take() {
+                    if let Err(e) = write_frame(&mut conn.stream, &bye()).await {
+                        warn!(host = %name, become = %key.label(), "Bye send failed: {e:#}");
+                    } else {
+                        debug!(host = %name, become = %key.label(), "Bye sent");
+                    }
+                }
             }
         }
     }
@@ -684,6 +703,39 @@ fn apply_play_vars(
     }
 }
 
+/// Render `task.vars:` against the host's current view and write each
+/// entry into `ctx.task_vars`. Each entry is rendered with all
+/// previously-rendered entries already visible, so cross-references
+/// between vars work (subject to BTreeMap key ordering — same caveat
+/// as `apply_play_vars`).
+fn apply_task_vars(
+    vars: &BTreeMap<String, serde_yaml::Value>,
+    ctx: &mut HostCtx,
+    env: &Environment<'static>,
+    world: &WorldVars,
+) -> anyhow::Result<()> {
+    for (k, v) in vars {
+        let view = build_template_ctx(ctx, world);
+        let val = match v {
+            serde_yaml::Value::String(s) => {
+                let rendered = render_str(env, s, &view)
+                    .with_context(|| format!("render task var {k:?}"))?;
+                let trimmed = rendered.trim();
+                if looks_jsonish(trimmed) {
+                    serde_json::from_str::<JsonValue>(trimmed)
+                        .unwrap_or(JsonValue::String(rendered))
+                } else {
+                    JsonValue::String(rendered)
+                }
+            }
+            other => yaml_to_json(other.clone())
+                .with_context(|| format!("coerce task var {k:?}"))?,
+        };
+        ctx.task_vars.insert(k.clone(), val);
+    }
+    Ok(())
+}
+
 // ---------- implicit gather_facts ----------
 
 /// Transient register name the implicit gather task writes into. The
@@ -726,6 +778,7 @@ fn make_gather_facts_task() -> Task {
         changed_when: None,
         failed_when: None,
         no_log: None,
+        vars: std::collections::BTreeMap::new(),
     }
 }
 
@@ -737,7 +790,7 @@ fn make_gather_facts_task() -> Task {
 async fn gather_facts_for_play(
     play: &Play,
     targets: &[String],
-    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    pools: &Arc<BTreeMap<String, PoolHandle>>,
     ctxs: &mut BTreeMap<String, HostCtx>,
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
@@ -767,7 +820,7 @@ async fn gather_facts_for_play(
     info!(play = %play.name, hosts = live.len(), "gathering facts");
     let mut set: JoinSet<PerHostTaskResult> = JoinSet::new();
     for name in &live {
-        let own_conn = conns.get(name).expect("live host has handle").clone();
+        let own_pool = pools.get(name).expect("live host has pool").clone();
         let ctx = ctxs
             .remove(name)
             .unwrap_or_else(|| HostCtx::new(name.clone()));
@@ -775,9 +828,25 @@ async fn gather_facts_for_play(
         let seq_src = next_seq.clone();
         let env = env.clone();
         let world = world.clone();
-        let conns_for = conns.clone();
+        let pools_for = pools.clone();
         set.spawn(async move {
-            run_task_on_one_host(&task, own_conn, conns_for, ctx, seq_src, env, world).await
+            // Synthetic single-task dispatch: no run_once coordination
+            // needed (gather_facts is fan-out on every host, no blocks).
+            let coord = RunOnceCoord::empty();
+            let mut slot_counter: u32 = 0;
+            run_task_on_one_host(
+                &task,
+                own_pool,
+                pools_for,
+                ctx,
+                seq_src,
+                env,
+                world,
+                coord,
+                &mut slot_counter,
+                /*is_runner=*/ true,
+            )
+            .await
         });
     }
     while let Some(joined) = set.join_next().await {
@@ -827,7 +896,7 @@ async fn gather_facts_for_play(
 async fn run_play_per_task(
     play: &Play,
     targets: &[String],
-    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    pools: &Arc<BTreeMap<String, PoolHandle>>,
     ctxs: &mut BTreeMap<String, HostCtx>,
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
@@ -840,7 +909,7 @@ async fn run_play_per_task(
         // control-flow marker that drains the per-host pending queue.
         if let TaskBody::Meta(MetaAction::FlushHandlers) = &task.body {
             let stop =
-                flush_handlers(play, targets, conns, ctxs, report, next_seq, env, world).await?;
+                flush_handlers(play, targets, pools, ctxs, report, next_seq, env, world).await?;
             if stop {
                 return Ok(true);
             }
@@ -872,10 +941,10 @@ async fn run_play_per_task(
         }
 
         let any_failed = if task.run_once {
-            run_task_once_per_task(task, &live, conns, ctxs, report, next_seq, env, world, play)
+            run_task_once_per_task(task, &live, pools, ctxs, report, next_seq, env, world, play)
                 .await?
         } else {
-            run_task_fanout(task, &live, conns, ctxs, report, next_seq, env, world, play).await?
+            run_task_fanout(task, &live, pools, ctxs, report, next_seq, env, world, play).await?
         };
 
         if any_failed && play.on_failure == OnFailure::Stop {
@@ -883,7 +952,7 @@ async fn run_play_per_task(
         }
     }
     // Implicit end-of-play flush.
-    let stop = flush_handlers(play, targets, conns, ctxs, report, next_seq, env, world).await?;
+    let stop = flush_handlers(play, targets, pools, ctxs, report, next_seq, env, world).await?;
     Ok(stop)
 }
 
@@ -891,7 +960,7 @@ async fn run_play_per_task(
 async fn run_task_fanout(
     task: &Task,
     live: &[String],
-    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    pools: &Arc<BTreeMap<String, PoolHandle>>,
     ctxs: &mut BTreeMap<String, HostCtx>,
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
@@ -900,8 +969,15 @@ async fn run_task_fanout(
     play: &Play,
 ) -> Result<bool> {
     let mut set: JoinSet<PerHostTaskResult> = JoinSet::new();
+    // Allocate a per-fanout coord covering this task's subtree. For
+    // leaf tasks the coord has one slot (unused). For block tasks the
+    // coord covers every nested task — that's what makes `run_once:`
+    // on inner block tasks work under the per_task strategy. The first
+    // live host is the designated runner for any `run_once:` inside.
+    let coord = RunOnceCoord::allocate(std::slice::from_ref(task));
+    let runner_name = live.first().cloned();
     for name in live {
-        let own_conn = conns.get(name).expect("live host has handle").clone();
+        let own_pool = pools.get(name).expect("live host has pool").clone();
         let ctx = ctxs
             .remove(name)
             .unwrap_or_else(|| HostCtx::new(name.clone()));
@@ -909,15 +985,38 @@ async fn run_task_fanout(
         let seq_src = next_seq.clone();
         let env = env.clone();
         let world = world.clone();
-        let conns_for = conns.clone();
+        let pools_for = pools.clone();
+        let coord = coord.clone();
+        let is_runner = runner_name.as_deref() == Some(name.as_str());
+        let name_owned = name.clone();
         set.spawn(async move {
-            run_task_on_one_host(&task, own_conn, conns_for, ctx, seq_src, env, world).await
+            let _ = name_owned;
+            let mut slot_counter: u32 = 0;
+            // Always go through `dispatch_one_task` for the entry-level
+            // task: that's the function that increments the counter
+            // past the task's own slot before recursing into a block.
+            // Calling `run_task_on_one_host` directly would leave the
+            // counter at slot 0 (the block's own slot), so the first
+            // inner task would look up the wrong cell.
+            dispatch_one_task(
+                &task,
+                own_pool,
+                pools_for,
+                ctx,
+                seq_src,
+                env,
+                world,
+                coord,
+                &mut slot_counter,
+                is_runner,
+            )
+            .await
         });
     }
     let mut any_failed = false;
     while let Some(joined) = set.join_next().await {
         let r = joined.context("per-host task panicked")?;
-        let host_failed = apply_per_host_result(play, task, r, conns, ctxs, report).await;
+        let host_failed = apply_per_host_result(play, task, r, pools, ctxs, report).await;
         any_failed = any_failed || host_failed;
     }
     Ok(any_failed)
@@ -928,7 +1027,7 @@ async fn run_task_fanout(
 async fn run_task_once_per_task(
     task: &Task,
     live: &[String],
-    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    pools: &Arc<BTreeMap<String, PoolHandle>>,
     ctxs: &mut BTreeMap<String, HostCtx>,
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
@@ -951,18 +1050,27 @@ async fn run_task_once_per_task(
         "run_once dispatch",
     );
 
-    let own_conn = conns.get(&runner).expect("runner has handle").clone();
+    let own_pool = pools.get(&runner).expect("runner has pool").clone();
     let ctx = ctxs
         .remove(&runner)
         .unwrap_or_else(|| HostCtx::new(runner.clone()));
+    // Single-task dispatch — `run_once: true` on a `block:` is rejected
+    // at parse time, so this task is a leaf. An empty coord suffices;
+    // run_once broadcast is handled by this function's body via the
+    // `other_targets` loop below.
+    let coord = RunOnceCoord::empty();
+    let mut slot_counter: u32 = 0;
     let result = run_task_on_one_host(
         task,
-        own_conn,
-        conns.clone(),
+        own_pool,
+        pools.clone(),
         ctx,
         next_seq.clone(),
         env.clone(),
         world.clone(),
+        coord,
+        &mut slot_counter,
+        /*is_runner=*/ true,
     )
     .await;
 
@@ -983,7 +1091,7 @@ async fn run_task_once_per_task(
             .map(|r| r.changed)
             .unwrap_or(true);
 
-    let runner_failed = apply_per_host_result(play, task, result, conns, ctxs, report).await;
+    let runner_failed = apply_per_host_result(play, task, result, pools, ctxs, report).await;
     // Broadcast to other live hosts (regardless of runner outcome — if it
     // failed they all see the failed register too, mirroring Ansible).
     for other in &other_targets {
@@ -1018,7 +1126,7 @@ async fn run_task_once_per_task(
 async fn run_play_per_play(
     play: &Play,
     targets: &[String],
-    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    pools: &Arc<BTreeMap<String, PoolHandle>>,
     ctxs: &mut BTreeMap<String, HostCtx>,
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
@@ -1036,17 +1144,13 @@ async fn run_play_per_play(
         return Ok(false);
     }
 
-    // One OnceCell per task in the play, shared across all per-host
-    // futures. run_once-flagged tasks use these to coordinate: the first
-    // arrival fills the cell with the runner's RegisterValue (and a
-    // changed flag); the others await it and write the value into their
-    // own ctx without re-running the body.
-    let oncecells: Arc<Vec<Arc<OnceCell<RunOnceResult>>>> = Arc::new(
-        play.tasks
-            .iter()
-            .map(|_| Arc::new(OnceCell::new()))
-            .collect(),
-    );
+    // One coord shared across every per-host walker. Covers the full
+    // play.tasks tree in pre-order DFS: top-level tasks AND every task
+    // nested inside `block:` arms. `run_once: true` is honored at any
+    // depth — runner host fills its slot's OnceCell, every non-runner
+    // walker awaits the cell and broadcasts the result without
+    // re-executing the body.
+    let coord = RunOnceCoord::allocate(&play.tasks);
 
     let on_failure = play.on_failure;
     let handlers: Arc<Vec<Task>> = Arc::new(play.handlers.clone());
@@ -1057,12 +1161,12 @@ async fn run_play_per_play(
         let seq_src = next_seq.clone();
         let env = env.clone();
         let world = world.clone();
-        let conns_for = conns.clone();
-        let own_conn = conns.get(name).expect("live host has handle").clone();
+        let pools_for = pools.clone();
+        let own_pool = pools.get(name).expect("live host has pool").clone();
         let ctx = ctxs
             .remove(name)
             .unwrap_or_else(|| HostCtx::new(name.clone()));
-        let oncecells = oncecells.clone();
+        let coord_for_host = coord.clone();
         let name_owned = name.clone();
         let handlers = handlers.clone();
         let live_names = live.clone();
@@ -1070,13 +1174,26 @@ async fn run_play_per_play(
         set.spawn(async move {
             let mut ctx = ctx;
             let mut first_failure: Option<(String, String)> = None;
+            let is_runner = name_owned == live_names[0];
+            let mut slot_counter: u32 = 0;
             for (i, task) in tasks.iter().enumerate() {
+                let _ = i; // index retained for diagnostics if needed
+                // Every task in the tree owns a coord slot; advance
+                // through skipped/meta/tag-filtered tasks so the
+                // counter stays in lockstep with hosts that didn't
+                // skip them.
+                let advance_past_task = |counter: &mut u32, coord: &RunOnceCoord| {
+                    let slot = *counter;
+                    let size = coord.subtree_size(slot);
+                    *counter = slot + size;
+                };
                 // Meta tasks: flush handlers inline.
                 if let TaskBody::Meta(MetaAction::FlushHandlers) = &task.body {
+                    advance_past_task(&mut slot_counter, &coord_for_host);
                     let stop_handler_failure = run_handlers_one_host(
                         &handlers,
-                        own_conn.clone(),
-                        conns_for.clone(),
+                        own_pool.clone(),
+                        pools_for.clone(),
                         &mut ctx,
                         seq_src.clone(),
                         env.clone(),
@@ -1100,6 +1217,7 @@ async fn run_play_per_play(
                 // unused (a tag-skipped run_once task simply doesn't run
                 // on any host).
                 if !tag_filter.should_run(&task.tags) {
+                    advance_past_task(&mut slot_counter, &coord_for_host);
                     if name_owned == live_names[0] {
                         // Log once per filtered task — only the first
                         // host emits; others would be redundant noise.
@@ -1113,108 +1231,19 @@ async fn run_play_per_play(
                     continue;
                 }
 
-                let r: PerHostTaskResult;
-                if task.run_once {
-                    // The first live host (inventory order) is the runner;
-                    // every other host waits for the runner's result.
-                    let cell = oncecells[i].clone();
-                    let is_runner = name_owned == live_names[0];
-                    if is_runner {
-                        let ran = run_task_on_one_host(
-                            task,
-                            own_conn.clone(),
-                            conns_for.clone(),
-                            ctx,
-                            seq_src.clone(),
-                            env.clone(),
-                            world.clone(),
-                        )
-                        .await;
-                        let register_val = task
-                            .register
-                            .as_ref()
-                            .and_then(|n| ran.ctx.registers.get(n).cloned());
-                        let set_facts_snap: BTreeMap<String, JsonValue> = match &task.body {
-                            TaskBody::SetFact(_) => ran.ctx.set_facts.clone(),
-                            _ => BTreeMap::new(),
-                        };
-                        let success = matches!(ran.outcome, HostTaskOutcome::Ok { .. });
-                        let _ = cell.set(RunOnceResult {
-                            register: register_val,
-                            set_facts: set_facts_snap,
-                            success,
-                            outcome: clone_outcome(&ran.outcome),
-                        });
-                        r = ran;
-                    } else {
-                        // Wait until the runner publishes its result.
-                        let waited = cell
-                            .get_or_init(|| async {
-                                // We're not the runner; just wait forever
-                                // for the runner to set the cell.
-                                std::future::pending::<RunOnceResult>().await
-                            })
-                            .await;
-                        // Apply broadcast effects.
-                        if let (Some(name), Some(rv)) =
-                            (task.register.as_ref(), waited.register.as_ref())
-                        {
-                            ctx.registers.insert(name.clone(), rv.clone());
-                        }
-                        if matches!(&task.body, TaskBody::SetFact(_)) && waited.success {
-                            for (k, v) in &waited.set_facts {
-                                ctx.set_facts.insert(k.clone(), v.clone());
-                            }
-                        }
-                        if waited.success
-                            && !task.notify.is_empty()
-                            && waited.register.as_ref().map(|r| r.changed).unwrap_or(true)
-                        {
-                            for n in &task.notify {
-                                let rendered =
-                                    match render_str(&env, n, &build_template_ctx(&ctx, &world)) {
-                                        Ok(s) => s,
-                                        Err(_) => n.clone(),
-                                    };
-                                ctx.pending_handlers.insert(rendered);
-                            }
-                        }
-                        // Build a synthetic per-host result so the
-                        // per-play loop's bookkeeping stays uniform.
-                        r = PerHostTaskResult {
-                            name: name_owned.clone(),
-                            ctx,
-                            outcome: clone_outcome(&waited.outcome),
-                            conn_alive: true,
-                        };
-                        ctx = r.ctx;
-                        match &r.outcome {
-                            HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {}
-                            HostTaskOutcome::Failed { reason, .. } => {
-                                if first_failure.is_none() {
-                                    first_failure = Some((task.name.clone(), reason.clone()));
-                                }
-                                if matches!(on_failure, OnFailure::Stop | OnFailure::MarkHostFailed)
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        info!(host = %name_owned, play = %play_name, task = %task.name, "task done (inherited from run_once runner)");
-                        continue;
-                    }
-                } else {
-                    r = run_task_on_one_host(
-                        task,
-                        own_conn.clone(),
-                        conns_for.clone(),
-                        ctx,
-                        seq_src.clone(),
-                        env.clone(),
-                        world.clone(),
-                    )
-                    .await;
-                }
+                let r: PerHostTaskResult = dispatch_one_task(
+                    task,
+                    own_pool.clone(),
+                    pools_for.clone(),
+                    ctx,
+                    seq_src.clone(),
+                    env.clone(),
+                    world.clone(),
+                    coord_for_host.clone(),
+                    &mut slot_counter,
+                    is_runner,
+                )
+                .await;
                 ctx = r.ctx;
                 match &r.outcome {
                     HostTaskOutcome::Ok { .. } | HostTaskOutcome::Skipped => {}
@@ -1228,10 +1257,14 @@ async fn run_play_per_play(
                     }
                 }
                 if !r.conn_alive {
-                    // Conn died; mark inner None and stop this host's loop.
-                    let mut guard = own_conn.lock().await;
-                    *guard = None;
-                    drop(guard);
+                    // Conn died; mark every slot in this host's pool
+                    // dead so any subsequent delegate hop (and the
+                    // best-effort Bye) sees `None` rather than trying
+                    // to spawn fresh agents on a host the orchestrator
+                    // has already given up on.
+                    let pool = own_pool.lock().await;
+                    pool.kill_all().await;
+                    drop(pool);
                     break;
                 }
                 info!(host = %name_owned, play = %play_name, task = %task.name, "task done");
@@ -1243,8 +1276,8 @@ async fn run_play_per_play(
             {
                 if let Some((hn, reason)) = run_handlers_one_host(
                     &handlers,
-                    own_conn.clone(),
-                    conns_for.clone(),
+                    own_pool.clone(),
+                    pools_for.clone(),
                     &mut ctx,
                     seq_src.clone(),
                     env.clone(),
@@ -1278,13 +1311,14 @@ async fn run_play_per_play(
                     reason: reason.clone(),
                 },
             );
-            // Drop the conn under mark_host_failed / stop policies so it
-            // doesn't carry into the next play.
+            // Drop every conn in the host's pool under
+            // mark_host_failed / stop so they don't carry into the
+            // next play.
             if matches!(on_failure, OnFailure::MarkHostFailed | OnFailure::Stop) {
-                if let Some(handle) = conns.get(&r.name) {
-                    let mut guard = handle.lock().await;
-                    *guard = None;
-                    debug!(host = %r.name, "dropping conn (on_failure={:?})", on_failure);
+                if let Some(pool_handle) = pools.get(&r.name) {
+                    let pool = pool_handle.lock().await;
+                    pool.kill_all().await;
+                    debug!(host = %r.name, "dropping pool conns (on_failure={:?})", on_failure);
                 }
             }
         }
@@ -1367,20 +1401,50 @@ struct PerHostTaskResult {
 
 /// Execute one task on one host, including loop expansion and delegation.
 ///
-/// `own_conn` is this host's connection handle; if `task.delegate_to` is
-/// set and resolves to another host, the body runs against *that* host's
-/// handle. Register/set_fact/notify side effects still land on this
+/// `own_pool` is this host's per-host [`AgentPool`]; if `task.delegate_to`
+/// is set and resolves to another host, the body runs against *that*
+/// host's pool. Register/set_fact/notify side effects still land on this
 /// host's ctx (Ansible semantics).
+///
+/// The pool slot (i.e. which agent process handles the wire ops) is
+/// chosen per-body-call from the task's effective [`BecomeKey`]. Loop
+/// iterations re-resolve become per item so a `become_user: "{{ item }}"`
+/// pattern routes each iteration to its matching slot.
 async fn run_task_on_one_host(
     task: &Task,
-    own_conn: ConnHandle,
-    conns_map: Arc<BTreeMap<String, ConnHandle>>,
+    own_pool: PoolHandle,
+    pools: Arc<BTreeMap<String, PoolHandle>>,
     mut ctx: HostCtx,
     next_seq: Arc<AtomicU32>,
     env: Arc<Environment<'static>>,
     world: Arc<WorldVars>,
+    coord: RunOnceCoord,
+    slot_counter: &mut u32,
+    is_runner: bool,
 ) -> PerHostTaskResult {
     let name = ctx.host_name.clone();
+
+    // Task-scoped `vars:` come into effect *before* anything else
+    // (including `when:`). Each entry is rendered in BTreeMap order
+    // against a ctx that already sees earlier-rendered task_vars, so
+    // playbooks can chain `vars:` entries that reference each other
+    // (alphabetical key ordering controls the chain — matches the
+    // same constraint that play.vars already lives with). Clears
+    // any prior task's slot so vars never bleed across tasks.
+    ctx.task_vars.clear();
+    if !task.vars.is_empty() {
+        if let Err(e) = apply_task_vars(&task.vars, &mut ctx, &env, &world) {
+            return PerHostTaskResult {
+                name,
+                ctx,
+                outcome: HostTaskOutcome::Failed {
+                    reason: format!("vars: {e:#}"),
+                    register: None,
+                },
+                conn_alive: true,
+            };
+        }
+    }
 
     // when: evaluation — bypasses everything else if false.
     match eval_when(&env, task.when.as_deref(), &ctx, &world) {
@@ -1422,7 +1486,17 @@ async fn run_task_on_one_host(
     // run_task_list_on_host → run_task_on_one_host → here).
     if let TaskBody::Block(block) = &task.body {
         return Box::pin(run_block_on_one_host(
-            task, block, own_conn, conns_map, ctx, next_seq, env, world,
+            task,
+            block,
+            own_pool,
+            pools,
+            ctx,
+            next_seq,
+            env,
+            world,
+            coord,
+            slot_counter,
+            is_runner,
         ))
         .await;
     }
@@ -1448,27 +1522,50 @@ async fn run_task_on_one_host(
         .and_then(|lc| lc.loop_var.clone())
         .unwrap_or_else(|| "item".to_string());
 
-    // Helper to resolve which conn handle the body should run against.
-    let resolve_target = |ctx: &HostCtx| -> Result<ConnHandle, String> {
-        match &task.delegate_to {
-            None => Ok(own_conn.clone()),
-            Some(expr) => {
-                let view = build_template_ctx(ctx, &world);
-                let rendered = render_str(&env, expr, &view)
-                    .map_err(|e| format!("delegate_to render: {e:#}"))?;
-                conns_map
-                    .get(&rendered)
-                    .cloned()
-                    .ok_or_else(|| format!("delegate_to references unknown host {rendered:?}"))
+    // Helper closure: resolve the BecomeKey + target pool + slot
+    // ConnHandle for this body call, in one shot. Per-iteration
+    // resolution (rather than hoisting outside the loop) so that
+    // `become_user: "{{ item }}"` or `delegate_to: "{{ item.host }}"`
+    // see the current iter_item context.
+    //
+    // We don't materialize this as a free `async fn` because that
+    // would force all the borrowed pieces (env, world, pools,
+    // own_pool, task) to be passed explicitly and would lose
+    // ergonomics; instead we inline an async block at each call site
+    // via the `resolve_target!` macro below.
+    macro_rules! resolve_target {
+        ($ctx:expr) => {{
+            let ctx_ref: &HostCtx = $ctx;
+            let res: Result<ConnHandle, String> = async {
+                let eff = become_::effective(task, ctx_ref, &env, &world)
+                    .map_err(|e| format!("become resolve: {e:#}"))?;
+                let key = BecomeKey::from_effective(&eff);
+                let target_pool = match &task.delegate_to {
+                    None => own_pool.clone(),
+                    Some(expr) => {
+                        let view = build_template_ctx(ctx_ref, &world);
+                        let rendered = render_str(&env, expr, &view)
+                            .map_err(|e| format!("delegate_to render: {e:#}"))?;
+                        pools.get(&rendered).cloned().ok_or_else(|| {
+                            format!("delegate_to references unknown host {rendered:?}")
+                        })?
+                    }
+                };
+                let mut p = target_pool.lock().await;
+                p.get_or_spawn(&key)
+                    .await
+                    .map_err(|e| format!("spawn agent for {}: {e:#}", key.label()))
             }
-        }
-    };
+            .await;
+            res
+        }};
+    }
 
     let mut own_conn_alive = true;
 
     if task.loop_spec.is_none() {
         // Single execution.
-        let target = match resolve_target(&ctx) {
+        let target = match resolve_target!(&ctx) {
             Ok(t) => t,
             Err(reason) => {
                 return PerHostTaskResult {
@@ -1534,7 +1631,7 @@ async fn run_task_on_one_host(
             });
             continue;
         }
-        let target = match resolve_target(&ctx) {
+        let target = match resolve_target!(&ctx) {
             Ok(t) => t,
             Err(reason) => {
                 if any_failed.is_none() {
@@ -1610,6 +1707,309 @@ async fn run_task_on_one_host(
     }
 }
 
+// ---------- run_once coordination ----------
+
+/// Cross-host coordination for `run_once: true` tasks — including tasks
+/// nested inside a `block:`.
+///
+/// The per-play (or per-fanout) dispatcher pre-walks the task tree in
+/// pre-order DFS and allocates one [`OnceCell`] per Task slot. Every
+/// per-host walker that traverses the same tree shares the same
+/// `RunOnceCoord` (the cells are `Arc`-wrapped). Each walker carries a
+/// local `slot_counter: u32` that advances as it visits tasks in the
+/// same pre-order. So all walkers reach the same slot index for the
+/// same task, even across nested blocks.
+///
+/// When a walker hits a `run_once: true` task it consults
+/// [`Self::cell`]: the designated runner host fills the cell with its
+/// result; every other host awaits the cell and broadcasts the
+/// runner's register/set_facts/notifies into its own ctx without
+/// re-executing the body.
+///
+/// `subtree_sizes[i]` is the pre-order subtree size for the task at
+/// slot `i` (including the task itself). Used to compensate the local
+/// counter when a task short-circuits — `when:`-skipped, render-error,
+/// loop-spec-error, etc. — without recursing into its block children.
+/// Without this, hosts that took the early-exit path would desync
+/// their counter from hosts that walked into the block.
+///
+/// Parse-time enforcement keeps the rules manageable: `run_once:` on a
+/// `block:` is rejected, so a run_once slot can never have child slots.
+/// That's why the runner/non-runner branches only need to handle a
+/// single task body, not a subtree.
+
+/// Per-slot signalling cell for run_once coordination.
+///
+/// We need a primitive where ONE task (the runner) sets a value, and
+/// MANY other tasks (non-runners) await that value externally — and
+/// the wake has to come from the setter, not from inside the awaiter.
+///
+/// `tokio::sync::OnceCell` alone doesn't satisfy this: `get_or_init`
+/// with a `pending()` future LOCKS the cell's init slot, so the
+/// runner's later `.set()` returns `Err` (silently swallowed) and the
+/// non-runner's pending future never wakes. Combining `OnceCell` with
+/// a `Notify` fixes it: `OnceCell` keeps the set-once + take-the-value
+/// semantics; `Notify` carries the external wake.
+struct RunOnceSlot {
+    cell: OnceCell<RunOnceResult>,
+    notify: Notify,
+}
+
+impl RunOnceSlot {
+    fn new() -> Self {
+        Self {
+            cell: OnceCell::new(),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Publish the result and wake every current waiter. No-op (silent)
+    /// if a value has already been published — same semantics callers
+    /// relied on with the bare `OnceCell::set` we used previously.
+    fn publish(&self, value: RunOnceResult) {
+        if self.cell.set(value).is_ok() {
+            // Only notify on the actual transition empty→set. Future
+            // waiters that subscribe after the publish will see the
+            // value on their initial check inside `wait` and won't
+            // need a notification.
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Block until a value has been published, then return a clone.
+    ///
+    /// Register interest on the Notify BEFORE checking the cell, so we
+    /// can't miss a publish that lands between our check and our await
+    /// — `Notify::notified()` is a permit; if `notify_waiters` fires
+    /// before our `.await`, the permit is already there and `.await`
+    /// returns immediately.
+    async fn wait(&self) -> RunOnceResult {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(v) = self.cell.get() {
+                return v.clone();
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RunOnceCoord {
+    cells: Arc<Vec<Arc<RunOnceSlot>>>,
+    subtree_sizes: Arc<Vec<u32>>,
+}
+
+impl RunOnceCoord {
+    /// Pre-walk `tasks` in pre-order DFS, assigning one slot per
+    /// visited Task (including tasks nested in `block:` arms). Returns
+    /// a coord whose `cells[i]` is a fresh slot and whose
+    /// `subtree_sizes[i]` is the pre-order subtree size of the task at
+    /// slot `i`.
+    fn allocate(tasks: &[Task]) -> Self {
+        let mut sizes = Vec::new();
+        collect_subtree_sizes(tasks, &mut sizes);
+        let n = sizes.len();
+        Self {
+            cells: Arc::new((0..n).map(|_| Arc::new(RunOnceSlot::new())).collect()),
+            subtree_sizes: Arc::new(sizes),
+        }
+    }
+
+    /// Empty coord — for synthetic dispatch paths that don't traverse
+    /// a task tree (gather_facts, handler dispatch, test helpers).
+    /// Slot lookups return `None` and the counter never advances past
+    /// the (empty) vec; callers must not invoke run_once dispatch
+    /// against an empty coord.
+    fn empty() -> Self {
+        Self {
+            cells: Arc::new(Vec::new()),
+            subtree_sizes: Arc::new(Vec::new()),
+        }
+    }
+
+    fn cell(&self, slot: u32) -> Option<Arc<RunOnceSlot>> {
+        self.cells.get(slot as usize).cloned()
+    }
+
+    /// Subtree size for the task at `slot`. Returns 1 if the slot is
+    /// out-of-bounds (defensive — shouldn't happen on a well-formed
+    /// coord, but means an empty coord behaves like "every task is a
+    /// leaf" for compensation purposes).
+    fn subtree_size(&self, slot: u32) -> u32 {
+        self.subtree_sizes.get(slot as usize).copied().unwrap_or(1)
+    }
+}
+
+/// Pre-order DFS visit: for each task in `tasks`, push a placeholder,
+/// recurse into the block arms if any, then fix up the placeholder
+/// with the visited count.
+fn collect_subtree_sizes(tasks: &[Task], out: &mut Vec<u32>) {
+    for task in tasks {
+        let self_idx = out.len();
+        out.push(0); // placeholder; filled in after children visited.
+        if let TaskBody::Block(block) = &task.body {
+            collect_subtree_sizes(&block.tasks, out);
+            collect_subtree_sizes(&block.rescue, out);
+            collect_subtree_sizes(&block.always, out);
+        }
+        out[self_idx] = (out.len() - self_idx) as u32;
+    }
+}
+
+/// Dispatch a single task, applying run_once coordination if the task
+/// has `run_once: true` and a slot in the coord. Otherwise delegates
+/// straight to [`run_task_on_one_host`]. Always advances
+/// `slot_counter` past this task's subtree before returning, so that
+/// hosts that early-exited (when:false, render error, etc.) stay
+/// counter-synchronized with hosts that walked the full subtree.
+async fn dispatch_one_task(
+    task: &Task,
+    own_pool: PoolHandle,
+    pools: Arc<BTreeMap<String, PoolHandle>>,
+    ctx: HostCtx,
+    next_seq: Arc<AtomicU32>,
+    env: Arc<Environment<'static>>,
+    world: Arc<WorldVars>,
+    coord: RunOnceCoord,
+    slot_counter: &mut u32,
+    is_runner: bool,
+) -> PerHostTaskResult {
+    let slot = *slot_counter;
+    let subtree_size = coord.subtree_size(slot);
+    // Self counted now; nested-block subtree slots are consumed by the
+    // recursive dispatch_one_task calls inside run_block_on_one_host.
+    *slot_counter = slot + 1;
+
+    let result = if task.run_once {
+        match coord.cell(slot) {
+            Some(cell) => {
+                if is_runner {
+                    let r = Box::pin(run_task_on_one_host(
+                        task,
+                        own_pool,
+                        pools,
+                        ctx,
+                        next_seq,
+                        env,
+                        world,
+                        coord.clone(),
+                        slot_counter,
+                        is_runner,
+                    ))
+                    .await;
+                    // Publish to cell so non-runners can broadcast.
+                    let register_val = task
+                        .register
+                        .as_ref()
+                        .and_then(|n| r.ctx.registers.get(n).cloned());
+                    let set_facts_snap: BTreeMap<String, JsonValue> = match &task.body {
+                        TaskBody::SetFact(_) => r.ctx.set_facts.clone(),
+                        _ => BTreeMap::new(),
+                    };
+                    let success = matches!(r.outcome, HostTaskOutcome::Ok { .. });
+                    cell.publish(RunOnceResult {
+                        register: register_val,
+                        set_facts: set_facts_snap,
+                        success,
+                        outcome: clone_outcome(&r.outcome),
+                    });
+                    r
+                } else {
+                    // Non-runner: wait for the runner to publish, then
+                    // apply broadcast effects locally. Note: we go
+                    // through the slot's own `wait` method (OnceCell +
+                    // Notify) rather than `OnceCell::get_or_init` —
+                    // the latter would lock the init slot with our
+                    // pending future, so the runner's `.set()` would
+                    // silently fail and we'd hang forever.
+                    let waited = cell.wait().await;
+                    let mut ctx = ctx;
+                    let name = ctx.host_name.clone();
+                    if let (Some(reg_name), Some(rv)) =
+                        (task.register.as_ref(), waited.register.as_ref())
+                    {
+                        ctx.registers.insert(reg_name.clone(), rv.clone());
+                    }
+                    if matches!(&task.body, TaskBody::SetFact(_)) && waited.success {
+                        for (k, v) in &waited.set_facts {
+                            ctx.set_facts.insert(k.clone(), v.clone());
+                        }
+                    }
+                    if waited.success
+                        && !task.notify.is_empty()
+                        && waited
+                            .register
+                            .as_ref()
+                            .map(|r| r.changed)
+                            .unwrap_or(true)
+                    {
+                        for n in &task.notify {
+                            let rendered = match render_str(
+                                &env,
+                                n,
+                                &build_template_ctx(&ctx, &world),
+                            ) {
+                                Ok(s) => s,
+                                Err(_) => n.clone(),
+                            };
+                            ctx.pending_handlers.insert(rendered);
+                        }
+                    }
+                    PerHostTaskResult {
+                        name,
+                        ctx,
+                        outcome: clone_outcome(&waited.outcome),
+                        conn_alive: true,
+                    }
+                }
+            }
+            // No cell in the coord for this slot — fall back to
+            // executing on every host. Should only happen for
+            // synthetic dispatch (empty coord); normal play dispatch
+            // pre-allocates one cell per task.
+            None => Box::pin(run_task_on_one_host(
+                task,
+                own_pool,
+                pools,
+                ctx,
+                next_seq,
+                env,
+                world,
+                coord.clone(),
+                slot_counter,
+                is_runner,
+            ))
+            .await,
+        }
+    } else {
+        Box::pin(run_task_on_one_host(
+            task,
+            own_pool,
+            pools,
+            ctx,
+            next_seq,
+            env,
+            world,
+            coord.clone(),
+            slot_counter,
+            is_runner,
+        ))
+        .await
+    };
+
+    // Compensate for early-exit paths that didn't recurse into a block:
+    // when:false, vars: render error, loop-spec render error, etc.
+    // After this call, the counter MUST be at slot+subtree_size so the
+    // next sibling task's slot lookup is correct on every host.
+    let expected_end = slot + subtree_size;
+    if *slot_counter < expected_end {
+        *slot_counter = expected_end;
+    }
+
+    result
+}
+
 // ---------- block / rescue / always driver ----------
 
 /// Result of walking a task list on one host. Returned by
@@ -1646,33 +2046,48 @@ struct TaskListResult {
 /// concern, not block-local. Note in CLAUDE.md.
 async fn run_task_list_on_host(
     tasks: &[Task],
-    own_conn: ConnHandle,
-    conns_map: Arc<BTreeMap<String, ConnHandle>>,
+    own_pool: PoolHandle,
+    pools: Arc<BTreeMap<String, PoolHandle>>,
     mut ctx: HostCtx,
     next_seq: Arc<AtomicU32>,
     env: Arc<Environment<'static>>,
     world: Arc<WorldVars>,
+    coord: RunOnceCoord,
+    slot_counter: &mut u32,
+    is_runner: bool,
 ) -> TaskListResult {
     let mut conn_alive = true;
     let mut first_failure: Option<(String, String, Option<RegisterValue>)> = None;
+    let mut broken_at: Option<usize> = None;
 
-    for task in tasks {
+    for (idx, task) in tasks.iter().enumerate() {
         // Meta tasks inside a block aren't dispatched. Tag filtering
         // is also play-level (block-inner tasks inherit the block's
         // tags via the load-time pass; the play-level filter has
         // already decided whether the whole block runs).
         if matches!(&task.body, TaskBody::Meta(_)) {
+            // Still advance the slot counter — every Task in the tree
+            // owns a coord slot, including Meta. (Meta tasks can't be
+            // run_once and can't carry a block subtree, so this is
+            // always a +1, but compensate via subtree_size to stay
+            // correct if that ever changes.)
+            let slot = *slot_counter;
+            let size = coord.subtree_size(slot);
+            *slot_counter = slot + size;
             continue;
         }
 
-        let r = run_task_on_one_host(
+        let r = dispatch_one_task(
             task,
-            own_conn.clone(),
-            conns_map.clone(),
+            own_pool.clone(),
+            pools.clone(),
             ctx,
             next_seq.clone(),
             env.clone(),
             world.clone(),
+            coord.clone(),
+            slot_counter,
+            is_runner,
         )
         .await;
         ctx = r.ctx;
@@ -1687,12 +2102,27 @@ async fn run_task_list_on_host(
             }
             HostTaskOutcome::Failed { reason, register } => {
                 first_failure = Some((task.name.clone(), reason, register));
+                broken_at = Some(idx + 1);
                 break;
             }
         }
         if !conn_alive {
             // Conn died — no point continuing the list.
+            broken_at = Some(idx + 1);
             break;
+        }
+    }
+
+    // If we broke early, advance slot_counter past every task we
+    // didn't visit — keeps this host's counter aligned with hosts
+    // that walked the full list (e.g. the runner that succeeded
+    // while this host failed earlier).
+    if let Some(from) = broken_at {
+        for task in &tasks[from..] {
+            let slot = *slot_counter;
+            let size = coord.subtree_size(slot);
+            *slot_counter = slot + size;
+            let _ = task;
         }
     }
 
@@ -1717,12 +2147,15 @@ async fn run_task_list_on_host(
 async fn run_block_on_one_host(
     block_task: &Task,
     block: &BlockSpec,
-    own_conn: ConnHandle,
-    conns_map: Arc<BTreeMap<String, ConnHandle>>,
+    own_pool: PoolHandle,
+    pools: Arc<BTreeMap<String, PoolHandle>>,
     mut ctx: HostCtx,
     next_seq: Arc<AtomicU32>,
     env: Arc<Environment<'static>>,
     world: Arc<WorldVars>,
+    coord: RunOnceCoord,
+    slot_counter: &mut u32,
+    is_runner: bool,
 ) -> PerHostTaskResult {
     let name = ctx.host_name.clone();
 
@@ -1764,7 +2197,32 @@ async fn run_block_on_one_host(
         items.into_iter().map(Some).collect()
     };
 
+    // For single-shot blocks (the common case, and the only shape
+    // drill-failover uses today), inherit the outer coord so that
+    // `run_once:` on inner tasks is honored. For LOOPED blocks, every
+    // iteration would re-traverse the same coord slots — the
+    // OnceCells set on iteration 1 would deadlock iteration 2's
+    // non-runner hosts. Fall back to an empty coord (no run_once
+    // coordination — each host runs each inner task per iteration);
+    // counter advancement is compensated by the outer
+    // `dispatch_one_task`'s `subtree_size` push. This matches
+    // pre-fix behavior for looped blocks; a future commit can wire
+    // per-iteration fresh OnceCells if a real playbook needs it.
+    let inner_coord = if single_shot {
+        coord.clone()
+    } else {
+        RunOnceCoord::empty()
+    };
+    let inner_start = *slot_counter;
+
     for maybe_item in iter_set {
+        // Each iteration replays the same inner slot range. For
+        // single-shot this is a no-op (the for loop only runs once);
+        // for looped blocks the empty coord means the slot identities
+        // don't matter, but we still reset to keep the counter
+        // intelligible.
+        *slot_counter = inner_start;
+
         if let Some(item) = maybe_item {
             ctx.iter_item = Some((loop_var.clone(), item));
         }
@@ -1772,12 +2230,15 @@ async fn run_block_on_one_host(
         // 1. Run block.tasks
         let body_r = run_task_list_on_host(
             &block.tasks,
-            own_conn.clone(),
-            conns_map.clone(),
+            own_pool.clone(),
+            pools.clone(),
             ctx,
             next_seq.clone(),
             env.clone(),
             world.clone(),
+            inner_coord.clone(),
+            slot_counter,
+            is_runner,
         )
         .await;
         ctx = body_r.ctx;
@@ -1800,12 +2261,15 @@ async fn run_block_on_one_host(
 
                 let rescue_r = run_task_list_on_host(
                     &block.rescue,
-                    own_conn.clone(),
-                    conns_map.clone(),
+                    own_pool.clone(),
+                    pools.clone(),
                     ctx,
                     next_seq.clone(),
                     env.clone(),
                     world.clone(),
+                    inner_coord.clone(),
+                    slot_counter,
+                    is_runner,
                 )
                 .await;
                 ctx = rescue_r.ctx;
@@ -1834,12 +2298,15 @@ async fn run_block_on_one_host(
         if !block.always.is_empty() {
             let always_r = run_task_list_on_host(
                 &block.always,
-                own_conn.clone(),
-                conns_map.clone(),
+                own_pool.clone(),
+                pools.clone(),
                 ctx,
                 next_seq.clone(),
                 env.clone(),
                 world.clone(),
+                inner_coord.clone(),
+                slot_counter,
+                is_runner,
             )
             .await;
             ctx = always_r.ctx;
@@ -2034,6 +2501,7 @@ async fn run_body_once(
         TaskBody::Assert(a) => run_assert_body(a, ctx, env, world),
         TaskBody::Fail(f) => run_fail_body(f, ctx, env, world),
         TaskBody::Debug(d) => run_debug_body(d, task, ctx, env, world),
+        TaskBody::Pause(p) => run_pause_body(p, ctx, env, world).await,
         TaskBody::SetFact(m) => run_set_fact_body(m, ctx, env, world),
         TaskBody::ImportTasks(p) => BodyResult::Failed {
             reason: format!(
@@ -2274,7 +2742,7 @@ async fn run_op_body(
     world: &WorldVars,
     next_seq: &Arc<AtomicU32>,
 ) -> BodyResult {
-    let mut rendered = match render_op(op, ctx, env, world) {
+    let rendered = match render_op(op, ctx, env, world) {
         Ok(r) => r,
         Err(e) => {
             return BodyResult::Failed {
@@ -2341,12 +2809,13 @@ async fn run_op_body(
         }
         _ => {}
     }
-    // Apply `become:` argv wrapping after render (so the wrapping is
-    // never templated) and before `to_wire_op` (so the wire op carries
-    // the wrapped argv verbatim, with no further string surgery agent-
-    // side).
-    let eff = become_::effective(task, ctx);
-    become_::apply(&mut rendered, &eff);
+    // `become:` is honored at the transport layer now — the task's
+    // wire op is dispatched against the pool slot keyed by its
+    // effective BecomeKey. See the per-host `AgentPool` and the
+    // routing logic at the four task-dispatch sites that call this
+    // function. Argv wrapping (the old `sudo -n -u <user> --` prefix
+    // on shell/exec/command) is gone; the agent for that BecomeKey
+    // already runs with the right EUID. No mutation needed here.
     let inner_wire_op = match rendered.to_wire_op() {
         Ok(w) => w,
         Err(e) => {
@@ -2360,10 +2829,23 @@ async fn run_op_body(
 
     // `async: N` (with N>0) wraps the inner op in OpAsyncStart so the
     // agent runs it as a background job. `async: 0` (or absent) is
-    // synchronous — same as Ansible.
-    let async_wrap = task
-        .async_seconds
-        .and_then(|n| if n > 0 { Some(n) } else { None });
+    // synchronous — same as Ansible. `async:` is stored as a string
+    // (int|jinja) so it accepts templated values like
+    // `async: "{{ writer_duration_s | int + 30 }}"`.
+    let async_wrap = match task.async_seconds.as_deref() {
+        None => None,
+        Some(src) => match render_int_field(env, src, ctx, world) {
+            Ok(n) if n > 0 => Some(n as u32),
+            Ok(_) => None, // async: 0 → synchronous
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!("rendering `async:`: {e:#}"),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        },
+    };
     let wire_op = match async_wrap {
         Some(seconds) => rsansible_wire::msg::op_async_start(
             seconds.saturating_mul(1000),
@@ -2403,7 +2885,30 @@ async fn run_op_body(
     // module fields lifted via the agent), making the wrapped task feel
     // like a synchronous run from the caller's perspective.
     if let (Some(async_n), Ok(exec)) = (async_wrap, result.as_ref()) {
-        let poll = task.poll_seconds.unwrap_or(10);
+        // `poll:` is stored as a templated string (int|jinja). Render
+        // it now; default to 10 when unset (matches Ansible). A render
+        // failure surfaces as a clean task failure rather than silently
+        // falling back.
+        let poll = match task.poll_seconds.as_deref() {
+            None => 10u32,
+            Some(src) => match render_int_field(env, src, ctx, world) {
+                Ok(n) if n >= 0 => n as u32,
+                Ok(n) => {
+                    return BodyResult::Failed {
+                        reason: format!("rendering `poll:`: got negative value {n}"),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!("rendering `poll:`: {e:#}"),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            },
+        };
         if poll > 0 && exec.done.exit_code == 0 {
             let deadline = Instant::now() + std::time::Duration::from_secs(async_n as u64);
             let job_id = seq;
@@ -2513,6 +3018,16 @@ async fn run_op_body(
             // playbooks can do `register.files | length > 0` etc.
             if matches!(op, TaskOp::Unarchive(_)) {
                 lift_unarchive_envelope(&mut rv);
+            }
+            // async start/status envelope: `ansible_job_id`, `started`,
+            // `finished`, `results_file` — Ansible's contract is to put
+            // these at the top of the register so playbooks can do
+            // `register.ansible_job_id` and pass it to a follow-up
+            // `async_status: jid:`. Applies both when async_wrap fires
+            // (the wire op was OpAsyncStart) and when the user wrote
+            // an explicit `async_status:` task (inner op is AsyncStatus).
+            if async_wrap.is_some() || matches!(op, TaskOp::AsyncStatus(_)) {
+                lift_async_envelope(&mut rv);
             }
             emit_timing_trace(&label, &task.name, seq, &exec);
             if exec.done.exit_code == 0 {
@@ -3248,6 +3763,61 @@ fn run_fail_body(
     }
 }
 
+/// `pause:` — controller-side sleep. Mirrors Ansible's
+/// `ansible.builtin.pause` for the non-interactive subset
+/// (`seconds:` / `minutes:`); interactive `prompt:` is rejected at
+/// parse time, see ANSIBLE_COMPAT.md §8.
+///
+/// One of `seconds` / `minutes` is guaranteed Some by PauseTask's
+/// deserializer (both-Some / neither-Some / null are parse-time errors).
+/// Negative durations are rejected at render time with a clean task
+/// failure rather than panicking or being treated as zero.
+async fn run_pause_body(
+    p: &PauseTask,
+    ctx: &HostCtx,
+    env: &Environment<'static>,
+    world: &WorldVars,
+) -> BodyResult {
+    // Render whichever knob is set. PauseTask::deserialize guarantees
+    // exactly one is Some; multiplication picks the right unit factor.
+    let (src, unit_secs, field_name) = match (&p.seconds, &p.minutes) {
+        (Some(s), None) => (s.as_str(), 1u64, "seconds"),
+        (None, Some(m)) => (m.as_str(), 60u64, "minutes"),
+        _ => unreachable!("PauseTask::deserialize guarantees exactly one of seconds/minutes"),
+    };
+    let n = match render_int_field(env, src, ctx, world) {
+        Ok(n) => n,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("pause.{field_name} render: {e:#}"),
+                register: None,
+                conn_alive: true,
+            };
+        }
+    };
+    if n < 0 {
+        return BodyResult::Failed {
+            reason: format!("pause.{field_name}: negative duration {n} is not allowed"),
+            register: None,
+            conn_alive: true,
+        };
+    }
+    let duration = std::time::Duration::from_secs((n as u64).saturating_mul(unit_secs));
+    info!(
+        host = %ctx.host_name,
+        secs = duration.as_secs(),
+        "pause",
+    );
+    tokio::time::sleep(duration).await;
+    let mut rv = RegisterValue::default();
+    rv.changed = false;
+    BodyResult::Ok {
+        register: rv,
+        changed: false,
+        skipped: false,
+    }
+}
+
 fn run_debug_body(
     d: &DebugTask,
     task: &Task,
@@ -3258,7 +3828,7 @@ fn run_debug_body(
     let view = build_template_ctx(ctx, world);
     // Render msg (Jinja-templated) or look up var by dotted path.
     let (label, payload) = match (&d.msg, &d.var) {
-        (Some(msg), _) => match render_str(env, msg, &view) {
+        (Some(crate::playbook::DebugMsg::One(msg)), _) => match render_str(env, msg, &view) {
             Ok(rendered) => ("msg".to_string(), JsonValue::String(rendered)),
             Err(e) => {
                 return BodyResult::Failed {
@@ -3268,6 +3838,24 @@ fn run_debug_body(
                 };
             }
         },
+        (Some(crate::playbook::DebugMsg::Many(lines)), _) => {
+            // Render each line independently — keeps embedded Jinja
+            // string literals from getting YAML-escape-mangled.
+            let mut rendered_lines = Vec::with_capacity(lines.len());
+            for (i, line) in lines.iter().enumerate() {
+                match render_str(env, line, &view) {
+                    Ok(r) => rendered_lines.push(JsonValue::String(r)),
+                    Err(e) => {
+                        return BodyResult::Failed {
+                            reason: format!("debug.msg[{i}] render: {e:#}"),
+                            register: None,
+                            conn_alive: true,
+                        };
+                    }
+                }
+            }
+            ("msg".to_string(), JsonValue::Array(rendered_lines))
+        }
         (None, Some(var_name)) => {
             // First render the var-name string itself (Ansible allows
             // `var: "{{ dyn_name }}"`), then dotted-path-lookup.
@@ -3496,6 +4084,34 @@ fn lift_slurp_envelope(rv: &mut RegisterValue) {
     }
 }
 
+/// Lift the async-job envelope from `rv.json` to top-level register
+/// keys. Used both for OpAsyncStart-wrapped tasks (where the agent
+/// emits `{ansible_job_id, started, finished, results_file}` on stdout)
+/// and for explicit OpAsyncStatus polls (where the agent emits the
+/// same envelope shape plus the inner module's keys merged in).
+///
+/// Ansible's contract is `register.ansible_job_id`,
+/// `register.finished`, `register.started`, etc. — direct top-level
+/// access, not nested under `register.json`. Matches how
+/// ansible.builtin.async / async_status return shape work.
+fn lift_async_envelope(rv: &mut RegisterValue) {
+    let Some(JsonValue::Object(obj)) = rv.json.as_ref() else {
+        return;
+    };
+    let envelope = obj.clone();
+    rv.json = None;
+    for (k, v) in envelope {
+        if matches!(
+            k.as_str(),
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+                | "failed"
+        ) {
+            continue;
+        }
+        rv.extra.insert(k, v);
+    }
+}
+
 fn lift_unarchive_envelope(rv: &mut RegisterValue) {
     // Same shape as get_url / slurp: hoist top-level envelope keys into
     // `rv.extra` so vendored playbooks can `register.files`,
@@ -3586,17 +4202,40 @@ fn render_op(
             })
         }
         TaskOp::Command(c) => {
-            let argv = c
-                .argv
-                .iter()
-                .map(|a| render_str(env, a, &view))
-                .collect::<Result<Vec<_>>>()?;
+            // If `cmd:` / shorthand was used, render the whole string
+            // *first*, then shlex-split — so `{{ var }}` arguments end
+            // up as one argv element, not three (`{{`, var, `}}`). The
+            // argv-list form keeps per-element rendering since the user
+            // explicitly told us how to slice it.
+            let argv = if let Some(raw) = c.raw_cmd.as_deref() {
+                let rendered = render_str(env, raw, &view)?;
+                let v = shlex::split(&rendered).ok_or_else(|| {
+                    anyhow!(
+                        "command.cmd: shlex parse failed on rendered command \
+                         {rendered:?} (unterminated quote?)"
+                    )
+                })?;
+                if v.is_empty() {
+                    return Err(anyhow!(
+                        "command.cmd: empty after rendering+shlex-split"
+                    ));
+                }
+                v
+            } else {
+                c.argv
+                    .iter()
+                    .map(|a| render_str(env, a, &view))
+                    .collect::<Result<Vec<_>>>()?
+            };
             let chdir = render_str(env, &c.chdir, &view)?;
             let creates = render_str(env, &c.creates, &view)?;
             let removes = render_str(env, &c.removes, &view)?;
             let stdin = render_str(env, &c.stdin, &view)?;
             TaskOp::Command(crate::playbook::CommandOp {
                 argv,
+                // raw_cmd was the *source* for the rendered argv above;
+                // downstream wire-conversion only reads argv.
+                raw_cmd: None,
                 chdir,
                 creates,
                 removes,
@@ -3764,6 +4403,23 @@ fn render_op(
                 allow_unauthenticated: p.allow_unauthenticated,
             })
         }
+        TaskOp::Repository(r) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            TaskOp::Repository(RepositoryOp {
+                manager: r.manager,
+                repo: render_str(env, &r.repo, &view)?,
+                state: r.state,
+                filename: render_if(&r.filename)?,
+                mode: r.mode,
+                update_cache: r.update_cache,
+            })
+        }
         TaskOp::Ufw(u) => {
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {
@@ -3785,6 +4441,36 @@ fn render_op(
                 comment: render_if(&u.comment)?,
                 delete: u.delete,
                 insert: u.insert,
+            })
+        }
+        TaskOp::AsyncStatus(a) => {
+            let jid = render_str(env, &a.jid, &view)?;
+            TaskOp::AsyncStatus(AsyncStatusOp { jid })
+        }
+        TaskOp::Iptables(i) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            TaskOp::Iptables(IptablesOp {
+                table: render_if(&i.table)?,
+                chain: render_if(&i.chain)?,
+                protocol: render_if(&i.protocol)?,
+                source: render_if(&i.source)?,
+                destination: render_if(&i.destination)?,
+                source_port: render_if(&i.source_port)?,
+                destination_port: render_if(&i.destination_port)?,
+                in_interface: render_if(&i.in_interface)?,
+                out_interface: render_if(&i.out_interface)?,
+                jump: render_if(&i.jump)?,
+                ctstate: render_if(&i.ctstate)?,
+                comment: render_if(&i.comment)?,
+                ip_version: i.ip_version,
+                action: i.action,
+                rule_state: i.rule_state,
             })
         }
         TaskOp::Uri(u) => {
@@ -4359,7 +5045,7 @@ async fn apply_per_host_result(
     play: &Play,
     task: &Task,
     r: PerHostTaskResult,
-    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    pools: &Arc<BTreeMap<String, PoolHandle>>,
     ctxs: &mut BTreeMap<String, HostCtx>,
     report: &mut RunReport,
 ) -> bool {
@@ -4393,20 +5079,24 @@ async fn apply_per_host_result(
     }
     // Always reinsert ctx — set_facts/registers should persist even from failed hosts.
     ctxs.insert(name.clone(), ctx);
-    // Decide whether to kill this host's conn handle.
-    let drop_conn = !conn_alive
+    // Decide whether to kill every conn in this host's pool. We
+    // kill the whole pool rather than the just-died slot because
+    // (a) under SSH the slots share one session — when one channel
+    // dies it's almost always the session dying; (b) under local
+    // each slot is independent but the host is still "failed" from
+    // the orchestrator's perspective, so leaving stale slots in
+    // place would just confuse the next task.
+    let drop_conns = !conn_alive
         || (failed
             && matches!(
                 play.on_failure,
                 OnFailure::MarkHostFailed | OnFailure::Stop
             ));
-    if drop_conn {
-        if let Some(handle) = conns.get(&name) {
-            let mut guard = handle.lock().await;
-            if guard.is_some() {
-                debug!(host = %name, "dropping conn (conn_alive={conn_alive}, on_failure={:?})", play.on_failure);
-                *guard = None;
-            }
+    if drop_conns {
+        if let Some(pool_handle) = pools.get(&name) {
+            let pool = pool_handle.lock().await;
+            debug!(host = %name, "dropping pool conns (conn_alive={conn_alive}, on_failure={:?})", play.on_failure);
+            pool.kill_all().await;
         }
     }
     failed
@@ -4422,7 +5112,7 @@ async fn apply_per_host_result(
 async fn flush_handlers(
     play: &Play,
     targets: &[String],
-    conns: &Arc<BTreeMap<String, ConnHandle>>,
+    pools: &Arc<BTreeMap<String, PoolHandle>>,
     ctxs: &mut BTreeMap<String, HostCtx>,
     report: &mut RunReport,
     next_seq: &Arc<AtomicU32>,
@@ -4455,7 +5145,7 @@ async fn flush_handlers(
         );
 
         let any_failed = run_task_fanout(
-            handler, &interested, conns, ctxs, report, next_seq, env, world, play,
+            handler, &interested, pools, ctxs, report, next_seq, env, world, play,
         )
         .await?;
 
@@ -4480,8 +5170,8 @@ async fn flush_handlers(
 /// (handler-name, reason) pair that failed (None on success).
 async fn run_handlers_one_host(
     handlers: &[Task],
-    own_conn: ConnHandle,
-    conns: Arc<BTreeMap<String, ConnHandle>>,
+    own_pool: PoolHandle,
+    pools: Arc<BTreeMap<String, PoolHandle>>,
     ctx: &mut HostCtx,
     next_seq: Arc<AtomicU32>,
     env: Arc<Environment<'static>>,
@@ -4503,14 +5193,21 @@ async fn run_handlers_one_host(
         let placeholder = HostCtx::new(ctx.host_name.clone());
         let taken = std::mem::replace(ctx, placeholder);
         // ctx temporarily replaced; restore from the per-host result.
+        // Handlers are dispatched once per host (run_once on handlers
+        // is not honored — same as Ansible). No cross-host coord.
+        let handler_coord = RunOnceCoord::empty();
+        let mut handler_slot: u32 = 0;
         let r = run_task_on_one_host(
             handler,
-            own_conn.clone(),
-            conns.clone(),
+            own_pool.clone(),
+            pools.clone(),
             taken,
             next_seq.clone(),
             env.clone(),
             world.clone(),
+            handler_coord,
+            &mut handler_slot,
+            /*is_runner=*/ true,
         )
         .await;
         *ctx = r.ctx;
@@ -4773,6 +5470,125 @@ mod tests {
         assert!(!rv.extra.contains_key("changed"));
     }
 
+    /// Regression: `register:` on an `async: N` task previously dropped
+    /// the start envelope's `ansible_job_id` / `started` / `finished` /
+    /// `results_file` into `rv.json` instead of lifting them to the top
+    /// level. Result: a follow-up `async_status: jid: "{{
+    /// async_register.ansible_job_id }}"` rendered to `""` and failed
+    /// the play. `lift_async_envelope` mirrors the existing per-module
+    /// lift pattern (postgresql, slurp, …) — verify it pulls each
+    /// envelope key into `rv.extra`, drops `rv.json`, and skips the
+    /// reserved register fields.
+    #[test]
+    fn lift_async_envelope_pulls_job_id_to_top_level() {
+        let envelope = serde_json::json!({
+            "ansible_job_id": 7,
+            "started": 1,
+            "finished": 0,
+            "results_file": "",
+            // Reserved keys — should NOT be lifted into extra.
+            "changed": true,
+            "rc": 999
+        });
+        let stdout = serde_json::to_vec(&envelope).unwrap();
+        let mut rv = RegisterValue::from_exec(0, false, 0, &stdout, b"");
+        lift_async_envelope(&mut rv);
+        // Envelope keys ended up at the top level.
+        assert_eq!(
+            rv.extra.get("ansible_job_id").unwrap(),
+            &serde_json::json!(7)
+        );
+        assert_eq!(rv.extra.get("started").unwrap(), &serde_json::json!(1));
+        assert_eq!(rv.extra.get("finished").unwrap(), &serde_json::json!(0));
+        assert_eq!(
+            rv.extra.get("results_file").unwrap(),
+            &serde_json::json!("")
+        );
+        // Reserved fields are NOT shadowed via extra.
+        assert!(!rv.extra.contains_key("rc"));
+        assert!(!rv.extra.contains_key("changed"));
+        assert_eq!(rv.rc, 0);
+        assert!(!rv.changed);
+        // rv.json drained — the lifted shape replaces the nested one,
+        // same as get_url / slurp / unarchive.
+        assert!(rv.json.is_none());
+    }
+
+    /// Regression: when the non-runner host hits a `run_once:` task
+    /// before the runner has published, it MUST be woken by an
+    /// external `publish()` call. The previous implementation used
+    /// `OnceCell::get_or_init(|| pending().await)` for the non-runner,
+    /// which locked the cell's init slot — the runner's later
+    /// `cell.set(...)` returned `Err` (silently swallowed by `let _ =
+    /// ...`) and the waiter never woke, deadlocking the play.
+    ///
+    /// The fix wraps the OnceCell with a `Notify`: `publish` calls
+    /// `set` then `notify_waiters`; `wait` registers on the Notify
+    /// BEFORE checking the cell so it can't miss the wake. This test
+    /// drives the actual sequence (wait first, publish later) to catch
+    /// any future regression where the wake mechanism gets cut out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_slot_external_publish_wakes_pending_waiter() {
+        let slot = Arc::new(RunOnceSlot::new());
+        let waiter_slot = slot.clone();
+        // Spawn the waiter first. With the buggy `get_or_init` shape,
+        // this call would acquire the init permit; the later `publish`
+        // would silently fail and the waiter would hang forever — the
+        // test would time out instead of completing.
+        let waiter = tokio::spawn(async move { waiter_slot.wait().await });
+        // Yield enough times for the waiter to register on the Notify
+        // before we publish. Both `yield_now()` and a short sleep work
+        // on current-thread; sleep is more forgiving across scheduler
+        // versions.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        slot.publish(RunOnceResult {
+            register: None,
+            set_facts: BTreeMap::new(),
+            success: true,
+            outcome: HostTaskOutcome::Ok {
+                changed: true,
+                skipped: false,
+            },
+        });
+        // The waiter unblocks with the published value. Wrap in a tight
+        // timeout so a re-introduced deadlock fails fast instead of
+        // hanging the test process.
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must unblock after publish — deadlock regressed?")
+            .expect("waiter task didn't panic");
+        assert!(r.success);
+        assert!(matches!(
+            r.outcome,
+            HostTaskOutcome::Ok {
+                changed: true,
+                skipped: false
+            }
+        ));
+    }
+
+    /// Companion to the wake-test above: when the cell is already
+    /// published BEFORE the waiter calls `wait`, the waiter must
+    /// return immediately rather than blocking on a new Notify
+    /// registration that nobody will ever fire. The `wait` impl checks
+    /// the cell after registering interest, which covers this case —
+    /// guard against a future "optimize by skipping the initial check"
+    /// regression.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_slot_wait_returns_immediately_when_already_published() {
+        let slot = RunOnceSlot::new();
+        slot.publish(RunOnceResult {
+            register: None,
+            set_facts: BTreeMap::new(),
+            success: true,
+            outcome: HostTaskOutcome::Skipped,
+        });
+        let r = tokio::time::timeout(std::time::Duration::from_millis(100), slot.wait())
+            .await
+            .expect("wait must return immediately when value already present");
+        assert!(matches!(r.outcome, HostTaskOutcome::Skipped));
+    }
+
     #[test]
     fn lift_postgresql_envelope_pulls_query_result_to_top_level() {
         let envelope = serde_json::json!({
@@ -4993,6 +5809,141 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pause_body_sleeps_rendered_seconds() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.set_facts
+            .insert("wait_s".into(), serde_json::json!(1));
+        let p = PauseTask {
+            seconds: Some("{{ wait_s }}".into()),
+            minutes: None,
+        };
+        let started = std::time::Instant::now();
+        let r = run_pause_body(&p, &ctx, &env, &WorldVars::default()).await;
+        let elapsed = started.elapsed();
+        match r {
+            BodyResult::Ok { .. } => {}
+            _ => panic!("expected Ok"),
+        }
+        // We asked for 1s; allow some slack on the slow side and reject
+        // anything that suspiciously short-circuited.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(950),
+            "pause too short: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "pause too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_body_minutes_unit_factor() {
+        // Using a tiny rendered value (0) so the test stays fast — the
+        // point is that minutes is accepted and routed correctly.
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into());
+        let p = PauseTask {
+            seconds: None,
+            minutes: Some("0".into()),
+        };
+        let r = run_pause_body(&p, &ctx, &env, &WorldVars::default()).await;
+        assert!(matches!(r, BodyResult::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn pause_body_negative_value_fails_cleanly() {
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into());
+        let p = PauseTask {
+            seconds: Some("-5".into()),
+            minutes: None,
+        };
+        let r = run_pause_body(&p, &ctx, &env, &WorldVars::default()).await;
+        match r {
+            BodyResult::Failed { reason, .. } => {
+                assert!(reason.contains("negative"), "unexpected reason: {reason}");
+            }
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_body_render_failure_propagates() {
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into());
+        let p = PauseTask {
+            seconds: Some("not_a_number".into()),
+            minutes: None,
+        };
+        let r = run_pause_body(&p, &ctx, &env, &WorldVars::default()).await;
+        match r {
+            BodyResult::Failed { reason, .. } => {
+                assert!(reason.contains("pause.seconds"), "unexpected reason: {reason}");
+            }
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn apply_task_vars_renders_in_order_and_chains() {
+        // BTreeMap key order (alphabetical) means `all_attempts` lands
+        // first, then `writer_aggregate_data` can reference it. This is
+        // the exact pattern the gothab drill-failover playbook uses.
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.set_facts.insert("n".into(), serde_json::json!(3));
+        let mut vars: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        vars.insert(
+            "all_attempts".into(),
+            serde_yaml::Value::String("{{ n }}".into()),
+        );
+        vars.insert(
+            "writer_aggregate_data".into(),
+            serde_yaml::Value::String("count={{ all_attempts }}".into()),
+        );
+        apply_task_vars(&vars, &mut ctx, &env, &WorldVars::default()).unwrap();
+        // Numeric-looking rendered output is coerced (looks_jsonish path);
+        // the non-numeric chained reference stays a string but with the
+        // chained value substituted in.
+        assert_eq!(ctx.task_vars["all_attempts"], serde_json::json!(3));
+        assert_eq!(ctx.task_vars["writer_aggregate_data"], serde_json::json!("count=3"));
+    }
+
+    #[test]
+    fn apply_task_vars_render_failure_propagates() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        let mut vars: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        vars.insert(
+            "bad".into(),
+            serde_yaml::Value::String("{{ undefined_filter | nope }}".into()),
+        );
+        let err = apply_task_vars(&vars, &mut ctx, &env, &WorldVars::default()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bad"), "got: {msg}");
+    }
+
+    #[test]
+    fn apply_task_vars_extra_vars_still_wins() {
+        // CLI -e overrides per-task vars (matches Ansible precedence).
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.extra_vars.insert("v".into(), serde_json::json!("from_cli"));
+        let mut vars: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        vars.insert(
+            "v".into(),
+            serde_yaml::Value::String("from_task".into()),
+        );
+        apply_task_vars(&vars, &mut ctx, &env, &WorldVars::default()).unwrap();
+        // The slot is set...
+        assert_eq!(ctx.task_vars["v"], serde_json::json!("from_task"));
+        // ...but the merged view shows extra_vars winning.
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        assert_eq!(view.get("v"), Some(&serde_json::json!("from_cli")));
+    }
+
     #[test]
     fn fail_body_renders_msg() {
         let env = template::make_env();
@@ -5140,6 +6091,7 @@ all:
             changed_when: None,
             failed_when: None,
             no_log: None,
+            vars: std::collections::BTreeMap::new(),
         }
     }
 
@@ -5374,6 +6326,7 @@ all:
             changed_when: None,
             failed_when: None,
             no_log: None,
+            vars: std::collections::BTreeMap::new(),
         }
     }
 
@@ -5417,22 +6370,45 @@ all:
         )
     }
 
-    /// Construct a dummy ConnHandle that's None — controller-side
-    /// bodies never touch it. Anything that tries to dispatch a wire
-    /// op via this conn would panic at unwrap; failure to use the
-    /// conn is part of the test contract for controller-side blocks.
-    fn dead_conn() -> ConnHandle {
-        Arc::new(TokioMutex::new(None))
+    /// Pool with the `Mock` transport: `get_or_spawn` vends a dead
+    /// handle (inner `Option=None`) for every requested key. Tests
+    /// for controller-only tasks (set_fact, fail, assert, debug,
+    /// block dispatch, …) use this — those bodies never call
+    /// `run_op_body` against the conn, so the dead handle is never
+    /// touched. A controller-only test that ever does dispatch a
+    /// wire op surfaces a clean "agent conn is dead" failure, which
+    /// is the right signal.
+    fn dead_pool() -> PoolHandle {
+        let p = AgentPool::new("test".to_string(), crate::pool::PoolTransport::Mock);
+        Arc::new(TokioMutex::new(p))
     }
 
     async fn drive(task: &Task) -> PerHostTaskResult {
-        let conn = dead_conn();
-        let conns_map: Arc<BTreeMap<String, ConnHandle>> = Arc::new(BTreeMap::new());
+        let pool = dead_pool();
+        let pools_map: Arc<BTreeMap<String, PoolHandle>> = Arc::new(BTreeMap::new());
         let ctx = HostCtx::new("h1".into());
         let env = Arc::new(template::make_env());
         let world = WorldVars::empty();
         let seq = Arc::new(AtomicU32::new(1));
-        run_task_on_one_host(task, conn, conns_map, ctx, seq, env, world).await
+        let coord = RunOnceCoord::allocate(std::slice::from_ref(task));
+        let mut slot_counter: u32 = 0;
+        // Go through dispatch_one_task so the counter is properly
+        // incremented past this task's own slot before recursing into
+        // a block body — same invariant the production dispatchers
+        // (per_play / per_task fanout) rely on.
+        dispatch_one_task(
+            task,
+            pool,
+            pools_map,
+            ctx,
+            seq,
+            env,
+            world,
+            coord,
+            &mut slot_counter,
+            /*is_runner=*/ true,
+        )
+        .await
     }
 
     fn assert_ok(r: &PerHostTaskResult) {
@@ -5691,6 +6667,232 @@ all:
         assert!(!r.ctx.set_facts.contains_key("rescue_fired"));
     }
 
+    // ---------- run_once inside block ----------
+
+    /// Drive a single task on one host with an explicit coord +
+    /// is_runner. Used by tests that exercise run_once-in-block
+    /// coordination — the runner test pre-allocates the coord, runs
+    /// the task with is_runner=true, then a separate test simulates
+    /// the non-runner by pre-filling the same coord's cell.
+    async fn drive_with_coord(
+        task: &Task,
+        ctx: HostCtx,
+        coord: RunOnceCoord,
+        is_runner: bool,
+    ) -> PerHostTaskResult {
+        let pool = dead_pool();
+        let pools_map: Arc<BTreeMap<String, PoolHandle>> = Arc::new(BTreeMap::new());
+        let env = Arc::new(template::make_env());
+        let world = WorldVars::empty();
+        let seq = Arc::new(AtomicU32::new(1));
+        let mut slot_counter: u32 = 0;
+        dispatch_one_task(
+            task,
+            pool,
+            pools_map,
+            ctx,
+            seq,
+            env,
+            world,
+            coord,
+            &mut slot_counter,
+            is_runner,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_coord_assigns_one_slot_per_task_in_tree() {
+        // Block holding 2 tasks + 1 rescue + 1 always. Plus the block
+        // task itself. Plus a sibling top-level task. Pre-order DFS
+        // total: 1 (block) + 2 (tasks) + 1 (rescue) + 1 (always) + 1
+        // (sibling) = 6.
+        let block = block_node(
+            "outer",
+            vec![assert_true("inner1"), assert_true("inner2")],
+            vec![assert_true("rescue1")],
+            vec![assert_true("always1")],
+        );
+        let sibling = assert_true("sibling");
+        let tasks = vec![block, sibling];
+        let coord = RunOnceCoord::allocate(&tasks);
+        assert_eq!(coord.cells.len(), 6);
+        assert_eq!(coord.subtree_sizes.len(), 6);
+        // The block at slot 0 has subtree size 5 (self + 4 inner).
+        assert_eq!(coord.subtree_size(0), 5);
+        // Inner tasks are leaves: subtree size 1.
+        assert_eq!(coord.subtree_size(1), 1);
+        assert_eq!(coord.subtree_size(2), 1);
+        assert_eq!(coord.subtree_size(3), 1);
+        assert_eq!(coord.subtree_size(4), 1);
+        // Sibling at slot 5: leaf.
+        assert_eq!(coord.subtree_size(5), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_inside_block_runner_publishes_to_cell() {
+        // A run_once SetFact task inside a block. Running as the
+        // designated runner should populate the cell's RunOnceResult
+        // with the set_facts the task produced.
+        let mut inner = set_fact("inner-runonce", "marker", "true");
+        inner.run_once = true;
+        let block = block_node("outer", vec![inner], vec![], vec![]);
+        let coord = RunOnceCoord::allocate(std::slice::from_ref(&block));
+        // The inner run_once task is at slot 1 (block at 0, inner at 1).
+        let cell = coord.cell(1).expect("inner slot exists");
+        let r = drive_with_coord(
+            &block,
+            HostCtx::new("runner".into()),
+            coord,
+            /*is_runner=*/ true,
+        )
+        .await;
+        assert_ok(&r);
+        // Cell got populated with the runner's set_facts.
+        let published = cell.cell.get().expect("cell published");
+        assert!(published.success);
+        assert_eq!(
+            published.set_facts.get("marker"),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_inside_block_non_runner_inherits_set_facts() {
+        // Pre-populate the cell with a "runner-published" result, then
+        // run the same block on a non-runner host. The non-runner
+        // should NOT execute the inner body (set_fact would otherwise
+        // run regardless of is_runner), but should pick up the set_fact
+        // from the broadcast.
+        let mut inner = set_fact("inner-runonce", "from_runner", "\"runner-value\"");
+        inner.run_once = true;
+        let block = block_node("outer", vec![inner.clone()], vec![], vec![]);
+        let coord = RunOnceCoord::allocate(std::slice::from_ref(&block));
+        // Pre-fill slot 1 with a synthetic runner result that carries
+        // a different value — proving the non-runner used the cell's
+        // value rather than re-executing the body.
+        let mut synthetic_set_facts = BTreeMap::new();
+        synthetic_set_facts.insert(
+            "from_runner".into(),
+            JsonValue::String("from-cell".into()),
+        );
+        let cell = coord.cell(1).expect("inner slot");
+        cell.publish(RunOnceResult {
+            register: None,
+            set_facts: synthetic_set_facts,
+            success: true,
+            outcome: HostTaskOutcome::Ok {
+                changed: true,
+                skipped: false,
+            },
+        });
+
+        let r = drive_with_coord(
+            &block,
+            HostCtx::new("nonrunner".into()),
+            coord,
+            /*is_runner=*/ false,
+        )
+        .await;
+        assert_ok(&r);
+        // The non-runner picked up the cell's value, NOT what the
+        // body would have set ("runner-value").
+        assert_eq!(
+            r.ctx.set_facts.get("from_runner"),
+            Some(&JsonValue::String("from-cell".into()))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_inside_block_non_runner_propagates_failure_to_rescue() {
+        // The runner's body failed. A non-runner host should see
+        // Failed via the cell broadcast and the block's rescue arm
+        // should fire — same as if the non-runner had executed and
+        // failed locally.
+        let mut inner = assert_false("inner-runonce");
+        inner.run_once = true;
+        let block = block_node(
+            "outer",
+            vec![inner.clone()],
+            vec![set_fact("rescue-ran", "rescue_fired", "true")],
+            vec![],
+        );
+        let coord = RunOnceCoord::allocate(std::slice::from_ref(&block));
+        // Pre-fill slot 1 with a Failed runner result.
+        let cell = coord.cell(1).expect("inner slot");
+        cell.publish(RunOnceResult {
+            register: None,
+            set_facts: BTreeMap::new(),
+            success: false,
+            outcome: HostTaskOutcome::Failed {
+                reason: "synthetic runner failure".into(),
+                register: None,
+            },
+        });
+
+        let r = drive_with_coord(
+            &block,
+            HostCtx::new("nonrunner".into()),
+            coord,
+            /*is_runner=*/ false,
+        )
+        .await;
+        // The block recovered via the rescue arm, so the overall
+        // outcome is Ok.
+        assert_ok(&r);
+        // Rescue task fired, set_fact landed in ctx.
+        assert_eq!(
+            r.ctx.set_facts.get("rescue_fired"),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_slot_counter_advances_past_skipped_block() {
+        // A block with `when: false` should not be entered, but its
+        // subtree slots must still be consumed so a sibling task on
+        // the same host lands on the same slot index as on a host
+        // that walked the full subtree. We check this by reading the
+        // counter after dispatching a block-then-sibling pair.
+        let mut block = block_node(
+            "outer-skipped",
+            vec![assert_true("inner1"), assert_true("inner2")],
+            vec![],
+            vec![],
+        );
+        block.when = Some("false".into());
+        let sibling = assert_true("sibling");
+        let tasks = vec![block, sibling];
+        let coord = RunOnceCoord::allocate(&tasks);
+        // Block subtree (slot 0 + 2 inners) = 3 slots; sibling at slot 3.
+        assert_eq!(coord.subtree_size(0), 3);
+
+        let mut slot_counter: u32 = 0;
+        let pool = dead_pool();
+        let pools_map: Arc<BTreeMap<String, PoolHandle>> = Arc::new(BTreeMap::new());
+        let env = Arc::new(template::make_env());
+        let world = WorldVars::empty();
+        let seq = Arc::new(AtomicU32::new(1));
+
+        // Dispatch the block via dispatch_one_task; the counter must
+        // jump from 0 to 3 even though `when: false` short-circuited
+        // before recursing into block.tasks.
+        let _ = dispatch_one_task(
+            &tasks[0],
+            pool,
+            pools_map,
+            HostCtx::new("h".into()),
+            seq,
+            env,
+            world,
+            coord.clone(),
+            &mut slot_counter,
+            /*is_runner=*/ true,
+        )
+        .await;
+        assert_eq!(slot_counter, 3, "skipped block must consume its subtree");
+    }
+
     // ---------- retries: / until: / delay: matrix ----------
 
     fn fail_task(name: &str, msg: &str) -> Task {
@@ -5703,12 +6905,26 @@ all:
     /// Drive a task with a pre-built `HostCtx` so tests can preload
     /// host vars (used by the templating tests for retries/delay).
     async fn drive_with_ctx(task: &Task, ctx: HostCtx) -> PerHostTaskResult {
-        let conn = dead_conn();
-        let conns_map: Arc<BTreeMap<String, ConnHandle>> = Arc::new(BTreeMap::new());
+        let pool = dead_pool();
+        let pools_map: Arc<BTreeMap<String, PoolHandle>> = Arc::new(BTreeMap::new());
         let env = Arc::new(template::make_env());
         let world = WorldVars::empty();
         let seq = Arc::new(AtomicU32::new(1));
-        run_task_on_one_host(task, conn, conns_map, ctx, seq, env, world).await
+        let coord = RunOnceCoord::allocate(std::slice::from_ref(task));
+        let mut slot_counter: u32 = 0;
+        dispatch_one_task(
+            task,
+            pool,
+            pools_map,
+            ctx,
+            seq,
+            env,
+            world,
+            coord,
+            &mut slot_counter,
+            /*is_runner=*/ true,
+        )
+        .await
     }
 
     /// Pull the register a task wrote to its `register:` slot.
@@ -5748,7 +6964,7 @@ all:
                 let rv = register.as_ref().expect("fail body provides a register");
                 assert_eq!(rv.attempts, 4);
             }
-            other => panic!("expected Failed, got {other:?}"),
+            _ => panic!("expected Failed"),
         }
     }
 
@@ -5978,7 +7194,7 @@ all:
                     );
                 }
             }
-            other => panic!("expected Failed, got {other:?}"),
+            _ => panic!("expected Failed"),
         }
     }
 }

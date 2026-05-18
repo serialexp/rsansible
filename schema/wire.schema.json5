@@ -222,6 +222,41 @@
       ],
     },
 
+    OpIptables: {
+      description: "`iptables` wrapper. Maps Ansible's `ansible.builtin.iptables` (subset). Manages a single rule on the host's iptables/ip6tables filter (or named) table. `rule_state` is uint8: 0=absent, 1=present. `action` is uint8: 0=append (-A, default), 1=insert (-I). `ip_version` is uint8: 4=iptables, 6=ip6tables. `table` defaults to `\"filter\"` when empty. All string knobs (`protocol`, `source`, `destination`, `source_port`, `destination_port`, `in_interface`, `out_interface`, `jump`, `ctstate`, `comment`) treat empty as \"unset\" (no corresponding flag emitted). Idempotency: the agent runs `iptables -C ...` with the same args first; if the rule already exists in the requested state, the op is a no-op and reports `changed=0`. Otherwise it dispatches `-A` / `-I` (state=present) or `-D` (state=absent). Wire kind=20. Envelope: {present: 0|1 (final state), table, chain, jump, comment}. The op runs `iptables` / `ip6tables` directly — sudo escalation comes from the controller's per-host agent pool (see CLAUDE.md), not from a flag here.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 20 },
+        { name: "table", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "chain", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "protocol", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "source", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "destination", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "source_port", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "destination_port", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "in_interface", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "out_interface", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "jump", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "ctstate", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "comment", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "ip_version", type: "uint8" },
+        { name: "action", type: "uint8" },
+        { name: "rule_state", type: "uint8" },
+      ],
+    },
+
+    OpRepository: {
+      description: "Add/remove a third-party package repository. Maps Ansible's `ansible.builtin.apt_repository` and (in future) its `yum_repository`/`zypper_repository` cousins under one canonical task name. `manager` selects the backend: 0=auto (agent picks based on what's on PATH / facts), 1=apt. Other backends (dnf/yum/apk/pacman/zypper) reserve the same byte values as OpPackage and return BAD_REQUEST until a per-manager backend lands. `repo` is the source-list line (deb URL or PPA shorthand for apt; future managers will use the same field with their own grammar). `state` is uint8: 0=present (write the file if missing/changed), 1=absent (delete the file if present). `filename` is the basename of the on-disk source file (apt: `/etc/apt/sources.list.d/<filename>.list`); empty string means \"derive from sanitised `repo` string\" (Ansible-compatible). `mode` is the unix file mode for the source file (0=use default 0o644). `update_cache=1` runs the manager's index refresh after a change (apt: `apt-get update`), suppressed when nothing changed. Idempotency: read the current file (if any), compare to the desired content; no-op if equal. Wire kind=21.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 21 },
+        { name: "manager", type: "uint8" },
+        { name: "repo", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "state", type: "uint8" },
+        { name: "filename", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "mode", type: "uint32" },
+        { name: "update_cache", type: "uint8" },
+      ],
+    },
+
     OpUri: {
       description: "HTTP client. Maps Ansible's `ansible.builtin.uri` (subset). `method` is a uint8: 0=GET, 1=POST, 2=PUT, 3=PATCH, 4=DELETE, 5=HEAD. `header_keys` / `header_values` are parallel arrays carrying the request headers (case preserved on the wire; reqwest canonicalises at send time). `body_format` is a uint8: 0=raw (body shipped verbatim, no Content-Type touched), 1=json (body shipped as-is — controller pre-serialises any YAML map at parse time; Content-Type set to application/json when not already in headers), 2=form (body shipped verbatim; Content-Type set to application/x-www-form-urlencoded when not already in headers — caller does the k=v&k=v encoding). `status_codes` is the list of accepted HTTP statuses; the agent emits TaskDone with exit_code=0 when the response status is in this list, exit_code=1 otherwise. The envelope is shipped on stdout in both cases for diagnostics. `follow_redirects` is a uint8: 0=none, 1=safe (follow up to 10 hops iff the original method was GET/HEAD), 2=all (follow up to 10 hops regardless of method). `validate_certs=0` disables TLS cert/hostname verification. `return_content=1` includes the response body as a UTF-8 string in the envelope's `content` field. Envelope shape: {status: uint16, url: string, headers: map<string,string> (response headers, keys lowercased), content?: string (only if return_content), content_length: uint, content_type: string, json?: <parsed body if Content-Type indicates JSON>, elapsed_ms: uint, redirected: bool}. `changed` is 1 for any successful non-GET/HEAD request (Ansible's contract: mutating verbs report changed even if the server didn't actually change), 0 for GET/HEAD or for any failed status. Pre-status errors (connect refused, DNS, TLS handshake, timeout) surface as TaskError BAD_HOST/BAD_REQUEST without an envelope. Wire kind=12.",
       sequence: [
@@ -426,6 +461,8 @@
         { type: "OpAsyncStatus", when: "value === 17" },
         { type: "OpReadFile", when: "value === 18" },
         { type: "OpUnarchive", when: "value === 19" },
+        { type: "OpIptables", when: "value === 20" },
+        { type: "OpRepository", when: "value === 21" },
       ],
     },
 

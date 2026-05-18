@@ -63,6 +63,7 @@ shlex = "1.3.0"
 # the drop-cleanup behavior — `tempfile:` matches Ansible's contract
 # of leaving the temp object on disk for downstream tasks to consume.
 tempfile = "3"
+rand = "0.9.4"
 
 [dev-dependencies]
 # Enable tokio's `test-util` so unit tests can `tokio::time::pause()` /

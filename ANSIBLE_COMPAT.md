@@ -249,6 +249,225 @@ When writing new rsansible-native code, prefer the Ansible spelling
 
 ---
 
+## 7. `become:` is honored only via `sudo -n`, and `become_method` is sudo-only
+
+| Setting               | rsansible                                         |
+|-----------------------|---------------------------------------------------|
+| `become_method:`      | Only `sudo` (default). Any other value is rejected at parse time. |
+| `become_flags:`       | Ignored. Sudo is always invoked as `sudo -n -u <user> --`. |
+| `become_exe:`         | Ignored. We always shell out to the system `sudo`. |
+| Password prompts      | Never. `-n` is non-interactive — sudo fails fast rather than prompt. NOPASSWD entries in `/etc/sudoers` are required. |
+
+### Rationale
+
+Ansible's privilege-escalation layer is a pluggable shim with seven
+methods (`sudo`, `su`, `doas`, `runas`, `pbrun`, `pmrun`, `dzdo`,
+`ksu`, `machinectl`, `sesu`). Each carries its own argv shape, its
+own password-prompt protocol, and its own quirks; the matrix between
+that and `become_user` × `become_flags` × `become_exe` is large and
+mostly load-bearing for nobody.
+
+rsansible picks the path that ~every modern Ansible deployment
+already uses: `sudo` with `NOPASSWD` entries. The choice has knock-on
+benefits: the agent process for a given `(host, become_user)` tuple
+runs under the right EUID from spawn time, so every wire op
+(systemd, copy, file, package, …) gets the right privileges
+*automatically* — see CLAUDE.md's "Agent-pool become routing"
+section for the architectural shape.
+
+### Per-host agent pool: how `become:` is actually routed
+
+For a given host, rsansible holds one persistent agent process per
+distinct `(BecomeKey)`:
+
+- `BecomeKey::None` — the agent we spawned at connect time, running
+  as the SSH user.
+- `BecomeKey::As(user)` — an agent spawned lazily under
+  `sudo -n -u <user> -- <agent_path>`.
+
+Each task computes its effective become (precedence: task `become:`
+→ inventory `ansible_become` → default `false`) and routes its wire
+ops to the pool slot matching that key. A play with
+`become: true, become_user: root` plus some unbecomed tasks ends up
+with two agents per host: one under the SSH user, one under root.
+
+`become_user:` is rendered as a Jinja template against the per-host
+context before keying — so `become_user: "{{ db_user }}"` works.
+
+### Fix when porting an Ansible playbook
+
+- **`become_method: sudo`** — works (no-op, that's the default).
+- **`become_method:` anything else** — rejected at parse time. If
+  your fleet has a real reason to need `doas` or `pbrun` here,
+  surface it: file an issue with the use case.
+- **`become_flags:`** — dropped on the floor with a warning. If your
+  flags were just `-H` or `-i` (preserve / login shell) you can
+  usually delete the directive. If they were carrying password input
+  via a non-NOPASSWD sudo, switch to NOPASSWD; rsansible will never
+  send a password down the wire.
+- **Password prompts (`--ask-become-pass`, `ansible_become_pass`)** —
+  ignored. NOPASSWD is required.
+
+Code pointers:
+- `crates/ctl/src/become_.rs` — `BecomeKey` + `effective()` + Jinja
+  templating of `become_user`.
+- `crates/ctl/src/pool.rs` — `AgentPool` with lazy `get_or_spawn`
+  per `BecomeKey`.
+- `crates/ctl/src/ssh.rs` — `spawn_agent_channel` builds the
+  `sudo -n -u <user> --` exec line for `BecomeKey::As(user)`.
+
+---
+
+## 8. `pause:` rejects the interactive (no-duration / `prompt:`) path
+
+| Ansible spelling | rsansible behavior |
+|---|---|
+| `pause:` (no args) | **Parse error** — rejects with a pointer to this section. |
+| `pause: { prompt: "..." }` | **Parse error.** |
+| `pause: { echo: ... }` | **Parse error** (the `echo:` knob only applies to `prompt:`). |
+| `pause: { seconds: N }` / `{ minutes: N }` | Honored. Accepts int or Jinja string. |
+| `pause: { seconds: N, minutes: M }` | **Parse error** — mutually exclusive. |
+
+### Why
+
+Ansible's `pause:` has two unrelated modes folded under one module
+name:
+
+1. **Timed pause.** Sleep for `seconds:` or `minutes:` and continue.
+   This is what almost every production playbook means by `pause:`.
+2. **Interactive pause.** With no duration (or with `prompt:` set),
+   block forever waiting for a human to press Enter or answer a
+   prompt at the controller's terminal. The result of the prompt is
+   bound to a register.
+
+The second mode is fundamentally incompatible with how rsansible is
+used. We're a non-interactive runner — typical invocation paths
+include CI, cron, deploy scripts, and remote agents. There's no
+terminal to read from in any of those, and pretending there is would
+mean the play hangs forever the first time it's run in automation.
+
+We could have silently treated a no-duration pause as a no-op, but
+that masks the real intent ("wait for human confirmation"); the
+playbook would behave differently in the runner than the author
+expected. Rejecting at parse time means the author sees the
+divergence the first time they load the playbook, not the first
+time a drill hangs in CI.
+
+The `seconds:` / `minutes:` knobs accept both literal ints and
+Jinja-templated strings — same shape as `async:` / `poll:` /
+`retries:` / `delay:`. The runtime renders + parses at dispatch.
+
+### Code pointers
+
+- `crates/ctl/src/playbook/task_op/mod.rs` — `PauseTask` and its
+  `Deserialize` impl reject `prompt:` / `echo:` / no-args.
+- `crates/ctl/src/orchestrator.rs` — `run_pause_body` renders the
+  duration via `render_int_field` and `tokio::time::sleep`s.
+
+---
+
+## 9. `iptables:` covers a subset, rejects extension knobs loudly
+
+| Ansible knob | rsansible behavior |
+|---|---|
+| `chain`, `protocol`/`proto`, `source`/`src`, `destination`/`dest`, `source_port`, `destination_port`, `in_interface`, `out_interface`, `jump`, `comment`, `ctstate`, `table`, `ip_version`, `action`, `state` | **Honored.** |
+| `match`, `tcp_flags`, `syn`, `to_destination`, `to_source`, `to_ports`, `reject_with`, `icmp_type`, `uid_owner`, `gid_owner`, `log_prefix`, `log_level`, `limit`, `limit_burst`, `flush`, `policy`, `rule_num`, `gateway`, `numeric`, `wait` | **Parse error** — "not yet supported" with a pointer to file an issue. |
+
+### Why
+
+Ansible's `iptables` module has ~30 knobs spanning filter, NAT,
+LOG/REJECT targets, conntrack, owner-match, rate-limiting, and
+whole-chain operations (`flush:` / `policy:`). The full surface is a
+substantial agent module.
+
+The subset above covers what gothab and similar production playbooks
+actually use: insert/remove DROP rules with a comment tag for
+idempotency, optionally scoped to a single interface, address, and
+port. The unsupported knobs are rejected **at parse time, loudly**,
+with their name in the error message and a pointer to file an issue.
+A silent skip would let a NAT or LOG playbook run end-to-end without
+its rules ever firing, which is a much worse failure mode than "we
+told you up front this isn't ready yet."
+
+### Idempotency model
+
+We use `iptables -C` (the kernel's own "would this rule match an
+existing entry?" check) rather than parsing `iptables-save` output.
+This is what the upstream Ansible module also does and it's robust
+against tab/space/order differences that `iptables-save` parsers
+trip on. Exit code 0 = present, 1 = absent; any other exit is
+treated as a real error.
+
+### `become_method` is still sudo-only
+
+The agent does NOT run `iptables` via internal escalation — it
+inherits the EUID of the agent process. With `become: true,
+become_user: root` (the typical case), the agent itself is already
+running as root via the per-host pool's `BecomeKey::As("root")`
+slot (see §7), so `iptables` just works. Without `become:` it'll
+fail with iptables's "Permission denied" exit, surfaced as
+`TaskError IO`.
+
+### Code pointers
+
+- `schema/wire.schema.json5` — `OpIptables` (kind=20). 15 string
+  fields plus `ip_version`, `action`, `rule_state` bytes.
+- `crates/ctl/src/playbook/task_op/iptables.rs` — controller parser
+  with the unsupported-knob allowlist and per-field validation.
+- `crates/agent/src/modules/iptables.rs` — `-C` probe → `-A`/`-I`/`-D`
+  with argv construction respecting iptables's flag ordering rules.
+
+---
+
+## 10. `command:` shlex-splits its `cmd:` **after** Jinja renders, not before
+
+Ansible's `command:` module renders the full command string against the
+play context, then shlex-splits the result into argv. We do the same.
+The natural Rust port — split at parse time, render each argv element
+at task time — broke any `cmd:` that embedded `{{ var }}`, because the
+splitter saw `{{`, `var`, and `}}` as three separate tokens and the
+template engine then failed to compile `{{` as an expression.
+
+| Input | Parse-time argv | Render-time argv |
+|---|---|---|
+| `command: "/usr/bin/echo hi"` (no Jinja) | `[]` (deferred) | `["/usr/bin/echo", "hi"]` |
+| `command: { cmd: "/bin/x --id {{ drill_id }}" }` | `[]` (deferred) | `["/bin/x", "--id", "drill-1234"]` |
+| `command: { argv: ["/bin/x", "{{ id }}"] }` | `["/bin/x", "{{ id }}"]` | `["/bin/x", "drill-1234"]` |
+
+The argv-list form keeps the per-element render path — the user
+explicitly told us how to slice, so we don't second-guess it.
+
+### What still happens at parse time
+
+- **Unterminated quotes** in `cmd:` strings that contain no Jinja are
+  surfaced immediately (a literal command string with no `{{ }}` has
+  no reason to wait until render to fail).
+- **Empty** `cmd:` / shorthand strings.
+- **Mutual exclusion** of `cmd:` and `argv:`.
+- **Template syntax errors** in the raw `cmd:` string (caught by
+  `template.rs` precompile, which now compiles the whole string
+  instead of each token).
+
+### What only happens at render time
+
+- The actual shlex-split of `cmd:` into argv.
+- Render-time variable substitution.
+- Render-time shlex parse errors (e.g. a variable expanded into an
+  unterminated quoted string).
+
+### Code pointers
+
+- `crates/ctl/src/playbook/task_op/command.rs` — `CommandOp.raw_cmd`
+  holds the unsplit string; the deserializer leaves `argv` empty for
+  the `cmd:`/shorthand paths.
+- `crates/ctl/src/template.rs` (TaskOp::Command branch) — compiles
+  `raw_cmd` as one template instead of per-argv-element.
+- `crates/ctl/src/orchestrator.rs` `render_op` — renders `raw_cmd`,
+  then `shlex::split`s the result into the final argv before
+  dispatch.
+
+---
+
 ## When you add a new divergence
 
 1. **Document it here first.** Add a `## N. <one-line summary>`

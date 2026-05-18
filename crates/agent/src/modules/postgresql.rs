@@ -68,6 +68,81 @@ use serde_json::{Map, Value};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 
+/// Translate psycopg2-style `%s` placeholders to PostgreSQL's native
+/// `$1`, `$2`, ... numbering. Ansible's `community.postgresql.*` modules
+/// accept the `%s` spelling because they go through psycopg2; we drive
+/// tokio-postgres directly, which only speaks the native form.
+///
+/// Conservative rules: `%s` inside a single-quoted or double-quoted
+/// string literal is left alone (it's a literal `%s`, not a parameter).
+/// `%%` is psycopg's escape for a literal `%` — keep it as `%`. We
+/// don't try to handle `--` line comments or `/* … */` block comments;
+/// the Ansible idiom never embeds `%s` inside a comment in practice.
+fn translate_psycopg_placeholders(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    let mut idx: u32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = query.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(c);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(c);
+            }
+            '%' if !in_single && !in_double => {
+                match chars.peek() {
+                    Some('s') => {
+                        chars.next();
+                        idx += 1;
+                        out.push_str(&format!("${idx}"));
+                    }
+                    Some('%') => {
+                        chars.next();
+                        out.push('%');
+                    }
+                    _ => out.push('%'),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Format a `tokio_postgres::Error` with as much useful detail as the
+/// crate exposes. The default Display impl says `"db error"` for any
+/// server-reported error, hiding the SQLSTATE + server message — which
+/// turns every failing query into an unhelpful one-line log entry.
+fn format_pg_err(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        // Server-side: surface SQLSTATE + the primary message + the
+        // optional DETAIL/HINT lines (one line each, space-separated
+        // for compactness in a single log line).
+        let mut s = format!("[{}] {}", db.code().code(), db.message());
+        if let Some(d) = db.detail() {
+            s.push_str(&format!(" — detail: {d}"));
+        }
+        if let Some(h) = db.hint() {
+            s.push_str(&format!(" — hint: {h}"));
+        }
+        if let Some(p) = db.position() {
+            s.push_str(&format!(" — position: {p:?}"));
+        }
+        s
+    } else if let Some(src) = e.source() {
+        // Connection / IO errors — Display + cause chain.
+        format!("{e}: {src}")
+    } else {
+        format!("{e}")
+    }
+}
+use std::error::Error as _;
+
 use super::{emit_error, Context};
 
 // ── OpPostgresqlQuery ───────────────────────────────────────────────
@@ -160,14 +235,19 @@ async fn execute_simple(
     let to_run = if autocommit {
         query
     } else {
-        wrapped = format!("BEGIN;\n{}\nCOMMIT;", query.trim_end_matches(';'));
+        // Always force a `;` between the user query and our trailing
+        // COMMIT — otherwise queries that end in a closing paren
+        // (e.g. `CREATE TABLE IF NOT EXISTS foo (...)`) concatenate
+        // into `) COMMIT` which the parser rejects.
+        let trimmed = query.trim_end().trim_end_matches(';');
+        wrapped = format!("BEGIN;\n{trimmed};\nCOMMIT;");
         &wrapped
     };
 
     let messages = client
         .simple_query(to_run)
         .await
-        .map_err(|e| format!("postgres error: {e}"))?;
+        .map_err(|e| format!("postgres error: {}", format_pg_err(&e)))?;
 
     let mut rows = Vec::new();
     let mut statusmessage = String::new();
@@ -227,6 +307,11 @@ async fn execute_typed(
     positional_args: &[String],
     autocommit: bool,
 ) -> Result<Value, String> {
+    // Ansible's `community.postgresql.postgresql_query` uses psycopg2's
+    // `%s` placeholders. tokio-postgres requires `$1`, `$2`, ... — so
+    // translate any `%s` outside string literals before dispatch.
+    let translated = translate_psycopg_placeholders(query);
+    let query = translated.as_str();
     let args: Vec<&(dyn ToSql + Sync)> = positional_args
         .iter()
         .map(|s| s as &(dyn ToSql + Sync))
@@ -239,22 +324,22 @@ async fn execute_typed(
         let rows = client
             .query(query, &args)
             .await
-            .map_err(|e| format!("postgres error: {e}"))?;
+            .map_err(|e| format!("postgres error: {}", format_pg_err(&e)))?;
         let n = rows.len();
         (rows, n as u64)
     } else {
         let tx = client
             .transaction()
             .await
-            .map_err(|e| format!("postgres error: {e}"))?;
+            .map_err(|e| format!("postgres error: {}", format_pg_err(&e)))?;
         let rows = tx
             .query(query, &args)
             .await
-            .map_err(|e| format!("postgres error: {e}"))?;
+            .map_err(|e| format!("postgres error: {}", format_pg_err(&e)))?;
         let n = rows.len();
         tx.commit()
             .await
-            .map_err(|e| format!("postgres error: {e}"))?;
+            .map_err(|e| format!("postgres error: {}", format_pg_err(&e)))?;
         (rows, n as u64)
     };
 

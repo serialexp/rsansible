@@ -23,9 +23,9 @@
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
     msg::{
-        op_blockinfile, op_exec, op_file, op_gather_facts, op_get_url, op_lineinfile, op_package,
-        op_postgresql_ext, op_postgresql_query, op_shell, op_stat, op_systemd, op_ufw, op_uri,
-        op_wait_for, op_write_file,
+        op_async_status, op_blockinfile, op_exec, op_file, op_gather_facts, op_get_url,
+        op_iptables, op_lineinfile, op_package, op_postgresql_ext, op_postgresql_query,
+        op_repository, op_shell, op_stat, op_systemd, op_ufw, op_uri, op_wait_for, op_write_file,
     },
     Op,
 };
@@ -47,6 +47,8 @@ mod lineinfile;
 mod blockinfile;
 mod systemd;
 mod package;
+mod repository;
+mod iptables;
 mod ufw;
 mod uri;
 mod openssl;
@@ -67,6 +69,7 @@ pub use get_url::GetUrlOp;
 pub use lineinfile::{LineInFileOp, LineInFileState};
 pub use openssl::{OpenSslCsrPipeOp, OpenSslPrivkeyOp, X509CertificatePipeOp};
 pub use package::{PackageManager, PackageOp, PackageState};
+pub use repository::{RepositoryManager, RepositoryOp, RepositoryState};
 pub use postgresql::{classify_sql_readonly, PostgresqlExtOp, PostgresqlQueryOp};
 pub use shell::ShellOp;
 pub use slurp::SlurpOp;
@@ -74,6 +77,7 @@ pub use stat::StatOp;
 pub use systemd::{SystemdOp, SystemdState};
 pub use template::TemplateOp;
 pub use tempfile::{TempfileKind, TempfileOp};
+pub use iptables::{IptablesAction, IptablesIpVersion, IptablesOp, IptablesRuleState};
 pub use ufw::{UfwOp, UfwOpKind};
 pub use unarchive::UnarchiveOp;
 pub use uri::UriOp;
@@ -152,19 +156,25 @@ pub struct Task {
     /// The orchestrator computes the effective flag at dispatch time:
     /// `task.check_mode.unwrap_or(ctx.check_mode)`.
     pub check_mode: Option<bool>,
-    /// `async: <seconds>` — run the task body as a background job on
+    /// `async: <int|jinja>` — run the task body as a background job on
     /// the agent. Wraps the inner wire op in `OpAsyncStart(timeout_ms
-    /// = async*1000, inner)`. `Some(0)` is interpreted as "synchronous"
+    /// = async*1000, inner)`. `Some("0")` is interpreted as "synchronous"
     /// (matches Ansible: async: 0 disables async). `None` means absent.
-    pub async_seconds: Option<u32>,
-    /// `poll: <seconds>` — how often the orchestrator polls the job
-    /// for completion. `Some(0)` is fire-and-forget: the orchestrator
+    ///
+    /// Stored as a String to support templated values like
+    /// `async: "{{ (writer_duration_s | int) + 30 }}"`; the runtime
+    /// renders + parses to u32 immediately before dispatch.
+    pub async_seconds: Option<String>,
+    /// `poll: <int|jinja>` — how often the orchestrator polls the job
+    /// for completion. `Some("0")` is fire-and-forget: the orchestrator
     /// returns the start envelope (`ansible_job_id`, `started:1`,
     /// `finished:0`) and lets the user poll later via `async_status:`.
-    /// `Some(n)` with n>0 makes the orchestrator block, polling every
+    /// `Some("n")` with n>0 makes the orchestrator block, polling every
     /// n seconds until the job finishes or the async deadline expires.
     /// `None` defaults to 10 when async is set (matches Ansible).
-    pub poll_seconds: Option<u32>,
+    ///
+    /// Same templated-string storage as `async_seconds`.
+    pub poll_seconds: Option<String>,
     /// `retries: <int|jinja>` — re-run the task up to N times on
     /// failure or until `until:` is satisfied. Stored as a String to
     /// support templated values like
@@ -209,6 +219,18 @@ pub struct Task {
     /// because the cost of getting it wrong is leaking secrets, not
     /// just an incorrect changed flag.
     pub no_log: Option<bool>,
+    /// `vars:` — per-task variable scope. Rendered against the host's
+    /// view immediately before the body dispatches; each rendered value
+    /// lands in `ctx.task_vars` and is visible to `when:`, body fields,
+    /// templates, etc. for the duration of this task only. Cleared
+    /// after the task returns. Layered just below `extra_vars` in
+    /// precedence (above registers/set_facts/play_vars).
+    ///
+    /// Empty for tasks that don't declare `vars:`. Note: for
+    /// `include_role:` tasks the same YAML field instead populates
+    /// `IncludeRoleSpec.vars` (Ansible's per-role-include override) and
+    /// this field stays empty.
+    pub vars: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -224,6 +246,10 @@ pub enum TaskBody {
     Debug(DebugTask),
     /// Controller-side: bind values into the host's set_facts dict.
     SetFact(SetFactMap),
+    /// Controller-side: sleep for a fixed duration. Mirrors Ansible's
+    /// `ansible.builtin.pause` with the interactive-prompt path
+    /// rejected at parse time (see ANSIBLE_COMPAT.md §8).
+    Pause(PauseTask),
     /// Parse-time directive: splice in tasks from `<file>`. After the
     /// import-flattening pass walks the playbook, no `ImportTasks` body
     /// should remain.
@@ -336,9 +362,29 @@ pub enum TaskOp {
     /// `Auto` to let the agent pick at run time. Batched (one wire op
     /// carries multiple `name`s). Idempotency is per-backend.
     Package(PackageOp),
+    /// `repository:` (canonical) / `apt_repository:` (compat shim) —
+    /// add or remove a third-party package source. `manager:` selects the
+    /// backend (default `Auto`; today only `apt` is implemented). See
+    /// `RSANSIBLE_IDIOMS.md §2` for why `repository:` is the preferred
+    /// spelling.
+    Repository(RepositoryOp),
     /// `ufw:` — Uncomplicated Firewall control. One op covers one of
     /// rule / enable / disable / reset / default / reload / logging.
     Ufw(UfwOp),
+    /// `iptables:` — manage a single iptables/ip6tables rule.
+    /// Idempotency comes from `iptables -C` on the agent before the
+    /// `-A` / `-I` / `-D`. Subset of Ansible's
+    /// `ansible.builtin.iptables` — extension knobs like
+    /// `to_destination`, `tcp_flags`, `limit:`, `reject_with:`,
+    /// `flush:`, `policy:` are rejected at parse time.
+    Iptables(IptablesOp),
+    /// `async_status:` — poll the status of an async job started with
+    /// `async: N, poll: 0` (fire-and-forget). The `jid` is taken from
+    /// the register of the start task as `{{ start_result.ansible_job_id }}`.
+    /// The agent looks up the job in its in-process table and returns
+    /// the latest status envelope (finished/started/elapsed/rc, plus
+    /// the inner module's envelope once finished).
+    AsyncStatus(AsyncStatusOp),
     /// `uri:` — HTTP client. Maps Ansible's `ansible.builtin.uri`
     /// (subset). The agent emits a JSON envelope on stdout describing
     /// the response; the orchestrator lifts the envelope fields to the
@@ -427,6 +473,10 @@ const BODY_KEYS: &[&str] = &[
     "service",
     "apt",
     "package",
+    "repository",
+    "apt_repository",
+    "async_status",
+    "iptables",
     "ufw",
     "uri",
     "openssl_privatekey",
@@ -441,6 +491,7 @@ const BODY_KEYS: &[&str] = &[
     "assert",
     "fail",
     "debug",
+    "pause",
     "set_fact",
     "import_tasks",
     "include_role",
@@ -610,32 +661,11 @@ impl<'de> Deserialize<'de> for Task {
                 )));
             }
         };
-        let async_seconds = match map.remove("async") {
-            None | Some(serde_yaml::Value::Null) => None,
-            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
-                D::Error::custom(format!(
-                    "task {name:?}: `async` must be a non-negative integer (seconds), got: {n:?}"
-                ))
-            })? as u32),
-            Some(other) => {
-                return Err(D::Error::custom(format!(
-                    "task {name:?}: `async` must be an integer number of seconds, got: {other:?}"
-                )));
-            }
-        };
-        let poll_seconds = match map.remove("poll") {
-            None | Some(serde_yaml::Value::Null) => None,
-            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
-                D::Error::custom(format!(
-                    "task {name:?}: `poll` must be a non-negative integer (seconds), got: {n:?}"
-                ))
-            })? as u32),
-            Some(other) => {
-                return Err(D::Error::custom(format!(
-                    "task {name:?}: `poll` must be an integer number of seconds, got: {other:?}"
-                )));
-            }
-        };
+        // async/poll accept either an integer (most common) or a
+        // Jinja-templated string (e.g. `async: "{{ (n | int) + 30 }}"`).
+        // Store both as String — the runtime renders + parses to u32.
+        let async_seconds = take_int_or_template_string(&mut map, "async", &name)?;
+        let poll_seconds = take_int_or_template_string(&mut map, "poll", &name)?;
         if poll_seconds.is_some() && async_seconds.is_none() {
             return Err(D::Error::custom(format!(
                 "task {name:?}: `poll:` is only meaningful with `async:` set"
@@ -646,7 +676,38 @@ impl<'de> Deserialize<'de> for Task {
         // Store both as String — the runtime renders + parses to u32.
         let retries = take_int_or_template_string(&mut map, "retries", &name)?;
         let delay = take_int_or_template_string(&mut map, "delay", &name)?;
-        let until = take_optional_string(&mut map, "until", &name)?;
+        // `until:` accepts a single Jinja expression OR a list of
+        // expressions (implicit AND between items — matches Ansible).
+        // List form joins as `(item1) and (item2) and ...` so each
+        // item's operator precedence stays self-contained.
+        let until = match map.remove("until") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::String(s)) => Some(s),
+            Some(serde_yaml::Value::Sequence(seq)) => {
+                let mut parts: Vec<String> = Vec::with_capacity(seq.len());
+                for (i, item) in seq.into_iter().enumerate() {
+                    match item {
+                        serde_yaml::Value::String(s) => parts.push(format!("({s})")),
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "task {name:?}: `until[{i}]` must be a string Jinja expression, got: {other:?}"
+                            )));
+                        }
+                    }
+                }
+                if parts.is_empty() {
+                    return Err(D::Error::custom(format!(
+                        "task {name:?}: `until:` cannot be an empty list"
+                    )));
+                }
+                Some(parts.join(" and "))
+            }
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `until:` must be a string or list of strings, got: {other:?}"
+                )));
+            }
+        };
         // until: requires register: (we need the registered envelope
         // to evaluate the expression against). See ANSIBLE_COMPAT.md §4.
         if until.is_some() && register.is_none() {
@@ -834,6 +895,33 @@ impl<'de> Deserialize<'de> for Task {
                     map,
                 )?))
             }
+            "repository" => {
+                // Canonical rsansible spelling. `manager:` is read from
+                // the body; defaults to `Auto`. See `RSANSIBLE_IDIOMS.md §2`.
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Repository(
+                    repository::parse_repository_body::<D::Error>(None, map)?,
+                ))
+            }
+            "apt_repository" => {
+                // Ansible-compat shim. Pins `manager: Apt`; body may not
+                // contradict it.
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Repository(
+                    repository::parse_repository_body::<D::Error>(
+                        Some(RepositoryManager::Apt),
+                        map,
+                    )?,
+                ))
+            }
+            "iptables" => TaskBody::Op(TaskOp::Iptables(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "async_status" => TaskBody::Op(TaskOp::AsyncStatus(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
             "ufw" => TaskBody::Op(TaskOp::Ufw(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
@@ -874,6 +962,9 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             ),
             "debug" => TaskBody::Debug(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            ),
+            "pause" => TaskBody::Pause(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             ),
             "set_fact" => {
@@ -999,15 +1090,16 @@ impl<'de> Deserialize<'de> for Task {
             _ => unreachable!("body key not in BODY_KEYS dispatch"),
         };
 
-        // `vars:` is consumed by the include_role arm above. If it's set
-        // on any other body kind, surface the error (rather than silently
-        // dropping the override).
-        if task_vars.is_some() && !matches!(body, TaskBody::IncludeRole(_)) {
-            return Err(D::Error::custom(format!(
-                "task {name:?}: `vars:` is only supported on `include_role:` tasks; \
-                 use set_fact or play-level vars for general task variables"
-            )));
-        }
+        // `vars:` on an `include_role:` is consumed by the include_role
+        // arm above (becomes `IncludeRoleSpec.vars`). For every other
+        // body kind, it becomes the task-level scoped vars layered into
+        // `ctx.task_vars` at dispatch time.
+        let task_level_vars: BTreeMap<String, serde_yaml::Value> =
+            if matches!(body, TaskBody::IncludeRole(_)) {
+                BTreeMap::new()
+            } else {
+                task_vars.unwrap_or_default()
+            };
         // `rescue:` and `always:` are consumed by the block body arm.
         // If they're set on any other body kind, surface the error.
         if rescue_yaml.is_some() {
@@ -1087,6 +1179,7 @@ impl<'de> Deserialize<'de> for Task {
             changed_when,
             failed_when,
             no_log,
+            vars: task_level_vars,
         })
     }
 }
@@ -1166,13 +1259,146 @@ fn default_fail_msg() -> String {
     "Failed as requested".to_string()
 }
 
+/// `async_status:` parsed form. The wire op carries a u32 job id;
+/// we store the raw input as a String so it can carry Jinja
+/// (`jid: "{{ start_result.ansible_job_id }}"`) and render+parse at
+/// dispatch time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsyncStatusOp {
+    /// Job id — int-or-jinja. Rendered at dispatch; the wire op then
+    /// gets the parsed u32.
+    pub jid: String,
+}
+
+impl<'de> Deserialize<'de> for AsyncStatusOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+        // Accept either an int (`jid: 12`) or a string (the Jinja form
+        // the playbook author uses 100% of the time in practice).
+        let jid = match map.remove("jid") {
+            None | Some(serde_yaml::Value::Null) => {
+                return Err(D::Error::custom("async_status.jid: required"));
+            }
+            Some(serde_yaml::Value::String(s)) => s,
+            Some(serde_yaml::Value::Number(n)) => n.to_string(),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "async_status.jid: expected int or string, got: {other:?}"
+                )));
+            }
+        };
+        // `mode:` (Ansible's `cleanup` / `status` selector) is rejected —
+        // we only support the implicit `status` mode; the agent's job
+        // table cleans itself up when the agent dies.
+        if let Some((k, _)) = map.into_iter().next() {
+            return Err(D::Error::custom(format!(
+                "async_status: unknown field {k:?}; only `jid` accepted"
+            )));
+        }
+        Ok(AsyncStatusOp { jid })
+    }
+}
+
+/// `pause:` — controller-side sleep. Blocks the orchestrator for the
+/// rendered duration. `seconds:` and `minutes:` accept int-or-Jinja
+/// (rendered at dispatch). Exactly one of `seconds:` / `minutes:` may
+/// be set; setting both is rejected at parse time.
+///
+/// `prompt:` (interactive pause that waits for human input) is rejected
+/// at parse time — see ANSIBLE_COMPAT.md §8. rsansible is a
+/// non-interactive runner; an interactive prompt would deadlock under
+/// any automated invocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PauseTask {
+    /// Rendered to integer seconds at dispatch. Mutually exclusive with
+    /// `minutes`. Stored as String to support templated values like
+    /// `seconds: "{{ poll_interval * 2 }}"`.
+    pub seconds: Option<String>,
+    /// Rendered to integer minutes at dispatch. Mutually exclusive with
+    /// `seconds`. Same templated-string storage.
+    pub minutes: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PauseTask {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_yaml::Value::deserialize(d)?;
+        // `pause:` with no args at all means "pause indefinitely until
+        // a user hits Enter" in Ansible. For a non-interactive runner
+        // that's a deadlock, not a wait — reject it the same way we
+        // reject `prompt:`.
+        let mut map = match v {
+            serde_yaml::Value::Mapping(m) => m,
+            serde_yaml::Value::Null => {
+                return Err(D::Error::custom(
+                    "pause: requires `seconds:` or `minutes:` — \
+                     interactive (no-arg) pause is rejected by \
+                     rsansible (see ANSIBLE_COMPAT.md §8)",
+                ));
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "pause: expected a mapping with `seconds:` or `minutes:`, got: {other:?}"
+                )));
+            }
+        };
+        if map.remove("prompt").is_some() {
+            return Err(D::Error::custom(
+                "pause: `prompt:` (interactive wait) is not supported — \
+                 rsansible is a non-interactive runner (see ANSIBLE_COMPAT.md §8)",
+            ));
+        }
+        // `echo:` is an Ansible-specific knob for the interactive
+        // prompt path. Since we've already rejected `prompt:`, accepting
+        // a bare `echo:` would be confusing — surface it loudly.
+        if map.remove("echo").is_some() {
+            return Err(D::Error::custom(
+                "pause: `echo:` only applies to interactive `prompt:` mode, \
+                 which rsansible doesn't support (see ANSIBLE_COMPAT.md §8)",
+            ));
+        }
+        let seconds = take_int_or_template_string::<D::Error>(&mut map, "seconds", "pause")?;
+        let minutes = take_int_or_template_string::<D::Error>(&mut map, "minutes", "pause")?;
+        if let Some((k, _)) = map.into_iter().next() {
+            return Err(D::Error::custom(format!(
+                "pause: unknown field {k:?}; only seconds/minutes accepted"
+            )));
+        }
+        if seconds.is_some() && minutes.is_some() {
+            return Err(D::Error::custom(
+                "pause: `seconds:` and `minutes:` are mutually exclusive",
+            ));
+        }
+        if seconds.is_none() && minutes.is_none() {
+            return Err(D::Error::custom(
+                "pause: one of `seconds:` or `minutes:` is required \
+                 (interactive pause without a duration is not supported; \
+                 see ANSIBLE_COMPAT.md §8)",
+            ));
+        }
+        Ok(PauseTask { seconds, minutes })
+    }
+}
+
 /// `debug: { msg: "..." }` or `debug: { var: "name.path" }`. Controller-
 /// side; emits an info-level log line and registers a no-change result.
 /// Exactly one of `msg`/`var` must be set. `verbosity:` is parsed and
 /// ignored — every debug task runs at info level for now.
 #[derive(Debug, Clone, PartialEq)]
+pub enum DebugMsg {
+    /// `msg: "hello"` (or scalar coerced via YAML) — a single
+    /// Jinja-templated string. Rendered as one unit.
+    One(String),
+    /// `msg:` is a YAML list — rendered line-by-line at runtime so
+    /// per-item Jinja expressions stay independent. (YAML
+    /// round-tripping a list of strings re-quotes them, which
+    /// corrupts inline Jinja string literals like
+    /// `{{ '' + foo if cond else '' }}`.)
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DebugTask {
-    pub msg: Option<String>,
+    pub msg: Option<DebugMsg>,
     pub var: Option<String>,
 }
 
@@ -1182,7 +1408,7 @@ impl<'de> Deserialize<'de> for DebugTask {
         // Shorthand: `debug: "string"` → msg=string.
         if let serde_yaml::Value::String(s) = &v {
             return Ok(DebugTask {
-                msg: Some(s.clone()),
+                msg: Some(DebugMsg::One(s.clone())),
                 var: None,
             });
         }
@@ -1196,16 +1422,40 @@ impl<'de> Deserialize<'de> for DebugTask {
         };
         let msg = match map.remove("msg") {
             None | Some(serde_yaml::Value::Null) => None,
-            Some(serde_yaml::Value::String(s)) => Some(s),
-            // Ansible accepts non-string msg (list/dict/number) and
-            // prints them via repr. Accept whatever it is and stringify
-            // via YAML to_string for fidelity.
-            Some(other) => Some(
+            Some(serde_yaml::Value::String(s)) => Some(DebugMsg::One(s)),
+            // A list of strings becomes DebugMsg::Many; each entry is
+            // rendered independently at runtime so embedded Jinja
+            // string literals don't get YAML-escaped through a
+            // round-trip.
+            Some(serde_yaml::Value::Sequence(seq)) => {
+                let mut lines = Vec::with_capacity(seq.len());
+                for item in seq {
+                    match item {
+                        serde_yaml::Value::String(s) => lines.push(s),
+                        other => {
+                            // Non-string entries get YAML-stringified
+                            // for fidelity with Ansible's repr-style
+                            // output (numbers, nested maps, etc.).
+                            lines.push(
+                                serde_yaml::to_string(&other)
+                                    .map_err(D::Error::custom)?
+                                    .trim_end()
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                Some(DebugMsg::Many(lines))
+            }
+            // Ansible accepts non-string/non-list msg (dict/number)
+            // and prints them via repr. Accept whatever it is and
+            // stringify via YAML for fidelity.
+            Some(other) => Some(DebugMsg::One(
                 serde_yaml::to_string(&other)
                     .map_err(D::Error::custom)?
                     .trim_end()
                     .to_string(),
-            ),
+            )),
         };
         let var = match map.remove("var") {
             None | Some(serde_yaml::Value::Null) => None,
@@ -1231,7 +1481,7 @@ impl<'de> Deserialize<'de> for DebugTask {
         if msg.is_none() && var.is_none() {
             // Ansible defaults to msg="Hello world!" when neither is given.
             return Ok(DebugTask {
-                msg: Some("Hello world!".into()),
+                msg: Some(DebugMsg::One("Hello world!".into())),
                 var: None,
             });
         }
@@ -1437,6 +1687,40 @@ impl TaskOp {
                 p.autoremove,
                 p.default_release.clone(),
                 p.allow_unauthenticated,
+            )),
+            TaskOp::Repository(r) => Ok(op_repository(
+                r.manager.wire_byte(),
+                r.repo.clone(),
+                r.state.wire_byte(),
+                r.filename.clone(),
+                r.mode,
+                r.update_cache,
+            )),
+            TaskOp::AsyncStatus(a) => {
+                // `jid` has already been rendered to its final string
+                // form by the orchestrator's render_op pass; we just
+                // parse it to u32 here.
+                let jid: u32 = a.jid.trim().parse().map_err(|e| {
+                    anyhow!("async_status.jid: expected u32 after rendering, got {:?}: {e}", a.jid)
+                })?;
+                Ok(op_async_status(jid))
+            }
+            TaskOp::Iptables(i) => Ok(op_iptables(
+                i.table.clone(),
+                i.chain.clone(),
+                i.protocol.clone(),
+                i.source.clone(),
+                i.destination.clone(),
+                i.source_port.clone(),
+                i.destination_port.clone(),
+                i.in_interface.clone(),
+                i.out_interface.clone(),
+                i.jump.clone(),
+                i.ctstate.clone(),
+                i.comment.clone(),
+                i.ip_version.wire_byte(),
+                i.action.wire_byte(),
+                i.rule_state.wire_byte(),
             )),
             TaskOp::Ufw(u) => Ok(op_ufw(
                 u.op.wire_byte(),
@@ -1996,21 +2280,44 @@ include_role:
     }
 
     #[test]
-    fn vars_on_non_include_role_task_is_rejected() {
-        let err = try_parse_task(
+    fn vars_on_non_include_role_task_lands_in_task_vars() {
+        let t = parse_task(
             r#"
 name: t
 shell: echo hi
 vars:
   x: 1
+  y: "{{ x }}"
 "#,
-        )
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("include_role") && msg.contains("vars"),
-            "got: {msg}"
         );
+        assert!(matches!(t.body, TaskBody::Op(TaskOp::Shell(_))));
+        assert_eq!(t.vars.len(), 2);
+        assert_eq!(t.vars["x"], serde_yaml::Value::from(1));
+        assert_eq!(
+            t.vars["y"],
+            serde_yaml::Value::String("{{ x }}".to_string())
+        );
+    }
+
+    #[test]
+    fn vars_on_include_role_still_routes_to_include_role_spec() {
+        let t = parse_task(
+            r#"
+name: t
+include_role:
+  name: myrole
+vars:
+  x: 1
+"#,
+        );
+        // Include-role consumes vars itself; the task-level slot stays empty.
+        assert!(t.vars.is_empty());
+        match t.body {
+            TaskBody::IncludeRole(spec) => {
+                assert_eq!(spec.vars["x"], serde_yaml::Value::from(1));
+            }
+            other => panic!("expected IncludeRole, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2389,7 +2696,7 @@ debug:
 "#,
         );
         let TaskBody::Debug(d) = t.body else { panic!() };
-        assert_eq!(d.msg.as_deref(), Some("value is {{ foo }}"));
+        assert_eq!(d.msg, Some(DebugMsg::One("value is {{ foo }}".into())));
         assert!(d.var.is_none());
     }
 
@@ -2416,7 +2723,7 @@ debug: hello world
 "#,
         );
         let TaskBody::Debug(d) = t.body else { panic!() };
-        assert_eq!(d.msg.as_deref(), Some("hello world"));
+        assert_eq!(d.msg, Some(DebugMsg::One("hello world".into())));
     }
 
     #[test]
@@ -2428,7 +2735,7 @@ debug: {}
 "#,
         );
         let TaskBody::Debug(d) = t.body else { panic!() };
-        assert_eq!(d.msg.as_deref(), Some("Hello world!"));
+        assert_eq!(d.msg, Some(DebugMsg::One("Hello world!".into())));
     }
 
     #[test]
@@ -2480,8 +2787,8 @@ async: 60
 poll: 5
 "#,
         );
-        assert_eq!(t.async_seconds, Some(60));
-        assert_eq!(t.poll_seconds, Some(5));
+        assert_eq!(t.async_seconds.as_deref(), Some("60"));
+        assert_eq!(t.poll_seconds.as_deref(), Some("5"));
     }
 
     #[test]
@@ -2493,7 +2800,7 @@ shell: sleep 5
 async: 60
 "#,
         );
-        assert_eq!(t.async_seconds, Some(60));
+        assert_eq!(t.async_seconds.as_deref(), Some("60"));
         assert_eq!(t.poll_seconds, None);
     }
 
@@ -2520,6 +2827,201 @@ shell: ok
 async: 0
 "#,
         );
-        assert_eq!(t.async_seconds, Some(0));
+        assert_eq!(t.async_seconds.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn until_list_form_joins_with_and() {
+        let t = parse_task(
+            r#"
+name: t
+shell: probe
+register: r
+until:
+  - r.status == 200
+  - r.json.members | length == 1
+retries: 3
+"#,
+        );
+        // List form is flattened into a single Jinja expr at parse
+        // time — each item wrapped in parens, joined with `and`.
+        assert_eq!(
+            t.until.as_deref(),
+            Some("(r.status == 200) and (r.json.members | length == 1)")
+        );
+    }
+
+    #[test]
+    fn until_empty_list_rejected() {
+        let yaml = r#"
+name: t
+shell: probe
+register: r
+until: []
+retries: 3
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        let err = format!("{:?}", r.err().expect("expected error"));
+        assert!(err.contains("empty list"), "msg: {err}");
+    }
+
+    #[test]
+    fn until_non_string_in_list_rejected() {
+        let yaml = r#"
+name: t
+shell: probe
+register: r
+until:
+  - 42
+retries: 3
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        let err = format!("{:?}", r.err().expect("expected error"));
+        assert!(err.contains("until[0]"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_pause_seconds_literal() {
+        let t = parse_task(
+            r#"
+name: t
+pause:
+  seconds: 3
+"#,
+        );
+        let TaskBody::Pause(p) = t.body else {
+            panic!("expected Pause body, got {:?}", t.body);
+        };
+        assert_eq!(p.seconds.as_deref(), Some("3"));
+        assert_eq!(p.minutes, None);
+    }
+
+    #[test]
+    fn parse_pause_minutes_jinja() {
+        let t = parse_task(
+            r#"
+name: t
+pause:
+  minutes: "{{ wait_minutes }}"
+"#,
+        );
+        let TaskBody::Pause(p) = t.body else {
+            panic!("expected Pause body, got {:?}", t.body);
+        };
+        assert_eq!(p.seconds, None);
+        assert_eq!(p.minutes.as_deref(), Some("{{ wait_minutes }}"));
+    }
+
+    #[test]
+    fn parse_pause_both_units_rejected() {
+        let yaml = r#"
+name: t
+pause:
+  seconds: 5
+  minutes: 1
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        let err = format!("{:?}", r.err().expect("expected error"));
+        assert!(
+            err.contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_pause_no_args_rejected() {
+        // `pause:` with no args means interactive (wait for Enter) in
+        // Ansible. We reject this — interactive wait is not supported.
+        let yaml = r#"
+name: t
+pause:
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        let err = format!("{:?}", r.err().expect("expected error"));
+        assert!(
+            err.contains("ANSIBLE_COMPAT.md") && err.contains("pause"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_pause_neither_unit_rejected() {
+        // Map present but neither seconds nor minutes set. Same rule —
+        // we need a duration.
+        let yaml = r#"
+name: t
+pause: {}
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        let err = format!("{:?}", r.err().expect("expected error"));
+        assert!(
+            err.contains("seconds") && err.contains("minutes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_pause_prompt_rejected() {
+        let yaml = r#"
+name: t
+pause:
+  prompt: "press enter"
+  seconds: 5
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        let err = format!("{:?}", r.err().expect("expected error"));
+        assert!(
+            err.contains("prompt") && err.contains("non-interactive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_pause_unknown_field_rejected() {
+        let yaml = r#"
+name: t
+pause:
+  seconds: 5
+  bogus: 1
+"#;
+        let r: Result<Task, _> = serde_yaml::from_str(yaml);
+        let err = format!("{:?}", r.err().expect("expected error"));
+        assert!(err.contains("bogus"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_pause_fqcn_spelling_works() {
+        // Ansible's namespaced spelling normalizes to the bare token at
+        // the FQCN-rewrite stage. The pause body itself is unchanged.
+        let t = parse_task(
+            r#"
+name: t
+ansible.builtin.pause:
+  seconds: 2
+"#,
+        );
+        let TaskBody::Pause(p) = t.body else {
+            panic!("expected Pause body");
+        };
+        assert_eq!(p.seconds.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn parse_async_jinja_string_form_parses() {
+        // Mirror of retries_jinja_string_form_parses: `async:` / `poll:`
+        // accept templated values that render to ints at dispatch.
+        let t = parse_task(
+            r#"
+name: t
+shell: sleep 5
+async: "{{ (writer_duration_s | int) + 30 }}"
+poll: "{{ poll_interval }}"
+"#,
+        );
+        assert_eq!(
+            t.async_seconds.as_deref(),
+            Some("{{ (writer_duration_s | int) + 30 }}")
+        );
+        assert_eq!(t.poll_seconds.as_deref(), Some("{{ poll_interval }}"));
     }
 }

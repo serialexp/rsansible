@@ -12,10 +12,12 @@ mod exec;
 mod file;
 mod gather_facts;
 mod get_url;
+mod iptables;
 mod lineinfile;
 mod package;
 mod postgresql;
 mod read_file;
+mod repository;
 mod stat;
 mod systemd;
 mod ufw;
@@ -86,6 +88,8 @@ pub fn dispatch<'a>(
             Op::OpAsyncStatus(o) => async_job::run_status(ctx, seq, o, check_mode).await,
             Op::OpReadFile(o) => read_file::run(ctx, seq, o, check_mode).await,
             Op::OpUnarchive(o) => unarchive::run(ctx, seq, o, check_mode).await,
+            Op::OpIptables(o) => iptables::run(ctx, seq, o, check_mode).await,
+            Op::OpRepository(o) => repository::run(ctx, seq, o, check_mode).await,
         }
     })
 }

@@ -53,7 +53,12 @@ pub const OMIT_SENTINEL: &str =
 /// Build a fresh minijinja `Environment` configured for our use.
 pub fn make_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
-    env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    // Ansible playbooks rely on `undefined.attr | default(x)` returning
+    // `x` — a pattern that requires undefined attribute access to *also*
+    // produce undefined (chainable), not raise. minijinja's Lenient mode
+    // raises on attribute access; Chainable matches Ansible's Jinja2
+    // behavior. See ANSIBLE_COMPAT.md (any future entry on undefineds).
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Chainable);
     // Python-method compatibility shim. Ansible playbooks routinely call
     // Python string/dict/list methods inside Jinja expressions —
     // `s.strip()`, `s.split(",")`, `s.startswith("foo")`,
@@ -82,6 +87,12 @@ pub fn make_env<'a>() -> Environment<'a> {
     env.add_filter("to_json", to_json_filter);
     env.add_filter("regex_replace", regex_replace_filter);
     env.add_filter("extract", extract_filter);
+    // Ansible's `random` filter — `{{ 99 | random }}` returns an int
+    // in [0, 99). When applied to a sequence it picks a random element.
+    // No seed/salt args supported (Ansible's optional `start`/`step`
+    // args fall through to mandatory-default semantics that gothab
+    // doesn't use). See ANSIBLE_COMPAT.md.
+    env.add_filter("random", random_filter);
     // `omit` global: see OMIT_SENTINEL doc above. Ansible playbooks rely
     // on the spelling `default(omit)` to make optional fields truly
     // optional rather than getting a stringified empty value.
@@ -302,6 +313,50 @@ fn lookup_one(container: &MjValue, key: &MjValue) -> Result<MjValue, MjError> {
 /// `value | b64encode` — base64-encode a string. Ansible accepts strings
 /// only (its docs note "for binary use the `base64` shell filter"); we
 /// match that. Bytes-by-bytes round-trip with `b64decode`.
+/// `value | random` — Ansible's `random` filter.
+///
+/// - On an integer N (>=0): returns a uniformly random integer in [0, N).
+///   `{{ 9999 | random }}` is the gothab idiom for unique IDs.
+/// - On a sequence: returns one randomly selected element.
+///
+/// We don't implement the optional `start:` / `step:` / `seed:` kwargs —
+/// gothab doesn't use them and Ansible's docs explicitly recommend
+/// `set_fact` + a deterministic generator if you need reproducibility.
+fn random_filter(value: MjValue) -> Result<MjValue, MjError> {
+    use rand::Rng as _;
+    let mut rng = rand::thread_rng();
+    if let Some(n) = value.as_i64() {
+        if n < 0 {
+            return Err(MjError::new(
+                MjKind::InvalidOperation,
+                format!("random: integer argument must be >= 0, got {n}"),
+            ));
+        }
+        if n == 0 {
+            // Ansible returns 0 here; mirror that rather than panicking
+            // on an empty range.
+            return Ok(MjValue::from(0i64));
+        }
+        let r: i64 = rng.gen_range(0..n);
+        return Ok(MjValue::from(r));
+    }
+    if let Some(seq) = value.as_object().and_then(|o| o.try_iter()) {
+        let items: Vec<MjValue> = seq.collect();
+        if items.is_empty() {
+            return Err(MjError::new(
+                MjKind::InvalidOperation,
+                "random: cannot pick from an empty sequence",
+            ));
+        }
+        let idx = rng.gen_range(0..items.len());
+        return Ok(items[idx].clone());
+    }
+    Err(MjError::new(
+        MjKind::InvalidOperation,
+        format!("random: expected an integer or a sequence, got {:?}", value.kind()),
+    ))
+}
+
 fn b64encode_filter(value: MjValue) -> Result<MjValue, MjError> {
     use base64::Engine as _;
     let s = value.as_str().ok_or_else(|| {
@@ -631,9 +686,18 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
                 .map_err(|e| anyhow!("fail.msg: {e}"))?;
         }
         TaskBody::Debug(d) => {
-            if let Some(s) = &d.msg {
-                env.template_from_str(s)
-                    .map_err(|e| anyhow!("debug.msg: {e}"))?;
+            match &d.msg {
+                None => {}
+                Some(crate::playbook::DebugMsg::One(s)) => {
+                    env.template_from_str(s)
+                        .map_err(|e| anyhow!("debug.msg: {e}"))?;
+                }
+                Some(crate::playbook::DebugMsg::Many(lines)) => {
+                    for (i, s) in lines.iter().enumerate() {
+                        env.template_from_str(s)
+                            .map_err(|e| anyhow!("debug.msg[{i}]: {e}"))?;
+                    }
+                }
             }
             if let Some(s) = &d.var {
                 env.template_from_str(s)
@@ -646,6 +710,18 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
                     env.template_from_str(s)
                         .map_err(|e| anyhow!("set_fact.{k}: {e}"))?;
                 }
+            }
+        }
+        TaskBody::Pause(p) => {
+            // Pre-compile any Jinja in `seconds:` / `minutes:` so bad
+            // templates surface at load time, not at the wakeup point.
+            if let Some(s) = &p.seconds {
+                env.template_from_str(s)
+                    .map_err(|e| anyhow!("pause.seconds: {e}"))?;
+            }
+            if let Some(s) = &p.minutes {
+                env.template_from_str(s)
+                    .map_err(|e| anyhow!("pause.minutes: {e}"))?;
             }
         }
         TaskBody::ImportTasks(_) => {
@@ -718,9 +794,14 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 .map_err(|e| anyhow!("exec.stdin: {e}"))?;
         }
         TaskOp::Command(c) => {
-            for (i, a) in c.argv.iter().enumerate() {
-                env.template_from_str(a)
-                    .map_err(|e| anyhow!("command.argv[{i}]: {e}"))?;
+            if let Some(raw) = c.raw_cmd.as_deref() {
+                env.template_from_str(raw)
+                    .map_err(|e| anyhow!("command.cmd: {e}"))?;
+            } else {
+                for (i, a) in c.argv.iter().enumerate() {
+                    env.template_from_str(a)
+                        .map_err(|e| anyhow!("command.argv[{i}]: {e}"))?;
+                }
             }
             env.template_from_str(&c.chdir)
                 .map_err(|e| anyhow!("command.chdir: {e}"))?;
@@ -821,6 +902,14 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("{label}.default_release: {e}"))?;
             }
         }
+        TaskOp::Repository(r) => {
+            env.template_from_str(&r.repo)
+                .map_err(|e| anyhow!("repository.repo: {e}"))?;
+            if !r.filename.is_empty() {
+                env.template_from_str(&r.filename)
+                    .map_err(|e| anyhow!("repository.filename: {e}"))?;
+            }
+        }
         TaskOp::Ufw(u) => {
             // Most ufw fields are rendered as raw strings (proto, direction
             // are gated by parse-time allowlists; rule/state are tokens).
@@ -832,6 +921,37 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 ("ufw.to_port", &u.to_port),
                 ("ufw.interface", &u.interface),
                 ("ufw.comment", &u.comment),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(val)
+                        .map_err(|e| anyhow!("{label}: {e}"))?;
+                }
+            }
+        }
+        TaskOp::AsyncStatus(a) => {
+            // `jid` is Jinja: typically `{{ start_task.ansible_job_id }}`.
+            env.template_from_str(&a.jid)
+                .map_err(|e| anyhow!("async_status.jid: {e}"))?;
+        }
+        TaskOp::Iptables(i) => {
+            // Every string knob on iptables is potentially Jinja
+            // (chain, ports, addresses, jump targets, comment all
+            // commonly come from inventory). Precompile each so a bad
+            // template surfaces at load time, not at the partition
+            // task firing in the middle of a drill.
+            for (label, val) in [
+                ("iptables.table", &i.table),
+                ("iptables.chain", &i.chain),
+                ("iptables.protocol", &i.protocol),
+                ("iptables.source", &i.source),
+                ("iptables.destination", &i.destination),
+                ("iptables.source_port", &i.source_port),
+                ("iptables.destination_port", &i.destination_port),
+                ("iptables.in_interface", &i.in_interface),
+                ("iptables.out_interface", &i.out_interface),
+                ("iptables.jump", &i.jump),
+                ("iptables.ctstate", &i.ctstate),
+                ("iptables.comment", &i.comment),
             ] {
                 if !val.is_empty() {
                     env.template_from_str(val)

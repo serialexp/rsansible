@@ -1396,6 +1396,326 @@ impl From<OpUfwOutput> for OpUfwInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpIptablesInput {
+    pub table: std::string::String,
+    pub chain: std::string::String,
+    pub protocol: std::string::String,
+    pub source: std::string::String,
+    pub destination: std::string::String,
+    pub source_port: std::string::String,
+    pub destination_port: std::string::String,
+    pub in_interface: std::string::String,
+    pub out_interface: std::string::String,
+    pub jump: std::string::String,
+    pub ctstate: std::string::String,
+    pub comment: std::string::String,
+    pub ip_version: u8,
+    pub action: u8,
+    pub rule_state: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpIptablesOutput {
+    pub kind: u8,
+    pub table: std::string::String,
+    pub chain: std::string::String,
+    pub protocol: std::string::String,
+    pub source: std::string::String,
+    pub destination: std::string::String,
+    pub source_port: std::string::String,
+    pub destination_port: std::string::String,
+    pub in_interface: std::string::String,
+    pub out_interface: std::string::String,
+    pub jump: std::string::String,
+    pub ctstate: std::string::String,
+    pub comment: std::string::String,
+    pub ip_version: u8,
+    pub action: u8,
+    pub rule_state: u8,
+}
+
+pub type OpIptables = OpIptablesOutput;
+
+impl OpIptablesInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(20);
+        encoder.write_u16_le(self.table.len() as u16);
+        let string_bytes: &[u8] = self.table.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.chain.len() as u16);
+        let string_bytes: &[u8] = self.chain.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.protocol.len() as u16);
+        let string_bytes: &[u8] = self.protocol.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.source.len() as u16);
+        let string_bytes: &[u8] = self.source.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.destination.len() as u16);
+        let string_bytes: &[u8] = self.destination.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.source_port.len() as u16);
+        let string_bytes: &[u8] = self.source_port.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.destination_port.len() as u16);
+        let string_bytes: &[u8] = self.destination_port.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.in_interface.len() as u16);
+        let string_bytes: &[u8] = self.in_interface.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.out_interface.len() as u16);
+        let string_bytes: &[u8] = self.out_interface.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.jump.len() as u16);
+        let string_bytes: &[u8] = self.jump.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.ctstate.len() as u16);
+        let string_bytes: &[u8] = self.ctstate.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u16_le(self.comment.len() as u16);
+        let string_bytes: &[u8] = self.comment.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.ip_version);
+        encoder.write_byte(self.action);
+        encoder.write_byte(self.rule_state);
+        Ok(())
+    }
+
+}
+
+impl OpIptablesOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 20u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 20, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let table = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let chain = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let protocol = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let source = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let destination = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let source_port = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let destination_port = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let in_interface = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let out_interface = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let jump = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let ctstate = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let comment = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let ip_version = decoder.read_byte()?;
+        let action = decoder.read_byte()?;
+        let rule_state = decoder.read_byte()?;
+        Ok(Self {
+            kind,
+            table,
+            chain,
+            protocol,
+            source,
+            destination,
+            source_port,
+            destination_port,
+            in_interface,
+            out_interface,
+            jump,
+            ctstate,
+            comment,
+            ip_version,
+            action,
+            rule_state,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpIptablesInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpIptablesInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpIptablesOutput> for OpIptablesInput {
+    fn from(o: OpIptablesOutput) -> Self {
+        Self {
+            table: o.table,
+            chain: o.chain,
+            protocol: o.protocol,
+            source: o.source,
+            destination: o.destination,
+            source_port: o.source_port,
+            destination_port: o.destination_port,
+            in_interface: o.in_interface,
+            out_interface: o.out_interface,
+            jump: o.jump,
+            ctstate: o.ctstate,
+            comment: o.comment,
+            ip_version: o.ip_version,
+            action: o.action,
+            rule_state: o.rule_state,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpRepositoryInput {
+    pub manager: u8,
+    pub repo: std::string::String,
+    pub state: u8,
+    pub filename: std::string::String,
+    pub mode: u32,
+    pub update_cache: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpRepositoryOutput {
+    pub kind: u8,
+    pub manager: u8,
+    pub repo: std::string::String,
+    pub state: u8,
+    pub filename: std::string::String,
+    pub mode: u32,
+    pub update_cache: u8,
+}
+
+pub type OpRepository = OpRepositoryOutput;
+
+impl OpRepositoryInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(21);
+        encoder.write_byte(self.manager);
+        encoder.write_u16_le(self.repo.len() as u16);
+        let string_bytes: &[u8] = self.repo.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.state);
+        encoder.write_u16_le(self.filename.len() as u16);
+        let string_bytes: &[u8] = self.filename.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_u32_le(self.mode);
+        encoder.write_byte(self.update_cache);
+        Ok(())
+    }
+
+}
+
+impl OpRepositoryOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 21u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 21, got {}", kind)));
+        }
+        let manager = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let repo = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let state = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let filename = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let mode = decoder.read_u32_le()?;
+        let update_cache = decoder.read_byte()?;
+        Ok(Self {
+            kind,
+            manager,
+            repo,
+            state,
+            filename,
+            mode,
+            update_cache,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpRepositoryInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpRepositoryInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpRepositoryOutput> for OpRepositoryInput {
+    fn from(o: OpRepositoryOutput) -> Self {
+        Self {
+            manager: o.manager,
+            repo: o.repo,
+            state: o.state,
+            filename: o.filename,
+            mode: o.mode,
+            update_cache: o.update_cache,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpUriInput {
     pub method: u8,
     pub url: std::string::String,
@@ -2570,6 +2890,8 @@ pub enum Op {
     OpAsyncStatus(OpAsyncStatusOutput),
     OpReadFile(OpReadFileOutput),
     OpUnarchive(OpUnarchiveOutput),
+    OpIptables(OpIptablesOutput),
+    OpRepository(OpRepositoryOutput),
 }
 
 impl Op {
@@ -3114,6 +3436,89 @@ impl Op {
                     }
                 }
             }
+            Op::OpIptables(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.table.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.table.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.chain.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.chain.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.protocol.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.protocol.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.source.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.source.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.destination.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.destination.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.source_port.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.source_port.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.destination_port.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.destination_port.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.in_interface.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.in_interface.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.out_interface.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.out_interface.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.jump.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.jump.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.ctstate.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.ctstate.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint16(v.comment.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.comment.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.ip_version);
+                encoder.write_uint8(v.action);
+                encoder.write_uint8(v.rule_state);
+            }
+            Op::OpRepository(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint8(v.manager);
+                encoder.write_uint16(v.repo.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.repo.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint16(v.filename.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.filename.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint32(v.mode, Endianness::LittleEndian);
+                encoder.write_uint8(v.update_cache);
+            }
         }
         Ok(())
     }
@@ -3166,6 +3571,10 @@ impl Op {
             Ok(Op::OpReadFile(OpReadFileOutput::decode_with_decoder(decoder)?))
         } else if value == 19 {
             Ok(Op::OpUnarchive(OpUnarchiveOutput::decode_with_decoder(decoder)?))
+        } else if value == 20 {
+            Ok(Op::OpIptables(OpIptablesOutput::decode_with_decoder(decoder)?))
+        } else if value == 21 {
+            Ok(Op::OpRepository(OpRepositoryOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }

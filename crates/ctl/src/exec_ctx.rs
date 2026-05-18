@@ -54,6 +54,13 @@ pub struct HostCtx {
     /// iteration's body and templates; consulted by `build_template_ctx`
     /// to expose `item` (or a renamed `loop_var`).
     pub iter_item: Option<(String, JsonValue)>,
+    /// Transient per-task scoped vars (from `task.vars:`). Set just
+    /// before dispatching a task that declares `vars:`, cleared after
+    /// the task returns. Layered just below `extra_vars` (i.e. above
+    /// registers/set_facts/play_vars/facts/inventory_vars/role_defaults
+    /// but still overridable by CLI `-e`). Empty for tasks without
+    /// `vars:`.
+    pub task_vars: BTreeMap<String, JsonValue>,
     /// Handler names notified by tasks on this host but not yet flushed.
     /// Deduped naturally (BTreeSet). Drained at end-of-play or on
     /// `meta: flush_handlers`.
@@ -120,6 +127,7 @@ impl HostCtx {
             extra_vars: BTreeMap::new(),
             failed: false,
             iter_item: None,
+            task_vars: BTreeMap::new(),
             pending_handlers: BTreeSet::new(),
             wire_cost: WireCost::default(),
             wire_strategy: WireStrategy::default(),
@@ -340,6 +348,12 @@ pub fn build_template_ctx(
     }
     for (k, v) in &ctx.registers {
         out.insert(k.clone(), v.to_json());
+    }
+    // Per-task scoped vars (`task.vars:`). Visible to `when:`, body
+    // fields, templates rendered during this task's dispatch. Beats
+    // every play-scoped layer but loses to CLI extra_vars.
+    for (k, v) in &ctx.task_vars {
+        out.insert(k.clone(), v.clone());
     }
     // `--extra-vars` — Ansible's highest-precedence source. Layered last
     // so it cannot be shadowed by registers, set_facts, play_vars,

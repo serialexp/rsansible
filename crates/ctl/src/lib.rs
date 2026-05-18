@@ -13,6 +13,7 @@ pub mod limit;
 pub mod local;
 pub mod orchestrator;
 pub mod playbook;
+pub mod pool;
 pub mod ssh;
 pub mod tags;
 pub mod template;

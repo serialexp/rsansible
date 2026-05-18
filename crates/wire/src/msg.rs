@@ -295,6 +295,48 @@ pub fn op_package(
     })
 }
 
+/// `manager:` byte values for `OpRepository`. Mirrors the
+/// `package_manager` byte allocation 1:1 so a single auto-detect step
+/// on the agent can pick a backend for both ops. Only `AUTO` and `APT`
+/// have an implementation today; the rest are reserved for future
+/// backends.
+pub mod repository_manager {
+    pub const AUTO: u8 = 0;
+    pub const APT: u8 = 1;
+    pub const DNF: u8 = 2;
+    pub const YUM: u8 = 3;
+    pub const APK: u8 = 4;
+    pub const PACMAN: u8 = 5;
+    pub const ZYPPER: u8 = 6;
+}
+
+/// `state:` byte values for `OpRepository`. Two states: present
+/// (idempotent write of the source-list file), absent (idempotent delete).
+pub mod repository_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_repository(
+    manager: u8,
+    repo: String,
+    state: u8,
+    filename: String,
+    mode: u32,
+    update_cache: bool,
+) -> Op {
+    Op::OpRepository(OpRepositoryOutput {
+        kind: 21,
+        manager,
+        repo,
+        state,
+        filename,
+        mode,
+        update_cache: if update_cache { 1 } else { 0 },
+    })
+}
+
 /// `op:` byte values for `OpUfw`.
 pub mod ufw_op {
     pub const RULE: u8 = 0;
@@ -335,6 +377,66 @@ pub fn op_ufw(
         comment,
         delete: if delete { 1 } else { 0 },
         insert,
+    })
+}
+
+/// `rule_state:` byte values for `OpIptables`.
+pub mod iptables_state {
+    pub const ABSENT: u8 = 0;
+    pub const PRESENT: u8 = 1;
+}
+
+/// `action:` byte values for `OpIptables`.
+pub mod iptables_action {
+    /// `-A <chain>` (default).
+    pub const APPEND: u8 = 0;
+    /// `-I <chain>` (prepend at position 1).
+    pub const INSERT: u8 = 1;
+}
+
+/// `ip_version:` byte values for `OpIptables`.
+pub mod iptables_ip_version {
+    /// `iptables` (IPv4, default).
+    pub const V4: u8 = 4;
+    /// `ip6tables` (IPv6).
+    pub const V6: u8 = 6;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_iptables(
+    table: String,
+    chain: String,
+    protocol: String,
+    source: String,
+    destination: String,
+    source_port: String,
+    destination_port: String,
+    in_interface: String,
+    out_interface: String,
+    jump: String,
+    ctstate: String,
+    comment: String,
+    ip_version: u8,
+    action: u8,
+    rule_state: u8,
+) -> Op {
+    Op::OpIptables(OpIptablesOutput {
+        kind: 20,
+        table,
+        chain,
+        protocol,
+        source,
+        destination,
+        source_port,
+        destination_port,
+        in_interface,
+        out_interface,
+        jump,
+        ctstate,
+        comment,
+        ip_version,
+        action,
+        rule_state,
     })
 }
 

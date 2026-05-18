@@ -267,6 +267,7 @@ fn validate_task(task: &Task, where_: &str, ti: usize) -> Result<()> {
         }
         TaskBody::Fail(_) => {}
         TaskBody::Debug(_) => {}
+        TaskBody::Pause(_) => {}
         TaskBody::ImportTasks(p) => {
             // After load(), this shouldn't appear. Treat it as an error so a
             // caller that bypasses load() (parse + validate manually) sees a
@@ -363,7 +364,12 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
         TaskOp::Exec(e) if e.argv.is_empty() => {
             bail!("{}: task[{ti}] {:?}: exec.argv is empty", where_, task.name)
         }
-        TaskOp::Command(c) if c.argv.is_empty() => {
+        TaskOp::Command(c) if c.argv.is_empty() && c.raw_cmd.is_none() => {
+            // Either the parsed argv-list form must be non-empty, or
+            // the user supplied a `cmd:` / shorthand string which we
+            // shlex at render time (so argv stays empty at validate
+            // time but raw_cmd carries the source). Both empty means
+            // the deserializer produced an invalid CommandOp.
             bail!(
                 "{}: task[{ti}] {:?}: command.argv is empty",
                 where_,
@@ -598,6 +604,16 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
                         task.name
                     );
                 }
+            }
+            Ok(())
+        }
+        TaskOp::Repository(r) => {
+            if r.repo.trim().is_empty() {
+                bail!(
+                    "{}: task[{ti}] {:?}: repository.repo is empty",
+                    where_,
+                    task.name
+                );
             }
             Ok(())
         }

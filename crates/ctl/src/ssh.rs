@@ -31,6 +31,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, info, warn};
 
+use crate::become_::BecomeKey;
+
 /// Trait alias bundling the duplex-stream traits we need for the
 /// orchestrator-to-agent pipe, plus `Send + Unpin` so it can flow
 /// through tokio's mutex / boxed-future plumbing. A blanket impl
@@ -112,10 +114,19 @@ pub struct AgentConn {
 /// Variant per transport — the orchestrator never matches on this,
 /// it exists only so dropping the conn drops the right resource.
 pub enum TransportKeepalive {
+    /// Standalone SSH conn. Drops the session at conn-close. Used by
+    /// the legacy `connect_and_push` wrapper (tests) and by any
+    /// future single-shot callers that don't want a pool.
     Ssh(Handle<Client>),
     /// Local subprocess child. We wait on it at conn-close time so
-    /// orphan agents don't accumulate.
+    /// orphan agents don't accumulate. Used by both standalone and
+    /// pool-managed local conns (each subprocess is independent).
     Local(Box<tokio::process::Child>),
+    /// This conn is one slot of an `AgentPool` — the pool owns the
+    /// underlying transport (e.g., the SSH `Handle`) and outlives
+    /// any single slot. Dropping a pool slot tears down only the
+    /// slot's channel; the session stays open for other slots.
+    Pooled,
 }
 
 #[derive(Clone)]
@@ -138,8 +149,31 @@ impl client::Handler for Client {
     }
 }
 
-/// Connect + auth + arch-probe + upload-agent + exec-agent + read-Hello.
-pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Result<AgentConn> {
+/// Established SSH session with the agent binary already pushed.
+/// Holds the russh `Handle` (the session keepalive) and the remote
+/// path of the uploaded binary; agent channels are spawned on
+/// demand by `spawn_agent_channel`.
+///
+/// Used by `AgentPool` (pool.rs) to lazily open one channel per
+/// distinct `BecomeKey`. Standalone callers can also use this
+/// directly via `connect_and_push`, which seeds a single
+/// `BecomeKey::None` agent and packages everything into one
+/// keepalive-bearing `AgentConn`.
+pub struct SshSession {
+    pub handle: Handle<Client>,
+    pub remote_path: String,
+    pub label: String,
+}
+
+/// Connect + auth + arch probe + push binary. Returns the established
+/// session without spawning an agent channel — pool callers want to
+/// spawn channels lazily per `BecomeKey`, so we don't presume the
+/// first BecomeKey here.
+///
+/// All the slow / fallible network work happens in this function;
+/// `spawn_agent_channel` against the returned session is cheap
+/// (one channel open + Hello + clock-skew probe = ~1 RTT total).
+pub async fn open_session(opts: &ConnectOptions, agent_binary: &[u8]) -> Result<SshSession> {
     let label = format!("{}@{}:{}", opts.user, opts.host, opts.port);
 
     let config = Arc::new(client::Config {
@@ -176,29 +210,80 @@ pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Res
         .await
         .with_context(|| format!("pushing agent to {label}:{remote_path}"))?;
 
-    let channel = handle
+    Ok(SshSession { handle, remote_path, label })
+}
+
+/// Open a new channel on the given session and exec the agent under
+/// the right user. `BecomeKey::None` runs the agent as the SSH user;
+/// `BecomeKey::As(u)` wraps in `sudo -n -u <u> -- <agent>`. Reads the
+/// `Hello` frame and runs the clock-skew probe.
+///
+/// The returned `AgentConn` carries `TransportKeepalive::Pooled` —
+/// the pool owns the session, slot drop doesn't tear it down.
+pub async fn spawn_agent_channel(
+    session: &SshSession,
+    key: &BecomeKey,
+) -> Result<AgentConn> {
+    // `RSANSIBLE_AGENT_KEEP_BINARY=1` tells the agent NOT to self-unlink its
+    // on-disk binary at startup. The pool may spawn additional agents (one
+    // per become-config) from the same on-disk path within the same SSH
+    // session, so the file must persist for the lifetime of the session.
+    // Controller-side cleanup happens via Bye / session close.
+    let cmd = match key {
+        BecomeKey::None => format!(
+            "RSANSIBLE_AGENT_KEEP_BINARY=1 {}",
+            session.remote_path,
+        ),
+        // `sudo -n` makes sudo fail fast rather than prompt for a password —
+        // any deployment that needs `become: true` must have NOPASSWD
+        // sudoers entries, matching Ansible's default for ssh + become.
+        //
+        // Sudo's default `env_reset` strips RSANSIBLE_AGENT_KEEP_BINARY from
+        // the caller env, so we use `env VAR=VAL <cmd>` after the sudo
+        // boundary to set it for the agent itself. `env` lives in sudoers'
+        // default `secure_path`, so this is universally available.
+        BecomeKey::As(user) => format!(
+            "sudo -n -u {user} -- env RSANSIBLE_AGENT_KEEP_BINARY=1 {p}",
+            p = session.remote_path,
+            user = user,
+        ),
+    };
+
+    let channel = session
+        .handle
         .channel_open_session()
         .await
-        .with_context(|| format!("opening agent exec channel to {label}"))?;
+        .with_context(|| format!("opening agent exec channel to {}", session.label))?;
     channel
-        .exec(true, remote_path.as_bytes())
+        .exec(true, cmd.as_bytes())
         .await
-        .with_context(|| format!("exec {remote_path} on {label}"))?;
+        .with_context(|| format!("exec {cmd} on {}", session.label))?;
 
     let mut stream = channel.into_stream();
 
     let first = read_frame(&mut stream)
         .await
-        .with_context(|| format!("reading Hello from {label}"))?
-        .ok_or_else(|| anyhow!("agent on {label} closed stdout before sending Hello"))?;
+        .with_context(|| format!("reading Hello from {} ({})", session.label, key.label()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "agent on {} ({}) closed stdout before sending Hello",
+                session.label,
+                key.label()
+            )
+        })?;
     let hello = match first {
         Message::Hello(h) => h,
-        other => bail!("first frame from {label} was not Hello: {other:?}"),
+        other => bail!(
+            "first frame from {} ({}) was not Hello: {other:?}",
+            session.label,
+            key.label()
+        ),
     };
     info!(
-        host = %label,
+        host = %session.label,
         agent_version = %hello.agent_version,
         kernel = %hello.kernel,
+        become = %key.label(),
         "agent up",
     );
 
@@ -206,31 +291,50 @@ pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Res
     // fails for any reason we proceed with offset=0 rather than aborting
     // the whole connection — task timing traces become less accurate
     // but everything else still works.
-    let (clock_offset_ns, clock_rtt_ns) = match probe_clock_skew(&mut stream, &label).await {
-        Ok((offset, rtt)) => {
-            info!(
-                host = %label,
-                offset_us = offset / 1_000,
-                rtt_us = rtt / 1_000,
-                "clock-skew probe done",
-            );
-            (offset, rtt)
-        }
-        Err(e) => {
-            warn!(host = %label, "clock-skew probe failed (continuing with offset=0): {e:#}");
-            (0, 0)
-        }
-    };
+    let (clock_offset_ns, clock_rtt_ns) =
+        match probe_clock_skew(&mut stream, &session.label).await {
+            Ok((offset, rtt)) => {
+                info!(
+                    host = %session.label,
+                    become = %key.label(),
+                    offset_us = offset / 1_000,
+                    rtt_us = rtt / 1_000,
+                    "clock-skew probe done",
+                );
+                (offset, rtt)
+            }
+            Err(e) => {
+                warn!(host = %session.label, become = %key.label(), "clock-skew probe failed (continuing with offset=0): {e:#}");
+                (0, 0)
+            }
+        };
 
     Ok(AgentConn {
-        label,
-        remote_path,
+        label: session.label.clone(),
+        remote_path: session.remote_path.clone(),
         hello,
         stream: Box::pin(stream),
         clock_offset_ns,
         clock_rtt_ns,
-        _keepalive: TransportKeepalive::Ssh(handle),
+        _keepalive: TransportKeepalive::Pooled,
     })
+}
+
+/// Connect + auth + arch-probe + upload-agent + exec-agent + read-Hello.
+///
+/// Thin convenience wrapper preserving the legacy single-conn shape:
+/// opens a session, spawns one `BecomeKey::None` agent channel,
+/// transfers the session `Handle` into the returned conn's
+/// `_keepalive` so the conn fully owns the SSH session. Used by
+/// standalone callers (smoke tests, profilers) — the orchestrator
+/// switched to the pool API.
+pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Result<AgentConn> {
+    let session = open_session(opts, agent_binary).await?;
+    let mut conn = spawn_agent_channel(&session, &BecomeKey::None).await?;
+    // Transfer the Handle into the conn — without a pool around it,
+    // the conn IS the keepalive.
+    conn._keepalive = TransportKeepalive::Ssh(session.handle);
+    Ok(conn)
 }
 
 /// Drive one Ping/Pong round to estimate the agent's clock offset from

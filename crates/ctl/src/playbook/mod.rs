@@ -22,11 +22,15 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
-    classify_sql_readonly, AssertTask, BlockInFileOp, BlockInFileState, BlockSpec, CommandOp,
-    CopyOp, DebugTask, ExecOp,
-    FailTask, FileOp, FileState, GetUrlOp, IncludeRoleSpec, LineInFileOp, LineInFileState,
+    classify_sql_readonly, AssertTask, AsyncStatusOp, BlockInFileOp, BlockInFileState, BlockSpec,
+    CommandOp,
+    CopyOp, DebugMsg, DebugTask, ExecOp,
+    FailTask, FileOp, FileState, GetUrlOp, IncludeRoleSpec, IptablesAction, IptablesIpVersion,
+    IptablesOp, IptablesRuleState, LineInFileOp, LineInFileState,
     LoopControl, LoopSpec, MetaAction, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageManager,
-    PackageOp, PackageState, PostgresqlExtOp, PostgresqlQueryOp, SetFactMap, ShellOp, SlurpOp,
+    PackageOp, PackageState, PauseTask, PostgresqlExtOp, PostgresqlQueryOp,
+    RepositoryManager, RepositoryOp, RepositoryState, SetFactMap, ShellOp,
+    SlurpOp,
     StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp, TempfileKind, TempfileOp,
     UfwOp, UfwOpKind, UnarchiveOp, UriOp, WaitForOp, WaitForState, WriteFileOp,
     X509CertificatePipeOp,

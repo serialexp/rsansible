@@ -422,6 +422,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_task_dispatch_repository() {
+        // present, apt-pinned, explicit filename + mode + update_cache.
+        roundtrip(msg::task_dispatch(
+            120,
+            false,
+            msg::op_repository(
+                msg::repository_manager::APT,
+                "deb [signed-by=/etc/apt/keyrings/pg.asc] https://apt.postgresql.org/pub/repos/apt focal-pgdg main".into(),
+                msg::repository_state::PRESENT,
+                "pgdg".into(),
+                0o644,
+                true,
+            ),
+        ))
+        .await;
+        // absent, auto-manager, derived filename (empty string on the wire).
+        roundtrip(msg::task_dispatch(
+            121,
+            false,
+            msg::op_repository(
+                msg::repository_manager::AUTO,
+                "deb https://example.com/repo focal main".into(),
+                msg::repository_state::ABSENT,
+                String::new(),
+                0,
+                false,
+            ),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrip_task_dispatch_stat() {
         roundtrip(msg::task_dispatch(
             102,

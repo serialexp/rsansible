@@ -183,3 +183,48 @@ Vault).
 For reference, v0 today is roughly 2000 LoC across all crates. So
 running gothab is a ~3.5× larger codebase than what's there now. Not
 absurd, but it's a real project, not a weekend.
+
+## drill-failover blockers surfaced 2026-05-18
+
+Two `block:`-related orchestrator bugs found by running gothab's
+drill-failover.yml live and fixed in the same session; one
+playbook-level dependency surfaced after, NOT yet implemented:
+
+1. **(FIXED)** `run_once:` on tasks nested inside a `block:` deadlocked
+   in production. Root cause: non-runner hosts awaited
+   `OnceCell::get_or_init(|| pending().await)`, which holds the cell's
+   init slot — so the runner's later `cell.set(...)` returned Err
+   (swallowed by `let _ =`) and the awaiter never woke. Replaced
+   the bare `OnceCell` with a `RunOnceSlot { cell: OnceCell, notify:
+   Notify }` so `publish()` actually wakes external `wait()`ers.
+   Live drill now progresses through the entire block.
+
+2. **(FIXED)** `register:` from an `async: N` task (with `poll: 0`)
+   didn't surface `ansible_job_id` at the register top level, so the
+   follow-up `async_status: jid: "{{ writer_async.ansible_job_id }}"`
+   rendered to `""` and failed with "expected u32 after rendering,
+   got ''". Added `lift_async_envelope` mirroring the existing
+   per-module lift pattern (postgresql_query, slurp, etc.); called
+   from the orchestrator when `async_wrap.is_some()` OR the inner op
+   is `AsyncStatus`.
+
+3. **(OPEN)** Cross-host `hostvars[<peer>].writer_data` access in
+   templates. drill-failover's `[writer] Aggregate writer outcomes`
+   task does:
+   ```
+   groups['postgres']
+     | map('extract', hostvars, 'writer_data')
+     | map(attribute='attempts') | flatten
+   ```
+   …which needs `hostvars` to expose facts/registers set on OTHER
+   hosts during the current run. Currently fails at template render
+   with `undefined value`. This is a real rsansible feature gap, not
+   a bug — Ansible's `hostvars` is a controller-side cross-host view
+   into the in-progress run's per-host state. Implementing it cleanly
+   needs:
+   - shared (read-only) snapshot of every host's set_facts +
+     registers at template-render time
+   - exposed under `hostvars[<host_name>]` in the Jinja env
+   - probably populated lazily from the per-host ctxs map the
+     orchestrator already maintains
+   Scope: probably 50-100 LoC plus tests. Not in the current commit.

@@ -22,7 +22,7 @@
 //!     ~milliseconds.
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::task::{Context as TaskContext, Poll};
@@ -32,6 +32,7 @@ use tracing::{info, warn};
 
 use rsansible_wire::{read_frame, Message};
 
+use crate::become_::BecomeKey;
 use crate::ssh::{AgentConn, BoxedAgentStream, TransportKeepalive};
 
 /// Bidirectional adapter: wraps the child's stdin (write side) and
@@ -85,29 +86,35 @@ impl AsyncWrite for LocalStdioStream {
     }
 }
 
-/// Spawn the agent binary as a subprocess and bring up a wire-level
-/// `AgentConn` against its stdio. Mirrors `ssh::connect_and_push` for
-/// the SSH path: writes the agent bytes to a temp file, execs it,
-/// reads the `Hello` frame, runs the clock-skew probe (offset will
-/// be near-zero — same machine), returns the conn.
+/// Local-transport analog of [`crate::ssh::SshSession`]: holds the
+/// on-disk path of the materialized agent binary plus a display
+/// label. Cheap to clone shape-wise (only owned strings/paths) — the
+/// expensive step is `write_agent_binary` which lays the bytes down.
 ///
-/// `agent_binary` is the in-memory bytes loaded by the CLI; we
-/// materialize them to a temp file on the controller filesystem and
-/// chmod +x before spawning. The temp file lives only for the
-/// duration of this function (we keep its path inside the conn so
-/// the process can keep mmap'ing it, but the unlink-on-drop is
-/// handled by `tempfile` after the child has started — Linux keeps
-/// the inode alive while the process holds a reference).
-pub async fn connect_local(
-    label: String,
-    agent_binary: &[u8],
-) -> Result<AgentConn> {
-    // Materialize the agent on disk so we can exec it. We use a
-    // `NamedTempFile` for the spawn step then immediately detach the
-    // path via `.into_temp_path()` so we can `keep()` it for the run
-    // — Linux holds the inode alive via the running process, but the
-    // explicit path makes troubleshooting easier when something goes
-    // sideways mid-run.
+/// One session backs N pooled processes (one per [`BecomeKey`]).
+/// Each `spawn_agent_process` call execs the same binary path under
+/// a different identity.
+pub struct LocalSession {
+    pub agent_path: PathBuf,
+    pub label: String,
+}
+
+/// Materialize the agent bytes to a temp file on the controller
+/// filesystem and chmod 0700. Returns the kept path — the file lives
+/// for the rest of the run and the OS reaps `$TMPDIR` eventually.
+///
+/// We use `NamedTempFile::into_temp_path().keep()` rather than a
+/// permanent file by hand because the intermediate `TempPath` gives
+/// us atomic-create-with-unique-suffix without us writing the
+/// retry-on-collision loop. Linux holds the inode alive via every
+/// child process that has it open, so even if `$TMPDIR` is on a
+/// short-lived tmpfs we're fine for the duration of any pooled
+/// agents.
+///
+/// Splitting "materialize" from "spawn" lets the pool write the
+/// binary once and spawn N child processes (one per `BecomeKey`)
+/// against the same path — instead of N temp files.
+pub fn write_agent_binary(agent_binary: &[u8]) -> Result<PathBuf> {
     let mut tf = tempfile::Builder::new()
         .prefix("rsansible-agent-")
         .tempfile()
@@ -123,21 +130,50 @@ pub async fn connect_local(
     std::fs::set_permissions(tf.path(), perms)
         .context("chmod 0700 on local agent temp file")?;
     let agent_path = tf.into_temp_path();
-    // Detach: file stays around for the run, deleted when the
-    // returned `agent_path` is dropped at end-of-conn. We hold the
-    // `TempPath` inside the conn via the Child handle's drop guard
-    // — but tokio's `Child` doesn't have a slot for arbitrary
-    // payloads, so instead we just `keep()` and rely on a temp-dir
-    // cleanup; the path is in $TMPDIR so it gets reaped by the OS.
-    let agent_path: std::path::PathBuf = agent_path.keep().context("keep agent temp file")?;
-    spawn_against_path(label, &agent_path).await
+    let agent_path: PathBuf = agent_path.keep().context("keep agent temp file")?;
+    Ok(agent_path)
 }
 
-/// Lower-level entry: spawn an already-on-disk agent path. Useful
-/// for tests where you don't want the bytes-to-tempfile round-trip
-/// and have a real path already.
-pub async fn spawn_against_path(label: String, agent_path: &Path) -> Result<AgentConn> {
-    let mut child = Command::new(agent_path)
+/// Spawn one agent process against an already-materialized binary
+/// path under the identity implied by `key`. Mirrors
+/// `ssh::spawn_agent_channel` for the local transport: child stdin /
+/// stdout become the wire, Hello is read, clock-skew probe runs,
+/// returns an [`AgentConn`].
+///
+/// `BecomeKey::None` execs the binary directly — the agent runs as
+/// the controller user.
+/// `BecomeKey::As(u)` wraps in `sudo -n -u <u> -- <agent>` — same
+/// non-interactive contract as the SSH path, NOPASSWD required, no
+/// prompt fallback.
+///
+/// The returned `AgentConn` carries `TransportKeepalive::Local(child)`
+/// — the conn owns its child process, so dropping the conn reaps it.
+pub async fn spawn_agent_process(
+    session: &LocalSession,
+    key: &BecomeKey,
+) -> Result<AgentConn> {
+    // `RSANSIBLE_AGENT_KEEP_BINARY=1` tells the agent NOT to self-unlink
+    // its on-disk binary at startup. The pool may spawn additional agents
+    // (one per become-config) from the same on-disk path during the same
+    // run, so the file must persist for the lifetime of the LocalSession.
+    let mut command = match key {
+        BecomeKey::None => {
+            let mut c = Command::new(&session.agent_path);
+            c.env("RSANSIBLE_AGENT_KEEP_BINARY", "1");
+            c
+        }
+        // `sudo -n` — fail fast if a password would be prompted,
+        // matching the SSH path's `become` contract. Sudo's default
+        // `env_reset` strips the caller env, so route through `env`
+        // to set the keep-binary var for the agent itself.
+        BecomeKey::As(user) => {
+            let mut c = Command::new("sudo");
+            c.args(["-n", "-u", user.as_str(), "--", "env", "RSANSIBLE_AGENT_KEEP_BINARY=1"]);
+            c.arg(&session.agent_path);
+            c
+        }
+    };
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // stderr inherits — agent logs land in the controller's
@@ -145,7 +181,13 @@ pub async fn spawn_against_path(label: String, agent_path: &Path) -> Result<Agen
         // explicitly opted into local execution.
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("spawning local agent {:?}", agent_path))?;
+        .with_context(|| {
+            format!(
+                "spawning local agent {:?} ({})",
+                session.agent_path,
+                key.label()
+            )
+        })?;
 
     let stdin = child
         .stdin
@@ -159,17 +201,34 @@ pub async fn spawn_against_path(label: String, agent_path: &Path) -> Result<Agen
 
     let first = read_frame(&mut stream)
         .await
-        .with_context(|| format!("reading Hello from local agent {label}"))?
-        .ok_or_else(|| anyhow!("local agent {label} closed stdout before sending Hello"))?;
+        .with_context(|| {
+            format!(
+                "reading Hello from local agent {} ({})",
+                session.label,
+                key.label()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "local agent {} ({}) closed stdout before sending Hello",
+                session.label,
+                key.label()
+            )
+        })?;
     let hello = match first {
         Message::Hello(h) => h,
-        other => bail!("first frame from local agent {label} was not Hello: {other:?}"),
+        other => bail!(
+            "first frame from local agent {} ({}) was not Hello: {other:?}",
+            session.label,
+            key.label()
+        ),
     };
     info!(
-        host = %label,
+        host = %session.label,
         agent_version = %hello.agent_version,
         kernel = %hello.kernel,
         transport = "local",
+        become = %key.label(),
         "agent up",
     );
 
@@ -180,21 +239,44 @@ pub async fn spawn_against_path(label: String, agent_path: &Path) -> Result<Agen
     // the heuristic will naturally pick blind for everything, which
     // is the right default for "same machine".
     let (clock_offset_ns, clock_rtt_ns) =
-        match crate::ssh::probe_clock_skew(&mut stream, &label).await {
+        match crate::ssh::probe_clock_skew(&mut stream, &session.label).await {
             Ok((offset, rtt)) => (offset, rtt),
             Err(e) => {
-                warn!(host = %label, "local clock-skew probe failed (continuing): {e:#}");
+                warn!(host = %session.label, become = %key.label(), "local clock-skew probe failed (continuing): {e:#}");
                 (0, 0)
             }
         };
 
     Ok(AgentConn {
-        label: label.clone(),
-        remote_path: agent_path.to_string_lossy().into_owned(),
+        label: session.label.clone(),
+        remote_path: session.agent_path.to_string_lossy().into_owned(),
         hello,
         stream: Box::pin(stream) as BoxedAgentStream,
         clock_offset_ns,
         clock_rtt_ns,
         _keepalive: TransportKeepalive::Local(Box::new(child)),
     })
+}
+
+/// Thin convenience wrapper preserving the legacy single-conn shape:
+/// materializes the agent and spawns one `BecomeKey::None` child.
+/// Used by standalone callers (smoke tests, profilers) and by the
+/// orchestrator's initial connect phase until the pool refactor
+/// lands at the dispatch sites.
+pub async fn connect_local(label: String, agent_binary: &[u8]) -> Result<AgentConn> {
+    let agent_path = write_agent_binary(agent_binary)?;
+    let session = LocalSession { agent_path, label };
+    spawn_agent_process(&session, &BecomeKey::None).await
+}
+
+/// Lower-level entry retained for tests that have a real on-disk
+/// path already (e.g. point at `target/release/rsansible-agent`).
+/// Equivalent to constructing a `LocalSession` and calling
+/// `spawn_agent_process(&session, &BecomeKey::None)`.
+pub async fn spawn_against_path(label: String, agent_path: &Path) -> Result<AgentConn> {
+    let session = LocalSession {
+        agent_path: agent_path.to_path_buf(),
+        label,
+    };
+    spawn_agent_process(&session, &BecomeKey::None).await
 }
