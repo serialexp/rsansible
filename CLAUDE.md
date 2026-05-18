@@ -472,6 +472,75 @@ this one silently doesn't."
 [`AgentPool`]: ./crates/ctl/src/pool.rs
 [`BecomeKey`]: ./crates/ctl/src/become_.rs
 
+## Dynamic `hostvars[<peer>]`: snapshot between tasks, not on every render
+
+Ansible exposes `hostvars` as a controller-side view into every host's
+current state — `{{ hostvars[other].some_register }}` resolves to the
+value `other` registered earlier in the run, not the static inventory
+snapshot. rsansible implements the same shape, with the freshness
+window pinned to **task barriers** rather than per-render.
+
+### The rules
+
+1. **`build_world_vars` produces the static layer only.** Each peer's
+   view is seeded from inventory (`all_vars` → group_vars → host_vars
+   → host-inline → connection coords). This snapshot is built once at
+   run start and never mutated; same shape Ansible exposes for hosts
+   that have not yet had a task run on them.
+
+2. **`merge_dynamic_hostvars(base, ctxs)` overlays the live state.**
+   For every host's current `HostCtx`, the function layers (low →
+   high) `facts → play_vars → set_facts → registers → extra_vars`
+   on top of the static base, and stamps `inventory_hostname` into
+   the view. Precedence mirrors `build_template_ctx`, **excluding**:
+   - `iter_item` / `task_vars` — transient on the owning host; a
+     peer's loop item must not leak into another host's
+     `hostvars[…]` lookup.
+   - `ansible_failed_*` — local to the host whose rescue arm is
+     running.
+   - `groups` / `hostvars` themselves — world-scoped; would recurse.
+
+3. **Refresh happens at the per-task barrier, never mid-fanout.**
+   `run_play_per_task` calls `merge_dynamic_hostvars` once per task
+   iteration (and once before `flush_handlers`), wrapping the result
+   in a fresh `Arc<WorldVars>` that the fanout broadcasts to every
+   per-host walker. At that point all `HostCtx`s are back in `ctxs`
+   (the fanout owns them by-value during dispatch and re-inserts via
+   `apply_per_host_result` before the next task) — no locking needed.
+
+4. **Semantics: hosts see each other's state as it was at the start
+   of the current task.** Within one fanout, hosts don't observe
+   each other's mid-task mutations. This matches Ansible's per-task
+   barrier exactly — registers from task N are visible to task N+1's
+   `hostvars[<peer>]` lookups; references to in-flight values within
+   task N return the prior-task snapshot.
+
+5. **`run_play_per_play` is NOT YET wired.** Each host walks the
+   task list independently with no natural barrier, so a snapshot
+   point would race with concurrent ctx mutations. Per_play
+   hostvars remain the static inventory snapshot. Documented at the
+   call site; if a real playbook needs dynamic hostvars under
+   per_play we plumb `Arc<RwLock<HostCtx>>` and snapshot per-render.
+
+### Why a snapshot per task and not lazy per-render
+
+The clean alternative is a minijinja dynamic-object proxy that
+resolves `hostvars[h].x` against a live ctxs reference at lookup
+time. That's the gold standard but it costs:
+- `Arc<RwLock<…>>` around every `HostCtx` so the current host's
+  fanout-owned `&mut HostCtx` doesn't lock out peer reads.
+- A custom `Object`/`Value` impl plus careful Send+Sync proof.
+- Per-render lock acquisition.
+
+The snapshot approach gives us identical Ansible-faithful semantics
+(per-task barrier visibility) for a 50-line pure function and an
+extra `Arc::new(…)` per task. The amortized cost is dwarfed by the
+network/agent dispatch that follows. We can graduate to a live
+proxy if the snapshot ever shows up in profiles — but `BTreeMap`
+clones at scale are still cheap relative to one SSH round-trip.
+
+[`merge_dynamic_hostvars`]: ./crates/ctl/src/orchestrator.rs
+
 ## Every bug fix ships with a regression test
 
 If you fix a bug, you write a test that **fails against the old code

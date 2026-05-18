@@ -208,23 +208,34 @@ playbook-level dependency surfaced after, NOT yet implemented:
    from the orchestrator when `async_wrap.is_some()` OR the inner op
    is `AsyncStatus`.
 
-3. **(OPEN)** Cross-host `hostvars[<peer>].writer_data` access in
-   templates. drill-failover's `[writer] Aggregate writer outcomes`
-   task does:
-   ```
-   groups['postgres']
-     | map('extract', hostvars, 'writer_data')
-     | map(attribute='attempts') | flatten
-   ```
-   …which needs `hostvars` to expose facts/registers set on OTHER
-   hosts during the current run. Currently fails at template render
-   with `undefined value`. This is a real rsansible feature gap, not
-   a bug — Ansible's `hostvars` is a controller-side cross-host view
-   into the in-progress run's per-host state. Implementing it cleanly
-   needs:
-   - shared (read-only) snapshot of every host's set_facts +
-     registers at template-render time
-   - exposed under `hostvars[<host_name>]` in the Jinja env
-   - probably populated lazily from the per-host ctxs map the
-     orchestrator already maintains
-   Scope: probably 50-100 LoC plus tests. Not in the current commit.
+3. **(FIXED for per_task strategy)** Cross-host `hostvars[<peer>].…`
+   access into the running play's per-host state (facts, set_facts,
+   registers, plus `inventory_hostname`). `merge_dynamic_hostvars`
+   rebuilds `world.hostvars` from every host's current `HostCtx`
+   before each task (and the implicit end-of-play flush). Since all
+   ctxs are back in the map at task boundaries — the fanout owns
+   them by-value mid-task and re-inserts via `apply_per_host_result`
+   — no locking is needed.
+   - **Open: per_play strategy** — each host walks the task list
+     independently with no natural barrier, so a snapshot point
+     would race with concurrent ctx mutations. Per_play hostvars
+     remain the static inventory snapshot for now; if a real
+     playbook hits it we plumb `Arc<RwLock<HostCtx>>` and snapshot
+     per-render.
+
+## Test-infrastructure flake (pre-existing)
+
+- [ ] **ETXTBSY race in stub-script tests.** A handful of agent tests
+  (`getent`, `hostname`, `pip`, possibly others) write a small shell
+  script into a tempdir and then exec it. When several such tests
+  run in parallel, Linux returns ETXTBSY for one of the execs:
+  thread A finishes its `std::fs::write` (closes its fd in A's
+  parent), but thread B forked between A's open and close — B's
+  child inherited A's write fd and still holds it open until B's
+  child execs. A's subsequent exec of its own script sees the
+  inherited write fd from B's child and refuses with ETXTBSY.
+  Rate: maybe 1 in 5 full-workspace runs. Re-running fixes it.
+  Real fix: process-wide mutex around the write-then-exec window in
+  the test helpers, OR a single shared write_script helper that
+  serialises across the binary. Out of scope for now — flake is
+  rare enough that it's noise, not a blocker.

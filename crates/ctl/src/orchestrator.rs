@@ -646,6 +646,79 @@ fn build_world_vars_for_play(base: &WorldVars, play: &Play) -> WorldVars {
     }
 }
 
+/// Rebuild `world.hostvars` overlaying each host's **dynamic** state
+/// (facts → play_vars → set_facts → registers → extra_vars +
+/// `inventory_hostname`) on top of the inventory-derived base. Lets
+/// templates reach into another host's *current* state via
+/// `{{ hostvars[<peer>].some_register }}` — required by clustering
+/// playbooks (etcd peer URLs, pgbackrest pubkey mesh, valkey
+/// sentinel discovery, …).
+///
+/// Precedence inside each peer's view mirrors `build_template_ctx`,
+/// EXCLUDING the layers that don't make sense cross-host:
+///   - `iter_item` — render-local; one host's loop item must not leak
+///     into another host's `hostvars[…]` lookup.
+///   - `task_vars` — scoped to the task currently dispatching on the
+///     OWNING host, not on the host doing the lookup.
+///   - `ansible_failed_*` — block-rescue arm state; visible only
+///     locally to the host whose rescue arm is running.
+///   - `groups` / `hostvars` themselves — world-scoped, would recurse.
+///
+/// Refresh point: this is called **between tasks** in the per_task
+/// strategy. At that point all `HostCtx`s are back in `ctxs` (the
+/// fanout temporarily owns them by-value and re-inserts via
+/// `apply_per_host_result` before the next task), so no locking is
+/// needed. The resulting snapshot is what every host's per-task
+/// fanout sees for `hostvars[<peer>]`. This matches Ansible's
+/// per-task barrier semantics: hosts see each other's state as it
+/// was at the start of the current task, not mid-flight.
+///
+/// **Not wired for `run_play_per_play`** — that strategy walks tasks
+/// per-host with no natural barrier, so a snapshot here would race
+/// with concurrent ctx mutations. Per_play hostvars remain the
+/// static inventory snapshot; documented at its call site.
+fn merge_dynamic_hostvars(
+    base: &WorldVars,
+    ctxs: &BTreeMap<String, HostCtx>,
+) -> WorldVars {
+    let mut hostvars = base.hostvars.clone();
+    for (name, ctx) in ctxs {
+        let view = hostvars
+            .entry(name.clone())
+            .or_insert_with(BTreeMap::new);
+        // Overlay in precedence order (low → high). Each layer
+        // overwrites the prior for shared keys.
+        for (k, v) in &ctx.facts {
+            view.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &ctx.play_vars {
+            view.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &ctx.set_facts {
+            view.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &ctx.registers {
+            view.insert(k.clone(), v.to_json());
+        }
+        for (k, v) in &ctx.extra_vars {
+            view.insert(k.clone(), v.clone());
+        }
+        // Always present so `{{ hostvars[h].inventory_hostname }}`
+        // works (used by e.g. the etcd config template to build
+        // `name=URL` pairs from a group iteration).
+        view.insert(
+            "inventory_hostname".into(),
+            JsonValue::String(ctx.host_name.clone()),
+        );
+    }
+    WorldVars {
+        groups: base.groups.clone(),
+        hostvars,
+        playbook_dir: base.playbook_dir.clone(),
+        inventory_dir: base.inventory_dir.clone(),
+    }
+}
+
 /// Render `play.vars` against each host's (role_defaults ∪ inventory_vars
 /// ∪ facts) view and store the result in `ctx.play_vars`. Clears prior
 /// plays' vars first.
@@ -907,11 +980,18 @@ async fn run_play_per_task(
     tag_filter: &Arc<crate::tags::TagFilter>,
 ) -> Result<bool> {
     for task in &play.tasks {
+        // Refresh `world.hostvars` from every host's current state
+        // BEFORE this task fans out. Any registers / set_facts / facts
+        // a prior task established are now visible cross-host via
+        // `{{ hostvars[<peer>].… }}`. See `merge_dynamic_hostvars` for
+        // precedence + rationale.
+        let world = Arc::new(merge_dynamic_hostvars(world, ctxs));
+
         // `meta: flush_handlers` is not dispatched to hosts — it's a
         // control-flow marker that drains the per-host pending queue.
         if let TaskBody::Meta(MetaAction::FlushHandlers) = &task.body {
             let stop =
-                flush_handlers(play, targets, pools, ctxs, report, next_seq, env, world).await?;
+                flush_handlers(play, targets, pools, ctxs, report, next_seq, env, &world).await?;
             if stop {
                 return Ok(true);
             }
@@ -943,18 +1023,20 @@ async fn run_play_per_task(
         }
 
         let any_failed = if task.run_once {
-            run_task_once_per_task(task, &live, pools, ctxs, report, next_seq, env, world, play)
+            run_task_once_per_task(task, &live, pools, ctxs, report, next_seq, env, &world, play)
                 .await?
         } else {
-            run_task_fanout(task, &live, pools, ctxs, report, next_seq, env, world, play).await?
+            run_task_fanout(task, &live, pools, ctxs, report, next_seq, env, &world, play).await?
         };
 
         if any_failed && play.on_failure == OnFailure::Stop {
             return Ok(true);
         }
     }
-    // Implicit end-of-play flush.
-    let stop = flush_handlers(play, targets, pools, ctxs, report, next_seq, env, world).await?;
+    // Implicit end-of-play flush. Same refresh discipline as the
+    // task loop — handlers can also reference `{{ hostvars[…] }}`.
+    let world = Arc::new(merge_dynamic_hostvars(world, ctxs));
+    let stop = flush_handlers(play, targets, pools, ctxs, report, next_seq, env, &world).await?;
     Ok(stop)
 }
 
@@ -5560,6 +5642,224 @@ mod tests {
             vec!["a", "b", "c"]
         );
         assert!(!targets.contains("d"));
+    }
+
+    /// Build a minimal `WorldVars` carrying a static hostvars map —
+    /// matches what `build_world_vars` would produce for the same
+    /// inventory shape (inventory_vars baked into each peer's view).
+    fn static_world_for(peers: &[(&str, &[(&str, JsonValue)])]) -> WorldVars {
+        let mut hostvars: BTreeMap<String, BTreeMap<String, JsonValue>> =
+            BTreeMap::new();
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut all_members = Vec::new();
+        for (name, inv_vars) in peers {
+            let mut view = BTreeMap::new();
+            for (k, v) in *inv_vars {
+                view.insert(k.to_string(), v.clone());
+            }
+            hostvars.insert(name.to_string(), view);
+            all_members.push(name.to_string());
+        }
+        groups.insert("all".into(), all_members);
+        WorldVars {
+            groups,
+            hostvars,
+            playbook_dir: None,
+            inventory_dir: None,
+        }
+    }
+
+    #[test]
+    fn merge_dynamic_hostvars_overlays_facts_and_set_facts_and_registers() {
+        let base = static_world_for(&[
+            ("a", &[("vswitch_ip", serde_json::json!("10.0.0.1"))]),
+            ("b", &[("vswitch_ip", serde_json::json!("10.0.0.2"))]),
+        ]);
+        let mut ctx_a = HostCtx::new("a".into());
+        ctx_a.facts.insert(
+            "ansible_distribution".into(),
+            serde_json::json!("Ubuntu"),
+        );
+        ctx_a
+            .set_facts
+            .insert("patroni_ready".into(), serde_json::json!(true));
+        ctx_a.record_register(
+            "pubkey_blob",
+            RegisterValue::from_exec(0, false, 0, b"ssh-ed25519 AAA...", b""),
+        );
+        let ctx_b = HostCtx::new("b".into());
+        // b is plain; should still get its `inventory_hostname` added.
+        let mut ctxs = BTreeMap::new();
+        ctxs.insert("a".to_string(), ctx_a);
+        ctxs.insert("b".to_string(), ctx_b);
+
+        let merged = merge_dynamic_hostvars(&base, &ctxs);
+
+        // Static layer survives (inventory_vars).
+        assert_eq!(
+            merged.hostvars["a"].get("vswitch_ip"),
+            Some(&serde_json::json!("10.0.0.1"))
+        );
+
+        // Facts → set_facts → registers all visible cross-host.
+        assert_eq!(
+            merged.hostvars["a"].get("ansible_distribution"),
+            Some(&serde_json::json!("Ubuntu"))
+        );
+        assert_eq!(
+            merged.hostvars["a"].get("patroni_ready"),
+            Some(&serde_json::json!(true))
+        );
+        let reg = merged.hostvars["a"].get("pubkey_blob").expect("pubkey");
+        assert_eq!(
+            reg.get("stdout").and_then(|v| v.as_str()),
+            Some("ssh-ed25519 AAA...")
+        );
+
+        // inventory_hostname stamped into every peer's view — even the
+        // one with no dynamic state of its own.
+        assert_eq!(
+            merged.hostvars["a"].get("inventory_hostname"),
+            Some(&serde_json::json!("a"))
+        );
+        assert_eq!(
+            merged.hostvars["b"].get("inventory_hostname"),
+            Some(&serde_json::json!("b"))
+        );
+
+    }
+
+    #[test]
+    fn merge_dynamic_hostvars_precedence_registers_beat_facts_beat_inventory() {
+        let base = static_world_for(&[("a", &[("v", serde_json::json!("inv"))])]);
+        let mut ctx = HostCtx::new("a".into());
+        ctx.facts.insert("v".into(), serde_json::json!("fact"));
+        ctx.set_facts.insert("v".into(), serde_json::json!("set"));
+        ctx.record_register(
+            "v",
+            RegisterValue::from_exec(0, false, 0, b"reg", b""),
+        );
+        let mut ctxs = BTreeMap::new();
+        ctxs.insert("a".to_string(), ctx);
+
+        let merged = merge_dynamic_hostvars(&base, &ctxs);
+        // Register wins (highest of the three layers we overlay).
+        let reg = merged.hostvars["a"].get("v").expect("v");
+        assert_eq!(
+            reg.get("stdout").and_then(|v| v.as_str()),
+            Some("reg"),
+            "register should beat set_fact / fact / inventory"
+        );
+    }
+
+    /// End-to-end integration: drive `run_play_per_task` against two
+    /// mock-pool hosts. Host A sets a fact in task 1 that's keyed off
+    /// its `inventory_hostname`; host B's task 2 asserts the value is
+    /// visible via `hostvars['a']`. If the dynamic-hostvars refresh
+    /// between tasks is removed, this assertion fails at render time
+    /// (B sees only A's inventory layer, not its set_facts).
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_play_per_task_makes_cross_host_set_facts_visible_via_hostvars() {
+        use crate::pool::{AgentPool, PoolTransport};
+        use tokio::sync::Mutex as TokioMutex;
+
+        let pb = playbook::parse(
+            r#"
+- name: dyn-hostvars
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: stamp role per host
+      set_fact:
+        my_role: "{{ inventory_hostname }}"
+    - name: cross-host assertion
+      assert:
+        that: "hostvars['a'].my_role == 'a'"
+"#,
+        )
+        .expect("playbook parses");
+        let play = &pb.plays[0];
+
+        let targets: Vec<String> = vec!["a".into(), "b".into()];
+        // Static world has both hosts with empty inventory views; the
+        // refresh between tasks is what surfaces `a`'s set_fact to `b`.
+        let base_world = static_world_for(&[("a", &[]), ("b", &[])]);
+
+        // One mock pool per host.
+        let mut pools_map: BTreeMap<String, PoolHandle> = BTreeMap::new();
+        for name in &targets {
+            let p = AgentPool::new(name.clone(), PoolTransport::Mock);
+            pools_map.insert(name.clone(), Arc::new(TokioMutex::new(p)));
+        }
+        let pools = Arc::new(pools_map);
+
+        let mut ctxs: BTreeMap<String, HostCtx> = BTreeMap::new();
+        for name in &targets {
+            ctxs.insert(name.clone(), HostCtx::new(name.clone()));
+        }
+
+        let mut report = RunReport {
+            host_outcomes: targets
+                .iter()
+                .map(|n| (n.clone(), HostOutcome::Ok))
+                .collect(),
+            stopped_early: false,
+            check_mode: false,
+            tasks_changed: 0,
+            tasks_skipped: 0,
+            tasks_ok: 0,
+        };
+        let next_seq = Arc::new(AtomicU32::new(1));
+        let env = Arc::new(template::make_env());
+        let world = Arc::new(base_world);
+        let tag_filter = Arc::new(crate::tags::TagFilter::from_cli(&[], &[]).unwrap());
+
+        let stopped = run_play_per_task(
+            play,
+            &targets,
+            &pools,
+            &mut ctxs,
+            &mut report,
+            &next_seq,
+            &env,
+            &world,
+            &tag_filter,
+        )
+        .await
+        .expect("per_task runs");
+
+        assert!(!stopped, "play should not have stopped early");
+        for n in &targets {
+            assert_eq!(
+                report.host_outcomes.get(n),
+                Some(&HostOutcome::Ok),
+                "host {n} should be Ok; report = {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_dynamic_hostvars_does_not_leak_task_local_or_loop_state() {
+        // task_vars + iter_item are transient (set per-task / per-iteration
+        // on the OWNING host) and must NOT bleed into peer views — a host
+        // doing `hostvars[a].x` should not see `a`'s in-flight loop item.
+        let base = static_world_for(&[("a", &[])]);
+        let mut ctx = HostCtx::new("a".into());
+        ctx.task_vars
+            .insert("transient".into(), serde_json::json!("nope"));
+        ctx.iter_item = Some(("item".into(), serde_json::json!("nope")));
+        let mut ctxs = BTreeMap::new();
+        ctxs.insert("a".to_string(), ctx);
+
+        let merged = merge_dynamic_hostvars(&base, &ctxs);
+        assert!(
+            !merged.hostvars["a"].contains_key("transient"),
+            "task_vars must not leak into hostvars[peer]"
+        );
+        assert!(
+            !merged.hostvars["a"].contains_key("item"),
+            "iter_item must not leak into hostvars[peer]"
+        );
     }
 
     #[test]
