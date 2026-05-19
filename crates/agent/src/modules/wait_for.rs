@@ -104,6 +104,10 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWaitForOutput, _check_mode: bool
 enum Mode {
     Tcp,
     Path,
+    /// "Just sleep" form — no host/port/path given. Matches Ansible's
+    /// behavior: sleep for `delay` seconds and report success. `sleep`
+    /// and `timeout` have no meaning here (nothing to probe).
+    Sleep,
 }
 
 fn classify(op: &OpWaitForOutput) -> Result<Mode, String> {
@@ -119,7 +123,7 @@ fn classify(op: &OpWaitForOutput) -> Result<Mode, String> {
         }
         (false, true) => Ok(Mode::Path),
         (true, true) => Err("wait_for: host+port and path are mutually exclusive".to_string()),
-        (false, false) => Err("wait_for: must specify host+port OR path".to_string()),
+        (false, false) => Ok(Mode::Sleep),
     }
 }
 
@@ -137,6 +141,14 @@ fn wait_loop(
     sleep: Duration,
     timeout: Duration,
 ) -> Outcome {
+    // "Just sleep" mode: pure delay, then success. Nothing to probe,
+    // so `timeout` and `sleep` are inert. Matches Ansible exactly.
+    if matches!(mode, Mode::Sleep) {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        return Outcome::Met;
+    }
     let deadline = Instant::now() + timeout;
     if !delay.is_zero() {
         std::thread::sleep(delay.min(timeout));
@@ -145,6 +157,7 @@ fn wait_loop(
         let observed_present = match &mode {
             Mode::Tcp => probe_tcp(&op.host, op.port),
             Mode::Path => Ok(Path::new(&op.path).exists()),
+            Mode::Sleep => unreachable!("Sleep handled above"),
         };
         match observed_present {
             Ok(present) if present == want_present => return Outcome::Met,
@@ -177,6 +190,13 @@ fn describe_timeout(op: &OpWaitForOutput, mode: &Mode, want_present: bool, total
             "wait_for: timed out after {}ms waiting for {} to {action}",
             total.as_millis(),
             op.path,
+        ),
+        // Sleep mode never reaches timeout — wait_loop returns Met
+        // immediately after the delay sleep. This arm exists only to
+        // make the match exhaustive.
+        Mode::Sleep => format!(
+            "wait_for: sleep-only mode timed out after {}ms (this is a bug — Sleep should never time out)",
+            total.as_millis(),
         ),
     }
 }
@@ -250,8 +270,12 @@ mod tests {
         assert!(err.contains("mutually exclusive"), "got: {err}");
     }
 
+    /// Regression: bare wait_for (no host/port/path) classifies as
+    /// Sleep mode rather than failing. Matches Ansible's "just sleep"
+    /// shape and unblocks playbooks that use wait_for as a placeholder
+    /// or controlled pause.
     #[test]
-    fn classify_rejects_neither_mode() {
+    fn classify_no_target_is_sleep_mode() {
         let op = OpWaitForOutput {
             kind: 6,
             host: String::new(),
@@ -262,8 +286,62 @@ mod tests {
             delay_ms: 0,
             sleep_ms: 0,
         };
-        let err = classify(&op).unwrap_err();
-        assert!(err.contains("must specify"), "got: {err}");
+        let mode = classify(&op).expect("bare wait_for must classify");
+        assert!(matches!(mode, Mode::Sleep));
+    }
+
+    #[test]
+    fn sleep_mode_returns_met_immediately_when_delay_zero() {
+        let op = OpWaitForOutput {
+            kind: 6,
+            host: String::new(),
+            port: 0,
+            path: String::new(),
+            state: STATE_PRESENT,
+            timeout_ms: 60_000,
+            delay_ms: 0,
+            sleep_ms: 1000,
+        };
+        let start = Instant::now();
+        let out = wait_loop(
+            &op,
+            Mode::Sleep,
+            true,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        );
+        assert!(matches!(out, Outcome::Met));
+        // Should not have slept its 60s timeout — sleep mode returns
+        // immediately when delay is zero.
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn sleep_mode_honors_delay() {
+        let op = OpWaitForOutput {
+            kind: 6,
+            host: String::new(),
+            port: 0,
+            path: String::new(),
+            state: STATE_PRESENT,
+            timeout_ms: 60_000,
+            delay_ms: 150,
+            sleep_ms: 1000,
+        };
+        let start = Instant::now();
+        let out = wait_loop(
+            &op,
+            Mode::Sleep,
+            true,
+            Duration::from_millis(150),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        );
+        assert!(matches!(out, Outcome::Met));
+        // Must have slept ~150ms (allow generous slack for CI jitter).
+        assert!(start.elapsed() >= Duration::from_millis(140));
+        assert!(start.elapsed() < Duration::from_millis(2000));
     }
 
     #[test]

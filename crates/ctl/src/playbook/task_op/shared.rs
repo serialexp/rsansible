@@ -65,35 +65,18 @@ pub(super) fn take_optional_port<E: serde::de::Error>(
 
 /// Pull an optional Ansible-flavored mode out of a YAML mapping. Accepts
 /// int (`0o755`) or string (`"0755"`/`"755"`/`"0o755"`).
+/// Hand-written `Option<ModeField>` extractor, mirror of
+/// [`take_optional_mode_field`] but for manual-`Deserialize` op impls
+/// that pull from a `serde_yaml::Mapping`. Accepts numeric literals,
+/// non-Jinja octal strings (resolved eagerly), and Jinja-templated
+/// strings (deferred to dispatch).
 pub(super) fn take_optional_mode<E: serde::de::Error>(
     map: &mut serde_yaml::Mapping,
     key: &str,
-) -> Result<Option<u32>, E> {
+) -> Result<Option<ModeField>, E> {
     match map.remove(key) {
         None | Some(serde_yaml::Value::Null) => Ok(None),
-        Some(serde_yaml::Value::Number(n)) => {
-            let v = n.as_u64().ok_or_else(|| {
-                E::custom(format!("{key}: expected non-negative integer, got: {n}"))
-            })? as u32;
-            if v & !0o7777 != 0 {
-                return Err(E::custom(format!(
-                    "{key}: only the low 12 bits are meaningful (got 0o{v:o})"
-                )));
-            }
-            Ok(Some(v))
-        }
-        Some(serde_yaml::Value::String(s)) => {
-            let v = parse_mode_str(&s).map_err(E::custom)?;
-            if v & !0o7777 != 0 {
-                return Err(E::custom(format!(
-                    "{key}: only the low 12 bits are meaningful (got 0o{v:o})"
-                )));
-            }
-            Ok(Some(v))
-        }
-        Some(other) => Err(E::custom(format!(
-            "{key}: expected string or int, got: {other:?}"
-        ))),
+        Some(v) => Ok(Some(value_to_mode_field(v, key)?)),
     }
 }
 
@@ -314,6 +297,143 @@ pub(super) fn take_seconds_ms<E: serde::de::Error>(
     }
 }
 
+/// A file mode that may be a literal octal number resolved at parse
+/// time, or a Jinja template string that the orchestrator renders +
+/// parses at dispatch time. The render pass (`render_op` in the
+/// orchestrator) replaces every `Template` with the corresponding
+/// `Literal` before the op heads to `to_wire_op` for serialization,
+/// so wire-side code only ever sees the resolved `u32`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModeField {
+    Literal(u32),
+    /// Jinja template string. Rendered against the per-host view by the
+    /// orchestrator; the rendered text is then parsed via
+    /// [`parse_mode_str`].
+    Template(String),
+}
+
+impl ModeField {
+    /// Post-render accessor — assumes the value is a `Literal`. Returns
+    /// an error if a `Template` survived to wire-op construction (a
+    /// dispatcher bug). Use this in `to_wire_op`.
+    pub fn expect_resolved(&self, where_: &str) -> Result<u32, anyhow::Error> {
+        match self {
+            ModeField::Literal(n) => Ok(*n),
+            ModeField::Template(t) => Err(anyhow::anyhow!(
+                "{where_}: mode template {t:?} reached to_wire_op without being rendered \
+                 (orchestrator render_op missed this op?)"
+            )),
+        }
+    }
+
+    /// Source for a template-form value, for the orchestrator to feed
+    /// through its render path. Returns `None` for a `Literal`.
+    pub fn template_source(&self) -> Option<&str> {
+        match self {
+            ModeField::Template(s) => Some(s.as_str()),
+            ModeField::Literal(_) => None,
+        }
+    }
+}
+
+/// Parse text that came out of Jinja rendering of a `mode:` template
+/// into a 12-bit u32. Mirrors the literal-parse path (octal, optional
+/// `0o` prefix). Used by the orchestrator's `render_op`.
+pub fn parse_rendered_mode(s: &str) -> Result<u32, String> {
+    let n = parse_mode_str(s)?;
+    if n & !0o7777 != 0 {
+        return Err(format!(
+            "mode: only the low 12 bits are meaningful (got 0o{n:o})"
+        ));
+    }
+    Ok(n)
+}
+
+/// Decide whether a YAML string for a `mode:` field should be treated
+/// as a Jinja template (deferred) vs. a literal octal (parsed eagerly).
+/// Heuristic: presence of `{{ ... }}` or `{% ... %}`. Anything else is
+/// parsed as octal at this stage, matching the historical strict
+/// behavior.
+pub(crate) fn string_is_jinja(s: &str) -> bool {
+    s.contains("{{") || s.contains("{%")
+}
+
+/// Parse a `mode:` YAML value into a [`ModeField`]. Numbers and
+/// non-Jinja strings are resolved to `Literal(u32)` at parse time;
+/// Jinja-templated strings are deferred as `Template(String)` and
+/// resolved by the orchestrator at dispatch.
+pub(super) fn value_to_mode_field<E: serde::de::Error>(
+    v: serde_yaml::Value,
+    key: &str,
+) -> Result<ModeField, E> {
+    match v {
+        serde_yaml::Value::Number(n) => {
+            let v = n.as_u64().ok_or_else(|| {
+                E::custom(format!("{key}: expected non-negative integer, got: {n}"))
+            })? as u32;
+            if v & !0o7777 != 0 {
+                return Err(E::custom(format!(
+                    "{key}: only the low 12 bits are meaningful (got 0o{v:o})"
+                )));
+            }
+            Ok(ModeField::Literal(v))
+        }
+        serde_yaml::Value::String(s) => {
+            if string_is_jinja(&s) {
+                Ok(ModeField::Template(s))
+            } else {
+                let v = parse_mode_str(&s).map_err(E::custom)?;
+                if v & !0o7777 != 0 {
+                    return Err(E::custom(format!(
+                        "{key}: only the low 12 bits are meaningful (got 0o{v:o})"
+                    )));
+                }
+                Ok(ModeField::Literal(v))
+            }
+        }
+        other => Err(E::custom(format!(
+            "{key}: expected string or int, got: {other:?}"
+        ))),
+    }
+}
+
+/// `Option<ModeField>` form: absent key / null → None.
+pub(super) fn take_optional_mode_field<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    key: &str,
+) -> Result<Option<ModeField>, E> {
+    match map.remove(key) {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(v) => Ok(Some(value_to_mode_field(v, key)?)),
+    }
+}
+
+/// Required-field serde deserializer for `ModeField`. Used via
+/// `#[serde(deserialize_with = ...)]` on struct fields whose serde
+/// `default = "..."` supplies the absent case (e.g. `TemplateOp.mode`).
+pub(super) fn deserialize_mode_field<'de, D>(d: D) -> Result<ModeField, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_yaml::Value::deserialize(d)?;
+    value_to_mode_field::<D::Error>(v, "mode")
+}
+
+/// `Option<ModeField>` for struct fields with `#[serde(default)] mode: Option<...>`.
+pub(super) fn deserialize_mode_field_opt<'de, D>(d: D) -> Result<Option<ModeField>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = match Option::<serde_yaml::Value>::deserialize(d)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if matches!(v, serde_yaml::Value::Null) {
+        return Ok(None);
+    }
+    Ok(Some(value_to_mode_field::<D::Error>(v, "mode")?))
+}
+
 /// Parse `mode:` from either a string (`"0755"`, `"755"`, `"0o755"`)
 /// or an int (e.g. `0o755` literal in YAML). Strings with a leading `0`
 /// are treated as octal — Ansible's behavior. Returns the parsed value
@@ -400,7 +520,7 @@ pub(super) fn parse_mode_str(s: &str) -> Result<u32, String> {
 /// Accept Ansible-flavored booleans: `true`, `false`, `yes`, `no`, `on`,
 /// `off` (case-insensitive). YAML 1.2 only accepts `true`/`false`, but
 /// every gothab playbook uses `yes`/`no` so we widen.
-pub(super) fn deserialize_ansible_bool<'de, D>(d: D) -> Result<bool, D::Error>
+pub(crate) fn deserialize_ansible_bool<'de, D>(d: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
 {

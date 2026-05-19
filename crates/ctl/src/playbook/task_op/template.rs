@@ -1,6 +1,8 @@
 //! `template:` task body.
 
+use super::shared::{deserialize_mode_field, ModeField};
 use serde::Deserialize;
+use std::path::PathBuf;
 
 /// `template: { src: foo.j2, dest: /etc/foo, mode: 0o644 }`
 ///
@@ -22,8 +24,8 @@ use serde::Deserialize;
 pub struct TemplateOp {
     pub src: String,
     pub dest: String,
-    #[serde(default = "default_template_mode", deserialize_with = "super::shared::deserialize_file_mode_u32")]
-    pub mode: u32,
+    #[serde(default = "default_template_mode", deserialize_with = "deserialize_mode_field")]
+    pub mode: ModeField,
     /// File owner (POSIX user name). `None` keeps whatever owner the
     /// agent's effective uid would assign on create — usually root when
     /// the task runs under `become:`. **Parsed but not yet honored** —
@@ -36,15 +38,31 @@ pub struct TemplateOp {
     /// honored caveat.
     #[serde(default)]
     pub group: Option<String>,
+    /// Optional validator command (Ansible `validate:`). When set, the
+    /// agent runs the command against the staged tmp file before the
+    /// rename; non-zero exit aborts the write. `%s` is substituted by
+    /// the tmp path. Empty / `None` = no validation.
+    #[serde(default)]
+    pub validate: Option<String>,
     /// Populated by the load-time template resolver. `None` until then.
+    /// Stays `None` when `src:` contains Jinja — in that case the
+    /// dispatch site renders `src:` against the per-host view and uses
+    /// `search_dirs` to locate the actual file at task execution time.
     #[serde(skip, default)]
     pub body: Option<String>,
+    /// Search base directories captured at load time. Used by the
+    /// orchestrator's Template dispatch arm to locate the file when
+    /// `src:` is Jinja-templated (and therefore wasn't pre-loaded into
+    /// `body`). Empty when `body` is populated (the load-time resolver
+    /// already found the file).
+    #[serde(skip, default)]
+    pub search_dirs: Vec<PathBuf>,
 }
 
 /// Ansible's `template:` default; matches the surveyed gothab usage
 /// where most templated files are non-executable config files.
 ///
 /// Re-used by `copy:` because the two ops share the same default.
-pub(super) fn default_template_mode() -> u32 {
-    0o644
+pub(super) fn default_template_mode() -> ModeField {
+    ModeField::Literal(0o644)
 }

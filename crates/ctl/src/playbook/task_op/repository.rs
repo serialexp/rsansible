@@ -23,7 +23,7 @@
 //!     filename: pgdg
 //! ```
 
-use super::shared::{take_optional_ansible_bool, take_optional_field_string, take_optional_mode};
+use super::shared::{take_optional_ansible_bool, take_optional_field_string, take_optional_mode, ModeField};
 
 /// `repository:` / `apt_repository:` parsed form.
 ///
@@ -44,9 +44,10 @@ pub struct RepositoryOp {
     /// On-disk basename (without extension) for the source file. Empty
     /// string means "derive from sanitised `repo` string" (Ansible-compat).
     pub filename: String,
-    /// Unix file mode for the source file. 0 means "use default" (0o644
-    /// for apt). Only the low 12 bits are meaningful.
-    pub mode: u32,
+    /// Unix file mode for the source file. `None` means "use default"
+    /// (0o644 for apt). Accepts a Jinja template too; resolved at
+    /// dispatch.
+    pub mode: Option<ModeField>,
     /// Run the manager's index refresh after a successful change.
     /// Default `true` to match Ansible's `apt_repository`.
     pub update_cache: bool,
@@ -198,7 +199,7 @@ pub(super) fn parse_repository_body<E: serde::de::Error>(
     };
 
     let filename = take_optional_field_string::<E>(&mut map, "filename")?.unwrap_or_default();
-    let mode = take_optional_mode::<E>(&mut map, "mode")?.unwrap_or(0);
+    let mode = take_optional_mode::<E>(&mut map, "mode")?;
     // Ansible's `apt_repository` defaults `update_cache: yes`. We match.
     let update_cache =
         take_optional_ansible_bool::<E>(&mut map, "update_cache")?.unwrap_or(true);
@@ -261,7 +262,7 @@ apt_repository:
                 // Default update_cache matches Ansible's apt_repository.
                 assert!(r.update_cache);
                 assert_eq!(r.filename, "");
-                assert_eq!(r.mode, 0);
+                assert_eq!(r.mode, None);
             }
             _ => panic!("expected Repository"),
         }
@@ -369,7 +370,7 @@ apt_repository:
             TaskBody::Op(TaskOp::Repository(r)) => {
                 assert_eq!(r.filename, "pgdg");
                 assert_eq!(r.state, RepositoryState::Absent);
-                assert_eq!(r.mode, 0o640);
+                assert_eq!(r.mode, Some(crate::playbook::ModeField::Literal(0o640)));
                 assert!(!r.update_cache);
             }
             _ => panic!("expected Repository"),
@@ -457,7 +458,7 @@ apt_repository:
             repo: "deb https://example.com/repo focal main".into(),
             state: RepositoryState::Present,
             filename: "pgdg".into(),
-            mode: 0o644,
+            mode: Some(crate::playbook::ModeField::Literal(0o644)),
             update_cache: true,
         });
         let wire = t.to_wire_op().unwrap();
@@ -480,7 +481,7 @@ apt_repository:
             repo: "deb x".into(),
             state: RepositoryState::Absent,
             filename: "".into(),
-            mode: 0,
+            mode: None,
             update_cache: false,
         });
         let wire = t.to_wire_op().unwrap();

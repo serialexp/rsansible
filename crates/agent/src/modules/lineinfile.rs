@@ -38,6 +38,7 @@ use regex::Regex;
 use rsansible_wire::generated::OpLineInFileOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
 
+use super::validate_helper::{validate_tmp, ValidateError};
 use super::{emit_error, Context};
 
 const STATE_PRESENT: u8 = 0;
@@ -200,10 +201,53 @@ pub async fn run(ctx: &Context, seq: u32, op: OpLineInFileOutput, check_mode: bo
 
     if changed {
         if !check_mode {
-            if let Err(e) = write_atomic(path, new_text.as_bytes(), mode, !file_existed) {
-                emit_error(ctx, seq, err::IO, format!("lineinfile: writing {}: {e}", path.display()))
+            match write_atomic(
+                path,
+                new_text.as_bytes(),
+                mode,
+                !file_existed,
+                if op.validate.is_empty() { None } else { Some(op.validate.as_str()) },
+            ) {
+                Ok(()) => {}
+                Err(WriteError::Io(e)) => {
+                    emit_error(
+                        ctx,
+                        seq,
+                        err::IO,
+                        format!("lineinfile: writing {}: {e}", path.display()),
+                    )
                     .await;
-                return Ok(());
+                    return Ok(());
+                }
+                Err(WriteError::Validate(ve)) => {
+                    let (code, reason) = match ve {
+                        ValidateError::BadRequest(m) => (err::BAD_REQUEST, m),
+                        ValidateError::Failed { code: c, stderr } => {
+                            let trimmed = stderr.trim();
+                            let r = if trimmed.is_empty() {
+                                format!(
+                                    "lineinfile: validate exited {c} for {} — leaving dest untouched",
+                                    path.display()
+                                )
+                            } else {
+                                format!(
+                                    "lineinfile: validate exited {c} for {} — leaving dest untouched: {trimmed}",
+                                    path.display()
+                                )
+                            };
+                            (err::BAD_REQUEST, r)
+                        }
+                        ValidateError::Spawn(e) => (
+                            err::IO,
+                            format!(
+                                "lineinfile: validate spawn failed for {}: {e}",
+                                path.display()
+                            ),
+                        ),
+                    };
+                    emit_error(ctx, seq, code, reason).await;
+                    return Ok(());
+                }
             }
         }
     } else if let Some(m) = mode {
@@ -374,7 +418,29 @@ fn join_lines(lines: &[String], trailing_newline: bool) -> String {
     s
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>, created: bool) -> std::io::Result<()> {
+/// Failure modes of the atomic write — distinguishes `validate:`
+/// rejections from plain I/O errors so the caller can surface a
+/// BAD_REQUEST-shaped error for the former (the user's playbook is
+/// the cause) vs. IO for the latter (the host's filesystem is).
+#[derive(Debug)]
+pub(crate) enum WriteError {
+    Io(std::io::Error),
+    Validate(ValidateError),
+}
+
+impl From<std::io::Error> for WriteError {
+    fn from(e: std::io::Error) -> Self {
+        WriteError::Io(e)
+    }
+}
+
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    created: bool,
+    validate: Option<&str>,
+) -> Result<(), WriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     // Use a sibling tempfile so rename is atomic across no FS boundary.
     let pid = std::process::id();
@@ -402,6 +468,14 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>, created: bool) -> 
             fs::set_permissions(&tmp, cur)?;
         }
     }
+    // Validate the staged tmp before swapping into place. On failure
+    // we unlink the tmp and propagate the error — dest is untouched.
+    if let Some(v) = validate {
+        if let Err(ve) = validate_tmp(v, &tmp) {
+            let _ = fs::remove_file(&tmp);
+            return Err(WriteError::Validate(ve));
+        }
+    }
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -423,6 +497,7 @@ mod tests {
             insertbefore: String::new(),
             insertafter: String::new(),
             backrefs: 0,
+            validate: String::new(),
         }
     }
 
@@ -583,11 +658,46 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rsansible-li-{}-{}", std::process::id(), now_unix_ns()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("out");
-        write_atomic(&p, b"hello\n", Some(0o600), true).unwrap();
+        write_atomic(&p, b"hello\n", Some(0o600), true, None).unwrap();
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(bytes, b"hello\n");
         let meta = std::fs::metadata(&p).unwrap();
         assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: write_atomic must abort the rename when validate
+    /// fails, leaving dest untouched. The whole sshd_config / sudoers
+    /// safety property depends on this.
+    #[tokio::test]
+    async fn write_atomic_validate_failure_leaves_dest_untouched() {
+        let dir = std::env::temp_dir().join(format!("rsansible-li-val-{}-{}", std::process::id(), now_unix_ns()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sshd_config");
+        std::fs::write(&p, b"# original-known-good\n").unwrap();
+        // /bin/false always exits 1.
+        let err = write_atomic(&p, b"BROKEN\n", Some(0o600), false, Some("/bin/false %s"))
+            .expect_err("validate must fail");
+        match err {
+            WriteError::Validate(_) => {}
+            WriteError::Io(e) => panic!("expected Validate, got Io: {e}"),
+        }
+        // dest still has original content.
+        assert_eq!(std::fs::read(&p).unwrap(), b"# original-known-good\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Symmetric: write_atomic must let the rename through when
+    /// validate succeeds. Guards against accidentally short-circuiting
+    /// all writes when validate is set.
+    #[tokio::test]
+    async fn write_atomic_validate_success_writes_dest() {
+        let dir = std::env::temp_dir().join(format!("rsansible-li-valok-{}-{}", std::process::id(), now_unix_ns()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config");
+        // /bin/true with %s — substitution exercised, success path.
+        write_atomic(&p, b"new\n", Some(0o600), true, Some("/bin/true %s")).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

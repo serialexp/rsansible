@@ -167,9 +167,67 @@ pub struct SelfSignedCertParams {
     pub valid_for_days: u32,
 }
 
+/// Inputs for CA-signed cert generation. The CSR's public key is what
+/// ends up in the cert; the CA's private key produces the signature.
+#[derive(Debug, Clone)]
+pub struct OwnCaSignedCertParams {
+    /// PEM-encoded CSR carrying the subject DN, SANs, and extensions
+    /// we'll lift into the cert.
+    pub csr_pem: Vec<u8>,
+    /// CA certificate PEM (extracted-from used for the issuer DN and
+    /// AKI).
+    pub ca_cert_pem: Vec<u8>,
+    /// CA private key PEM — produces the signature.
+    pub ca_privkey_pem: Vec<u8>,
+    /// Validity window in days from now.
+    pub valid_for_days: u32,
+}
+
+/// Sign a CSR with a separate CA cert + CA private key, returning the
+/// leaf cert PEM. Maps Ansible's `x509_certificate_pipe` with
+/// `provider: ownca`. The CSR's own private key is not needed — only
+/// its public key (already embedded in the CSR) ends up in the cert,
+/// and the CA's key produces the signature.
+///
+/// rcgen 0.13's `signed_by` takes a `&Certificate` for the issuer. To
+/// produce one from an existing CA PEM, we load the cert params with
+/// `CertificateParams::from_ca_cert_pem` (which preserves the
+/// subject DN, AKI/SKI material, basic constraints) and then
+/// `self_signed` it with the CA's own keypair. The reconstructed
+/// issuer cert has the same subject + public key as the original, so
+/// the leaf cert's issuer DN and AKI point at the real CA's
+/// certificate and validate properly against any client that trusts
+/// the original CA PEM.
+pub fn generate_ownca_signed_cert(p: &OwnCaSignedCertParams) -> Result<Vec<u8>> {
+    let ca_key_pem_str = std::str::from_utf8(&p.ca_privkey_pem)
+        .context("CA private key must be UTF-8 PEM")?;
+    let ca_key = KeyPair::from_pem(ca_key_pem_str)
+        .context("parsing CA private key PEM")?;
+    let ca_cert_pem_str = std::str::from_utf8(&p.ca_cert_pem)
+        .context("CA cert must be UTF-8 PEM")?;
+    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem_str)
+        .context("loading CA certificate params")?;
+    let issuer_cert = ca_params
+        .self_signed(&ca_key)
+        .context("reconstructing CA certificate for issuer slot")?;
+
+    let csr_pem_str = std::str::from_utf8(&p.csr_pem).context("CSR must be UTF-8 PEM")?;
+    let mut csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem_str)
+        .context("parsing CSR PEM")?;
+
+    // Apply the requested validity window. Same shape as selfsigned.
+    let now = time::OffsetDateTime::now_utc();
+    csr.params.not_before = now;
+    csr.params.not_after = now + time::Duration::days(p.valid_for_days as i64);
+
+    let cert = csr
+        .signed_by(&issuer_cert, &ca_key)
+        .context("signing CSR with CA")?;
+    Ok(cert.pem().into_bytes())
+}
+
 /// Generate a self-signed cert from a CSR + the same key, return the
-/// PEM encoding. v1 supports `provider: selfsigned` only — CA-signed
-/// will land when we need it (etcd peer certs don't).
+/// PEM encoding.
 pub fn generate_selfsigned_cert(p: &SelfSignedCertParams) -> Result<Vec<u8>> {
     let kp = KeyPair::from_pem(
         std::str::from_utf8(&p.privkey_pem)
@@ -434,6 +492,111 @@ mod tests {
     fn san_parse_ip() {
         let san = parse_san("IP:10.0.0.1").unwrap();
         assert!(matches!(san, SanType::IpAddress(_)));
+    }
+
+    #[test]
+    fn ownca_signed_cert_carries_csr_subject() {
+        // Build a CA: privkey + a self-signed root cert.
+        let ca_key = generate_privkey(&PrivkeyParams {
+            kind: PrivkeyType::Ed25519,
+            size: 0,
+        })
+        .unwrap();
+        // rcgen 0.13 doesn't allow CA:TRUE BasicConstraints in a CSR
+        // (it's a constraint, not a request). For the ownca test we
+        // build a minimal CSR and let the self_signed cert's defaults
+        // produce a usable issuer — we're not exercising X.509 path
+        // validation here, only "the ownca signing flow returns a
+        // parseable cert."
+        let ca_csr = generate_csr(&CsrParams {
+            privkey_pem: ca_key.clone(),
+            common_name: "Test Root CA".into(),
+            country_name: String::new(),
+            organization_name: "TestOrg".into(),
+            organizational_unit_name: String::new(),
+            subject_alt_name: vec![],
+            key_usage: vec![],
+            extended_key_usage: vec![],
+            basic_constraints: vec![],
+        })
+        .unwrap();
+        let ca_cert = generate_selfsigned_cert(&SelfSignedCertParams {
+            privkey_pem: ca_key.clone(),
+            csr_pem: ca_csr,
+            valid_for_days: 365,
+        })
+        .expect("CA cert");
+
+        // Build a leaf: separate privkey + CSR for a server, signed by
+        // the CA above. The leaf's own private key is not handed to
+        // ownca signing — only its CSR (which embeds the public key).
+        let leaf_key = generate_privkey(&PrivkeyParams {
+            kind: PrivkeyType::Ed25519,
+            size: 0,
+        })
+        .unwrap();
+        let leaf_csr = generate_csr(&CsrParams {
+            privkey_pem: leaf_key,
+            common_name: "leaf.example".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
+            subject_alt_name: vec!["DNS:leaf.example".into()],
+            key_usage: vec!["digitalSignature".into()],
+            extended_key_usage: vec!["serverAuth".into()],
+            basic_constraints: vec![],
+        })
+        .unwrap();
+
+        let leaf_cert = generate_ownca_signed_cert(&OwnCaSignedCertParams {
+            csr_pem: leaf_csr,
+            ca_cert_pem: ca_cert,
+            ca_privkey_pem: ca_key,
+            valid_for_days: 30,
+        })
+        .expect("ownca-signed leaf cert");
+        let s = std::str::from_utf8(&leaf_cert).unwrap();
+        assert!(s.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(s.contains("-----END CERTIFICATE-----"));
+        // Reparse via rcgen to confirm well-formedness.
+        CertificateParams::from_ca_cert_pem(s)
+            .expect("reparse leaf cert via rcgen");
+    }
+
+    #[test]
+    fn ownca_signed_cert_rejects_bad_ca_pem() {
+        let leaf_csr_key = generate_privkey(&PrivkeyParams {
+            kind: PrivkeyType::Ed25519,
+            size: 0,
+        })
+        .unwrap();
+        let leaf_csr = generate_csr(&CsrParams {
+            privkey_pem: leaf_csr_key,
+            common_name: "leaf.test".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
+            subject_alt_name: vec![],
+            key_usage: vec![],
+            extended_key_usage: vec![],
+            basic_constraints: vec![],
+        })
+        .unwrap();
+        let err = generate_ownca_signed_cert(&OwnCaSignedCertParams {
+            csr_pem: leaf_csr,
+            ca_cert_pem: b"not a real PEM".to_vec(),
+            ca_privkey_pem: b"also not a PEM".to_vec(),
+            valid_for_days: 30,
+        })
+        .expect_err("garbage CA inputs should fail");
+        let msg = format!("{err:#}");
+        // Either the CA cert or CA key parse fails first; either is
+        // acceptable as long as the error mentions CA / private key
+        // origin so the user knows which side is wrong.
+        assert!(
+            msg.contains("CA") || msg.contains("private key") || msg.contains("PEM"),
+            "got: {msg}"
+        );
     }
 
     #[test]

@@ -610,3 +610,26 @@ config, ufw rules, netplan, sshd handlers fire on change).
   rustcrypto stack (`aes`+`ctr`+`pbkdf2`+`hmac`+`sha2`+`subtle`+`hex`).
   Used by group_vars/host_vars discovery; one example is
   vault-encrypted in `examples/group_vars/web/secrets.yml`.
+- [x] **Bug 18 — recursive lazy templating of nested string vars**
+  (gothab live drill). `resolve_view_var_templates` in
+  `crates/ctl/src/orchestrator.rs` was walking only top-level keys of
+  the view map, so a role default like
+  `patroni_pg_hba: ["host all all {{ vswitch_cidr }} scram-sha-256"]`
+  passed into minijinja with the inner `{{ vswitch_cidr }}` literal.
+  When a template iterated the list, the literal Jinja text landed in
+  the rendered output — in gothab's case, that text was a
+  `pg_hba.conf` entry stored in Patroni's DCS, which postmaster then
+  rejected as "invalid authentication method 'vswitch_cidr'", taking
+  the cluster down. Recovery via plain Ansible:
+  `gothab/ansible/playbooks/recover-patroni-pg-hba.yml`. Fix: walk
+  the view recursively into arrays and objects per pass (sibling
+  helper `resolve_strings_in_value` that renders in-place against a
+  per-pass snapshot view, calls minijinja directly to avoid
+  re-entering `resolve_view_var_templates`). MAX_PASSES fixpoint and
+  cycle stabilization preserved. Three regression tests in
+  `orchestrator::tests` covering list-element, dict-value, and
+  list-element-through-top-level-indirection convergence. The
+  existing body-render-stays-one-pass test
+  (`render_str_does_not_re_render_jinja_looking_body_output`) and
+  cycle-termination test pass unchanged — the fix only touches
+  view pre-resolution, not body rendering.

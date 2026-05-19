@@ -68,6 +68,121 @@ pub struct PostgresqlExtOp {
     pub login_port: u16,
 }
 
+/// `postgresql_user:` parsed form. Maps Ansible's
+/// `community.postgresql.postgresql_user` (subset).
+///
+/// Implemented as a controller-side composite that dispatches one or
+/// two `OpPostgresqlQuery` wire ops per task: a `SELECT … FROM
+/// pg_authid` probe (always), followed by a CREATE/ALTER/DROP ROLE on
+/// divergence only. Idempotent re-runs cost one roundtrip; mutating
+/// runs cost two. See `crates/ctl/src/orchestrator.rs::run_postgresql_user_composite`
+/// for the dispatch logic and `TODO.md` for the "collapse to one
+/// wire-dispatch" follow-up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostgresqlUserOp {
+    /// Role name. Jinja-templatable. Quoted as an identifier in the
+    /// emitted SQL — no `;` injection risk.
+    pub name: String,
+    /// Password to set on the role. Empty means "do not touch the
+    /// password" (matches Ansible). Jinja-templatable. Treated as
+    /// secret: never logged in plaintext; masked from `register.queries`.
+    pub password: String,
+    /// `role_attr_flags:` — comma-separated list like
+    /// `"LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB"`. Each bool attr
+    /// in this list participates in idempotency; attrs not mentioned
+    /// keep their current server-side value. Jinja-templatable.
+    pub role_attr_flags: String,
+    /// Target state. 0=present (default), 1=absent.
+    pub state: u8,
+    /// `no_password_changes: true` skips the ALTER ROLE … WITH
+    /// PASSWORD path even when `password:` is set, but the password
+    /// is still used at CREATE time for absent → present runs.
+    pub no_password_changes: bool,
+    /// `conn_limit:` — connection limit attr.
+    /// `i32::MIN` (sentinel) = field not set; -1 = unlimited; >=0 =
+    /// max concurrent connections. Default sentinel.
+    pub conn_limit: i32,
+    /// `db:` / `login_db:` — database to connect to for executing the
+    /// SQL. Empty = server default ("postgres").
+    pub db: String,
+    pub login_user: String,
+    pub login_password: String,
+    pub login_unix_socket: String,
+    pub login_host: String,
+    pub login_port: u16,
+}
+
+/// Sentinel for "conn_limit: was not set in the playbook." `i32::MIN`
+/// is unmistakably outside any reasonable user value (-1 is the
+/// "unlimited" sentinel postgres itself uses).
+pub const CONN_LIMIT_UNSET: i32 = i32::MIN;
+
+/// `postgresql_db:` parsed form. Maps Ansible's
+/// `community.postgresql.postgresql_db` (subset).
+///
+/// Same controller-side composite shape as `postgresql_user`: probe
+/// `pg_database`, then conditionally CREATE/DROP/ALTER OWNER. Encoding
+/// / collation can't be changed post-CREATE — a divergence between
+/// requested and existing produces a hard error rather than a silent
+/// no-op.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostgresqlDbOp {
+    /// Database name. Jinja-templatable. Quoted as identifier.
+    pub name: String,
+    /// Owner role. Jinja-templatable. Empty = no ALTER OWNER on
+    /// existing DB; absent + create = postgres defaults the owner to
+    /// the connecting user.
+    pub owner: String,
+    /// `encoding:` — locale-encoding name (e.g. "UTF8"). Empty =
+    /// server-default. CREATE-only; mismatch on existing DB errors.
+    pub encoding: String,
+    /// `lc_collate:` — collation locale. Empty = server-default.
+    /// CREATE-only; mismatch errors.
+    pub lc_collate: String,
+    /// `lc_ctype:` — character classification locale. Empty =
+    /// server-default. CREATE-only; mismatch errors.
+    pub lc_ctype: String,
+    /// `template:` — template database to clone (default `template1`,
+    /// `template0` lets you specify a different collation/encoding).
+    /// Empty = postgres default. CREATE-only.
+    pub template: String,
+    /// Target state. 0=present, 1=absent.
+    pub state: u8,
+    pub login_user: String,
+    pub login_password: String,
+    pub login_unix_socket: String,
+    pub login_host: String,
+    pub login_port: u16,
+}
+
+/// `postgresql_membership:` parsed form. Maps Ansible's
+/// `community.postgresql.postgresql_membership` (subset).
+///
+/// Controller-side composite: probe `pg_auth_members` for each
+/// (group, target_role) pair, then GRANT or REVOKE on divergence.
+/// Idempotent re-runs cost one probe roundtrip per pair.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostgresqlMembershipOp {
+    /// One or more group roles. Accepts `group:` (singular) or
+    /// `groups:` (list). Jinja-templatable per item.
+    pub groups: Vec<String>,
+    /// One or more target roles (the roles being added to / removed
+    /// from the groups). Accepts `target_role:` or `target_roles:`.
+    /// Jinja-templatable per item.
+    pub target_roles: Vec<String>,
+    /// Target state. 0=present (grant), 1=absent (revoke).
+    pub state: u8,
+    /// `fail_on_role: false` lets the task succeed when the group or
+    /// target role doesn't exist (mirrors Ansible). Default true.
+    pub fail_on_role: bool,
+    pub db: String,
+    pub login_user: String,
+    pub login_password: String,
+    pub login_unix_socket: String,
+    pub login_host: String,
+    pub login_port: u16,
+}
+
 /// Classify a SQL statement as read-only or potentially-mutating, used
 /// by `--check` to decide whether to dispatch the task or skip it
 /// outright on the controller. Heuristic — not a full SQL parser — but
@@ -550,6 +665,372 @@ fn resolve_db_alias<E: serde::de::Error>(
     }
 }
 
+/// Shared deserialization of `login_user` / `login_password` /
+/// `login_unix_socket` / `login_host` / `login_port` for every
+/// postgresql_* task. Mutates `map` to consume the fields it
+/// recognises; caller checks `map.is_empty()` afterward.
+fn take_pg_login_fields<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    module: &str,
+) -> Result<(String, String, String, String, u16), E> {
+    let login_user = take_optional_field_string(map, "login_user")?.unwrap_or_default();
+    let login_password =
+        take_optional_field_string(map, "login_password")?.unwrap_or_default();
+    let login_unix_socket =
+        take_optional_field_string(map, "login_unix_socket")?.unwrap_or_default();
+    let login_host = take_optional_field_string(map, "login_host")?.unwrap_or_default();
+    let login_port = match map.remove("login_port") {
+        None | Some(serde_yaml::Value::Null) => 0u16,
+        Some(serde_yaml::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or_else(|| {
+                E::custom(format!(
+                    "{module}.login_port: expected uint16, got: {n}"
+                ))
+            })?,
+        Some(serde_yaml::Value::String(s)) => {
+            // Allow port as string (Jinja-rendered numerics arrive
+            // here as strings after templating; defer parsing to
+            // render arm via the empty/numeric heuristic if needed).
+            if s.is_empty() {
+                0u16
+            } else {
+                s.parse::<u16>().map_err(|e| {
+                    E::custom(format!(
+                        "{module}.login_port: expected uint16, got {s:?}: {e}"
+                    ))
+                })?
+            }
+        }
+        Some(other) => {
+            return Err(E::custom(format!(
+                "{module}.login_port: expected integer, got: {other:?}"
+            )))
+        }
+    };
+    Ok((login_user, login_password, login_unix_socket, login_host, login_port))
+}
+
+impl<'de> Deserialize<'de> for PostgresqlUserOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        let name = match map.remove("name") {
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
+            None => return Err(D::Error::missing_field("name")),
+            Some(other) => return Err(D::Error::custom(format!(
+                "postgresql_user.name: expected non-empty string, got: {other:?}"
+            ))),
+        };
+        let password = take_optional_field_string(&mut map, "password")?.unwrap_or_default();
+        let role_attr_flags =
+            take_optional_field_string(&mut map, "role_attr_flags")?.unwrap_or_default();
+        // Reject unknown attr flags at parse time IFF the string isn't
+        // Jinja-templated — otherwise defer to dispatch (we render
+        // role_attr_flags through Jinja same as name/password).
+        if !super::shared::string_is_jinja(&role_attr_flags) && !role_attr_flags.is_empty() {
+            for raw in role_attr_flags.split(',') {
+                let tok = raw.trim();
+                if tok.is_empty() {
+                    continue;
+                }
+                if normalize_role_attr_token(tok).is_none() {
+                    return Err(D::Error::custom(format!(
+                        "postgresql_user.role_attr_flags: unknown attr {tok:?}; \
+                         supported (each with NO… counterpart): LOGIN, SUPERUSER, \
+                         CREATEDB, CREATEROLE, INHERIT, REPLICATION, BYPASSRLS"
+                    )));
+                }
+            }
+        }
+        let state = match map.remove("state") {
+            None | Some(serde_yaml::Value::Null) => 0u8,
+            Some(serde_yaml::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "present" => 0u8,
+                "absent" => 1u8,
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "postgresql_user.state: expected one of [present, absent], got: {other:?}"
+                    )))
+                }
+            },
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_user.state: expected string, got: {other:?}"
+                )))
+            }
+        };
+        let no_password_changes =
+            take_optional_ansible_bool(&mut map, "no_password_changes")?.unwrap_or(false);
+        let conn_limit = match map.remove("conn_limit") {
+            None | Some(serde_yaml::Value::Null) => CONN_LIMIT_UNSET,
+            Some(serde_yaml::Value::Number(n)) => n
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .filter(|v| *v >= -1)
+                .ok_or_else(|| {
+                    D::Error::custom(format!(
+                        "postgresql_user.conn_limit: expected int >= -1, got: {n}"
+                    ))
+                })?,
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_user.conn_limit: expected integer, got: {other:?}"
+                )))
+            }
+        };
+        let db = resolve_db_alias::<D::Error>(&mut map, "postgresql_user")?;
+        let (login_user, login_password, login_unix_socket, login_host, login_port) =
+            take_pg_login_fields::<D::Error>(&mut map, "postgresql_user")?;
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "postgresql_user: unknown field(s): {unknown:?}; expected one of \
+                 [name, password, role_attr_flags, state, no_password_changes, \
+                 conn_limit, db, login_db, login_user, login_password, \
+                 login_unix_socket, login_host, login_port]"
+            )));
+        }
+
+        Ok(PostgresqlUserOp {
+            name,
+            password,
+            role_attr_flags,
+            state,
+            no_password_changes,
+            conn_limit,
+            db,
+            login_user,
+            login_password,
+            login_unix_socket,
+            login_host,
+            login_port,
+        })
+    }
+}
+
+/// Map a single role-attr token (case-insensitive) to a canonical
+/// (attr_name, value) tuple. Returns None for tokens we don't
+/// recognise so the caller can produce a useful error.
+///
+/// The canonical attr name matches the pg_authid column suffix:
+/// `super`, `createrole`, `createdb`, `canlogin`, `inherit`,
+/// `replication`, `bypassrls`. The yes/no spelling in Ansible
+/// (LOGIN vs NOLOGIN) collapses to a bool: LOGIN → ("canlogin", true),
+/// NOLOGIN → ("canlogin", false), etc.
+pub(crate) fn normalize_role_attr_token(tok: &str) -> Option<(&'static str, bool)> {
+    let upper = tok.to_ascii_uppercase();
+    let (name, want) = if let Some(rest) = upper.strip_prefix("NO") {
+        (rest, false)
+    } else {
+        (upper.as_str(), true)
+    };
+    let canonical: &'static str = match name {
+        "LOGIN" => "canlogin",
+        "SUPERUSER" => "super",
+        "CREATEDB" => "createdb",
+        "CREATEROLE" => "createrole",
+        "INHERIT" => "inherit",
+        "REPLICATION" => "replication",
+        "BYPASSRLS" => "bypassrls",
+        _ => return None,
+    };
+    Some((canonical, want))
+}
+
+impl<'de> Deserialize<'de> for PostgresqlDbOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        let name = match map.remove("name") {
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
+            None => return Err(D::Error::missing_field("name")),
+            Some(other) => return Err(D::Error::custom(format!(
+                "postgresql_db.name: expected non-empty string, got: {other:?}"
+            ))),
+        };
+        let owner = take_optional_field_string(&mut map, "owner")?.unwrap_or_default();
+        let encoding = take_optional_field_string(&mut map, "encoding")?.unwrap_or_default();
+        let lc_collate =
+            take_optional_field_string(&mut map, "lc_collate")?.unwrap_or_default();
+        let lc_ctype = take_optional_field_string(&mut map, "lc_ctype")?.unwrap_or_default();
+        let template = take_optional_field_string(&mut map, "template")?.unwrap_or_default();
+        let state = match map.remove("state") {
+            None | Some(serde_yaml::Value::Null) => 0u8,
+            Some(serde_yaml::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "present" => 0u8,
+                "absent" => 1u8,
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "postgresql_db.state: expected one of [present, absent], got: {other:?}"
+                    )))
+                }
+            },
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_db.state: expected string, got: {other:?}"
+                )))
+            }
+        };
+        let (login_user, login_password, login_unix_socket, login_host, login_port) =
+            take_pg_login_fields::<D::Error>(&mut map, "postgresql_db")?;
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "postgresql_db: unknown field(s): {unknown:?}; expected one of \
+                 [name, owner, encoding, lc_collate, lc_ctype, template, state, \
+                 login_user, login_password, login_unix_socket, login_host, login_port]"
+            )));
+        }
+
+        Ok(PostgresqlDbOp {
+            name,
+            owner,
+            encoding,
+            lc_collate,
+            lc_ctype,
+            template,
+            state,
+            login_user,
+            login_password,
+            login_unix_socket,
+            login_host,
+            login_port,
+        })
+    }
+}
+
+/// Accept a YAML field that's either a single string or a list of
+/// strings, normalising to `Vec<String>`. Used for
+/// postgresql_membership's `group:` / `groups:` and
+/// `target_role:` / `target_roles:` pairs (singular/plural aliases).
+fn take_string_or_list<E: serde::de::Error>(
+    map: &mut serde_yaml::Mapping,
+    singular: &str,
+    plural: &str,
+    module: &str,
+) -> Result<Vec<String>, E> {
+    let pull = |map: &mut serde_yaml::Mapping, key: &str| -> Result<Option<Vec<String>>, E> {
+        match map.remove(key) {
+            None | Some(serde_yaml::Value::Null) => Ok(None),
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => Ok(Some(vec![s])),
+            Some(serde_yaml::Value::String(_)) => Ok(Some(vec![])),
+            Some(serde_yaml::Value::Sequence(seq)) => {
+                let mut out = Vec::with_capacity(seq.len());
+                for v in seq {
+                    match v {
+                        serde_yaml::Value::String(s) => out.push(s),
+                        other => {
+                            return Err(E::custom(format!(
+                                "{module}.{key} item: expected string, got: {other:?}"
+                            )))
+                        }
+                    }
+                }
+                Ok(Some(out))
+            }
+            Some(other) => Err(E::custom(format!(
+                "{module}.{key}: expected string or list of strings, got: {other:?}"
+            ))),
+        }
+    };
+    let s = pull(map, singular)?;
+    let p = pull(map, plural)?;
+    match (s, p) {
+        (Some(_), Some(_)) => Err(E::custom(format!(
+            "{module}: set either `{singular}:` or `{plural}:`, not both"
+        ))),
+        (Some(v), None) | (None, Some(v)) => {
+            if v.is_empty() {
+                Err(E::custom(format!(
+                    "{module}: `{singular}` / `{plural}` is empty; pick at least one"
+                )))
+            } else {
+                Ok(v)
+            }
+        }
+        (None, None) => Err(E::custom(format!(
+            "{module}: missing required field `{singular}` (or its alias `{plural}`)"
+        ))),
+    }
+}
+
+impl<'de> Deserialize<'de> for PostgresqlMembershipOp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut map = serde_yaml::Mapping::deserialize(d)?;
+
+        let groups = take_string_or_list::<D::Error>(
+            &mut map,
+            "group",
+            "groups",
+            "postgresql_membership",
+        )?;
+        let target_roles = take_string_or_list::<D::Error>(
+            &mut map,
+            "target_role",
+            "target_roles",
+            "postgresql_membership",
+        )?;
+        let state = match map.remove("state") {
+            None | Some(serde_yaml::Value::Null) => 0u8,
+            Some(serde_yaml::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "present" => 0u8,
+                "absent" => 1u8,
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "postgresql_membership.state: expected one of [present, absent], got: {other:?}"
+                    )))
+                }
+            },
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_membership.state: expected string, got: {other:?}"
+                )))
+            }
+        };
+        let fail_on_role =
+            take_optional_ansible_bool(&mut map, "fail_on_role")?.unwrap_or(true);
+        let db = resolve_db_alias::<D::Error>(&mut map, "postgresql_membership")?;
+        let (login_user, login_password, login_unix_socket, login_host, login_port) =
+            take_pg_login_fields::<D::Error>(&mut map, "postgresql_membership")?;
+
+        if !map.is_empty() {
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .collect();
+            return Err(D::Error::custom(format!(
+                "postgresql_membership: unknown field(s): {unknown:?}; expected one of \
+                 [group, groups, target_role, target_roles, state, fail_on_role, \
+                 db, login_db, login_user, login_password, login_unix_socket, \
+                 login_host, login_port]"
+            )));
+        }
+
+        Ok(PostgresqlMembershipOp {
+            groups,
+            target_roles,
+            state,
+            fail_on_role,
+            db,
+            login_user,
+            login_password,
+            login_unix_socket,
+            login_host,
+            login_port,
+        })
+    }
+}
+
 impl<'de> Deserialize<'de> for PostgresqlQueryOp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut map = serde_yaml::Mapping::deserialize(d)?;
@@ -976,6 +1457,245 @@ postgresql_ext:
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_postgresql_user_basic() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_user:
+  name: gothab
+  password: secret123
+  role_attr_flags: "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB"
+  login_unix_socket: /var/run/postgresql
+"#,
+        );
+        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else { panic!() };
+        assert_eq!(u.name, "gothab");
+        assert_eq!(u.password, "secret123");
+        assert_eq!(u.role_attr_flags, "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB");
+        assert_eq!(u.state, 0); // present
+        assert_eq!(u.login_unix_socket, "/var/run/postgresql");
+        assert!(!u.no_password_changes);
+        assert_eq!(u.conn_limit, CONN_LIMIT_UNSET);
+    }
+
+    #[test]
+    fn parse_postgresql_user_rejects_unknown_role_attr_flag() {
+        // Catch typos at parse time when the flags string is a
+        // literal (not Jinja-templated). NEEDNOTHING isn't an attr.
+        let err = try_parse_task(
+            r#"
+name: t
+postgresql_user:
+  name: r
+  role_attr_flags: "LOGIN,NEEDNOTHING"
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("NEEDNOTHING"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_postgresql_user_defers_jinja_role_attr_flags() {
+        // Templated role_attr_flags must not be rejected at parse;
+        // dispatch-time resolves them post-render.
+        let t = parse_task(
+            r#"
+name: t
+postgresql_user:
+  name: r
+  role_attr_flags: "{{ pg_attr_set }}"
+"#,
+        );
+        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else { panic!() };
+        assert_eq!(u.role_attr_flags, "{{ pg_attr_set }}");
+    }
+
+    #[test]
+    fn parse_postgresql_user_state_absent() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_user:
+  name: r
+  state: absent
+"#,
+        );
+        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else { panic!() };
+        assert_eq!(u.state, 1);
+    }
+
+    #[test]
+    fn parse_postgresql_user_rejects_negative_conn_limit_below_minus_one() {
+        let err = try_parse_task(
+            r#"
+name: t
+postgresql_user:
+  name: r
+  conn_limit: -42
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("conn_limit") || msg.contains("-1"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_postgresql_db_basic() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_db:
+  name: gothab
+  owner: gothab
+  encoding: UTF8
+  lc_collate: en_US.UTF-8
+  lc_ctype: en_US.UTF-8
+  template: template0
+  login_unix_socket: /var/run/postgresql
+"#,
+        );
+        let TaskBody::Op(TaskOp::PostgresqlDb(d)) = t.body else { panic!() };
+        assert_eq!(d.name, "gothab");
+        assert_eq!(d.owner, "gothab");
+        assert_eq!(d.encoding, "UTF8");
+        assert_eq!(d.lc_collate, "en_US.UTF-8");
+        assert_eq!(d.lc_ctype, "en_US.UTF-8");
+        assert_eq!(d.template, "template0");
+        assert_eq!(d.state, 0);
+        assert_eq!(d.login_unix_socket, "/var/run/postgresql");
+    }
+
+    #[test]
+    fn parse_postgresql_db_state_absent_minimal() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_db:
+  name: scratch
+  state: absent
+"#,
+        );
+        let TaskBody::Op(TaskOp::PostgresqlDb(d)) = t.body else { panic!() };
+        assert_eq!(d.state, 1);
+        assert!(d.owner.is_empty());
+        assert!(d.encoding.is_empty());
+    }
+
+    #[test]
+    fn parse_postgresql_user_to_wire_op_errors() {
+        // Composite ops should refuse to_wire_op — they're intercepted
+        // earlier in the dispatch pipeline.
+        let t = parse_task(
+            r#"
+name: t
+postgresql_user:
+  name: x
+"#,
+        );
+        let TaskBody::Op(op) = t.body else { panic!() };
+        let err = op.to_wire_op().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("composite") || msg.contains("intercepted"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_postgresql_membership_groups_and_target_roles_lists() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_membership:
+  groups:
+    - readers
+    - writers
+  target_roles:
+    - alice
+    - bob
+"#,
+        );
+        let TaskBody::Op(TaskOp::PostgresqlMembership(m)) = t.body else { panic!() };
+        assert_eq!(m.groups, vec!["readers", "writers"]);
+        assert_eq!(m.target_roles, vec!["alice", "bob"]);
+        assert_eq!(m.state, 0);
+        assert!(m.fail_on_role);
+    }
+
+    #[test]
+    fn parse_postgresql_membership_singular_aliases() {
+        // `group:` (singular) and `target_role:` (singular) both
+        // accept either a string or a one-element list.
+        let t = parse_task(
+            r#"
+name: t
+postgresql_membership:
+  group: readers
+  target_role: alice
+  state: absent
+  fail_on_role: false
+"#,
+        );
+        let TaskBody::Op(TaskOp::PostgresqlMembership(m)) = t.body else { panic!() };
+        assert_eq!(m.groups, vec!["readers"]);
+        assert_eq!(m.target_roles, vec!["alice"]);
+        assert_eq!(m.state, 1);
+        assert!(!m.fail_on_role);
+    }
+
+    #[test]
+    fn parse_postgresql_membership_rejects_missing_groups() {
+        let err = try_parse_task(
+            r#"
+name: t
+postgresql_membership:
+  target_role: alice
+"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("group") || msg.contains("groups"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_postgresql_membership_to_wire_op_errors() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_membership:
+  group: g
+  target_role: t
+"#,
+        );
+        let TaskBody::Op(op) = t.body else { panic!() };
+        let err = op.to_wire_op().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("composite") || msg.contains("intercepted"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_postgresql_db_to_wire_op_errors() {
+        let t = parse_task(
+            r#"
+name: t
+postgresql_db:
+  name: scratch
+"#,
+        );
+        let TaskBody::Op(op) = t.body else { panic!() };
+        let err = op.to_wire_op().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("composite") || msg.contains("intercepted"),
+            "got: {msg}"
+        );
     }
 
     #[test]

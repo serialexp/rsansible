@@ -165,7 +165,7 @@ mod tests {
         roundtrip(msg::task_dispatch(
             99,
             false,
-            msg::op_write_file("/etc/motd".into(), 0o644, false, b"hello world\n".to_vec()),
+            msg::op_write_file("/etc/motd".into(), 0o644, false, b"hello world\n".to_vec(), String::new(), String::new(), String::new()),
         ))
         .await;
     }
@@ -256,6 +256,7 @@ mod tests {
                 String::new(),
                 "^# foo section".into(),
                 false,
+                String::new(),
             ),
         ))
         .await;
@@ -273,6 +274,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 false,
+                String::new(),
             ),
         ))
         .await;
@@ -294,6 +296,7 @@ mod tests {
                 true,
                 String::new(),
                 "EOF".into(),
+                String::new(),
             ),
         ))
         .await;
@@ -310,6 +313,7 @@ mod tests {
                 None,
                 false,
                 "^EXIT".into(),
+                String::new(),
                 String::new(),
             ),
         ))
@@ -627,7 +631,7 @@ mod tests {
         roundtrip(msg::task_dispatch(
             42,
             false,
-            msg::op_write_file("/etc/ssl/key.pem".into(), 0o600, true, b"PEM".to_vec()),
+            msg::op_write_file("/etc/ssl/key.pem".into(), 0o600, true, b"PEM".to_vec(), String::new(), String::new(), String::new()),
         ))
         .await;
     }

@@ -22,14 +22,17 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
-    classify_sql_readonly, AssertTask, AsyncStatusOp, BlockInFileOp, BlockInFileState, BlockSpec,
+    classify_sql_readonly, parse_rendered_mode, AssertTask, AsyncStatusOp, BlockInFileOp,
+    BlockInFileState, BlockSpec,
     CommandOp,
     CopyOp, DebugMsg, DebugTask, ExecOp,
     FailTask, FileOp, FileState, GetUrlOp, GetentOp, HostnameOp, IncludeRoleSpec, IptablesAction,
     IptablesIpVersion, IptablesOp, IptablesRuleState, LineInFileOp, LineInFileState,
-    LoopControl, LoopSpec, MetaAction, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageManager,
+    LoopControl, LoopSpec, MetaAction, ModeField, OpenSslCsrPipeOp, OpenSslPrivkeyOp,
+    PackageManager,
     AuthorizedKeyOp, AuthorizedKeyState, GroupOp, GroupState,
-    PackageOp, PackageState, PauseTask, PostgresqlExtOp, PostgresqlQueryOp,
+    PackageOp, PackageState, PauseTask, PostgresqlDbOp, PostgresqlExtOp, PostgresqlMembershipOp,
+    PostgresqlQueryOp, PostgresqlUserOp,
     RepositoryManager, RepositoryOp, RepositoryState, SetFactMap, ShellOp,
     UserOp, UserState,
     SlurpOp,
@@ -860,7 +863,7 @@ mod tests {
         match task_op(&p.tasks[1]) {
             TaskOp::WriteFile(w) => {
                 assert_eq!(w.path, "/tmp/hello");
-                assert_eq!(w.mode, 0o644);
+                assert_eq!(w.mode, crate::playbook::ModeField::Literal(0o644));
                 assert_eq!(w.content, "hi\n");
             }
             other => panic!("expected write_file, got {other:?}"),

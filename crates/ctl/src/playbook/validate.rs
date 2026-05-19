@@ -376,16 +376,10 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
                 task.name
             )
         }
-        TaskOp::Command(c) if !c.creates.is_empty() || !c.removes.is_empty() => {
-            // v1: composite OpStat probe for creates/removes isn't wired
-            // yet. Fail loudly at validate time rather than at dispatch.
-            bail!(
-                "{}: task[{ti}] {:?}: command.creates/command.removes \
-                 are not yet supported (file an issue if you need them)",
-                where_,
-                task.name
-            )
-        }
+        // `command.creates` / `command.removes` are honored at dispatch
+        // time via an OpStat probe in the orchestrator (composite
+        // pattern). Nothing to validate at parse time beyond what the
+        // command body itself checks above.
         TaskOp::WriteFile(w) if w.path.is_empty() => {
             bail!(
                 "{}: task[{ti}] {:?}: write_file.path is empty",
@@ -417,8 +411,14 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             }
             // The body should have been populated by the role-flatten /
             // template-resolution pass run in `playbook::load`. A `None`
-            // here means the caller bypassed load() or the file is missing.
-            if t.body.is_none() {
+            // here means either (a) the caller bypassed load() and the
+            // file is missing, or (b) `src:` is Jinja-templated and
+            // resolution was deferred to dispatch. The deferred-load
+            // path stashes the search dirs on the op; if those are
+            // empty we know the resolver was never run.
+            if t.body.is_none()
+                && !crate::playbook::task_op::shared::string_is_jinja(&t.src)
+            {
                 bail!(
                     "{}: task[{ti}] {:?}: template src {:?} was not resolved at load time; \
                      call playbook::load() or ensure the file exists",
@@ -443,7 +443,14 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
                         task.name
                     );
                 }
-                if c.body.is_none() {
+                // `remote_src: true` makes src a target-side path; no
+                // controller-side load. Jinja-templated src is deferred
+                // to dispatch (same shape as the template task). Both
+                // legitimately have `body: None` at validate time.
+                if c.body.is_none()
+                    && !c.remote_src
+                    && !crate::playbook::task_op::shared::string_is_jinja(src)
+                {
                     bail!(
                         "{}: task[{ti}] {:?}: copy src {:?} was not resolved at load time; \
                          call playbook::load() or ensure the file exists",
@@ -485,7 +492,9 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
         TaskOp::WaitFor(w) => {
             // The Deserialize impl enforces mode mutual-exclusion, but
             // an in-code constructor could bypass it. Re-check here.
-            let has_tcp = w.port.is_some();
+            // port_template (deferred Jinja port) counts as TCP mode
+            // too — the render arm validates the rendered number.
+            let has_tcp = w.port.is_some() || !w.port_template.is_empty();
             let has_path = w.path.is_some();
             if has_tcp && has_path {
                 bail!(
@@ -494,13 +503,11 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
                     task.name
                 );
             }
-            if !has_tcp && !has_path {
-                bail!(
-                    "{}: task[{ti}] {:?}: wait_for: must specify host+port OR path",
-                    where_,
-                    task.name
-                );
-            }
+            // Neither host+port nor path is allowed: it's the
+            // sleep-only form (Ansible's `wait_for: timeout: 30`).
+            // The orchestrator's dispatch arm needs to either
+            // controller-side-sleep or pass it to the agent as a
+            // pure timer wait — at validate time we just accept it.
             if has_tcp {
                 // Empty host with port set is meaningless — the agent
                 // doesn't default to 127.0.0.1; require an explicit value.
@@ -585,7 +592,10 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             Ok(())
         }
         TaskOp::Systemd(s) => {
-            if s.name.trim().is_empty() {
+            // `daemon_reload: true` is Ansible-idiomatic for "just run
+            // `systemctl daemon-reload`" with no unit. Allow empty
+            // name in that case; require a name otherwise.
+            if s.name.trim().is_empty() && !s.daemon_reload {
                 bail!(
                     "{}: task[{ti}] {:?}: systemd.name is empty",
                     where_,
@@ -596,7 +606,12 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
         }
         TaskOp::Package(p) => {
             let label = p.manager.label();
-            if p.names.is_empty() {
+            // `apt: update_cache: yes` (and `autoremove: yes`) are
+            // valid side-effect-only forms with no package name —
+            // the parser already accepts them. Validate must mirror
+            // that: only require a non-empty name list when there is
+            // no qualifying side-effect requested.
+            if p.names.is_empty() && !p.update_cache && !p.autoremove {
                 bail!(
                     "{}: task[{ti}] {:?}: {label}.name is empty",
                     where_,
@@ -813,10 +828,10 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             Ok(())
         }
         TaskOp::X509CertificatePipe(c) => {
-            if c.provider != "selfsigned" {
+            if c.provider != "selfsigned" && c.provider != "ownca" {
                 bail!(
                     "{}: task[{ti}] {:?}: x509_certificate_pipe.provider only supports \
-                     \"selfsigned\" in v1; got {:?}",
+                     \"selfsigned\" or \"ownca\" in v1; got {:?}",
                     where_,
                     task.name,
                     c.provider
@@ -1233,10 +1248,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_x509_pipe_provider_other_than_selfsigned() {
+    fn rejects_x509_pipe_unknown_provider() {
         // The provider check is enforced at Deserialize time (more
         // immediate UX than waiting for validate). Confirm parsing
-        // rejects the bad value before validate even runs.
+        // rejects an unknown provider value before validate even runs.
         let err = serde_yaml::from_str::<Playbook>(
             r#"
 - name: p
@@ -1245,12 +1260,12 @@ mod tests {
       x509_certificate_pipe:
         csr_content: x
         privatekey_content: y
-        provider: ownca
+        provider: acme
 "#,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("provider") || msg.contains("selfsigned"), "got: {msg}");
+        assert!(msg.contains("provider"), "got: {msg}");
     }
 
     #[test]

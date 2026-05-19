@@ -1,7 +1,7 @@
 //! `lineinfile:` task body.
 
 use super::shared::{
-    take_optional_ansible_bool, take_optional_field_string, take_optional_mode,
+    take_optional_ansible_bool, take_optional_field_string, take_optional_mode, ModeField,
 };
 use serde::{de::Error as _, Deserialize, Deserializer};
 
@@ -15,11 +15,17 @@ pub struct LineInFileOp {
     pub regexp: String,
     pub line: String,
     pub state: LineInFileState,
-    pub mode: Option<u32>,
+    pub mode: Option<ModeField>,
     pub create: bool,
     pub insertbefore: String,
     pub insertafter: String,
     pub backrefs: bool,
+    /// Optional validator command (Ansible `validate:`). When set, the
+    /// agent runs the command against the staged tmp file before the
+    /// rename; non-zero exit aborts the write. `%s` is substituted by
+    /// the tmp path. Empty / `None` = no validation. Classic use:
+    /// `validate: /usr/sbin/sshd -t -f %s` on /etc/ssh/sshd_config.
+    pub validate: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +104,7 @@ impl<'de> Deserialize<'de> for LineInFileOp {
         let mode = take_optional_mode(&mut map, "mode")?;
         let create = take_optional_ansible_bool(&mut map, "create")?.unwrap_or(false);
         let backrefs = take_optional_ansible_bool(&mut map, "backrefs")?.unwrap_or(false);
+        let validate = take_optional_field_string(&mut map, "validate")?;
 
         if !map.is_empty() {
             let unknown: Vec<String> = map
@@ -106,7 +113,7 @@ impl<'de> Deserialize<'de> for LineInFileOp {
                 .collect();
             return Err(D::Error::custom(format!(
                 "lineinfile: unknown field(s): {unknown:?}; expected one of \
-                 [path, line, regexp, state, mode, create, insertbefore, insertafter, backrefs]"
+                 [path, line, regexp, state, mode, create, insertbefore, insertafter, backrefs, validate]"
             )));
         }
 
@@ -136,6 +143,7 @@ impl<'de> Deserialize<'de> for LineInFileOp {
             insertbefore,
             insertafter,
             backrefs,
+            validate,
         })
     }
 }
@@ -187,7 +195,7 @@ lineinfile:
             TaskBody::Op(TaskOp::LineInFile(l)) => {
                 assert_eq!(l.regexp, "^foo=");
                 assert!(l.create);
-                assert_eq!(l.mode, Some(0o644));
+                assert_eq!(l.mode, Some(crate::playbook::ModeField::Literal(0o644)));
             }
             _ => panic!(),
         }
@@ -266,11 +274,12 @@ lineinfile:
             regexp: "^foo=".into(),
             line: "foo=42".into(),
             state: LineInFileState::Present,
-            mode: Some(0o644),
+            mode: Some(crate::playbook::ModeField::Literal(0o644)),
             create: true,
             insertbefore: String::new(),
             insertafter: "EOF".into(),
             backrefs: false,
+            validate: None,
         });
         let wire = t.to_wire_op().unwrap();
         let rsansible_wire::generated::Op::OpLineInFile(o) = wire else {
@@ -285,5 +294,48 @@ lineinfile:
         assert_eq!(o.create, 1);
         assert_eq!(o.insertafter, "EOF");
         assert_eq!(o.backrefs, 0);
+        assert_eq!(o.validate, "");
+    }
+
+    /// Regression: validate: must be accepted and threaded through to
+    /// the wire op. Classic use: `validate: sshd -t -f %s` on sshd_config.
+    #[test]
+    fn parses_lineinfile_with_validate() {
+        let t = parse_task(
+            r#"
+name: t
+lineinfile:
+  path: /etc/ssh/sshd_config
+  regexp: '^PasswordAuthentication '
+  line: PasswordAuthentication no
+  validate: /usr/sbin/sshd -t -f %s
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::LineInFile(l)) => {
+                assert_eq!(l.validate.as_deref(), Some("/usr/sbin/sshd -t -f %s"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn lineinfile_to_wire_carries_validate() {
+        let t = TaskOp::LineInFile(LineInFileOp {
+            path: "/etc/ssh/sshd_config".into(),
+            regexp: "^PasswordAuthentication ".into(),
+            line: "PasswordAuthentication no".into(),
+            state: LineInFileState::Present,
+            mode: None,
+            create: false,
+            insertbefore: String::new(),
+            insertafter: String::new(),
+            backrefs: false,
+            validate: Some("/usr/sbin/sshd -t -f %s".into()),
+        });
+        let rsansible_wire::generated::Op::OpLineInFile(o) = t.to_wire_op().unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.validate, "/usr/sbin/sshd -t -f %s");
     }
 }

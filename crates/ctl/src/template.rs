@@ -25,7 +25,7 @@ use anyhow::{anyhow, Result};
 use minijinja::{Environment, Error as MjError, ErrorKind as MjKind, Value as MjValue};
 
 use crate::playbook::{
-    AssertTask, ExecOp, LoopSpec, Playbook, ShellOp, Task, TaskBody, TaskOp, WriteFileOp,
+    AssertTask, ExecOp, LoopSpec, Playbook, ShellOp, Task, TaskBody, TaskOp,
 };
 
 /// Ansible-style `omit` sentinel.
@@ -49,6 +49,257 @@ use crate::playbook::{
 /// their YAML can confuse the engine. They shouldn't.
 pub const OMIT_SENTINEL: &str =
     "__rsansible_omit_placeholder_8c0a9f2d4b1e3a6d5c7f8b9a0c1d2e3f__";
+
+/// Rewrite a Jinja source string so attribute-style numeric subscripts
+/// like `item.0.name` become bracket subscripts `item[0].name`.
+///
+/// Why: Ansible's Jinja2 accepts both `a.0.b` and `a[0].b` as ways to
+/// index into a list / tuple. minijinja's lexer does not — it
+/// tokenizes `.0` as the start of a float literal and rejects the
+/// surrounding expression with "unexpected float, expected identifier
+/// or integer". Real-world Ansible playbooks (gothab being the
+/// motivating case) lean heavily on `item.0` / `item.1` after a
+/// `subelements` loop, so blanket-translating that syntax saves every
+/// caller from porting templates by hand.
+///
+/// The rewrite is **only** applied inside Jinja code blocks (`{{ ... }}`
+/// and `{% ... %}`) and only outside string literals within those
+/// blocks. Plain template text, comment blocks (`{# ... #}`), and
+/// string contents are passed through verbatim — so a literal "1.0.0"
+/// inside `{{ "1.0.0" }}` survives the rewrite.
+///
+/// The transform is a single state-machine pass over the source:
+///   * State: `Text` (default) | `Code` (inside `{{`/`{%`) |
+///     `Comment` (inside `{#`) | `Str(byte)` (inside a quoted literal).
+///   * Inside `Code`, when we see `.<digits>`, we look one further
+///     character ahead — if the digits are followed by something that
+///     would *not* form a number continuation (`.`, end-of-block, an
+///     identifier char, etc.), we emit `[<digits>]`.
+///   * Inside string literals, we honor the basic backslash-escape
+///     rule (consume the next byte after `\`) so `\"` and `\'` don't
+///     prematurely exit the string.
+///
+/// Returns `Cow::Borrowed(src)` when no rewrite was needed so the hot
+/// path (most strings have no `.<digit>` pattern at all) stays
+/// allocation-free.
+pub fn prepare_jinja_source(src: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: if there's no `.` followed by a digit anywhere, nothing
+    // to do. We still need to handle the case where that pattern is
+    // inside a string literal, but the cost of running the state
+    // machine is worth paying only when there's at least one
+    // candidate.
+    let bytes = src.as_bytes();
+    let mut has_candidate = false;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+            has_candidate = true;
+            break;
+        }
+        i += 1;
+    }
+    if !has_candidate {
+        return std::borrow::Cow::Borrowed(src);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum St {
+        Text,
+        Code,
+        Comment,
+        Str(u8),
+    }
+
+    // Build the output as a `Vec<u8>` rather than a `String` so that
+    // non-ASCII bytes in the source (e.g. an em-dash `e2 80 94` in a
+    // template comment) round-trip verbatim. The previous code used
+    // `String::push(b as char)`, which interprets each byte as a Unicode
+    // codepoint and re-encodes as UTF-8 — turning every UTF-8 byte
+    // ≥0x80 into its Latin-1-mishandled two-byte form (e2 → c3 a2,
+    // 80 → c2 80, …). Symptom: `template:`-rendered configs arriving on
+    // the agent with double-encoded non-ASCII, failing downstream
+    // validators (`vmagent -dryRun` rejected the corrupted YAML).
+    //
+    // The state machine itself only cares about ASCII delimiters
+    // (`{`, `}`, `%`, `#`, quotes, `.`, digits, `\\`), and UTF-8
+    // continuation/lead bytes (≥0x80) never collide with ASCII, so
+    // walking bytes is safe. Only the output accumulation needed
+    // fixing. Caught in the gothab live drill (scrape.yml.j2 has an
+    // em-dash in a comment, and several `.<digit>` sequences elsewhere
+    // that engaged the slow path).
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    let mut state = St::Text;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            St::Text => {
+                if b == b'{' && i + 1 < bytes.len() {
+                    let n = bytes[i + 1];
+                    if n == b'{' || n == b'%' {
+                        out.push(b'{');
+                        out.push(n);
+                        state = St::Code;
+                        i += 2;
+                        continue;
+                    } else if n == b'#' {
+                        out.push(b'{');
+                        out.push(b'#');
+                        state = St::Comment;
+                        i += 2;
+                        continue;
+                    }
+                }
+                out.push(b);
+                i += 1;
+            }
+            St::Comment => {
+                if b == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                    out.push(b'#');
+                    out.push(b'}');
+                    state = St::Text;
+                    i += 2;
+                    continue;
+                }
+                out.push(b);
+                i += 1;
+            }
+            St::Code => {
+                // End of code block: `}}` or `%}`.
+                if (b == b'}' || b == b'%') && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                    out.push(b);
+                    out.push(b'}');
+                    state = St::Text;
+                    i += 2;
+                    continue;
+                }
+                if b == b'\'' || b == b'"' {
+                    out.push(b);
+                    state = St::Str(b);
+                    i += 1;
+                    continue;
+                }
+                if b == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                    // Check the byte *before* the dot — `.0` only makes
+                    // sense as an index if there's a value to index INTO
+                    // (identifier char, `]`, or `)`). At the start of an
+                    // expression `.5` is a float fragment we shouldn't
+                    // touch. Identifier/`]`/`)` are all ASCII, so a
+                    // last-byte check is sufficient — a UTF-8
+                    // continuation byte (≥0x80) won't match any of
+                    // these and we correctly leave the dot alone.
+                    let prev = out.last().copied();
+                    let preceded_by_value = matches!(
+                        prev,
+                        Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b']' || c == b')'
+                    );
+                    if preceded_by_value {
+                        // Consume digits.
+                        let start = i + 1;
+                        let mut end = start;
+                        while end < bytes.len() && bytes[end].is_ascii_digit() {
+                            end += 1;
+                        }
+                        out.push(b'[');
+                        out.extend_from_slice(&bytes[start..end]);
+                        out.push(b']');
+                        i = end;
+                        continue;
+                    }
+                }
+                out.push(b);
+                i += 1;
+            }
+            St::Str(q) => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    out.push(b'\\');
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    out.push(b);
+                    state = St::Code;
+                    i += 1;
+                    continue;
+                }
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    // The input was a valid `&str` and we only emit either input bytes
+    // (preserving any multi-byte UTF-8 sequence intact) or injected
+    // ASCII (`[`, `]`, `{`, `}`, `#`, `%`, `\\`, quotes, digits) — so
+    // the result is always valid UTF-8.
+    std::borrow::Cow::Owned(
+        String::from_utf8(out).expect("prepare_jinja_source preserves UTF-8 validity"),
+    )
+}
+
+/// Install a path-based template loader on `env` that resolves
+/// `{% include "name" %}` (and any other named-template lookup) by
+/// probing the given `search_dirs` in order for the first regular file
+/// that matches.
+///
+/// Semantics:
+/// - The included template is the literal string passed to
+///   `{% include ... %}`; resolution is purely filesystem-based against
+///   `search_dirs`. Path traversal segments (`..`, absolute paths,
+///   backslashes) are rejected as `None` (template-not-found).
+/// - Missing files surface as `Ok(None)`, which minijinja reports as
+///   "template not found" at render time — matching Ansible's behavior
+///   for missing include targets.
+/// - Read errors other than NotFound surface as the underlying IO
+///   error wrapped in `ErrorKind::TemplateNotFound`.
+///
+/// Why per-task: `Environment::set_loader` takes `&mut self`, so the
+/// shared run-scoped env can't carry one. `Environment` is also not
+/// `Clone`. The strategy is to spin up a fresh env via [`make_env`]
+/// for any `template:` body render that might contain `{% include %}`,
+/// install this loader with the role's templates dirs captured at
+/// load time, and render the body against it. Other renders (`dest`,
+/// `when:`, scalar fields, …) keep using the long-lived shared env.
+pub fn install_include_loader(env: &mut Environment<'_>, search_dirs: Vec<std::path::PathBuf>) {
+    env.set_loader(move |name| {
+        // Reject obviously unsafe names. minijinja's own path_loader does
+        // the same (rejects `.`, `..`, backslash); we mirror that.
+        if name.is_empty() || name.contains('\\') {
+            return Ok(None);
+        }
+        for piece in name.split('/') {
+            if piece == "." || piece == ".." {
+                return Ok(None);
+            }
+        }
+        let candidate_path = std::path::Path::new(name);
+        if candidate_path.is_absolute() {
+            // We refuse to include absolute paths via the loader; an
+            // include target should be a relative name resolved against
+            // the role's templates/ directory tree.
+            return Ok(None);
+        }
+        for base in &search_dirs {
+            let cand = base.join(name);
+            if cand.is_file() {
+                match std::fs::read_to_string(&cand) {
+                    Ok(s) => return Ok(Some(s)),
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::NotFound {
+                            continue;
+                        }
+                        return Err(MjError::new(
+                            MjKind::TemplateNotFound,
+                            format!("failed to read include target {}", cand.display()),
+                        )
+                        .with_source(err));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    });
+}
 
 /// Build a fresh minijinja `Environment` configured for our use.
 pub fn make_env<'a>() -> Environment<'a> {
@@ -86,6 +337,37 @@ pub fn make_env<'a>() -> Environment<'a> {
     // under `tojson`, this adds the Ansible alias.
     env.add_filter("to_json", to_json_filter);
     env.add_filter("regex_replace", regex_replace_filter);
+    // Ansible's set-style list filters. minijinja doesn't ship these.
+    // Used heavily in gothab role templates for "every peer except me":
+    //   groups['pgbackrest'] | difference([inventory_hostname]) | first
+    env.add_filter("difference", difference_filter);
+    env.add_filter("intersect", intersect_filter);
+    env.add_filter("union", union_filter);
+    env.add_filter("symmetric_difference", symmetric_difference_filter);
+    env.add_filter("unique", unique_filter);
+    env.add_filter("flatten", flatten_filter);
+    // Ansible-style regex tests, used with `select`/`reject`/`when`:
+    //   - `match`  — Python's re.match (anchored at the start).
+    //   - `search` — Python's re.search (anywhere in the string).
+    //   - `regex`  — Ansible's alias for `search`.
+    // Caught in the gothab valkey verify task:
+    //   {{ lines | select('match', '^role:') | list | first | ... }}
+    // minijinja's built-in tests don't include these.
+    env.add_test("match", regex_match_test);
+    env.add_test("search", regex_search_test);
+    env.add_test("regex", regex_search_test);
+    // Register-shape tests: in Ansible `r is changed` / `r is failed`
+    // / `r is succeeded` / `r is skipped` are first-class. They look
+    // at the named attribute on the register dict; if the value isn't
+    // a register-shaped dict, they return false rather than erroring
+    // (matches Ansible's laxness — playbooks routinely test these
+    // against possibly-undefined values).
+    env.add_test("changed", register_is_changed_test);
+    env.add_test("failed", register_is_failed_test);
+    env.add_test("succeeded", register_is_succeeded_test);
+    env.add_test("success", register_is_succeeded_test);
+    env.add_test("skipped", register_is_skipped_test);
+    env.add_test("skip", register_is_skipped_test);
     env.add_filter("extract", extract_filter);
     // Ansible's `random` filter — `{{ 99 | random }}` returns an int
     // in [0, 99). When applied to a sequence it picks a random element.
@@ -429,6 +711,186 @@ fn to_json_filter(value: MjValue) -> Result<MjValue, MjError> {
 /// Ansible's filter also accepts an optional `multiline` / `ignorecase`
 /// flag; we don't yet (gothab doesn't use them). Easy to add via the
 /// `(?i)` / `(?m)` inline flags in the meantime.
+/// Helper for the register-shape tests. Look up a named bool-valued
+/// attribute on a value; return `Ok(false)` for anything that isn't a
+/// register dict with the attribute. Matches Ansible's laxness — `r
+/// is changed` on a non-register or undefined value returns false, not
+/// an error.
+fn register_bool_attr(value: &MjValue, attr: &str) -> bool {
+    let Ok(v) = value.get_attr(attr) else { return false };
+    if v.is_undefined() || v.is_none() {
+        return false;
+    }
+    v.is_true()
+}
+
+fn register_is_changed_test(value: MjValue) -> Result<bool, MjError> {
+    Ok(register_bool_attr(&value, "changed"))
+}
+
+fn register_is_failed_test(value: MjValue) -> Result<bool, MjError> {
+    Ok(register_bool_attr(&value, "failed"))
+}
+
+fn register_is_succeeded_test(value: MjValue) -> Result<bool, MjError> {
+    // `is succeeded` is the inverse of `is failed`, but: an entirely
+    // undefined value isn't "succeeded" either. Ansible's contract is
+    // "the register exists AND failed is not true". Both checks.
+    if value.is_undefined() || value.is_none() {
+        return Ok(false);
+    }
+    // If `failed` is explicitly true, not succeeded.
+    if register_bool_attr(&value, "failed") {
+        return Ok(false);
+    }
+    // If `skipped` is true, also not succeeded (Ansible treats skipped
+    // separately).
+    if register_bool_attr(&value, "skipped") {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn register_is_skipped_test(value: MjValue) -> Result<bool, MjError> {
+    Ok(register_bool_attr(&value, "skipped"))
+}
+
+/// Coerce a minijinja value to a `Vec<MjValue>` for the set-style
+/// filters. Accepts any iterable (lists, tuples, generators) and
+/// errors loudly on scalars rather than silently treating them as
+/// single-element sequences.
+fn to_seq(value: &MjValue, filter_name: &str) -> Result<Vec<MjValue>, MjError> {
+    value
+        .try_iter()
+        .map(|it| it.collect::<Vec<_>>())
+        .map_err(|e| {
+            MjError::new(
+                MjKind::InvalidOperation,
+                format!("{filter_name}: expected a sequence, got {:?}: {e}", value.kind()),
+            )
+        })
+}
+
+/// Stable-ordered de-dup using a string-form key. We can't put `MjValue`
+/// in a `HashSet` (no Hash impl), so we project to its `Debug`-formatted
+/// representation. That's good enough for the comparison shapes Ansible
+/// playbooks use (strings, ints, simple maps) — values that look the
+/// same under `Debug` get folded together.
+fn value_key(v: &MjValue) -> String {
+    format!("{v:?}")
+}
+
+fn difference_filter(value: MjValue, other: MjValue) -> Result<MjValue, MjError> {
+    let a = to_seq(&value, "difference")?;
+    let b = to_seq(&other, "difference")?;
+    let exclude: std::collections::HashSet<String> = b.iter().map(value_key).collect();
+    let out: Vec<MjValue> = a.into_iter().filter(|v| !exclude.contains(&value_key(v))).collect();
+    Ok(MjValue::from(out))
+}
+
+fn intersect_filter(value: MjValue, other: MjValue) -> Result<MjValue, MjError> {
+    let a = to_seq(&value, "intersect")?;
+    let b = to_seq(&other, "intersect")?;
+    let keep: std::collections::HashSet<String> = b.iter().map(value_key).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let out: Vec<MjValue> = a
+        .into_iter()
+        .filter(|v| {
+            let k = value_key(v);
+            keep.contains(&k) && seen.insert(k)
+        })
+        .collect();
+    Ok(MjValue::from(out))
+}
+
+fn union_filter(value: MjValue, other: MjValue) -> Result<MjValue, MjError> {
+    let a = to_seq(&value, "union")?;
+    let b = to_seq(&other, "union")?;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<MjValue> = Vec::with_capacity(a.len() + b.len());
+    for v in a.into_iter().chain(b.into_iter()) {
+        if seen.insert(value_key(&v)) {
+            out.push(v);
+        }
+    }
+    Ok(MjValue::from(out))
+}
+
+fn symmetric_difference_filter(value: MjValue, other: MjValue) -> Result<MjValue, MjError> {
+    let a = to_seq(&value, "symmetric_difference")?;
+    let b = to_seq(&other, "symmetric_difference")?;
+    let a_keys: std::collections::HashSet<String> = a.iter().map(value_key).collect();
+    let b_keys: std::collections::HashSet<String> = b.iter().map(value_key).collect();
+    let mut out: Vec<MjValue> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in a.iter().chain(b.iter()) {
+        let k = value_key(v);
+        let in_a = a_keys.contains(&k);
+        let in_b = b_keys.contains(&k);
+        if in_a != in_b && seen.insert(k) {
+            out.push(v.clone());
+        }
+    }
+    Ok(MjValue::from(out))
+}
+
+fn unique_filter(value: MjValue) -> Result<MjValue, MjError> {
+    let a = to_seq(&value, "unique")?;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let out: Vec<MjValue> = a.into_iter().filter(|v| seen.insert(value_key(v))).collect();
+    Ok(MjValue::from(out))
+}
+
+fn flatten_filter(value: MjValue) -> Result<MjValue, MjError> {
+    let a = to_seq(&value, "flatten")?;
+    let mut out: Vec<MjValue> = Vec::new();
+    for v in a {
+        match v.try_iter() {
+            Ok(it) => out.extend(it),
+            // Scalars in a flatten input pass through.
+            Err(_) => out.push(v),
+        }
+    }
+    Ok(MjValue::from(out))
+}
+
+/// Ansible's `match` test: `re.match(pattern, value)`-shaped — the
+/// pattern is anchored at the start of the string. A non-string
+/// `value` is a false test (rather than an error) to match Ansible's
+/// laxness, but a bad pattern is a hard error so playbooks find their
+/// typos.
+fn regex_match_test(value: MjValue, pattern: String) -> Result<bool, MjError> {
+    let Some(s) = value.as_str() else { return Ok(false) };
+    let re = regex::Regex::new(&pattern).map_err(|e| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("match: invalid pattern {pattern:?}: {e}"),
+        )
+    })?;
+    // re.match() anchors at the start, but the engine still scans for a
+    // first-position match — we get the same semantics by checking
+    // shortest_match() against the start, or equivalently by inserting
+    // a leading `\A` and using is_match. Easier: use find() and check
+    // that the match starts at 0.
+    Ok(match re.find(s) {
+        Some(m) => m.start() == 0,
+        None => false,
+    })
+}
+
+/// Ansible's `search` test (and `regex` alias): `re.search(pattern,
+/// value)`-shaped — the pattern can match anywhere in the string.
+fn regex_search_test(value: MjValue, pattern: String) -> Result<bool, MjError> {
+    let Some(s) = value.as_str() else { return Ok(false) };
+    let re = regex::Regex::new(&pattern).map_err(|e| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            format!("search: invalid pattern {pattern:?}: {e}"),
+        )
+    })?;
+    Ok(re.is_match(s))
+}
+
 fn regex_replace_filter(
     value: MjValue,
     pattern: String,
@@ -662,52 +1124,52 @@ pub fn precompile_all(pb: &Playbook) -> Result<()> {
 
 fn check_task(env: &Environment, task: &Task) -> Result<()> {
     if let Some(expr) = &task.when {
-        env.compile_expression(expr)
+        env.compile_expression(&crate::template::prepare_jinja_source(&expr))
             .map_err(|e| anyhow!("when: {e}"))?;
     }
     if let Some(LoopSpec::Expr(s)) = &task.loop_spec {
         // Treat the loop expression as a template — they're sometimes
         // bare `{{ var }}` and sometimes more complex `{{ a + b }}`.
-        env.template_from_str(s).map_err(|e| anyhow!("loop: {e}"))?;
+        env.template_from_str(&crate::template::prepare_jinja_source(&s)).map_err(|e| anyhow!("loop: {e}"))?;
     }
     if let Some(d) = &task.delegate_to {
-        env.template_from_str(d)
+        env.template_from_str(&crate::template::prepare_jinja_source(&d))
             .map_err(|e| anyhow!("delegate_to: {e}"))?;
     }
     for (i, n) in task.notify.iter().enumerate() {
-        env.template_from_str(n)
+        env.template_from_str(&crate::template::prepare_jinja_source(&n))
             .map_err(|e| anyhow!("notify[{i}]: {e}"))?;
     }
     match &task.body {
         TaskBody::Op(op) => check_op(env, op)?,
         TaskBody::Assert(a) => check_assert(env, a)?,
         TaskBody::Fail(f) => {
-            env.template_from_str(&f.msg)
+            env.template_from_str(&crate::template::prepare_jinja_source(&f.msg))
                 .map_err(|e| anyhow!("fail.msg: {e}"))?;
         }
         TaskBody::Debug(d) => {
             match &d.msg {
                 None => {}
                 Some(crate::playbook::DebugMsg::One(s)) => {
-                    env.template_from_str(s)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&s))
                         .map_err(|e| anyhow!("debug.msg: {e}"))?;
                 }
                 Some(crate::playbook::DebugMsg::Many(lines)) => {
                     for (i, s) in lines.iter().enumerate() {
-                        env.template_from_str(s)
+                        env.template_from_str(&crate::template::prepare_jinja_source(&s))
                             .map_err(|e| anyhow!("debug.msg[{i}]: {e}"))?;
                     }
                 }
             }
             if let Some(s) = &d.var {
-                env.template_from_str(s)
+                env.template_from_str(&crate::template::prepare_jinja_source(&s))
                     .map_err(|e| anyhow!("debug.var: {e}"))?;
             }
         }
         TaskBody::SetFact(m) => {
             for (k, v) in &m.0 {
                 if let serde_yaml::Value::String(s) = v {
-                    env.template_from_str(s)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&s))
                         .map_err(|e| anyhow!("set_fact.{k}: {e}"))?;
                 }
             }
@@ -716,11 +1178,11 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
             // Pre-compile any Jinja in `seconds:` / `minutes:` so bad
             // templates surface at load time, not at the wakeup point.
             if let Some(s) = &p.seconds {
-                env.template_from_str(s)
+                env.template_from_str(&crate::template::prepare_jinja_source(&s))
                     .map_err(|e| anyhow!("pause.seconds: {e}"))?;
             }
             if let Some(s) = &p.minutes {
-                env.template_from_str(s)
+                env.template_from_str(&crate::template::prepare_jinja_source(&s))
                     .map_err(|e| anyhow!("pause.minutes: {e}"))?;
             }
         }
@@ -735,7 +1197,7 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
             // surfaces here rather than at runtime.
             for (k, v) in &ir.vars {
                 if let serde_yaml::Value::String(s) = v {
-                    env.template_from_str(s)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&s))
                         .map_err(|e| anyhow!("include_role.vars.{k}: {e}"))?;
                 }
             }
@@ -768,67 +1230,75 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
 fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
     match op {
         TaskOp::Shell(ShellOp::Simple(s)) => {
-            env.template_from_str(s)
+            env.template_from_str(&crate::template::prepare_jinja_source(&s))
                 .map_err(|e| anyhow!("shell: {e}"))?;
         }
         TaskOp::Shell(ShellOp::Detailed { command, .. }) => {
-            env.template_from_str(command)
+            env.template_from_str(&crate::template::prepare_jinja_source(&command))
                 .map_err(|e| anyhow!("shell.command: {e}"))?;
         }
         TaskOp::Exec(ExecOp {
             argv, env: e_env, cwd, stdin, ..
         }) => {
             for (i, a) in argv.iter().enumerate() {
-                env.template_from_str(a)
+                env.template_from_str(&crate::template::prepare_jinja_source(&a))
                     .map_err(|e| anyhow!("exec.argv[{i}]: {e}"))?;
             }
             for (k, v) in e_env {
-                env.template_from_str(v)
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
                     .map_err(|e| anyhow!("exec.env.{k}: {e}"))?;
             }
             if let Some(c) = cwd {
-                env.template_from_str(c)
+                env.template_from_str(&crate::template::prepare_jinja_source(&c))
                     .map_err(|e| anyhow!("exec.cwd: {e}"))?;
             }
-            env.template_from_str(stdin)
+            env.template_from_str(&crate::template::prepare_jinja_source(&stdin))
                 .map_err(|e| anyhow!("exec.stdin: {e}"))?;
         }
         TaskOp::Command(c) => {
             if let Some(raw) = c.raw_cmd.as_deref() {
-                env.template_from_str(raw)
+                env.template_from_str(&crate::template::prepare_jinja_source(&raw))
                     .map_err(|e| anyhow!("command.cmd: {e}"))?;
             } else {
                 for (i, a) in c.argv.iter().enumerate() {
-                    env.template_from_str(a)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&a))
                         .map_err(|e| anyhow!("command.argv[{i}]: {e}"))?;
                 }
             }
-            env.template_from_str(&c.chdir)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.chdir))
                 .map_err(|e| anyhow!("command.chdir: {e}"))?;
-            env.template_from_str(&c.creates)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.creates))
                 .map_err(|e| anyhow!("command.creates: {e}"))?;
-            env.template_from_str(&c.removes)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.removes))
                 .map_err(|e| anyhow!("command.removes: {e}"))?;
-            env.template_from_str(&c.stdin)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.stdin))
                 .map_err(|e| anyhow!("command.stdin: {e}"))?;
         }
-        TaskOp::WriteFile(WriteFileOp { path, content, .. }) => {
-            env.template_from_str(path)
+        TaskOp::WriteFile(w) => {
+            env.template_from_str(&crate::template::prepare_jinja_source(&w.path))
                 .map_err(|e| anyhow!("write_file.path: {e}"))?;
-            env.template_from_str(content)
+            env.template_from_str(&crate::template::prepare_jinja_source(&w.content))
                 .map_err(|e| anyhow!("write_file.content: {e}"))?;
+            if let Some(v) = w.validate.as_deref() {
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
+                    .map_err(|e| anyhow!("write_file.validate: {e}"))?;
+            }
         }
         TaskOp::Template(t) => {
             // `src:` was resolved at load time; `dest:` is Jinja-able
             // at task time, and the loaded `.j2` body itself is also
             // compiled here so a syntax error in the template surfaces
             // at validate-time rather than at first task dispatch.
-            env.template_from_str(&t.dest)
+            env.template_from_str(&crate::template::prepare_jinja_source(&t.dest))
                 .map_err(|e| anyhow!("template.dest: {e}"))?;
             if let Some(body) = t.body.as_deref() {
-                env.template_from_str(body).map_err(|e| {
+                env.template_from_str(&crate::template::prepare_jinja_source(&body)).map_err(|e| {
                     anyhow!("template src {:?}: {e}", t.src)
                 })?;
+            }
+            if let Some(v) = t.validate.as_deref() {
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
+                    .map_err(|e| anyhow!("template.validate: {e}"))?;
             }
         }
         TaskOp::Copy(c) => {
@@ -836,142 +1306,163 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             // `content:` form — content is a Jinja-renderable string,
             // pre-compile it so syntax errors surface at validate time
             // rather than at first dispatch.
-            env.template_from_str(&c.dest)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.dest))
                 .map_err(|e| anyhow!("copy.dest: {e}"))?;
             if let Some(content) = c.content.as_deref() {
-                env.template_from_str(content)
+                env.template_from_str(&crate::template::prepare_jinja_source(&content))
                     .map_err(|e| anyhow!("copy.content: {e}"))?;
+            }
+            if let Some(v) = c.validate.as_deref() {
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
+                    .map_err(|e| anyhow!("copy.validate: {e}"))?;
             }
         }
         TaskOp::GatherFacts => {
             // Implicit op — no user-supplied fields to compile.
         }
         TaskOp::Stat(s) => {
-            env.template_from_str(&s.path)
+            env.template_from_str(&crate::template::prepare_jinja_source(&s.path))
                 .map_err(|e| anyhow!("stat.path: {e}"))?;
         }
         TaskOp::File(f) => {
-            env.template_from_str(&f.path)
+            env.template_from_str(&crate::template::prepare_jinja_source(&f.path))
                 .map_err(|e| anyhow!("file.path: {e}"))?;
             if let Some(o) = &f.owner {
-                env.template_from_str(o)
+                env.template_from_str(&crate::template::prepare_jinja_source(&o))
                     .map_err(|e| anyhow!("file.owner: {e}"))?;
             }
             if let Some(g) = &f.group {
-                env.template_from_str(g)
+                env.template_from_str(&crate::template::prepare_jinja_source(&g))
                     .map_err(|e| anyhow!("file.group: {e}"))?;
             }
         }
         TaskOp::WaitFor(w) => {
             if let Some(h) = &w.host {
-                env.template_from_str(h)
+                env.template_from_str(&crate::template::prepare_jinja_source(&h))
                     .map_err(|e| anyhow!("wait_for.host: {e}"))?;
             }
             if let Some(p) = &w.path {
-                env.template_from_str(p)
+                env.template_from_str(&crate::template::prepare_jinja_source(&p))
                     .map_err(|e| anyhow!("wait_for.path: {e}"))?;
             }
         }
         TaskOp::LineInFile(l) => {
-            env.template_from_str(&l.path)
+            env.template_from_str(&crate::template::prepare_jinja_source(&l.path))
                 .map_err(|e| anyhow!("lineinfile.path: {e}"))?;
-            env.template_from_str(&l.line)
+            env.template_from_str(&crate::template::prepare_jinja_source(&l.line))
                 .map_err(|e| anyhow!("lineinfile.line: {e}"))?;
+            if let Some(v) = l.validate.as_deref() {
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
+                    .map_err(|e| anyhow!("lineinfile.validate: {e}"))?;
+            }
             // regexp / insertbefore / insertafter are regex patterns —
             // we don't Jinja-render those (gothab doesn't use Jinja
             // inside regex patterns, and `{{...}}` would be ambiguous
             // with regex syntax). If we ever need it, add it here.
         }
         TaskOp::BlockInFile(b) => {
-            env.template_from_str(&b.path)
+            env.template_from_str(&crate::template::prepare_jinja_source(&b.path))
                 .map_err(|e| anyhow!("blockinfile.path: {e}"))?;
-            env.template_from_str(&b.block)
+            env.template_from_str(&crate::template::prepare_jinja_source(&b.block))
                 .map_err(|e| anyhow!("blockinfile.block: {e}"))?;
+            if let Some(v) = b.validate.as_deref() {
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
+                    .map_err(|e| anyhow!("blockinfile.validate: {e}"))?;
+            }
             // marker/marker_begin/marker_end pass through as raw
             // strings; the agent does the literal `{mark}` substitution
             // itself (not Jinja). insertbefore/insertafter are regex
             // patterns — same rationale as lineinfile.
         }
         TaskOp::Systemd(s) => {
-            env.template_from_str(&s.name)
+            env.template_from_str(&crate::template::prepare_jinja_source(&s.name))
                 .map_err(|e| anyhow!("systemd.name: {e}"))?;
         }
         TaskOp::Package(p) => {
             let label = p.manager.label();
             for n in &p.names {
-                env.template_from_str(n)
+                env.template_from_str(&crate::template::prepare_jinja_source(&n))
                     .map_err(|e| anyhow!("{label}.name: {e}"))?;
             }
             if !p.default_release.is_empty() {
-                env.template_from_str(&p.default_release)
+                env.template_from_str(&crate::template::prepare_jinja_source(&p.default_release))
                     .map_err(|e| anyhow!("{label}.default_release: {e}"))?;
             }
             if !p.virtualenv.is_empty() {
-                env.template_from_str(&p.virtualenv)
+                env.template_from_str(&crate::template::prepare_jinja_source(&p.virtualenv))
                     .map_err(|e| anyhow!("{label}.virtualenv: {e}"))?;
             }
             if !p.virtualenv_command.is_empty() {
-                env.template_from_str(&p.virtualenv_command)
+                env.template_from_str(&crate::template::prepare_jinja_source(&p.virtualenv_command))
                     .map_err(|e| anyhow!("{label}.virtualenv_command: {e}"))?;
             }
         }
         TaskOp::Repository(r) => {
-            env.template_from_str(&r.repo)
+            env.template_from_str(&crate::template::prepare_jinja_source(&r.repo))
                 .map_err(|e| anyhow!("repository.repo: {e}"))?;
             if !r.filename.is_empty() {
-                env.template_from_str(&r.filename)
+                env.template_from_str(&crate::template::prepare_jinja_source(&r.filename))
                     .map_err(|e| anyhow!("repository.filename: {e}"))?;
             }
         }
         TaskOp::Group(g) => {
-            env.template_from_str(&g.name)
+            env.template_from_str(&crate::template::prepare_jinja_source(&g.name))
                 .map_err(|e| anyhow!("group.name: {e}"))?;
         }
         TaskOp::User(u) => {
-            env.template_from_str(&u.name)
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.name))
                 .map_err(|e| anyhow!("user.name: {e}"))?;
             if let Some(s) = &u.shell {
-                env.template_from_str(s)
+                env.template_from_str(&crate::template::prepare_jinja_source(&s))
                     .map_err(|e| anyhow!("user.shell: {e}"))?;
             }
             if let Some(h) = &u.home {
-                env.template_from_str(h)
+                env.template_from_str(&crate::template::prepare_jinja_source(&h))
                     .map_err(|e| anyhow!("user.home: {e}"))?;
             }
             if !u.primary_group.is_empty() {
-                env.template_from_str(&u.primary_group)
+                env.template_from_str(&crate::template::prepare_jinja_source(&u.primary_group))
                     .map_err(|e| anyhow!("user.group: {e}"))?;
             }
             for (i, g) in u.groups.iter().enumerate() {
-                env.template_from_str(g)
+                env.template_from_str(&crate::template::prepare_jinja_source(&g))
                     .map_err(|e| anyhow!("user.groups[{i}]: {e}"))?;
             }
         }
         TaskOp::AuthorizedKey(a) => {
-            env.template_from_str(&a.user)
+            env.template_from_str(&crate::template::prepare_jinja_source(&a.user))
                 .map_err(|e| anyhow!("authorized_key.user: {e}"))?;
-            env.template_from_str(&a.key)
+            env.template_from_str(&crate::template::prepare_jinja_source(&a.key))
                 .map_err(|e| anyhow!("authorized_key.key: {e}"))?;
         }
         TaskOp::Getent(g) => {
-            env.template_from_str(&g.database)
+            env.template_from_str(&crate::template::prepare_jinja_source(&g.database))
                 .map_err(|e| anyhow!("getent.database: {e}"))?;
-            env.template_from_str(&g.key)
+            env.template_from_str(&crate::template::prepare_jinja_source(&g.key))
                 .map_err(|e| anyhow!("getent.key: {e}"))?;
             if !g.split.is_empty() {
-                env.template_from_str(&g.split)
+                env.template_from_str(&crate::template::prepare_jinja_source(&g.split))
                     .map_err(|e| anyhow!("getent.split: {e}"))?;
             }
         }
         TaskOp::Hostname(h) => {
-            env.template_from_str(&h.name)
+            env.template_from_str(&crate::template::prepare_jinja_source(&h.name))
                 .map_err(|e| anyhow!("hostname.name: {e}"))?;
         }
+        TaskOp::Timezone(z) => {
+            env.template_from_str(&crate::template::prepare_jinja_source(&z.name))
+                .map_err(|e| anyhow!("timezone.name: {e}"))?;
+        }
         TaskOp::Ufw(u) => {
-            // Most ufw fields are rendered as raw strings (proto, direction
-            // are gated by parse-time allowlists; rule/state are tokens).
-            // The fields that *could* carry Jinja are ip/port/comment/iface.
+            // All string fields may carry Jinja — the parse-time
+            // enum checks for rule/direction/proto are skipped when
+            // the value is templated, so the syntax check is the
+            // last chance to catch a malformed `{{ ... }}` before
+            // dispatch.
             for (label, val) in [
+                ("ufw.rule", &u.rule),
+                ("ufw.direction", &u.direction),
+                ("ufw.proto", &u.proto),
                 ("ufw.from_ip", &u.from_ip),
                 ("ufw.from_port", &u.from_port),
                 ("ufw.to_ip", &u.to_ip),
@@ -980,14 +1471,14 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 ("ufw.comment", &u.comment),
             ] {
                 if !val.is_empty() {
-                    env.template_from_str(val)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
                         .map_err(|e| anyhow!("{label}: {e}"))?;
                 }
             }
         }
         TaskOp::AsyncStatus(a) => {
             // `jid` is Jinja: typically `{{ start_task.ansible_job_id }}`.
-            env.template_from_str(&a.jid)
+            env.template_from_str(&crate::template::prepare_jinja_source(&a.jid))
                 .map_err(|e| anyhow!("async_status.jid: {e}"))?;
         }
         TaskOp::Iptables(i) => {
@@ -1011,7 +1502,7 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 ("iptables.comment", &i.comment),
             ] {
                 if !val.is_empty() {
-                    env.template_from_str(val)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
                         .map_err(|e| anyhow!("{label}: {e}"))?;
                 }
             }
@@ -1020,14 +1511,14 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             // url, header values, and body are Jinja-rendered at task
             // time. Header keys are not (header names aren't useful Jinja
             // targets and `:` in a name would be ambiguous anyway).
-            env.template_from_str(&u.url)
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.url))
                 .map_err(|e| anyhow!("uri.url: {e}"))?;
             for (k, v) in &u.headers {
-                env.template_from_str(v)
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
                     .map_err(|e| anyhow!("uri.headers.{k}: {e}"))?;
             }
             if !u.body.is_empty() {
-                env.template_from_str(&u.body)
+                env.template_from_str(&crate::template::prepare_jinja_source(&u.body))
                     .map_err(|e| anyhow!("uri.body: {e}"))?;
             }
             for label in ["client_cert", "client_key", "ca_path"] {
@@ -1038,22 +1529,22 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     _ => unreachable!(),
                 };
                 if !val.is_empty() {
-                    env.template_from_str(val)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
                         .map_err(|e| anyhow!("uri.{label}: {e}"))?;
                 }
             }
         }
         TaskOp::OpenSslPrivkey(p) => {
-            env.template_from_str(&p.path)
+            env.template_from_str(&crate::template::prepare_jinja_source(&p.path))
                 .map_err(|e| anyhow!("openssl_privatekey.path: {e}"))?;
         }
         TaskOp::OpenSslCsrPipe(c) => {
-            env.template_from_str(&c.privatekey_path)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.privatekey_path))
                 .map_err(|e| anyhow!("openssl_csr_pipe.privatekey_path: {e}"))?;
-            env.template_from_str(&c.common_name)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.common_name))
                 .map_err(|e| anyhow!("openssl_csr_pipe.common_name: {e}"))?;
             for (i, s) in c.subject_alt_name.iter().enumerate() {
-                env.template_from_str(s)
+                env.template_from_str(&crate::template::prepare_jinja_source(&s))
                     .map_err(|e| anyhow!("openssl_csr_pipe.subject_alt_name[{i}]: {e}"))?;
             }
             // key_usage / extended_key_usage are validated against
@@ -1063,9 +1554,9 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
         TaskOp::X509CertificatePipe(c) => {
             // csr_content / privatekey_content come from previous-task
             // registers via Jinja in real playbooks.
-            env.template_from_str(&c.csr_content)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.csr_content))
                 .map_err(|e| anyhow!("x509_certificate_pipe.csr_content: {e}"))?;
-            env.template_from_str(&c.privatekey_content)
+            env.template_from_str(&crate::template::prepare_jinja_source(&c.privatekey_content))
                 .map_err(|e| anyhow!("x509_certificate_pipe.privatekey_content: {e}"))?;
         }
         TaskOp::PostgresqlQuery(p) => {
@@ -1074,7 +1565,7 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             // facts; passwords come from vault). positional_args items
             // are also templatable. Sockets / ports usually aren't but
             // we render anyway for symmetry.
-            env.template_from_str(&p.query)
+            env.template_from_str(&crate::template::prepare_jinja_source(&p.query))
                 .map_err(|e| anyhow!("postgresql_query.query: {e}"))?;
             for (label, val) in [
                 ("db", &p.db),
@@ -1084,17 +1575,17 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 ("login_host", &p.login_host),
             ] {
                 if !val.is_empty() {
-                    env.template_from_str(val)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
                         .map_err(|e| anyhow!("postgresql_query.{label}: {e}"))?;
                 }
             }
             for (i, a) in p.positional_args.iter().enumerate() {
-                env.template_from_str(a)
+                env.template_from_str(&crate::template::prepare_jinja_source(&a))
                     .map_err(|e| anyhow!("postgresql_query.positional_args[{i}]: {e}"))?;
             }
         }
         TaskOp::PostgresqlExt(p) => {
-            env.template_from_str(&p.name)
+            env.template_from_str(&crate::template::prepare_jinja_source(&p.name))
                 .map_err(|e| anyhow!("postgresql_ext.name: {e}"))?;
             for (label, val) in [
                 ("version", &p.version),
@@ -1106,15 +1597,75 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 ("login_host", &p.login_host),
             ] {
                 if !val.is_empty() {
-                    env.template_from_str(val)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
                         .map_err(|e| anyhow!("postgresql_ext.{label}: {e}"))?;
                 }
             }
         }
+        TaskOp::PostgresqlUser(u) => {
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.name))
+                .map_err(|e| anyhow!("postgresql_user.name: {e}"))?;
+            for (label, val) in [
+                ("password", &u.password),
+                ("role_attr_flags", &u.role_attr_flags),
+                ("db", &u.db),
+                ("login_user", &u.login_user),
+                ("login_password", &u.login_password),
+                ("login_unix_socket", &u.login_unix_socket),
+                ("login_host", &u.login_host),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
+                        .map_err(|e| anyhow!("postgresql_user.{label}: {e}"))?;
+                }
+            }
+        }
+        TaskOp::PostgresqlDb(d) => {
+            env.template_from_str(&crate::template::prepare_jinja_source(&d.name))
+                .map_err(|e| anyhow!("postgresql_db.name: {e}"))?;
+            for (label, val) in [
+                ("owner", &d.owner),
+                ("encoding", &d.encoding),
+                ("lc_collate", &d.lc_collate),
+                ("lc_ctype", &d.lc_ctype),
+                ("template", &d.template),
+                ("login_user", &d.login_user),
+                ("login_password", &d.login_password),
+                ("login_unix_socket", &d.login_unix_socket),
+                ("login_host", &d.login_host),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
+                        .map_err(|e| anyhow!("postgresql_db.{label}: {e}"))?;
+                }
+            }
+        }
+        TaskOp::PostgresqlMembership(m) => {
+            for g in &m.groups {
+                env.template_from_str(&crate::template::prepare_jinja_source(&g))
+                    .map_err(|e| anyhow!("postgresql_membership.groups[]: {e}"))?;
+            }
+            for t in &m.target_roles {
+                env.template_from_str(&crate::template::prepare_jinja_source(&t))
+                    .map_err(|e| anyhow!("postgresql_membership.target_roles[]: {e}"))?;
+            }
+            for (label, val) in [
+                ("db", &m.db),
+                ("login_user", &m.login_user),
+                ("login_password", &m.login_password),
+                ("login_unix_socket", &m.login_unix_socket),
+                ("login_host", &m.login_host),
+            ] {
+                if !val.is_empty() {
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
+                        .map_err(|e| anyhow!("postgresql_membership.{label}: {e}"))?;
+                }
+            }
+        }
         TaskOp::GetUrl(g) => {
-            env.template_from_str(&g.url)
+            env.template_from_str(&crate::template::prepare_jinja_source(&g.url))
                 .map_err(|e| anyhow!("get_url.url: {e}"))?;
-            env.template_from_str(&g.dest)
+            env.template_from_str(&crate::template::prepare_jinja_source(&g.dest))
                 .map_err(|e| anyhow!("get_url.dest: {e}"))?;
             for (label, val) in [
                 ("checksum", &g.checksum),
@@ -1125,46 +1676,46 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 ("ca_path", &g.ca_path),
             ] {
                 if !val.is_empty() {
-                    env.template_from_str(val)
+                    env.template_from_str(&crate::template::prepare_jinja_source(&val))
                         .map_err(|e| anyhow!("get_url.{label}: {e}"))?;
                 }
             }
             for (k, v) in &g.headers {
-                env.template_from_str(v)
+                env.template_from_str(&crate::template::prepare_jinja_source(&v))
                     .map_err(|e| anyhow!("get_url.headers[{k}]: {e}"))?;
             }
         }
         TaskOp::Slurp(s) => {
-            env.template_from_str(&s.src)
+            env.template_from_str(&crate::template::prepare_jinja_source(&s.src))
                 .map_err(|e| anyhow!("slurp.src: {e}"))?;
         }
         TaskOp::Unarchive(u) => {
-            env.template_from_str(&u.src)
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.src))
                 .map_err(|e| anyhow!("unarchive.src: {e}"))?;
-            env.template_from_str(&u.dest)
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.dest))
                 .map_err(|e| anyhow!("unarchive.dest: {e}"))?;
-            env.template_from_str(&u.creates)
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.creates))
                 .map_err(|e| anyhow!("unarchive.creates: {e}"))?;
-            env.template_from_str(&u.owner)
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.owner))
                 .map_err(|e| anyhow!("unarchive.owner: {e}"))?;
-            env.template_from_str(&u.group)
+            env.template_from_str(&crate::template::prepare_jinja_source(&u.group))
                 .map_err(|e| anyhow!("unarchive.group: {e}"))?;
             for (i, p) in u.include.iter().enumerate() {
-                env.template_from_str(p)
+                env.template_from_str(&crate::template::prepare_jinja_source(&p))
                     .map_err(|e| anyhow!("unarchive.include[{i}]: {e}"))?;
             }
             for (i, p) in u.exclude.iter().enumerate() {
-                env.template_from_str(p)
+                env.template_from_str(&crate::template::prepare_jinja_source(&p))
                     .map_err(|e| anyhow!("unarchive.exclude[{i}]: {e}"))?;
             }
         }
         TaskOp::Tempfile(t) => {
-            env.template_from_str(&t.prefix)
+            env.template_from_str(&crate::template::prepare_jinja_source(&t.prefix))
                 .map_err(|e| anyhow!("tempfile.prefix: {e}"))?;
-            env.template_from_str(&t.suffix)
+            env.template_from_str(&crate::template::prepare_jinja_source(&t.suffix))
                 .map_err(|e| anyhow!("tempfile.suffix: {e}"))?;
             if let Some(p) = &t.path {
-                env.template_from_str(p)
+                env.template_from_str(&crate::template::prepare_jinja_source(&p))
                     .map_err(|e| anyhow!("tempfile.path: {e}"))?;
             }
         }
@@ -1174,11 +1725,11 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
 
 fn check_assert(env: &Environment, a: &AssertTask) -> Result<()> {
     for (i, expr) in a.that.iter().enumerate() {
-        env.compile_expression(expr)
+        env.compile_expression(&crate::template::prepare_jinja_source(&expr))
             .map_err(|e| anyhow!("assert.that[{i}]: {e}"))?;
     }
     if let Some(msg) = &a.fail_msg {
-        env.template_from_str(msg)
+        env.template_from_str(&crate::template::prepare_jinja_source(&msg))
             .map_err(|e| anyhow!("assert.fail_msg: {e}"))?;
     }
     Ok(())
@@ -1195,6 +1746,185 @@ mod tests {
         let tmpl = env.template_from_str("hello {{ name }}").unwrap();
         let out = tmpl.render(context! { name => "world" }).unwrap();
         assert_eq!(out, "hello world");
+    }
+
+    /// Regression: when `prepare_jinja_source` engages the slow path
+    /// (anything containing `.<digit>`), non-ASCII bytes in the source
+    /// must NOT be re-encoded. The buggy version did `out.push(b as
+    /// char)` per source byte, which interprets each byte as a Unicode
+    /// codepoint and re-encodes as UTF-8 — corrupting every em-dash,
+    /// every accented character, every emoji.
+    ///
+    /// Caught in the gothab drill: vmagent's scrape.yml.j2 had
+    /// `version: 1.0`-style sequences (engaging the slow path) and an
+    /// em-dash in a comment. The em-dash (`e2 80 94`) arrived on the
+    /// agent as `c3 a2 c2 80 c2 94`, causing `vmagent -dryRun` to
+    /// reject the staged file with "yaml: control characters are not
+    /// allowed". A round-trip test confined to ASCII would have missed
+    /// it — the test must include both a multi-byte UTF-8 character
+    /// AND a `.<digit>` to trigger the slow path.
+    #[test]
+    fn prepare_jinja_source_preserves_non_ascii_in_slow_path() {
+        // `1.0` engages the slow path; em-dash `—` (U+2014, e2 80 94)
+        // is the canary. If the bug regresses, the dash bytes get
+        // doubled to `c3 a2 c2 80 c2 94`.
+        let src = "# vmagent scrape — version 1.0";
+        let out = prepare_jinja_source(src);
+        assert_eq!(
+            out.as_bytes(),
+            src.as_bytes(),
+            "slow path must preserve non-ASCII bytes verbatim; \
+             got {:x?}, expected {:x?}",
+            out.as_bytes(),
+            src.as_bytes()
+        );
+    }
+
+    /// Regression: a template body containing non-ASCII UTF-8 (em-dash,
+    /// U+2014, bytes `e2 80 94`) must round-trip verbatim through
+    /// minijinja's render path. Caught in the gothab drill — vmagent
+    /// scrape.yml.j2 has em-dash in a comment, and the rendered output
+    /// was arriving on the agent as `c3 a2 c2 80 c2 94` (Latin-1-as-
+    /// UTF-8 double encoding), making `vmagent -dryRun` reject it with
+    /// "yaml: control characters are not allowed".
+    #[test]
+    fn render_preserves_non_ascii_utf8_bytes() {
+        let env = make_env();
+        let src = "vmagent scrape config — Prometheus format";
+        let tmpl = env.template_from_str(src).unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(
+            out.as_bytes(),
+            src.as_bytes(),
+            "minijinja must round-trip em-dash bytes verbatim; got {:x?}",
+            out.as_bytes()
+        );
+    }
+
+    /// Regression: minijinja rejects Ansible-flavored attribute-style
+    /// numeric subscripts (`item.0.name`) as "unexpected float";
+    /// `prepare_jinja_source` rewrites them to bracket form so the
+    /// real-world Ansible idiom keeps working.
+    #[test]
+    fn prepare_jinja_source_rewrites_attr_numeric_subscript() {
+        let out = prepare_jinja_source("{{ item.0.name }}");
+        assert_eq!(out, "{{ item[0].name }}");
+        // Chained subscripts.
+        let out = prepare_jinja_source("{{ a.0.1.b }}");
+        assert_eq!(out, "{{ a[0][1].b }}");
+        // After `]` (subscript chain).
+        let out = prepare_jinja_source("{{ a[0].1 }}");
+        assert_eq!(out, "{{ a[0][1] }}");
+    }
+
+    /// String literals inside Jinja blocks must NOT be rewritten —
+    /// the rewrite is identifier-attribute syntax only.
+    #[test]
+    fn prepare_jinja_source_leaves_string_literals_alone() {
+        let out = prepare_jinja_source(r#"{{ "1.0.0" }}"#);
+        assert_eq!(out, r#"{{ "1.0.0" }}"#);
+        let out = prepare_jinja_source(r#"{{ 'v.0.beta' }}"#);
+        assert_eq!(out, r#"{{ 'v.0.beta' }}"#);
+        // Even when mixed in the same expression.
+        let out = prepare_jinja_source(r#"{{ item.0 + "x.0" }}"#);
+        assert_eq!(out, r#"{{ item[0] + "x.0" }}"#);
+    }
+
+    /// Plain text outside Jinja blocks must pass through verbatim
+    /// (the rewrite only applies inside `{{ ... }}` / `{% ... %}`).
+    #[test]
+    fn prepare_jinja_source_leaves_plain_text_alone() {
+        let out = prepare_jinja_source("version 1.0.0\nitem.0 not jinja");
+        assert_eq!(out, "version 1.0.0\nitem.0 not jinja");
+    }
+
+    /// End-to-end through minijinja: a template that uses the
+    /// Ansible-style indexing must render once we run it through the
+    /// preprocessor.
+    #[test]
+    fn prepare_jinja_source_enables_ansible_subscript_through_minijinja() {
+        let env = make_env();
+        let prepared = prepare_jinja_source("{{ item.0.name }}");
+        let tmpl = env
+            .template_from_str(&prepared)
+            .expect("template compile must succeed after preprocessing");
+        let out = tmpl
+            .render(context! { item => vec![
+                context! { name => "alice" },
+            ] })
+            .unwrap();
+        assert_eq!(out, "alice");
+    }
+
+    /// Regression: gothab's `patroni.yml.j2` uses
+    /// `{% include "patroni-common.yml.j2" %}` to factor out shared
+    /// chunks. Resolution must walk a per-task `search_dirs` list
+    /// (role's `templates/` first, then playbook-level fallbacks).
+    /// Without `multi_template` and `install_include_loader` wired in,
+    /// minijinja rejects `include` as an unknown statement.
+    #[test]
+    fn install_include_loader_resolves_against_search_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let templates_dir = tmp.path().join("templates");
+        std::fs::create_dir(&templates_dir).unwrap();
+        std::fs::write(
+            templates_dir.join("greeting.j2"),
+            "hello {{ name }}",
+        )
+        .unwrap();
+
+        let mut env: Environment<'static> = make_env();
+        install_include_loader(&mut env, vec![templates_dir.clone()]);
+        let tmpl = env
+            .template_from_str(r#"{% include "greeting.j2" %}!"#)
+            .expect("outer template compiles");
+        let out = tmpl.render(context! { name => "world" }).unwrap();
+        assert_eq!(out, "hello world!");
+    }
+
+    /// Loader must reject path-traversal segments and absolute paths
+    /// in the include target — same defense minijinja's own
+    /// path_loader uses.
+    #[test]
+    fn install_include_loader_rejects_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let templates_dir = tmp.path().join("templates");
+        std::fs::create_dir(&templates_dir).unwrap();
+        std::fs::write(templates_dir.join("ok.j2"), "ok").unwrap();
+
+        let mut env: Environment<'static> = make_env();
+        install_include_loader(&mut env, vec![templates_dir.clone()]);
+
+        for bad in [r#"{% include "../etc/passwd" %}"#, r#"{% include "/etc/passwd" %}"#] {
+            let tmpl = env.template_from_str(bad).unwrap();
+            let err = tmpl.render(context! {}).unwrap_err();
+            assert!(
+                format!("{err}").contains("not found"),
+                "expected template-not-found for {bad:?}, got {err}",
+            );
+        }
+    }
+
+    /// Loader probes the dirs in order: an earlier dir wins over a
+    /// later one. Matches the role-then-playbook-fallback ordering
+    /// in `template_search_base_dirs`.
+    #[test]
+    fn install_include_loader_probes_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("a");
+        let second = tmp.path().join("b");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(first.join("shared.j2"), "FIRST").unwrap();
+        std::fs::write(second.join("shared.j2"), "SECOND").unwrap();
+
+        let mut env: Environment<'static> = make_env();
+        install_include_loader(&mut env, vec![first, second]);
+        let tmpl = env
+            .template_from_str(r#"{% include "shared.j2" %}"#)
+            .unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        assert_eq!(out, "FIRST");
     }
 
     #[test]
@@ -1839,6 +2569,161 @@ mod tests {
             panic!("expected TaskOp::Template");
         }
         precompile_all(&pb).unwrap();
+    }
+
+    /// Regression for the gothab valkey verify task that did
+    /// `{{ lines | select('match', '^role:') | list | first | default(...) }}`:
+    /// minijinja shipped without `match`/`search`/`regex` tests, so the
+    /// `select('match', ...)` call raised "unknown test" at render
+    /// time and the debug task failed across all valkey nodes. Pin
+    /// the test registrations.
+    /// Regression for the gothab pgbackrest.conf template that did
+    /// `groups['pgbackrest'] | difference([inventory_hostname]) | first`
+    /// to pick the peer node. minijinja shipped without `difference`
+    /// (or `intersect`/`union`/`symmetric_difference`/`unique`/`flatten`).
+    /// Pin the registrations.
+    /// Regression for the gothab pgbackrest-restore-drill task
+    /// `when: pgbackrest_drill_dockerfile is changed`: minijinja
+    /// shipped without `is changed` / `is failed` / `is succeeded` /
+    /// `is skipped` register tests. The when: render hit
+    /// "unknown test: test changed is unknown" and stopped the play.
+    #[test]
+    fn register_tests_read_register_attributes() {
+        let env = make_env();
+        let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([
+            ("r_changed".into(), serde_json::json!({"changed": true, "failed": false, "skipped": false, "rc": 0})),
+            ("r_failed".into(), serde_json::json!({"changed": false, "failed": true, "rc": 1})),
+            ("r_skipped".into(), serde_json::json!({"changed": false, "failed": false, "skipped": true})),
+            ("r_clean".into(), serde_json::json!({"changed": false, "failed": false, "skipped": false, "rc": 0})),
+        ]);
+        for (expr, expected, why) in [
+            ("r_changed is changed", "y", "changed register"),
+            ("r_clean is changed", "n", "unchanged register"),
+            ("r_failed is failed", "y", "failed register"),
+            ("r_clean is failed", "n", "ok register"),
+            ("r_clean is succeeded", "y", "ok register"),
+            ("r_failed is succeeded", "n", "failed register"),
+            ("r_skipped is succeeded", "n", "skipped is not succeeded"),
+            ("r_skipped is skipped", "y", "skipped register"),
+            ("r_clean is skipped", "n", "non-skipped register"),
+            // Undefined → false for all three (Ansible's laxness):
+            ("nope is changed", "n", "undefined → not changed"),
+            ("nope is failed", "n", "undefined → not failed"),
+            ("nope is succeeded", "n", "undefined → not succeeded"),
+        ] {
+            let src = format!("{{{{ 'y' if {expr} else 'n' }}}}");
+            let out = env.render_str(&src, &ctx).unwrap_or_else(|e| {
+                panic!("{why}: render failed: {e}; expr={expr}")
+            });
+            assert_eq!(out, expected, "{why}: expr={expr}");
+        }
+    }
+
+    #[test]
+    fn difference_filter_excludes_elements_present_in_other() {
+        let env = make_env();
+        let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([
+            ("hosts".into(), serde_json::json!(["db-1", "db-2"])),
+            ("me".into(), serde_json::json!("db-1")),
+        ]);
+        let out = env
+            .render_str(
+                "{{ hosts | difference([me]) | first }}",
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(out, "db-2");
+    }
+
+    #[test]
+    fn intersect_filter_keeps_common_elements_in_first_order() {
+        let env = make_env();
+        let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([
+            ("a".into(), serde_json::json!([1, 2, 3, 4])),
+            ("b".into(), serde_json::json!([3, 2, 5])),
+        ]);
+        let out = env
+            .render_str("{{ a | intersect(b) | join(',') }}", &ctx)
+            .unwrap();
+        assert_eq!(out, "2,3");
+    }
+
+    #[test]
+    fn union_filter_dedupes_across_inputs() {
+        let env = make_env();
+        let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([
+            ("a".into(), serde_json::json!([1, 2, 3])),
+            ("b".into(), serde_json::json!([3, 4, 5])),
+        ]);
+        let out = env
+            .render_str("{{ a | union(b) | join(',') }}", &ctx)
+            .unwrap();
+        assert_eq!(out, "1,2,3,4,5");
+    }
+
+    #[test]
+    fn unique_filter_dedupes_preserving_order() {
+        let env = make_env();
+        let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([(
+            "xs".into(),
+            serde_json::json!([3, 1, 2, 1, 3, 4]),
+        )]);
+        let out = env.render_str("{{ xs | unique | join(',') }}", &ctx).unwrap();
+        assert_eq!(out, "3,1,2,4");
+    }
+
+    #[test]
+    fn regex_match_test_anchors_at_start() {
+        let env = make_env();
+        let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([(
+            "lines".to_string(),
+            serde_json::json!(["role:master", "loading:0", "connected_slaves:1"]),
+        )]);
+        let out = env
+            .render_str(
+                "{{ lines | select('match', '^role:') | list | first }}",
+                &ctx,
+            )
+            .expect("select('match', ...) must render");
+        assert_eq!(out, "role:master");
+
+        // Anchored at start — `master_role` (substring "role" not at
+        // position 0) must not match.
+        let ctx2 = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([(
+            "s".to_string(),
+            serde_json::json!("master_role:1"),
+        )]);
+        let out = env
+            .render_str(
+                "{{ 'yes' if s is match('role:') else 'no' }}",
+                &ctx2,
+            )
+            .unwrap();
+        assert_eq!(out, "no", "match must anchor at start of string");
+    }
+
+    #[test]
+    fn regex_search_test_finds_anywhere() {
+        let env = make_env();
+        let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([(
+            "s".to_string(),
+            serde_json::json!("master_role:1"),
+        )]);
+        // `search` matches anywhere, `regex` is the alias.
+        let out = env
+            .render_str(
+                "{{ 'yes' if s is search('role:') else 'no' }}",
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(out, "yes");
+        let out = env
+            .render_str(
+                "{{ 'yes' if s is regex('role:') else 'no' }}",
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(out, "yes");
     }
 
     #[test]

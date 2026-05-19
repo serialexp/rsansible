@@ -15,6 +15,10 @@ pub struct WaitForOp {
     pub timeout_ms: u32,
     pub delay_ms: u32,
     pub sleep_ms: u32,
+    /// (deferred) The original `port:` string when it contained Jinja
+    /// and couldn't be parsed at load time. Empty otherwise. Rendered
+    /// at dispatch and parsed into a fresh u32 that overrides `port`.
+    pub port_template: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,14 +55,27 @@ impl<'de> Deserialize<'de> for WaitForOp {
                 )))
             }
         };
-        let port = match map.remove("port") {
-            None => None,
-            Some(serde_yaml::Value::Number(n)) => Some(n.as_u64().ok_or_else(|| {
-                D::Error::custom(format!("wait_for.port must be a non-negative int, got: {n}"))
-            })? as u32),
-            Some(serde_yaml::Value::String(s)) => Some(s.parse::<u32>().map_err(|e| {
-                D::Error::custom(format!("wait_for.port: invalid int {s:?}: {e}"))
-            })?),
+        let (port, port_template) = match map.remove("port") {
+            None => (None, String::new()),
+            Some(serde_yaml::Value::Number(n)) => (
+                Some(n.as_u64().ok_or_else(|| {
+                    D::Error::custom(format!("wait_for.port must be a non-negative int, got: {n}"))
+                })? as u32),
+                String::new(),
+            ),
+            Some(serde_yaml::Value::String(s)) => {
+                if super::shared::string_is_jinja(&s) {
+                    // Defer parsing — render arm validates at dispatch.
+                    (None, s)
+                } else {
+                    (
+                        Some(s.parse::<u32>().map_err(|e| {
+                            D::Error::custom(format!("wait_for.port: invalid int {s:?}: {e}"))
+                        })?),
+                        String::new(),
+                    )
+                }
+            }
             Some(other) => {
                 return Err(D::Error::custom(format!(
                     "wait_for.port must be an int or numeric string, got: {other:?}"
@@ -114,18 +131,18 @@ impl<'de> Deserialize<'de> for WaitForOp {
         }
 
         // Mode mutual exclusion (defensive; agent re-checks).
-        let has_tcp = port.is_some();
+        let has_tcp = port.is_some() || !port_template.is_empty();
         let has_path = path.is_some();
         if has_tcp && has_path {
             return Err(D::Error::custom(
                 "wait_for: host+port and path are mutually exclusive",
             ));
         }
-        if !has_tcp && !has_path {
-            return Err(D::Error::custom(
-                "wait_for: must specify either host+port (TCP probe) or path (file probe)",
-            ));
-        }
+        // Bare wait_for (no host/port/path) is Ansible's "just sleep
+        // for delay seconds" form — useful as a controlled pause and
+        // as a TODO placeholder. We accept it; the agent executes a
+        // pure sleep of `delay_ms`. `timeout`/`sleep` are ignored in
+        // this mode (there's nothing to probe).
         if has_tcp && port == Some(0) {
             return Err(D::Error::custom("wait_for: port must be non-zero"));
         }
@@ -138,6 +155,7 @@ impl<'de> Deserialize<'de> for WaitForOp {
             timeout_ms,
             delay_ms,
             sleep_ms,
+            port_template,
         })
     }
 }
@@ -214,18 +232,55 @@ wait_for:
         );
     }
 
+    /// Regression: gothab spells the etcd verify port as
+    /// `port: "{{ etcd_client_port }}"`. The literal string isn't a
+    /// valid u32 — parse-time validation must store the template and
+    /// defer parsing to the render arm.
     #[test]
-    fn wait_for_rejects_neither_mode() {
-        let yaml = r#"
+    fn wait_for_port_accepts_jinja_template() {
+        let t = parse_task(
+            r#"
+name: t
+wait_for:
+  host: 127.0.0.1
+  port: "{{ etcd_client_port }}"
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::WaitFor(w)) => {
+                assert!(w.port.is_none());
+                assert_eq!(w.port_template, "{{ etcd_client_port }}");
+                assert_eq!(w.host.as_deref(), Some("127.0.0.1"));
+            }
+            _ => panic!("expected wait_for"),
+        }
+    }
+
+    /// Regression: bare wait_for (no host/port/path) is Ansible's
+    /// "just sleep for delay seconds" form. Used as a controlled pause
+    /// and as a TODO placeholder in playbooks that ship with `when:
+    /// false`. Used to be rejected at parse time — that broke any
+    /// playbook with `wait_for: timeout: 30` as a placeholder.
+    #[test]
+    fn wait_for_accepts_bare_form_as_sleep() {
+        let t = parse_task(
+            r#"
 name: t
 wait_for:
   timeout: 10
-"#;
-        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("either host+port"),
-            "got: {err}"
+  delay: 2
+"#,
         );
+        match t.body {
+            TaskBody::Op(TaskOp::WaitFor(w)) => {
+                assert!(w.host.is_none());
+                assert!(w.port.is_none());
+                assert!(w.path.is_none());
+                assert_eq!(w.delay_ms, 2_000);
+                assert_eq!(w.timeout_ms, 10_000);
+            }
+            _ => panic!("expected wait_for"),
+        }
     }
 
     #[test]
@@ -261,6 +316,7 @@ wait_for:
                 timeout_ms: 5000,
                 delay_ms: 100,
                 sleep_ms: 250,
+                port_template: String::new(),
         });
         let wire = t.to_wire_op().unwrap();
         let rsansible_wire::generated::Op::OpWaitFor(w) = wire else {

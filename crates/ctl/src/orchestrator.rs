@@ -44,7 +44,8 @@ use crate::playbook::{
     AssertTask, AsyncStatusOp, BlockInFileOp, BlockSpec, CopyOp, DebugTask, ExecOp, FailTask,
     FileOp, GetUrlOp, GetentOp, HostSelector, HostnameOp, IptablesOp,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
-    AuthorizedKeyOp, GroupOp, PauseTask, Play, Playbook, PostgresqlExtOp, PostgresqlQueryOp,
+    AuthorizedKeyOp, GroupOp, PauseTask, Play, Playbook, PostgresqlDbOp, PostgresqlExtOp,
+    PostgresqlMembershipOp, PostgresqlQueryOp, PostgresqlUserOp,
     RepositoryOp, SetFactMap, ShellOp, SlurpOp, UserOp,
     StatOp, Strategy, SystemdOp, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, UfwOp,
     UnarchiveOp, UriOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
@@ -177,6 +178,12 @@ pub struct RunReport {
     pub tasks_skipped: u64,
     /// Total task-on-host successful invocations regardless of changed/skipped.
     pub tasks_ok: u64,
+    /// End-of-run snapshot of the per-run timing aggregator. Counts
+    /// every wire round-trip (task dispatches + idempotency probes)
+    /// and the time spent on each side of the wire. Zero values are
+    /// the default for tests / paths that never dispatched a wire op.
+    /// See `crate::run_metrics` for what each field measures.
+    pub timing: crate::run_metrics::RunMetricsSnapshot,
 }
 
 impl RunReport {
@@ -274,7 +281,8 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // host gets one `AgentPool` whose `BecomeKey::None` slot is
     // seeded by the initial connect; further slots (one per distinct
     // `BecomeKey::As(user)`) spawn lazily at dispatch time.
-    let conn_modes = resolve_host_connection_modes(&playbook, &inventory, &target_hosts)?;
+    let conn_modes =
+        resolve_host_connection_modes(&playbook, &inventory, &world, &target_hosts)?;
     let mut pools_raw: BTreeMap<String, (AgentPool, ConnHandle)> = BTreeMap::new();
     let semaphore = Arc::new(Semaphore::new(max_concurrent_hosts.max(1)));
     let mut set: JoinSet<(String, Result<(AgentPool, ConnHandle)>)> = JoinSet::new();
@@ -340,6 +348,11 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
             .collect(),
     );
 
+    // Run-shared timing accumulator. Lock-free atomics; cloned into
+    // every per-host ctx so per-host walkers can record without
+    // synchronizing. Snapshotted into `RunReport` at end-of-run.
+    let run_metrics = Arc::new(crate::run_metrics::RunMetrics::default());
+
     // Build per-host execution contexts. Lives across the whole run so
     // set_facts and registers persist across plays (Ansible-faithful).
     let mut ctxs: BTreeMap<String, HostCtx> = BTreeMap::new();
@@ -372,6 +385,10 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         // Run-scoped dry-run flag — same value across every host.
         // Per-task `check_mode:` overrides this at dispatch time.
         ctx.check_mode = check_mode;
+        // Run-shared timing aggregator. Cloning the Arc is the only
+        // per-host setup needed; updates inside dispatch are
+        // atomic-only.
+        ctx.run_metrics = run_metrics.clone();
         ctxs.insert(name.clone(), ctx);
     }
 
@@ -382,6 +399,10 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         tasks_changed: 0,
         tasks_skipped: 0,
         tasks_ok: 0,
+        // Filled at end-of-run by snapshotting `run_metrics` once
+        // every per-host walker has joined. Zero here is a sentinel,
+        // not a measurement.
+        timing: crate::run_metrics::RunMetricsSnapshot::default(),
     };
 
     let next_seq = Arc::new(AtomicU32::new(1));
@@ -500,6 +521,11 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
             }
         }
     }
+
+    // Snapshot the run-shared timing accumulator now that every
+    // walker has joined. Reads are Relaxed but there is no more
+    // concurrent write — the strategy futures are all awaited above.
+    report.timing = run_metrics.snapshot();
 
     Ok(report)
 }
@@ -901,6 +927,7 @@ fn make_gather_facts_task() -> Task {
         // want to skip it can pass `--skip-tags always`.
         tags: vec!["always".to_string()],
         delegate_to: None,
+        delegate_facts: false,
         run_once: false,
         notify: Vec::new(),
         role_dir: None,
@@ -2942,7 +2969,7 @@ async fn run_op_body(
     world: &WorldVars,
     next_seq: &Arc<AtomicU32>,
 ) -> BodyResult {
-    let rendered = match render_op(op, ctx, env, world) {
+    let mut rendered = match render_op(op, ctx, env, world) {
         Ok(r) => r,
         Err(e) => {
             return BodyResult::Failed {
@@ -2952,6 +2979,102 @@ async fn run_op_body(
             };
         }
     };
+
+    // `command:` / `shell:` idempotency probes — `creates:` / `removes:`.
+    // If either marker is set, stat the path on the agent first and
+    // short-circuit when the marker says "already in the right state":
+    //   - creates="/path" + path exists → skip (changed=false)
+    //   - removes="/path" + path missing → skip (changed=false)
+    // Otherwise we drop the markers from `rendered` and fall through to
+    // the normal dispatch path, which now sees a plain `command:` and
+    // ships an OpExec.
+    if let TaskOp::Command(c) = &rendered {
+        if !c.creates.is_empty() || !c.removes.is_empty() {
+            let probe_path = if !c.creates.is_empty() {
+                c.creates.clone()
+            } else {
+                c.removes.clone()
+            };
+            let probe_is_creates = !c.creates.is_empty();
+            let stat_seq = next_seq.fetch_add(1, Ordering::Relaxed);
+            let stat_op = rsansible_wire::msg::op_stat(probe_path.clone(), false);
+            let stat_outcome = {
+                let mut guard = target_conn.lock().await;
+                let conn = match guard.as_mut() {
+                    Some(conn) => conn,
+                    None => {
+                        return BodyResult::Failed {
+                            reason: "agent conn is dead (host marked failed)".into(),
+                            register: None,
+                            conn_alive: false,
+                        };
+                    }
+                };
+                let clock_offset_ns = conn.clock_offset_ns;
+                let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+                run_one_task_op(
+                    conn,
+                    stat_seq,
+                    stat_op,
+                    true,
+                    clock_offset_ns,
+                    check_mode,
+                    &ctx.run_metrics,
+                )
+                .await
+            };
+            let exists = match stat_outcome {
+                Ok(exec) => {
+                    if exec.done.exit_code != 0 {
+                        return BodyResult::Failed {
+                            reason: format!(
+                                "command creates/removes probe (OpStat) non-zero exit {} for {probe_path:?}",
+                                exec.done.exit_code
+                            ),
+                            register: None,
+                            conn_alive: true,
+                        };
+                    }
+                    let stdout = String::from_utf8_lossy(&exec.stdout);
+                    serde_json::from_str::<JsonValue>(stdout.trim())
+                        .ok()
+                        .and_then(|j| j.get("exists").and_then(|v| v.as_bool()))
+                        .unwrap_or(false)
+                }
+                Err(e) => {
+                    return BodyResult::Failed {
+                        reason: format!("command creates/removes probe: {e:#}"),
+                        register: None,
+                        conn_alive: false,
+                    };
+                }
+            };
+            let should_skip = if probe_is_creates {
+                // `creates`: skip when the marker is already there.
+                exists
+            } else {
+                // `removes`: skip when the marker is already gone.
+                !exists
+            };
+            if should_skip {
+                let mut rv = RegisterValue::default();
+                rv.took_ms = 0;
+                rv.changed = false;
+                rv.skipped = true;
+                return BodyResult::Ok {
+                    register: rv,
+                    changed: false,
+                    skipped: true,
+                };
+            }
+            // Marker says "go ahead". Drop the creates/removes so the
+            // normal `to_wire_op` path doesn't reject the task.
+            if let TaskOp::Command(c) = &mut rendered {
+                c.creates.clear();
+                c.removes.clear();
+            }
+        }
+    }
 
     // Controller-side --check skip for mutating `postgresql_query:`.
     // The SQL classifier (re-)ran during render so the read_only flag
@@ -3006,6 +3129,15 @@ async fn run_op_body(
         }
         TaskOp::Tempfile(t) => {
             return synth_tempfile(t);
+        }
+        TaskOp::PostgresqlUser(u) => {
+            return run_postgresql_user_composite(task, u, target_conn, ctx, next_seq).await;
+        }
+        TaskOp::PostgresqlDb(d) => {
+            return run_postgresql_db_composite(task, d, target_conn, ctx, next_seq).await;
+        }
+        TaskOp::PostgresqlMembership(m) => {
+            return run_postgresql_membership_composite(task, m, target_conn, ctx, next_seq).await;
         }
         _ => {}
     }
@@ -3135,8 +3267,16 @@ async fn run_op_body(
     // Effective per-task check_mode: task field wins both directions,
     // otherwise inherit the run-level flag.
     let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
-    let mut result =
-        run_one_task_op(conn, seq, wire_op, capture, clock_offset_ns, check_mode).await;
+    let mut result = run_one_task_op(
+        conn,
+        seq,
+        wire_op,
+        capture,
+        clock_offset_ns,
+        check_mode,
+        &ctx.run_metrics,
+    )
+    .await;
 
     // Async poll loop: when `async: N, poll: M (M>0)`, the orchestrator
     // blocks on the same connection, dispatching OpAsyncStatus every M
@@ -3189,6 +3329,7 @@ async fn run_op_body(
                     /*capture=*/ true,
                     clock_offset_ns,
                     /*check_mode=*/ false,
+                    &ctx.run_metrics,
                 )
                 .await;
                 let exec_now = match r {
@@ -3447,7 +3588,16 @@ async fn run_privkey_composite(
             // OpStat is read-only; pass effective check_mode through
             // for consistency (the agent's stat module ignores it).
             let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
-            let r = run_one_task_op(conn, stat_seq, stat_op, true, clock_offset_ns, check_mode).await;
+            let r = run_one_task_op(
+                conn,
+                stat_seq,
+                stat_op,
+                true,
+                clock_offset_ns,
+                check_mode,
+                &ctx.run_metrics,
+            )
+            .await;
             let _label = conn.label.clone();
             r
         };
@@ -3535,11 +3685,30 @@ async fn run_privkey_composite(
     // path we already made it.
     let only_if_missing = !probe;
     let write_seq = next_seq.fetch_add(1, Ordering::Relaxed);
+    let mode_bits = match p.mode.expect_resolved("openssl_privkey.mode") {
+        Ok(m) => m,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("openssl_privatekey: {e:#}"),
+                register: None,
+                conn_alive: true,
+            };
+        }
+    };
     let write_op = rsansible_wire::msg::op_write_file(
         p.path.clone(),
-        p.mode,
+        mode_bits,
         only_if_missing,
         pem.clone(),
+        // openssl_privatekey doesn't expose `validate:` — PEM keys
+        // aren't a file format where ad-hoc validators make sense.
+        String::new(),
+        // openssl_privatekey doesn't yet expose owner/group; the
+        // module typically runs with become so the PEM lands as the
+        // post-become user (usually root). If we add the fields,
+        // plumb them here.
+        String::new(),
+        String::new(),
     );
     let started = Instant::now();
     let write_result = {
@@ -3563,6 +3732,7 @@ async fn run_privkey_composite(
             task.register.is_some(),
             clock_offset_ns,
             check_mode,
+            &ctx.run_metrics,
         )
         .await
     };
@@ -3738,8 +3908,16 @@ async fn fetch_privkey_via_read_file(
         // OpReadFile is read-only; pass effective check_mode through
         // for plumbing consistency. The agent ignores it.
         let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
-        match run_one_task_op(conn, read_seq, read_op, true, clock_offset_ns, check_mode)
-            .await
+        match run_one_task_op(
+            conn,
+            read_seq,
+            read_op,
+            true,
+            clock_offset_ns,
+            check_mode,
+            &ctx.run_metrics,
+        )
+        .await
         {
             Ok(o) => o,
             Err(e) => {
@@ -3795,51 +3973,87 @@ async fn fetch_privkey_via_read_file(
     }
 }
 
-/// `x509_certificate_pipe:` — sign a CSR with a private key (self-signed
-/// in v1) and return the cert PEM via `register.content`. Pure
-/// controller-side; no wire dispatch.
+/// `x509_certificate_pipe:` — sign a CSR and return the resulting cert
+/// PEM via `register.content`. Pure controller-side; no wire dispatch.
 ///
-/// `csr_content` and `privatekey_content` are pre-rendered PEM strings,
-/// so playbooks typically pass them as
-/// `{{ csr_result.content }}` / `{{ key_result.content }}` chained
-/// through registers.
+/// Two provider modes:
+///   - `selfsigned`: the CSR is signed by the SAME private key that
+///     produced it. `privatekey_content:` / `privatekey_path:`.
+///   - `ownca`: the CSR is signed by a separate CA cert + CA private
+///     key. `ownca_content:` (CA cert PEM), `ownca_privatekey_content:`
+///     / `ownca_privatekey_path:` (CA key).
+///
+/// All PEM-carrying fields are pre-rendered by `render_op`, so playbooks
+/// typically pass them as `{{ csr_result.content }}` / `{{ ca_var }}`
+/// chained through registers and inventory vars.
 fn synth_cert_pipe(c: &X509CertificatePipeOp) -> BodyResult {
-    if c.provider != "selfsigned" {
-        return BodyResult::Failed {
-            reason: format!(
-                "x509_certificate_pipe.provider: only \"selfsigned\" is supported in v1, got {:?}",
-                c.provider
-            ),
-            register: None,
-            conn_alive: true,
-        };
-    }
-    // Resolve the privkey PEM from either `privatekey_content` (inline
-    // PEM, typically chained from a register) or `privatekey_path`
-    // (controller-side file read). The parser already enforced
-    // exactly-one-of, and render_op rendered both.
-    let privkey_pem: Vec<u8> = if !c.privatekey_path.is_empty() {
-        match std::fs::read(&c.privatekey_path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return BodyResult::Failed {
-                    reason: format!(
-                        "x509_certificate_pipe: reading privatekey_path {:?} failed: {e}",
-                        c.privatekey_path
-                    ),
-                    register: None,
-                    conn_alive: true,
-                };
-            }
+    let cert_pem_result = match c.provider.as_str() {
+        "selfsigned" => {
+            // Resolve the privkey PEM from either `privatekey_content`
+            // (inline PEM, typically chained from a register) or
+            // `privatekey_path` (controller-side file read). The parser
+            // already enforced exactly-one-of, and render_op rendered
+            // both.
+            let privkey_pem: Vec<u8> = if !c.privatekey_path.is_empty() {
+                match std::fs::read(&c.privatekey_path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return BodyResult::Failed {
+                            reason: format!(
+                                "x509_certificate_pipe: reading privatekey_path {:?} failed: {e}",
+                                c.privatekey_path
+                            ),
+                            register: None,
+                            conn_alive: true,
+                        };
+                    }
+                }
+            } else {
+                c.privatekey_content.as_bytes().to_vec()
+            };
+            crate::x509::generate_selfsigned_cert(&crate::x509::SelfSignedCertParams {
+                csr_pem: c.csr_content.as_bytes().to_vec(),
+                privkey_pem,
+                valid_for_days: c.valid_for_days,
+            })
         }
-    } else {
-        c.privatekey_content.as_bytes().to_vec()
+        "ownca" => {
+            let ca_key_pem: Vec<u8> = if !c.ownca_privatekey_path.is_empty() {
+                match std::fs::read(&c.ownca_privatekey_path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return BodyResult::Failed {
+                            reason: format!(
+                                "x509_certificate_pipe: reading ownca_privatekey_path {:?} failed: {e}",
+                                c.ownca_privatekey_path
+                            ),
+                            register: None,
+                            conn_alive: true,
+                        };
+                    }
+                }
+            } else {
+                c.ownca_privatekey_content.as_bytes().to_vec()
+            };
+            crate::x509::generate_ownca_signed_cert(&crate::x509::OwnCaSignedCertParams {
+                csr_pem: c.csr_content.as_bytes().to_vec(),
+                ca_cert_pem: c.ownca_content.as_bytes().to_vec(),
+                ca_privkey_pem: ca_key_pem,
+                valid_for_days: c.valid_for_days,
+            })
+        }
+        other => {
+            return BodyResult::Failed {
+                reason: format!(
+                    "x509_certificate_pipe.provider: unknown provider {other:?}; \
+                     expected \"selfsigned\" or \"ownca\""
+                ),
+                register: None,
+                conn_alive: true,
+            };
+        }
     };
-    let cert_pem = match crate::x509::generate_selfsigned_cert(&crate::x509::SelfSignedCertParams {
-        csr_pem: c.csr_content.as_bytes().to_vec(),
-        privkey_pem,
-        valid_for_days: c.valid_for_days,
-    }) {
+    let cert_pem = match cert_pem_result {
         Ok(b) => b,
         Err(e) => {
             return BodyResult::Failed {
@@ -3957,7 +4171,8 @@ fn run_assert_body(
 ) -> BodyResult {
     let view = build_template_ctx(ctx, world);
     for (i, expr) in a.that.iter().enumerate() {
-        match env.compile_expression(expr) {
+        let prepared = crate::template::prepare_jinja_source(expr);
+        match env.compile_expression(&prepared) {
             Ok(compiled) => match compiled.eval(&view) {
                 Ok(v) if v.is_true() => continue,
                 Ok(_) => {
@@ -4259,6 +4474,1163 @@ fn looks_jsonish(s: &str) -> bool {
         || s == "null"
 }
 
+// ---------- postgres composite dispatch (controller-side ops) ----------
+
+/// Quote a string as a PostgreSQL identifier: surround with double
+/// quotes, double any internal double quotes. Rejects names that
+/// contain a NUL byte (postgres can't store those) by returning Err.
+fn quote_pg_ident(name: &str) -> Result<String> {
+    if name.contains('\0') {
+        return Err(anyhow!(
+            "identifier {name:?} contains a NUL byte — postgres can't store these"
+        ));
+    }
+    let mut s = String::with_capacity(name.len() + 2);
+    s.push('"');
+    for c in name.chars() {
+        if c == '"' {
+            s.push('"');
+            s.push('"');
+        } else {
+            s.push(c);
+        }
+    }
+    s.push('"');
+    Ok(s)
+}
+
+/// Quote a string as a PostgreSQL string literal: surround with single
+/// quotes, double any internal single quotes. We don't use `E'...'`
+/// escape form — backslashes are passed through literally, which
+/// matches standard_conforming_strings=on (the default for ~all
+/// supported postgres versions).
+fn quote_pg_string_literal(val: &str) -> String {
+    let mut s = String::with_capacity(val.len() + 2);
+    s.push('\'');
+    for c in val.chars() {
+        if c == '\'' {
+            s.push('\'');
+            s.push('\'');
+        } else {
+            s.push(c);
+        }
+    }
+    s.push('\'');
+    s
+}
+
+/// Dispatch one `OpPostgresqlQuery` and return its raw exec outcome.
+/// All postgres composite helpers funnel through here so error wiring
+/// stays uniform.
+async fn dispatch_one_pg_query(
+    task: &Task,
+    ctx: &HostCtx,
+    target_conn: &ConnHandle,
+    next_seq: &Arc<AtomicU32>,
+    op: Op,
+    capture: bool,
+) -> std::result::Result<OpExecOutcome, BodyResult> {
+    let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+    let mut guard = target_conn.lock().await;
+    let conn = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            return Err(BodyResult::Failed {
+                reason: "agent conn is dead (host marked failed)".into(),
+                register: None,
+                conn_alive: false,
+            });
+        }
+    };
+    let clock_offset_ns = conn.clock_offset_ns;
+    // Composite SQL dispatches inherit the task's effective check_mode;
+    // the read-only probe always runs even under --check (matches the
+    // agent-side postgresql_ext probe shape), and the mutating arm
+    // suppresses itself under check_mode at the composite level.
+    let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+    run_one_task_op(
+        conn,
+        seq,
+        op,
+        capture,
+        clock_offset_ns,
+        check_mode,
+        &ctx.run_metrics,
+    )
+    .await
+    .map_err(|e| BodyResult::Failed {
+        reason: format!("postgresql composite dispatch: {e:#}"),
+        register: None,
+        conn_alive: false,
+    })
+}
+
+/// Parse the JSON envelope an `OpPostgresqlQuery` agent emits on
+/// stdout. The envelope shape is `{ query_result: [...], rowcount,
+/// statusmessage }` — see `crates/agent/src/modules/postgresql.rs`.
+fn parse_pg_query_envelope(
+    exec: &OpExecOutcome,
+    label: &str,
+) -> std::result::Result<JsonValue, BodyResult> {
+    if exec.done.exit_code != 0 {
+        // The agent emits a structured error envelope on stderr when
+        // it fails; surface its message when available, fall back to
+        // the exit code.
+        let stderr = String::from_utf8_lossy(&exec.stderr);
+        let reason = if stderr.trim().is_empty() {
+            format!("{label}: agent returned exit_code={}", exec.done.exit_code)
+        } else {
+            format!(
+                "{label}: agent returned exit_code={}: {}",
+                exec.done.exit_code,
+                stderr.trim()
+            )
+        };
+        return Err(BodyResult::Failed {
+            reason,
+            register: None,
+            conn_alive: true,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&exec.stdout);
+    serde_json::from_str::<JsonValue>(stdout.trim()).map_err(|e| BodyResult::Failed {
+        reason: format!("{label}: malformed agent envelope: {e}; stdout={stdout:?}"),
+        register: None,
+        conn_alive: true,
+    })
+}
+
+/// Mask known-secret SQL substrings (currently: `PASSWORD '<…>'`)
+/// from a stringified SQL statement for inclusion in
+/// `register.queries`. Case-insensitive on the `PASSWORD` keyword.
+fn mask_password_in_sql(sql: &str) -> String {
+    // Greedy replace: walk the string, when we hit "PASSWORD '<...>'"
+    // replace the quoted literal with '<masked>'. We don't try to
+    // handle E'...' or dollar-quoted strings — the composite never
+    // emits those.
+    let lower = sql.to_ascii_lowercase();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let bytes = sql.as_bytes();
+    while i < bytes.len() {
+        // Look for "password '" (case-insensitive) — preceded by
+        // whitespace/keyword separator boundary at i, then a literal '.
+        if lower[i..].starts_with("password") {
+            // Find the next single quote.
+            let kw_end = i + "password".len();
+            // Skip whitespace.
+            let mut j = kw_end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'\'' {
+                // Find the closing single quote, respecting '' escape.
+                let mut k = j + 1;
+                while k < bytes.len() {
+                    if bytes[k] == b'\'' {
+                        if k + 1 < bytes.len() && bytes[k + 1] == b'\'' {
+                            k += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    k += 1;
+                }
+                if k < bytes.len() {
+                    out.push_str(&sql[i..j]);
+                    out.push_str("'<masked>'");
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Resolved boolean attrs requested by `role_attr_flags`. Each Option
+/// is `Some(true)` for set / `Some(false)` for cleared / `None` if
+/// the user didn't mention this attr at all.
+#[derive(Debug, Default, Clone, Copy)]
+struct ResolvedRoleAttrs {
+    canlogin: Option<bool>,
+    super_: Option<bool>,
+    createdb: Option<bool>,
+    createrole: Option<bool>,
+    inherit: Option<bool>,
+    replication: Option<bool>,
+    bypassrls: Option<bool>,
+}
+
+impl ResolvedRoleAttrs {
+    fn from_flags_str(flags: &str) -> Result<Self> {
+        let mut out = Self::default();
+        for raw in flags.split(',') {
+            let tok = raw.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let (canonical, want) =
+                crate::playbook::task_op::postgresql::normalize_role_attr_token(tok)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "postgresql_user.role_attr_flags: unknown attr {tok:?} \
+                             (post-render); supported: LOGIN, SUPERUSER, CREATEDB, \
+                             CREATEROLE, INHERIT, REPLICATION, BYPASSRLS (each with \
+                             NO… counterpart)"
+                        )
+                    })?;
+            match canonical {
+                "canlogin" => out.canlogin = Some(want),
+                "super" => out.super_ = Some(want),
+                "createdb" => out.createdb = Some(want),
+                "createrole" => out.createrole = Some(want),
+                "inherit" => out.inherit = Some(want),
+                "replication" => out.replication = Some(want),
+                "bypassrls" => out.bypassrls = Some(want),
+                _ => unreachable!("normalize_role_attr_token returned unknown {canonical:?}"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Emit the CREATE ROLE option clause for this set. Skipped attrs
+    /// don't appear — postgres uses LOGIN/NOLOGIN-style defaults.
+    fn render_create_clause(&self) -> String {
+        let mut parts: Vec<&'static str> = Vec::new();
+        if let Some(v) = self.canlogin {
+            parts.push(if v { "LOGIN" } else { "NOLOGIN" });
+        }
+        if let Some(v) = self.super_ {
+            parts.push(if v { "SUPERUSER" } else { "NOSUPERUSER" });
+        }
+        if let Some(v) = self.createdb {
+            parts.push(if v { "CREATEDB" } else { "NOCREATEDB" });
+        }
+        if let Some(v) = self.createrole {
+            parts.push(if v { "CREATEROLE" } else { "NOCREATEROLE" });
+        }
+        if let Some(v) = self.inherit {
+            parts.push(if v { "INHERIT" } else { "NOINHERIT" });
+        }
+        if let Some(v) = self.replication {
+            parts.push(if v { "REPLICATION" } else { "NOREPLICATION" });
+        }
+        if let Some(v) = self.bypassrls {
+            parts.push(if v { "BYPASSRLS" } else { "NOBYPASSRLS" });
+        }
+        parts.join(" ")
+    }
+
+    /// Diff the requested attrs against current server-side values
+    /// (each column from `pg_authid`). Returns the diff as an ALTER
+    /// ROLE option clause covering only the attrs that need to flip.
+    /// Empty string means "no attr diff."
+    fn diff_against_probe(&self, probe: &PgAuthidRow) -> String {
+        let mut parts: Vec<&'static str> = Vec::new();
+        macro_rules! diff_one {
+            ($req:expr, $cur:expr, $true_kw:literal, $false_kw:literal) => {
+                if let Some(want) = $req {
+                    if want != $cur {
+                        parts.push(if want { $true_kw } else { $false_kw });
+                    }
+                }
+            };
+        }
+        diff_one!(self.canlogin, probe.canlogin, "LOGIN", "NOLOGIN");
+        diff_one!(self.super_, probe.super_, "SUPERUSER", "NOSUPERUSER");
+        diff_one!(self.createdb, probe.createdb, "CREATEDB", "NOCREATEDB");
+        diff_one!(self.createrole, probe.createrole, "CREATEROLE", "NOCREATEROLE");
+        diff_one!(self.inherit, probe.inherit, "INHERIT", "NOINHERIT");
+        diff_one!(self.replication, probe.replication, "REPLICATION", "NOREPLICATION");
+        diff_one!(self.bypassrls, probe.bypassrls, "BYPASSRLS", "NOBYPASSRLS");
+        parts.join(" ")
+    }
+}
+
+/// Decoded one-row result from the `pg_authid` probe SELECT.
+#[derive(Debug, Clone)]
+struct PgAuthidRow {
+    super_: bool,
+    createrole: bool,
+    createdb: bool,
+    canlogin: bool,
+    inherit: bool,
+    replication: bool,
+    bypassrls: bool,
+    connlimit: i32,
+    /// `rolpassword` (NULL → None). Tokio-postgres `simple_query`
+    /// surfaces every value as a text string; `NULL` shows as None.
+    rolpassword: Option<String>,
+}
+
+fn parse_pg_authid_row(env: &JsonValue) -> Result<Option<PgAuthidRow>> {
+    let rows = env
+        .get("query_result")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("pg_authid probe: missing/non-array query_result"))?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let row = rows[0]
+        .as_object()
+        .ok_or_else(|| anyhow!("pg_authid probe: row is not an object"))?;
+    let parse_bool = |k: &str| -> Result<bool> {
+        let v = row
+            .get(k)
+            .ok_or_else(|| anyhow!("pg_authid probe: missing column {k:?}"))?;
+        match v {
+            JsonValue::Bool(b) => Ok(*b),
+            JsonValue::String(s) => match s.as_str() {
+                "t" | "true" | "1" => Ok(true),
+                "f" | "false" | "0" => Ok(false),
+                other => Err(anyhow!(
+                    "pg_authid probe: column {k:?} unparseable as bool: {other:?}"
+                )),
+            },
+            other => Err(anyhow!(
+                "pg_authid probe: column {k:?} not a bool/string, got: {other:?}"
+            )),
+        }
+    };
+    let parse_i32 = |k: &str| -> Result<i32> {
+        let v = row
+            .get(k)
+            .ok_or_else(|| anyhow!("pg_authid probe: missing column {k:?}"))?;
+        match v {
+            JsonValue::Number(n) => n
+                .as_i64()
+                .and_then(|x| i32::try_from(x).ok())
+                .ok_or_else(|| anyhow!("pg_authid probe: column {k:?} out of i32 range: {n}")),
+            JsonValue::String(s) => s
+                .parse::<i32>()
+                .map_err(|e| anyhow!("pg_authid probe: column {k:?} not an int: {s:?}: {e}")),
+            other => Err(anyhow!(
+                "pg_authid probe: column {k:?} not a number/string, got: {other:?}"
+            )),
+        }
+    };
+    let parse_str_opt = |k: &str| -> Option<String> {
+        match row.get(k) {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::String(s)) => Some(s.clone()),
+            // tokio-postgres simple_query returns every column as a
+            // text string, so we shouldn't hit other variants. Coerce
+            // anyway for robustness.
+            Some(other) => Some(other.to_string()),
+        }
+    };
+    Ok(Some(PgAuthidRow {
+        super_: parse_bool("rolsuper")?,
+        createrole: parse_bool("rolcreaterole")?,
+        createdb: parse_bool("rolcreatedb")?,
+        canlogin: parse_bool("rolcanlogin")?,
+        inherit: parse_bool("rolinherit")?,
+        replication: parse_bool("rolreplication")?,
+        bypassrls: parse_bool("rolbypassrls")?,
+        connlimit: parse_i32("rolconnlimit")?,
+        rolpassword: parse_str_opt("rolpassword"),
+    }))
+}
+
+/// Decide whether the requested plaintext `password` should trigger
+/// an ALTER ROLE PASSWORD given the role's current `rolpassword`
+/// value.
+///
+/// v1 strategy: if password is set, **always emit ALTER** (returns
+/// true). This matches Ansible's behaviour on SCRAM-SHA-256 hashed
+/// roles (the default in PG 14+), where the stored hash includes a
+/// random salt and there's no way to tell client-side whether the
+/// plaintext matches without doing the SCRAM PBKDF2 dance.
+/// Consequence: `changed=true` is reported on every run that has
+/// `password:` set. Operators who want strict idempotency set
+/// `no_password_changes: true` after the role is provisioned.
+///
+/// Documented as a follow-up in TODO.md: we could implement the
+/// SCRAM-SHA-256 client-side comparison (extract salt + iter count
+/// from the stored `SCRAM-SHA-256$<iters>:<salt>$<storedkey>:<serverkey>`
+/// envelope, PBKDF2 the plaintext, compare keys) but the dependency
+/// footprint (pbkdf2 + hmac + base64) and complexity isn't worth it
+/// for v1. Also md5-hashed roles still hit this path and over-report;
+/// adding md5 client-side comparison is a smaller follow-up.
+fn decide_password_alter(
+    password: &str,
+    _username: &str,
+    _cur_rolpassword: Option<&str>,
+) -> bool {
+    // v1: always re-set when password is provided. See doc comment
+    // above for the SCRAM-vs-md5 hash-comparison follow-up.
+    !password.is_empty()
+}
+
+/// `postgresql_user:` composite. See the doc comment on
+/// `PostgresqlUserOp` for the high-level shape; this function owns
+/// the actual dispatch sequence.
+async fn run_postgresql_user_composite(
+    task: &Task,
+    op: &PostgresqlUserOp,
+    target_conn: &ConnHandle,
+    ctx: &mut HostCtx,
+    next_seq: &Arc<AtomicU32>,
+) -> BodyResult {
+    let effective_check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+
+    // Validate identifier early — quote_pg_ident errors on NUL bytes.
+    let name_quoted = match quote_pg_ident(&op.name) {
+        Ok(s) => s,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("postgresql_user: {e:#}"),
+                register: None,
+                conn_alive: true,
+            };
+        }
+    };
+
+    // Step 1: probe pg_authid.
+    let probe_sql = "SELECT rolsuper, rolcreaterole, rolcreatedb, rolcanlogin, \
+                     rolinherit, rolreplication, rolbypassrls, rolconnlimit, \
+                     rolpassword \
+                     FROM pg_authid WHERE rolname = $1"
+        .to_string();
+    let probe_op = rsansible_wire::msg::op_postgresql_query(
+        probe_sql.clone(),
+        op.db.clone(),
+        op.login_user.clone(),
+        op.login_password.clone(),
+        op.login_unix_socket.clone(),
+        op.login_host.clone(),
+        op.login_port,
+        false, // autocommit
+        vec![op.name.clone()],
+        true, // read_only
+    );
+    let probe_exec = match dispatch_one_pg_query(task, ctx, target_conn, next_seq, probe_op, true)
+        .await
+    {
+        Ok(e) => e,
+        Err(br) => return br,
+    };
+    let probe_env = match parse_pg_query_envelope(&probe_exec, "postgresql_user.probe") {
+        Ok(v) => v,
+        Err(br) => return br,
+    };
+    let current = match parse_pg_authid_row(&probe_env) {
+        Ok(c) => c,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("postgresql_user.probe: {e:#}"),
+                register: None,
+                conn_alive: true,
+            };
+        }
+    };
+
+    // Resolve requested attrs.
+    let requested_attrs = match ResolvedRoleAttrs::from_flags_str(&op.role_attr_flags) {
+        Ok(a) => a,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("{e:#}"),
+                register: None,
+                conn_alive: true,
+            };
+        }
+    };
+
+    // Decide what to do.
+    let want_present = op.state == 0;
+    let mut queries: Vec<String> = Vec::new();
+    let mut changed = false;
+
+    match (want_present, current.as_ref()) {
+        (true, None) => {
+            // CREATE ROLE.
+            let mut clauses = requested_attrs.render_create_clause();
+            if op.conn_limit != crate::playbook::task_op::postgresql::CONN_LIMIT_UNSET {
+                if !clauses.is_empty() {
+                    clauses.push(' ');
+                }
+                clauses.push_str(&format!("CONNECTION LIMIT {}", op.conn_limit));
+            }
+            let mut sql = format!("CREATE ROLE {name_quoted}");
+            if !clauses.is_empty() {
+                sql.push_str(" WITH ");
+                sql.push_str(&clauses);
+            }
+            if !op.password.is_empty() {
+                sql.push_str(" PASSWORD ");
+                sql.push_str(&quote_pg_string_literal(&op.password));
+            }
+            queries.push(mask_password_in_sql(&sql));
+            changed = true;
+            if !effective_check_mode {
+                let mut_op = rsansible_wire::msg::op_postgresql_query(
+                    sql,
+                    op.db.clone(),
+                    op.login_user.clone(),
+                    op.login_password.clone(),
+                    op.login_unix_socket.clone(),
+                    op.login_host.clone(),
+                    op.login_port,
+                    false,
+                    vec![],
+                    false,
+                );
+                let exec = match dispatch_one_pg_query(
+                    task, ctx, target_conn, next_seq, mut_op, true,
+                )
+                .await
+                {
+                    Ok(e) => e,
+                    Err(br) => return br,
+                };
+                if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_user.create") {
+                    return br;
+                }
+            }
+        }
+        (true, Some(cur)) => {
+            // ALTER ROLE if anything diverges.
+            let attr_clause = requested_attrs.diff_against_probe(cur);
+            let conn_limit_diff =
+                op.conn_limit != crate::playbook::task_op::postgresql::CONN_LIMIT_UNSET
+                    && op.conn_limit != cur.connlimit;
+            let want_password_alter = !op.password.is_empty()
+                && !op.no_password_changes
+                && decide_password_alter(
+                    &op.password,
+                    &op.name,
+                    cur.rolpassword.as_deref(),
+                );
+            if !attr_clause.is_empty() || conn_limit_diff || want_password_alter {
+                let mut sql = format!("ALTER ROLE {name_quoted}");
+                let mut wrote_with = false;
+                if !attr_clause.is_empty() {
+                    sql.push_str(" WITH ");
+                    sql.push_str(&attr_clause);
+                    wrote_with = true;
+                }
+                if conn_limit_diff {
+                    if !wrote_with {
+                        sql.push_str(" WITH");
+                        wrote_with = true;
+                    }
+                    sql.push_str(&format!(" CONNECTION LIMIT {}", op.conn_limit));
+                }
+                if want_password_alter {
+                    if !wrote_with {
+                        sql.push_str(" WITH");
+                    }
+                    sql.push_str(" PASSWORD ");
+                    sql.push_str(&quote_pg_string_literal(&op.password));
+                }
+                queries.push(mask_password_in_sql(&sql));
+                changed = true;
+                if !effective_check_mode {
+                    let mut_op = rsansible_wire::msg::op_postgresql_query(
+                        sql,
+                        op.db.clone(),
+                        op.login_user.clone(),
+                        op.login_password.clone(),
+                        op.login_unix_socket.clone(),
+                        op.login_host.clone(),
+                        op.login_port,
+                        false,
+                        vec![],
+                        false,
+                    );
+                    let exec = match dispatch_one_pg_query(
+                        task, ctx, target_conn, next_seq, mut_op, true,
+                    )
+                    .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
+                    if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_user.alter")
+                    {
+                        return br;
+                    }
+                }
+            }
+        }
+        (false, Some(_)) => {
+            // DROP ROLE.
+            let sql = format!("DROP ROLE {name_quoted}");
+            queries.push(sql.clone());
+            changed = true;
+            if !effective_check_mode {
+                let mut_op = rsansible_wire::msg::op_postgresql_query(
+                    sql,
+                    op.db.clone(),
+                    op.login_user.clone(),
+                    op.login_password.clone(),
+                    op.login_unix_socket.clone(),
+                    op.login_host.clone(),
+                    op.login_port,
+                    false,
+                    vec![],
+                    false,
+                );
+                let exec = match dispatch_one_pg_query(
+                    task, ctx, target_conn, next_seq, mut_op, true,
+                )
+                .await
+                {
+                    Ok(e) => e,
+                    Err(br) => return br,
+                };
+                if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_user.drop") {
+                    return br;
+                }
+            }
+        }
+        (false, None) => {
+            // No-op: role already absent.
+        }
+    }
+
+    // Assemble register.
+    let mut rv = RegisterValue::default();
+    rv.took_ms = 0;
+    rv.changed = changed;
+    rv.skipped = effective_check_mode && changed;
+    rv.extra
+        .insert("user".into(), JsonValue::String(op.name.clone()));
+    rv.extra.insert(
+        "queries".into(),
+        JsonValue::Array(queries.into_iter().map(JsonValue::String).collect()),
+    );
+    BodyResult::Ok {
+        register: rv,
+        changed,
+        skipped: effective_check_mode && changed,
+    }
+}
+
+/// `postgresql_membership:` composite. Probes `pg_auth_members` per
+/// (group, target_role) pair via a one-row EXISTS query and emits at
+/// most one GRANT or REVOKE per divergent pair. Idempotent: a run
+/// where every pair already matches the requested `state` emits zero
+/// mutating statements and reports `changed=false`. Cost: one probe
+/// roundtrip per pair plus one mutation roundtrip per divergent pair.
+/// See `PostgresqlMembershipOp` doc comment for the high-level shape.
+async fn run_postgresql_membership_composite(
+    task: &Task,
+    op: &PostgresqlMembershipOp,
+    target_conn: &ConnHandle,
+    ctx: &mut HostCtx,
+    next_seq: &Arc<AtomicU32>,
+) -> BodyResult {
+    let effective_check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+    let want_present = op.state == 0;
+
+    // Validate identifiers up front so a typo in any list element
+    // surfaces before we touch the network.
+    let mut group_idents: Vec<(String, String)> = Vec::with_capacity(op.groups.len());
+    for g in &op.groups {
+        match quote_pg_ident(g) {
+            Ok(q) => group_idents.push((g.clone(), q)),
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!("postgresql_membership.groups: {e:#}"),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        }
+    }
+    let mut target_idents: Vec<(String, String)> = Vec::with_capacity(op.target_roles.len());
+    for t in &op.target_roles {
+        match quote_pg_ident(t) {
+            Ok(q) => target_idents.push((t.clone(), q)),
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!("postgresql_membership.target_roles: {e:#}"),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        }
+    }
+
+    let mut queries: Vec<String> = Vec::new();
+    let mut granted: Vec<JsonValue> = Vec::new();
+    let mut revoked: Vec<JsonValue> = Vec::new();
+    let mut changed = false;
+
+    // Pair-loop. Each iteration: probe → maybe mutate.
+    for (group_name, group_quoted) in &group_idents {
+        for (target_name, target_quoted) in &target_idents {
+            // Probe pg_auth_members. We also check existence of both
+            // roles in the same SELECT so `fail_on_role` can be
+            // honored — three columns: group_exists, target_exists,
+            // is_member.
+            let probe_sql = "SELECT \
+                              EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) AS group_exists, \
+                              EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $2) AS target_exists, \
+                              EXISTS (SELECT 1 FROM pg_auth_members am \
+                                      JOIN pg_roles g ON g.oid = am.roleid \
+                                      JOIN pg_roles t ON t.oid = am.member \
+                                      WHERE g.rolname = $1 AND t.rolname = $2) AS is_member"
+                .to_string();
+            let probe_op = rsansible_wire::msg::op_postgresql_query(
+                probe_sql,
+                op.db.clone(),
+                op.login_user.clone(),
+                op.login_password.clone(),
+                op.login_unix_socket.clone(),
+                op.login_host.clone(),
+                op.login_port,
+                false,
+                vec![group_name.clone(), target_name.clone()],
+                true,
+            );
+            let probe_exec = match dispatch_one_pg_query(
+                task, ctx, target_conn, next_seq, probe_op, true,
+            )
+            .await
+            {
+                Ok(e) => e,
+                Err(br) => return br,
+            };
+            let probe_env =
+                match parse_pg_query_envelope(&probe_exec, "postgresql_membership.probe") {
+                    Ok(v) => v,
+                    Err(br) => return br,
+                };
+            let rows = match probe_env.get("query_result").and_then(|v| v.as_array()) {
+                Some(r) => r,
+                None => {
+                    return BodyResult::Failed {
+                        reason: "postgresql_membership.probe: missing/non-array query_result"
+                            .into(),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            };
+            if rows.is_empty() {
+                return BodyResult::Failed {
+                    reason: "postgresql_membership.probe: empty result set".into(),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+            let row = match rows[0].as_object() {
+                Some(r) => r,
+                None => {
+                    return BodyResult::Failed {
+                        reason: "postgresql_membership.probe: row is not an object".into(),
+                        register: None,
+                        conn_alive: true,
+                    };
+                }
+            };
+            let parse_bool_col = |k: &str| -> std::result::Result<bool, BodyResult> {
+                match row.get(k) {
+                    Some(JsonValue::Bool(b)) => Ok(*b),
+                    Some(JsonValue::String(s)) => match s.as_str() {
+                        "t" | "true" | "1" => Ok(true),
+                        "f" | "false" | "0" => Ok(false),
+                        other => Err(BodyResult::Failed {
+                            reason: format!(
+                                "postgresql_membership.probe: column {k:?} unparseable as bool: {other:?}"
+                            ),
+                            register: None,
+                            conn_alive: true,
+                        }),
+                    },
+                    other => Err(BodyResult::Failed {
+                        reason: format!(
+                            "postgresql_membership.probe: column {k:?} missing or wrong type: {other:?}"
+                        ),
+                        register: None,
+                        conn_alive: true,
+                    }),
+                }
+            };
+            let group_exists = match parse_bool_col("group_exists") {
+                Ok(b) => b,
+                Err(br) => return br,
+            };
+            let target_exists = match parse_bool_col("target_exists") {
+                Ok(b) => b,
+                Err(br) => return br,
+            };
+            let is_member = match parse_bool_col("is_member") {
+                Ok(b) => b,
+                Err(br) => return br,
+            };
+
+            if !group_exists || !target_exists {
+                if op.fail_on_role {
+                    let missing = if !group_exists {
+                        format!("group role {group_name:?} does not exist")
+                    } else {
+                        format!("target role {target_name:?} does not exist")
+                    };
+                    return BodyResult::Failed {
+                        reason: format!("postgresql_membership: {missing}"),
+                        register: None,
+                        conn_alive: true,
+                    };
+                } else {
+                    // Skip this pair silently — matches Ansible.
+                    continue;
+                }
+            }
+
+            if want_present && !is_member {
+                let sql = format!("GRANT {group_quoted} TO {target_quoted}");
+                queries.push(sql.clone());
+                granted.push(JsonValue::Array(vec![
+                    JsonValue::String(group_name.clone()),
+                    JsonValue::String(target_name.clone()),
+                ]));
+                changed = true;
+                if !effective_check_mode {
+                    let mut_op = rsansible_wire::msg::op_postgresql_query(
+                        sql,
+                        op.db.clone(),
+                        op.login_user.clone(),
+                        op.login_password.clone(),
+                        op.login_unix_socket.clone(),
+                        op.login_host.clone(),
+                        op.login_port,
+                        false,
+                        vec![],
+                        false,
+                    );
+                    let exec = match dispatch_one_pg_query(
+                        task, ctx, target_conn, next_seq, mut_op, true,
+                    )
+                    .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
+                    if let Err(br) =
+                        parse_pg_query_envelope(&exec, "postgresql_membership.grant")
+                    {
+                        return br;
+                    }
+                }
+            } else if !want_present && is_member {
+                let sql = format!("REVOKE {group_quoted} FROM {target_quoted}");
+                queries.push(sql.clone());
+                revoked.push(JsonValue::Array(vec![
+                    JsonValue::String(group_name.clone()),
+                    JsonValue::String(target_name.clone()),
+                ]));
+                changed = true;
+                if !effective_check_mode {
+                    let mut_op = rsansible_wire::msg::op_postgresql_query(
+                        sql,
+                        op.db.clone(),
+                        op.login_user.clone(),
+                        op.login_password.clone(),
+                        op.login_unix_socket.clone(),
+                        op.login_host.clone(),
+                        op.login_port,
+                        false,
+                        vec![],
+                        false,
+                    );
+                    let exec = match dispatch_one_pg_query(
+                        task, ctx, target_conn, next_seq, mut_op, true,
+                    )
+                    .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
+                    if let Err(br) =
+                        parse_pg_query_envelope(&exec, "postgresql_membership.revoke")
+                    {
+                        return br;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut rv = RegisterValue::default();
+    rv.took_ms = 0;
+    rv.changed = changed;
+    rv.skipped = effective_check_mode && changed;
+    rv.extra.insert("granted".into(), JsonValue::Array(granted));
+    rv.extra.insert("revoked".into(), JsonValue::Array(revoked));
+    rv.extra.insert(
+        "queries".into(),
+        JsonValue::Array(queries.into_iter().map(JsonValue::String).collect()),
+    );
+    BodyResult::Ok {
+        register: rv,
+        changed,
+        skipped: effective_check_mode && changed,
+    }
+}
+
+/// `postgresql_db:` composite. Probes `pg_database` for the database
+/// row, then issues CREATE/ALTER/DROP DATABASE on divergence. Like
+/// `postgresql_user`, idempotent steady state costs one probe
+/// roundtrip; first-time creation costs one extra mutation
+/// roundtrip.
+///
+/// CREATE DATABASE cannot run inside a transaction block — the
+/// agent's autocommit=false default would refuse it; we pass
+/// `autocommit=true` on every mutation here. The probe stays
+/// autocommit=false (read-only).
+async fn run_postgresql_db_composite(
+    task: &Task,
+    op: &PostgresqlDbOp,
+    target_conn: &ConnHandle,
+    ctx: &mut HostCtx,
+    next_seq: &Arc<AtomicU32>,
+) -> BodyResult {
+    let effective_check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+
+    let name_quoted = match quote_pg_ident(&op.name) {
+        Ok(s) => s,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("postgresql_db: {e:#}"),
+                register: None,
+                conn_alive: true,
+            };
+        }
+    };
+
+    // Probe pg_database joined with pg_roles for the owner name.
+    // `db: ""` defers to the agent's default — connecting to the DB
+    // you're about to create/drop is a chicken-and-egg problem, and
+    // the agent picks a reasonable default ("postgres") when the
+    // login is a unix socket. Callers who want a different bootstrap
+    // DB set `login_user` / `login_unix_socket` to point there.
+    let probe_op = rsansible_wire::msg::op_postgresql_query(
+        "SELECT d.datname, r.rolname AS owner, \
+         pg_encoding_to_char(d.encoding) AS encoding, \
+         d.datcollate AS lc_collate, d.datctype AS lc_ctype \
+         FROM pg_database d \
+         JOIN pg_roles r ON r.oid = d.datdba \
+         WHERE d.datname = $1"
+            .to_string(),
+        String::new(),
+        op.login_user.clone(),
+        op.login_password.clone(),
+        op.login_unix_socket.clone(),
+        op.login_host.clone(),
+        op.login_port,
+        false,
+        vec![op.name.clone()],
+        true,
+    );
+    let probe_exec = match dispatch_one_pg_query(task, ctx, target_conn, next_seq, probe_op, true)
+        .await
+    {
+        Ok(e) => e,
+        Err(br) => return br,
+    };
+    let probe_env = match parse_pg_query_envelope(&probe_exec, "postgresql_db.probe") {
+        Ok(v) => v,
+        Err(br) => return br,
+    };
+    let rows = match probe_env.get("query_result").and_then(|v| v.as_array()) {
+        Some(r) => r,
+        None => {
+            return BodyResult::Failed {
+                reason: "postgresql_db.probe: missing/non-array query_result".into(),
+                register: None,
+                conn_alive: true,
+            };
+        }
+    };
+    let current: Option<(String, String, String, String)> = if rows.is_empty() {
+        None
+    } else {
+        let row = match rows[0].as_object() {
+            Some(r) => r,
+            None => {
+                return BodyResult::Failed {
+                    reason: "postgresql_db.probe: row not an object".into(),
+                    register: None,
+                    conn_alive: true,
+                };
+            }
+        };
+        let get_str = |k: &str| -> String {
+            match row.get(k) {
+                Some(JsonValue::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            }
+        };
+        Some((
+            get_str("owner"),
+            get_str("encoding"),
+            get_str("lc_collate"),
+            get_str("lc_ctype"),
+        ))
+    };
+
+    let want_present = op.state == 0;
+    let mut queries: Vec<String> = Vec::new();
+    let mut changed = false;
+
+    match (want_present, current.as_ref()) {
+        (true, None) => {
+            // CREATE DATABASE.
+            let mut sql = format!("CREATE DATABASE {name_quoted}");
+            let mut parts: Vec<String> = Vec::new();
+            if !op.owner.is_empty() {
+                parts.push(format!("OWNER {}", quote_pg_ident(&op.owner).unwrap_or_else(|_| op.owner.clone())));
+            }
+            if !op.template.is_empty() {
+                parts.push(format!(
+                    "TEMPLATE {}",
+                    quote_pg_ident(&op.template).unwrap_or_else(|_| op.template.clone())
+                ));
+            }
+            if !op.encoding.is_empty() {
+                parts.push(format!("ENCODING {}", quote_pg_string_literal(&op.encoding)));
+            }
+            if !op.lc_collate.is_empty() {
+                parts.push(format!(
+                    "LC_COLLATE {}",
+                    quote_pg_string_literal(&op.lc_collate)
+                ));
+            }
+            if !op.lc_ctype.is_empty() {
+                parts.push(format!(
+                    "LC_CTYPE {}",
+                    quote_pg_string_literal(&op.lc_ctype)
+                ));
+            }
+            if !parts.is_empty() {
+                sql.push_str(" WITH ");
+                sql.push_str(&parts.join(" "));
+            }
+            queries.push(sql.clone());
+            changed = true;
+            if !effective_check_mode {
+                let mut_op = rsansible_wire::msg::op_postgresql_query(
+                    sql,
+                    String::new(),
+                    op.login_user.clone(),
+                    op.login_password.clone(),
+                    op.login_unix_socket.clone(),
+                    op.login_host.clone(),
+                    op.login_port,
+                    true, // autocommit — CREATE DATABASE forbids txn block
+                    vec![],
+                    false,
+                );
+                let exec =
+                    match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                        .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
+                if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_db.create") {
+                    return br;
+                }
+            }
+        }
+        (true, Some((owner, _encoding, _lc_collate, _lc_ctype))) => {
+            // Only OWNER can be ALTERed cheaply in-place — encoding,
+            // lc_collate, lc_ctype are baked at CREATE DATABASE and
+            // changing them requires DROP + CREATE which would
+            // destroy data. Match Ansible: warn-silently — emit no
+            // mutation for those, only adjust OWNER on divergence.
+            if !op.owner.is_empty() && owner != &op.owner {
+                let owner_quoted =
+                    quote_pg_ident(&op.owner).unwrap_or_else(|_| op.owner.clone());
+                let sql = format!("ALTER DATABASE {name_quoted} OWNER TO {owner_quoted}");
+                queries.push(sql.clone());
+                changed = true;
+                if !effective_check_mode {
+                    let mut_op = rsansible_wire::msg::op_postgresql_query(
+                        sql,
+                        String::new(),
+                        op.login_user.clone(),
+                        op.login_password.clone(),
+                        op.login_unix_socket.clone(),
+                        op.login_host.clone(),
+                        op.login_port,
+                        true,
+                        vec![],
+                        false,
+                    );
+                    let exec = match dispatch_one_pg_query(
+                        task, ctx, target_conn, next_seq, mut_op, true,
+                    )
+                    .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
+                    if let Err(br) =
+                        parse_pg_query_envelope(&exec, "postgresql_db.alter_owner")
+                    {
+                        return br;
+                    }
+                }
+            }
+        }
+        (false, Some(_)) => {
+            let sql = format!("DROP DATABASE {name_quoted}");
+            queries.push(sql.clone());
+            changed = true;
+            if !effective_check_mode {
+                let mut_op = rsansible_wire::msg::op_postgresql_query(
+                    sql,
+                    String::new(),
+                    op.login_user.clone(),
+                    op.login_password.clone(),
+                    op.login_unix_socket.clone(),
+                    op.login_host.clone(),
+                    op.login_port,
+                    true,
+                    vec![],
+                    false,
+                );
+                let exec =
+                    match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                        .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
+                if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_db.drop") {
+                    return br;
+                }
+            }
+        }
+        (false, None) => {}
+    }
+
+    let mut rv = RegisterValue::default();
+    rv.took_ms = 0;
+    rv.changed = changed;
+    rv.skipped = effective_check_mode && changed;
+    rv.extra
+        .insert("db".into(), JsonValue::String(op.name.clone()));
+    rv.extra.insert(
+        "queries".into(),
+        JsonValue::Array(queries.into_iter().map(JsonValue::String).collect()),
+    );
+    BodyResult::Ok {
+        register: rv,
+        changed,
+        skipped: effective_check_mode && changed,
+    }
+}
+
 // ---------- module result lifting ----------
 
 /// Lift the `uri:` envelope JSON object into the canonical RegisterValue
@@ -4296,6 +5668,7 @@ fn lift_postgresql_envelope(rv: &mut RegisterValue) {
                 | "stdout"
                 | "stderr"
                 | "stdout_lines"
+                | "stderr_lines"
                 | "took_ms"
                 | "skipped"
                 | "failed"
@@ -4323,7 +5696,7 @@ fn lift_get_url_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
                 | "failed"
         ) {
             continue;
@@ -4344,7 +5717,7 @@ fn lift_slurp_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
                 | "failed"
         ) {
             continue;
@@ -4401,7 +5774,7 @@ fn lift_async_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
                 | "failed"
         ) {
             continue;
@@ -4422,7 +5795,7 @@ fn lift_unarchive_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "took_ms" | "skipped"
+            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
                 | "failed"
         ) {
             continue;
@@ -4445,6 +5818,7 @@ fn lift_uri_envelope(rv: &mut RegisterValue) {
                 | "stdout"
                 | "stderr"
                 | "stdout_lines"
+                | "stderr_lines"
                 | "took_ms"
                 | "skipped"
                 | "failed"
@@ -4544,49 +5918,216 @@ fn render_op(
         TaskOp::WriteFile(w) => {
             let path = render_str(env, &w.path, &view)?;
             let content = render_str(env, &w.content, &view)?;
+            let validate = match &w.validate {
+                Some(v) => Some(render_str(env, v, &view)?),
+                None => None,
+            };
+            let owner = match &w.owner {
+                Some(s) => Some(render_str(env, s, &view)?),
+                None => None,
+            };
+            let group = match &w.group {
+                Some(s) => Some(render_str(env, s, &view)?),
+                None => None,
+            };
             TaskOp::WriteFile(WriteFileOp {
                 path,
-                mode: w.mode,
+                mode: resolve_mode(env, &w.mode, &view)?,
                 content,
+                validate,
+                owner,
+                group,
             })
         }
         TaskOp::Template(t) => {
-            // Desugar `template:` into `OpWriteFile`. The body was loaded
-            // and stashed onto the TemplateOp during `playbook::load()`;
-            // missing-body here means the template wasn't resolved at
-            // load time, which validation should have caught.
-            let body = t.body.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "template src {:?} was not loaded — playbook::load() didn't resolve it (this is a bug; validate should have caught it)",
-                    t.src
-                )
-            })?;
+            // Desugar `template:` into `OpWriteFile`. The body is either
+            // (a) loaded at parse time when `src:` was a literal path, or
+            // (b) located lazily here when `src:` was Jinja-templated —
+            // we render src against the per-host view and probe the
+            // search_dirs captured at load time.
+            let body_string: String;
+            let body_ref: &str = if let Some(b) = t.body.as_deref() {
+                b
+            } else {
+                let rendered_src = render_str(env, &t.src, &view)?;
+                let p = std::path::PathBuf::from(&rendered_src);
+                let mut located: Option<std::path::PathBuf> = None;
+                if p.is_absolute() {
+                    if p.is_file() {
+                        located = Some(p.clone());
+                    }
+                } else {
+                    for base in &t.search_dirs {
+                        let cand = base.join(&p);
+                        if cand.is_file() {
+                            located = Some(cand);
+                            break;
+                        }
+                    }
+                }
+                let path = match located {
+                    Some(path) => path,
+                    None => {
+                        let tried = if p.is_absolute() {
+                            format!("  {}", p.display())
+                        } else {
+                            t.search_dirs
+                                .iter()
+                                .map(|b| format!("  {}", b.join(&p).display()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        return Err(anyhow!(
+                            "template src {rendered_src:?} (rendered from {:?}) not found; tried:\n{tried}",
+                            t.src
+                        ));
+                    }
+                };
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| anyhow!("reading template {}: {e}", path.display()))?;
+                body_string = String::from_utf8(bytes).map_err(|e| {
+                    anyhow!("template {} contains non-UTF-8 bytes: {e}", path.display())
+                })?;
+                &body_string
+            };
             let dest = render_str(env, &t.dest, &view)?;
-            let content = render_str(env, body, &view)?;
+            // The body render needs to resolve `{% include "name" %}`
+            // statements against the role's templates dirs captured at
+            // load time. We can't mutate the shared env, so build a
+            // per-task one with a path loader. Other renders here
+            // (dest, validate, mode) keep using the shared env — they
+            // are scalar strings unlikely to carry includes.
+            let content = if t.search_dirs.is_empty() {
+                render_str(env, body_ref, &view)?
+            } else {
+                let mut local_env: minijinja::Environment<'static> =
+                    crate::template::make_env();
+                crate::template::install_include_loader(
+                    &mut local_env,
+                    t.search_dirs.clone(),
+                );
+                render_str(&local_env, body_ref, &view)?
+            };
+            let validate = match &t.validate {
+                Some(v) => Some(render_str(env, v, &view)?),
+                None => None,
+            };
+            let owner = match &t.owner {
+                Some(s) => Some(render_str(env, s, &view)?),
+                None => None,
+            };
+            let group = match &t.group {
+                Some(s) => Some(render_str(env, s, &view)?),
+                None => None,
+            };
             TaskOp::WriteFile(WriteFileOp {
                 path: dest,
-                mode: t.mode,
+                mode: resolve_mode(env, &t.mode, &view)?,
                 content,
+                validate,
+                owner,
+                group,
             })
         }
         TaskOp::Copy(c) => {
-            // Two forms:
-            //   - `src:` form — bytes were loaded at parse time into
-            //     `c.body`; we just clone them through. Variant stays
-            //     `TaskOp::Copy` rather than desugaring to WriteFile so
-            //     binary content survives (WriteFileOp.content is String).
+            // Three forms:
+            //   - `src:` form with remote_src=false — bytes were loaded
+            //     at parse time into `c.body`; we just clone them
+            //     through. Variant stays `TaskOp::Copy` rather than
+            //     desugaring to WriteFile so binary content survives
+            //     (WriteFileOp.content is String).
             //   - `content:` form — Jinja-render the inline content
             //     against the per-host view and populate `body` here.
-            //     This is semantically `template:` with inline source,
-            //     but kept under `TaskOp::Copy` for uniformity.
+            //   - `remote_src: true` — `src:` is a path on the target
+            //     host. Render src+dest+validate through Jinja, leave
+            //     body=None; `to_wire_op` emits `OpCopyTarget` and the
+            //     agent reads the bytes itself.
             let dest = render_str(env, &c.dest, &view)?;
+            let validate = match &c.validate {
+                Some(v) => Some(render_str(env, v, &view)?),
+                None => None,
+            };
+            // Render owner/group up front — both Copy branches need
+            // them. Before this fix a `copy: ... owner: "{{ user }}"`
+            // task shipped the literal Jinja string to the agent,
+            // which then rejected it as `unknown owner "{{ user }}"`.
+            // The TaskOp::WriteFile / TaskOp::Template arms already
+            // do this; Copy was the one that was forgotten.
+            let owner = match &c.owner {
+                Some(s) => Some(render_str(env, s, &view)?),
+                None => None,
+            };
+            let group = match &c.group {
+                Some(s) => Some(render_str(env, s, &view)?),
+                None => None,
+            };
+            if c.remote_src {
+                let src = match &c.src {
+                    Some(s) => Some(render_str(env, s, &view)?),
+                    None => {
+                        return Err(anyhow!(
+                            "internal: copy task dest {:?} has remote_src=true but no src (should have been caught at parse)",
+                            c.dest
+                        ))
+                    }
+                };
+                return Ok(TaskOp::Copy(CopyOp {
+                    src,
+                    content: None,
+                    dest,
+                    mode: resolve_mode(env, &c.mode, &view)?,
+                    owner,
+                    group,
+                    body: None,
+                    validate,
+                    remote_src: true,
+                    search_dirs: Vec::new(),
+                }));
+            }
             let body = match (&c.src, &c.content) {
-                (Some(_), _) => c.body.clone().ok_or_else(|| {
-                    anyhow!(
-                        "copy src {:?} was not loaded — playbook::load() didn't resolve it (validate should have caught this)",
-                        c.src
-                    )
-                })?,
+                (Some(src), _) => {
+                    if let Some(b) = c.body.as_ref() {
+                        b.clone()
+                    } else {
+                        // Deferred load: src was Jinja, render and probe
+                        // the search_dirs captured at load time.
+                        let rendered_src = render_str(env, src, &view)?;
+                        let p = std::path::PathBuf::from(&rendered_src);
+                        let mut located: Option<std::path::PathBuf> = None;
+                        if p.is_absolute() {
+                            if p.is_file() {
+                                located = Some(p.clone());
+                            }
+                        } else {
+                            for base in &c.search_dirs {
+                                let cand = base.join(&p);
+                                if cand.is_file() {
+                                    located = Some(cand);
+                                    break;
+                                }
+                            }
+                        }
+                        let path = match located {
+                            Some(p) => p,
+                            None => {
+                                let tried = if p.is_absolute() {
+                                    format!("  {}", p.display())
+                                } else {
+                                    c.search_dirs
+                                        .iter()
+                                        .map(|b| format!("  {}", b.join(&p).display()))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                };
+                                return Err(anyhow!(
+                                    "copy src {rendered_src:?} (rendered from {src:?}) not found; tried:\n{tried}"
+                                ));
+                            }
+                        };
+                        std::fs::read(&path)
+                            .map_err(|e| anyhow!("reading copy src {}: {e}", path.display()))?
+                    }
+                }
                 (None, Some(template)) => {
                     let rendered = render_str(env, template, &view)?;
                     rendered.into_bytes()
@@ -4602,10 +6143,13 @@ fn render_op(
                 src: c.src.clone(),
                 content: c.content.clone(),
                 dest,
-                mode: c.mode,
-                owner: c.owner.clone(),
-                group: c.group.clone(),
+                mode: resolve_mode(env, &c.mode, &view)?,
+                owner,
+                group,
                 body: Some(body),
+                validate,
+                remote_src: false,
+                search_dirs: Vec::new(),
             })
         }
         TaskOp::GatherFacts => TaskOp::GatherFacts,
@@ -4625,14 +6169,35 @@ fn render_op(
                 Some(p) => Some(render_str(env, p, &view)?),
                 None => None,
             };
+            // If `port:` was a Jinja template, render+parse it now.
+            let port = if !w.port_template.is_empty() {
+                let rendered = render_str(env, &w.port_template, &view)?;
+                let n: u32 = rendered.trim().parse().map_err(|e| {
+                    anyhow::anyhow!(
+                        "wait_for.port: rendered {rendered:?} (from template \
+                         {tpl:?}) is not a non-negative integer: {e}",
+                        tpl = w.port_template
+                    )
+                })?;
+                if n == 0 {
+                    return Err(anyhow::anyhow!(
+                        "wait_for.port: rendered to 0 (from template {:?}); must be non-zero",
+                        w.port_template
+                    ));
+                }
+                Some(n)
+            } else {
+                w.port
+            };
             TaskOp::WaitFor(WaitForOp {
                 host,
-                port: w.port,
+                port,
                 path,
                 state: w.state,
                 timeout_ms: w.timeout_ms,
                 delay_ms: w.delay_ms,
                 sleep_ms: w.sleep_ms,
+                port_template: String::new(),
             })
         }
         TaskOp::File(f) => {
@@ -4648,7 +6213,7 @@ fn render_op(
             TaskOp::File(FileOp {
                 path,
                 state: f.state,
-                mode: f.mode,
+                mode: resolve_mode_opt(env, &f.mode, &view)?,
                 owner,
                 group,
                 recurse: f.recurse,
@@ -4657,21 +6222,30 @@ fn render_op(
         TaskOp::LineInFile(l) => {
             let path = render_str(env, &l.path, &view)?;
             let line = render_str(env, &l.line, &view)?;
+            let validate = match &l.validate {
+                Some(v) => Some(render_str(env, v, &view)?),
+                None => None,
+            };
             TaskOp::LineInFile(LineInFileOp {
                 path,
                 regexp: l.regexp.clone(),
                 line,
                 state: l.state,
-                mode: l.mode,
+                mode: resolve_mode_opt(env, &l.mode, &view)?,
                 create: l.create,
                 insertbefore: l.insertbefore.clone(),
                 insertafter: l.insertafter.clone(),
                 backrefs: l.backrefs,
+                validate,
             })
         }
         TaskOp::BlockInFile(b) => {
             let path = render_str(env, &b.path, &view)?;
             let block = render_str(env, &b.block, &view)?;
+            let validate = match &b.validate {
+                Some(v) => Some(render_str(env, v, &view)?),
+                None => None,
+            };
             TaskOp::BlockInFile(BlockInFileOp {
                 path,
                 block,
@@ -4679,10 +6253,11 @@ fn render_op(
                 marker_begin: b.marker_begin.clone(),
                 marker_end: b.marker_end.clone(),
                 state: b.state,
-                mode: b.mode,
+                mode: resolve_mode_opt(env, &b.mode, &view)?,
                 create: b.create,
                 insertbefore: b.insertbefore.clone(),
                 insertafter: b.insertafter.clone(),
+                validate,
             })
         }
         TaskOp::Systemd(s) => {
@@ -4697,10 +6272,9 @@ fn render_op(
             })
         }
         TaskOp::Package(p) => {
-            let mut names = Vec::with_capacity(p.names.len());
-            for n in &p.names {
-                names.push(render_str(env, n, &view)?);
-            }
+            // `name: "{{ pkg_list }}"` must splat the list into N
+            // package names. See `render_string_or_list_sources`.
+            let names = render_string_or_list_sources(env, &p.names, &view)?;
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {
                     Ok(String::new())
@@ -4735,7 +6309,7 @@ fn render_op(
                 repo: render_str(env, &r.repo, &view)?,
                 state: r.state,
                 filename: render_if(&r.filename)?,
-                mode: r.mode,
+                mode: resolve_mode_opt(env, &r.mode, &view)?,
                 update_cache: r.update_cache,
             })
         }
@@ -4793,6 +6367,9 @@ fn render_op(
         TaskOp::Hostname(h) => TaskOp::Hostname(HostnameOp {
             name: render_str(env, &h.name, &view)?,
         }),
+        TaskOp::Timezone(z) => TaskOp::Timezone(crate::playbook::task_op::TimezoneOp {
+            name: render_str(env, &z.name, &view)?,
+        }),
         TaskOp::Ufw(u) => {
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {
@@ -4803,9 +6380,9 @@ fn render_op(
             };
             TaskOp::Ufw(UfwOp {
                 op: u.op,
-                rule: u.rule.clone(),
-                direction: u.direction.clone(),
-                proto: u.proto.clone(),
+                rule: render_if(&u.rule)?,
+                direction: render_if(&u.direction)?,
+                proto: render_if(&u.proto)?,
                 from_ip: render_if(&u.from_ip)?,
                 from_port: render_if(&u.from_port)?,
                 to_ip: render_if(&u.to_ip)?,
@@ -4943,6 +6520,7 @@ fn render_op(
                 basic_constraints,
                 basic_constraints_critical: c.basic_constraints_critical,
                 key_usage_critical: c.key_usage_critical,
+                digest: c.digest.clone(),
             })
         }
         TaskOp::X509CertificatePipe(c) => {
@@ -4959,13 +6537,31 @@ fn render_op(
             };
             let privatekey_content = render_if(&c.privatekey_content)?;
             let privatekey_path = render_if(&c.privatekey_path)?;
+            let ownca_content = render_if(&c.ownca_content)?;
+            let ownca_privatekey_content = render_if(&c.ownca_privatekey_content)?;
+            let ownca_privatekey_path = render_if(&c.ownca_privatekey_path)?;
+            // Late-bound `selfsigned_not_after:` / `ownca_not_after:`
+            // duration: deferred at parse time when it contained Jinja.
+            // Render then parse now, override valid_for_days.
+            let valid_for_days = if !c.not_after_template.is_empty() {
+                let rendered = render_str(env, &c.not_after_template, &view)?;
+                crate::playbook::task_op::openssl::parse_relative_duration_days(&rendered)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            } else {
+                c.valid_for_days
+            };
             TaskOp::X509CertificatePipe(X509CertificatePipeOp {
                 csr_content,
                 privatekey_content,
                 privatekey_path,
                 provider: c.provider.clone(),
-                valid_for_days: c.valid_for_days,
+                valid_for_days,
                 selfsigned_digest: c.selfsigned_digest.clone(),
+                ownca_content,
+                ownca_privatekey_content,
+                ownca_privatekey_path,
+                ownca_digest: c.ownca_digest.clone(),
+                not_after_template: String::new(),
             })
         }
         TaskOp::PostgresqlQuery(p) => {
@@ -5023,6 +6619,81 @@ fn render_op(
                 login_port: p.login_port,
             })
         }
+        TaskOp::PostgresqlUser(u) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            TaskOp::PostgresqlUser(PostgresqlUserOp {
+                name: render_str(env, &u.name, &view)?,
+                password: render_if(&u.password)?,
+                role_attr_flags: render_if(&u.role_attr_flags)?,
+                state: u.state,
+                no_password_changes: u.no_password_changes,
+                conn_limit: u.conn_limit,
+                db: render_if(&u.db)?,
+                login_user: render_if(&u.login_user)?,
+                login_password: render_if(&u.login_password)?,
+                login_unix_socket: render_if(&u.login_unix_socket)?,
+                login_host: render_if(&u.login_host)?,
+                login_port: u.login_port,
+            })
+        }
+        TaskOp::PostgresqlDb(d) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            TaskOp::PostgresqlDb(PostgresqlDbOp {
+                name: render_str(env, &d.name, &view)?,
+                owner: render_if(&d.owner)?,
+                encoding: render_if(&d.encoding)?,
+                lc_collate: render_if(&d.lc_collate)?,
+                lc_ctype: render_if(&d.lc_ctype)?,
+                template: render_if(&d.template)?,
+                state: d.state,
+                login_user: render_if(&d.login_user)?,
+                login_password: render_if(&d.login_password)?,
+                login_unix_socket: render_if(&d.login_unix_socket)?,
+                login_host: render_if(&d.login_host)?,
+                login_port: d.login_port,
+            })
+        }
+        TaskOp::PostgresqlMembership(m) => {
+            let render_if = |s: &str| -> Result<String> {
+                if s.is_empty() {
+                    Ok(String::new())
+                } else {
+                    render_str(env, s, &view)
+                }
+            };
+            let mut groups = Vec::with_capacity(m.groups.len());
+            for g in &m.groups {
+                groups.push(render_str(env, g, &view)?);
+            }
+            let mut target_roles = Vec::with_capacity(m.target_roles.len());
+            for t in &m.target_roles {
+                target_roles.push(render_str(env, t, &view)?);
+            }
+            TaskOp::PostgresqlMembership(PostgresqlMembershipOp {
+                groups,
+                target_roles,
+                state: m.state,
+                fail_on_role: m.fail_on_role,
+                db: render_if(&m.db)?,
+                login_user: render_if(&m.login_user)?,
+                login_password: render_if(&m.login_password)?,
+                login_unix_socket: render_if(&m.login_unix_socket)?,
+                login_host: render_if(&m.login_host)?,
+                login_port: m.login_port,
+            })
+        }
         TaskOp::GetUrl(g) => {
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {
@@ -5039,7 +6710,7 @@ fn render_op(
                 url: render_str(env, &g.url, &view)?,
                 dest: render_str(env, &g.dest, &view)?,
                 checksum: render_if(&g.checksum)?,
-                mode: g.mode,
+                mode: resolve_mode_opt(env, &g.mode, &view)?,
                 owner: render_if(&g.owner)?,
                 group: render_if(&g.group)?,
                 headers: rendered_headers,
@@ -5072,7 +6743,7 @@ fn render_op(
                 dest: render_str(env, &u.dest, &view)?,
                 format: u.format,
                 creates: render_str(env, &u.creates, &view)?,
-                mode: u.mode,
+                mode: resolve_mode_opt(env, &u.mode, &view)?,
                 owner: render_str(env, &u.owner, &view)?,
                 group: render_str(env, &u.group, &view)?,
                 keep_newer: u.keep_newer,
@@ -5099,16 +6770,72 @@ fn render_op(
     })
 }
 
+/// Resolve a [`ModeField`] for dispatch: render any embedded Jinja
+/// template against the per-host view and parse the result as an octal
+/// permission. `Literal` values pass through unchanged. This is the
+/// single place the orchestrator turns parse-time mode forms (literal
+/// or template) into post-render literals before they hit
+/// `to_wire_op`. Used by every op variant carrying a `mode:` field.
+fn resolve_mode(
+    env: &Environment<'static>,
+    m: &crate::playbook::ModeField,
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<crate::playbook::ModeField> {
+    use crate::playbook::ModeField;
+    match m {
+        ModeField::Literal(_) => Ok(m.clone()),
+        ModeField::Template(t) => {
+            let rendered = render_str(env, t, view)?;
+            let trimmed = rendered.trim();
+            let n = crate::playbook::parse_rendered_mode(trimmed).map_err(|e| {
+                anyhow!("mode template {t:?} rendered to {rendered:?}: {e}")
+            })?;
+            Ok(ModeField::Literal(n))
+        }
+    }
+}
+
+fn resolve_mode_opt(
+    env: &Environment<'static>,
+    m: &Option<crate::playbook::ModeField>,
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<Option<crate::playbook::ModeField>> {
+    match m {
+        Some(m) => Ok(Some(resolve_mode(env, m, view)?)),
+        None => Ok(None),
+    }
+}
+
 fn render_str(
     env: &Environment<'static>,
     src: &str,
     view: &BTreeMap<String, JsonValue>,
 ) -> Result<String> {
+    // Pre-resolve vars-of-vars in the view so the body render below
+    // can stay single-pass. Ansible's Templar evaluates variable
+    // values lazily as templates whenever they're accessed; we get
+    // the same observable result by walking the view up front and
+    // expanding any string-valued var that contains Jinja markers.
+    //
+    // The body render itself MUST run exactly once — alert-rule
+    // templates (Prometheus / vmalert) commonly emit literal
+    // `{{ $labels.x }}` via `{{ '{{' }} $labels.x {{ '}}' }}`, and
+    // re-rendering that output would treat `$labels.x` as a Jinja
+    // expression and explode. So the recursion is confined to the
+    // var-resolution helper; the body render is one pass exactly.
+    //
+    // Caught in the gothab live drill: vmalert's defaults say
+    // `monitoring_vmalert_version: "{{ monitoring_vm_version }}"`,
+    // and a get_url task referencing `{{ monitoring_vmalert_version }}`
+    // was producing a URL with the literal `{{ monitoring_vm_version }}`
+    // still in it. The fix is var-side, not render-side.
+    let resolved = resolve_view_var_templates(env, view)?;
+    let prepared = crate::template::prepare_jinja_source(src);
     let tmpl = env
-        .template_from_str(src)
+        .template_from_str(&prepared)
         .map_err(|e| anyhow!("template parse: {e}"))?;
     let out = tmpl
-        .render(view)
+        .render(&resolved)
         .map_err(|e| anyhow!("template render: {e}"))?;
     // Ansible-style `default(omit)` support: if the entire rendered
     // result is exactly the omit sentinel, collapse to empty string.
@@ -5120,6 +6847,105 @@ fn render_str(
     Ok(out)
 }
 
+/// Walk `view` and rewrite any string-valued variable whose contents
+/// contain Jinja markers into its rendered form, recursively into
+/// arrays and objects. Iterates until the view is stable (no string
+/// changed during the pass) or `MAX_PASSES` is hit. The body of
+/// `render_str` calls this once before rendering its own template,
+/// so a body template that references `{{ a }}` where `a = "{{ b }}"`
+/// and `b = "literal"` sees `a` as `"literal"` directly.
+///
+/// Bug 18 motivation: pre-fix this function stopped at the top level
+/// of the map, so role defaults like
+/// `patroni_pg_hba: ["host all all {{ vswitch_cidr }} scram-sha-256"]`
+/// passed into minijinja with the inner template still literal. The
+/// template-iteration body then emitted the literal Jinja text — and
+/// in gothab's case that text was a `pg_hba.conf` entry stored in
+/// Patroni's DCS, which postmaster then rejected as an "invalid
+/// authentication method 'vswitch_cidr'". Ansible's own Templar
+/// renders lazily on every variable access regardless of depth; this
+/// matches that.
+///
+/// Each pass renders against a snapshot of the view taken at the
+/// start of the pass, so the rendered output is independent of map
+/// traversal order. Strings whose render produces the same text as
+/// the source (a constant-Jinja literal in a var, or a cycle that
+/// hits its fixed point) are left as-is and don't trigger another
+/// pass — `MAX_PASSES` exhaustion only fires on true non-convergence.
+fn resolve_view_var_templates(
+    env: &Environment<'static>,
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<BTreeMap<String, JsonValue>> {
+    const MAX_PASSES: u32 = 8;
+    let mut current: BTreeMap<String, JsonValue> = view.clone();
+    for _ in 0..MAX_PASSES {
+        let snapshot = current.clone();
+        let mut changed = false;
+        for (k, v) in current.iter_mut() {
+            resolve_strings_in_value(env, k, v, &snapshot, &mut changed)?;
+        }
+        if !changed {
+            return Ok(current);
+        }
+    }
+    Err(anyhow!(
+        "var-template resolution did not stabilize after {MAX_PASSES} passes \
+         (likely a circular variable reference)"
+    ))
+}
+
+/// Walk a JSON value in place, rendering every string scalar that
+/// contains Jinja markers against `view`. Sibling of
+/// `render_json_strings` (used for loop items), but goes through
+/// minijinja directly rather than through `render_str` so it does
+/// not re-enter `resolve_view_var_templates` — that would explode
+/// the cost into something like O(view_size × MAX_PASSES²) and the
+/// extra passes add no information beyond what the outer fixpoint
+/// loop already does.
+///
+/// `path` is the dotted/indexed key path of the value being walked,
+/// surfaced only in error messages
+/// (`var "patroni_pg_hba[0]" template parse: …`) — gives the
+/// playbook author a starting point when an inner template is
+/// malformed.
+fn resolve_strings_in_value(
+    env: &Environment<'static>,
+    path: &str,
+    val: &mut JsonValue,
+    view: &BTreeMap<String, JsonValue>,
+    changed: &mut bool,
+) -> Result<()> {
+    match val {
+        JsonValue::String(s) if s.contains("{{") || s.contains("{%") => {
+            let prepared = crate::template::prepare_jinja_source(s);
+            let tmpl = env
+                .template_from_str(&prepared)
+                .map_err(|e| anyhow!("var {path:?} template parse: {e}"))?;
+            let rendered = tmpl
+                .render(view)
+                .map_err(|e| anyhow!("var {path:?} template render: {e}"))?;
+            if &rendered != s {
+                *s = rendered;
+                *changed = true;
+            }
+        }
+        JsonValue::Array(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                let child_path = format!("{path}[{i}]");
+                resolve_strings_in_value(env, &child_path, item, view, changed)?;
+            }
+        }
+        JsonValue::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                let child_path = format!("{path}.{k}");
+                resolve_strings_in_value(env, &child_path, v, view, changed)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn eval_when(
     env: &Environment<'static>,
     expr: Option<&str>,
@@ -5127,8 +6953,9 @@ fn eval_when(
     world: &WorldVars,
 ) -> Result<bool> {
     let Some(expr) = expr else { return Ok(true) };
+    let prepared = crate::template::prepare_jinja_source(expr);
     let compiled = env
-        .compile_expression(expr)
+        .compile_expression(&prepared)
         .map_err(|e| anyhow!("compile: {e}"))?;
     let view = build_template_ctx(ctx, world);
     let val = compiled
@@ -5169,9 +6996,13 @@ fn resolve_loop_items(
             // renders a Python-style repr; safer is to compile as an
             // expression and convert the resulting Value.
             // We use compile_expression to keep types intact.
+            let prepared = crate::template::prepare_jinja_source(s);
+            let trimmed_prepared = crate::template::prepare_jinja_source(
+                s.trim_start_matches("{{").trim_end_matches("}}").trim(),
+            );
             let compiled = env
-                .compile_expression(s.trim_start_matches("{{").trim_end_matches("}}").trim())
-                .or_else(|_| env.compile_expression(s))
+                .compile_expression(&trimmed_prepared)
+                .or_else(|_| env.compile_expression(&prepared))
                 .map_err(|e| anyhow!("loop expr compile: {e}"))?;
             let val = compiled
                 .eval(&view)
@@ -5220,6 +7051,80 @@ fn render_json_strings(
 fn mjvalue_to_json(v: &minijinja::Value) -> Result<JsonValue> {
     let s = serde_json::to_string(v).map_err(|e| anyhow!("serialize loop value: {e}"))?;
     serde_json::from_str::<JsonValue>(&s).map_err(|e| anyhow!("re-parse loop value: {e}"))
+}
+
+/// Render a list of string sources that may individually be Jinja
+/// expressions resolving to either a string or a sequence of strings.
+/// When a source is a *pure* Jinja expression (the whole string is
+/// `{{ ... }}` with no surrounding text), we evaluate it as an
+/// expression rather than as a template so the underlying Value's
+/// type is preserved. If the result is a sequence, we splat it into
+/// the output. Otherwise we coerce to string.
+///
+/// Why: Ansible's `apt:`/`package:`/`pip:` etc. accept
+/// `name: "{{ pkg_list }}"` where `pkg_list` is a list var, and the
+/// op then iterates over the list. minijinja's `template_from_str`
+/// always returns a string, so `render_str` on the same input would
+/// produce `'["curl", "git", ...]'` — a single literal string that
+/// then gets shipped as one bogus package name. Caught in the gothab
+/// drill: `apt-get install -y '["curl", "git", ...]'` → "Unable to
+/// correct problems, you have held broken packages."
+fn render_string_or_list_sources(
+    env: &Environment<'static>,
+    sources: &[String],
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(sources.len());
+    for src in sources {
+        let trimmed = src.trim();
+        let is_pure_expr = trimmed.starts_with("{{")
+            && trimmed.ends_with("}}")
+            // Reject mixed templates like `"{{ a }}-{{ b }}"` — the
+            // inner closing/opening pair means the source is not a
+            // single expression.
+            && !trimmed[2..trimmed.len() - 2].contains("}}");
+        if is_pure_expr {
+            let inner = trimmed[2..trimmed.len() - 2].trim();
+            let prepared = crate::template::prepare_jinja_source(inner);
+            match env.compile_expression(&prepared) {
+                Ok(compiled) => {
+                    let val = compiled
+                        .eval(view)
+                        .map_err(|e| anyhow!("expression eval for {src:?}: {e}"))?;
+                    let json = mjvalue_to_json(&val)?;
+                    match json {
+                        JsonValue::Array(items) => {
+                            for item in items {
+                                match item {
+                                    JsonValue::String(s) => out.push(s),
+                                    other => out.push(
+                                        serde_json::to_string(&other)
+                                            .unwrap_or_else(|_| String::new()),
+                                    ),
+                                }
+                            }
+                        }
+                        JsonValue::String(s) => out.push(s),
+                        JsonValue::Null => {}
+                        other => out.push(
+                            serde_json::to_string(&other).unwrap_or_else(|_| String::new()),
+                        ),
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    // Not a clean expression — fall back to template
+                    // rendering. e.g. `{{ items | join(',') }}` is
+                    // technically an expression but a template render
+                    // also produces a usable string, so either path
+                    // works; we let the template path handle the
+                    // edge cases.
+                }
+            }
+        }
+        out.push(render_str(env, src, view)?);
+    }
+    Ok(out)
 }
 
 // ---------- wire-level task dispatch ----------
@@ -5310,6 +7215,14 @@ struct OpExecOutcome {
 /// Drive one TaskDispatch / TaskDone pair on one host. When `capture` is
 /// true, accumulates stdout/stderr chunks (capped at MAX_CAPTURED_BYTES).
 /// Otherwise streams them to `tracing::debug` only.
+///
+/// `metrics` is the run-shared timing accumulator: every successful
+/// round-trip contributes its agent / wall / outbound / inbound
+/// deltas. This is the single source of truth for the end-of-run
+/// timing summary, so probes (stat-before-write, idempotency checks,
+/// async-status polls) — which all funnel through this function but
+/// are NOT individual user-visible tasks — are still counted as the
+/// real dispatch cost the operator paid.
 async fn run_one_task_op(
     conn: &mut AgentConn,
     seq: u32,
@@ -5317,6 +7230,7 @@ async fn run_one_task_op(
     capture: bool,
     clock_offset_ns: i64,
     check_mode: bool,
+    metrics: &crate::run_metrics::RunMetrics,
 ) -> Result<OpExecOutcome> {
     let dispatch = task_dispatch(seq, check_mode, op);
     write_frame(&mut conn.stream, &dispatch)
@@ -5379,6 +7293,13 @@ async fn run_one_task_op(
                         d.seq
                     ));
                 }
+                metrics.record(
+                    d.started_unix_ns,
+                    d.finished_unix_ns,
+                    dispatched_unix_ns,
+                    received_unix_ns,
+                    clock_offset_ns,
+                );
                 return Ok(OpExecOutcome {
                     done: d,
                     stdout,
@@ -5621,6 +7542,7 @@ enum ConnMode {
 fn resolve_host_connection_modes(
     playbook: &Playbook,
     inv: &Inventory,
+    world: &WorldVars,
     targets: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, ConnMode>> {
     use crate::playbook::Connection;
@@ -5628,6 +7550,22 @@ fn resolve_host_connection_modes(
         .iter()
         .map(|h| (h.clone(), ConnMode::Ssh))
         .collect();
+    // Host-var pin first. A host with inventory-level
+    // `ansible_connection: local` (most prominently the implicit
+    // `localhost` — Ansible auto-seeds it that way) is forced to
+    // Local regardless of what plays declare. Host-var wins over
+    // play-level connection in Ansible, so we do the same.
+    let mut pinned_local: BTreeSet<String> = BTreeSet::new();
+    for h in targets {
+        if let Some(hv) = world.hostvars.get(h) {
+            if let Some(JsonValue::String(s)) = hv.get("ansible_connection") {
+                if s == "local" {
+                    out.insert(h.clone(), ConnMode::Local);
+                    pinned_local.insert(h.clone());
+                }
+            }
+        }
+    }
     // Track whether we've ever seen an explicit non-local for each
     // host so we can detect the conflict cleanly.
     let mut seen_ssh: BTreeSet<String> = BTreeSet::new();
@@ -5642,6 +7580,11 @@ fn resolve_host_connection_modes(
         let hosts = resolve_play_targets(&play.hosts, inv);
         for h in hosts {
             if !targets.contains(&h) {
+                continue;
+            }
+            // Hosts pinned Local via inventory `ansible_connection`
+            // skip the play-level conflict check — host-var wins.
+            if pinned_local.contains(&h) {
                 continue;
             }
             match play_mode {
@@ -5687,7 +7630,20 @@ fn resolve_play_targets(sel: &HostSelector, inv: &Inventory) -> Vec<String> {
     // `Names(Vec<String>)` form is joined with `,` so each list entry
     // becomes a union term. `All` short-circuits.
     let raw = match sel {
-        HostSelector::All(_) => return inv.hosts.keys().cloned().collect(),
+        HostSelector::All(_) => {
+            // `hosts: all` resolves to the `all` group's members,
+            // NOT every key in inv.hosts. Matches Ansible: the
+            // implicit localhost is auto-added to `inv.hosts` but
+            // deliberately excluded from `all`, so plays with
+            // `hosts: all` don't accidentally include it. Fall
+            // back to every host only when no `all` group was
+            // declared (hand-built test inventories).
+            return inv
+                .groups
+                .get("all")
+                .cloned()
+                .unwrap_or_else(|| inv.hosts.keys().cloned().collect());
+        }
         HostSelector::Name(n) => n.clone(),
         HostSelector::Names(names) => names.join(","),
     };
@@ -5732,6 +7688,76 @@ mod tests {
             all_vars: BTreeMap::new(),
             group_inline_vars: BTreeMap::new(),
         }
+    }
+
+    /// Regression: a host with inventory-level
+    /// `ansible_connection: local` (e.g. the implicit localhost
+    /// auto-injected by `inventory::parse`) must be resolved to
+    /// `ConnMode::Local` even when no play declares
+    /// `connection: local` — host-var wins, matching Ansible.
+    ///
+    /// Caught during the gothab live drill: site.yml's first play
+    /// (`hosts: all`) targeted localhost, rsansible SSH'd to
+    /// bart@127.0.0.1, then died trying to spawn the as=root agent
+    /// over a sudo that wasn't NOPASSWD on the controller laptop.
+    #[test]
+    fn ansible_connection_local_host_var_pins_conn_mode_local() {
+        let mut inv = make_inv(&["a", "b"]);
+        inv.hosts.get_mut("a").unwrap().inline_vars.insert(
+            "ansible_connection".into(),
+            serde_json::Value::String("local".into()),
+        );
+        let pb = playbook::parse(
+            r#"
+- name: p
+  hosts: all
+  tasks:
+    - name: t
+      shell: echo
+"#,
+        )
+        .unwrap();
+        let mut world = WorldVars::default();
+        for (n, h) in &inv.hosts {
+            world
+                .hostvars
+                .insert(n.clone(), h.inline_vars.clone());
+        }
+        let targets: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let modes = resolve_host_connection_modes(&pb, &inv, &world, &targets).unwrap();
+        assert_eq!(modes.get("a"), Some(&ConnMode::Local));
+        assert_eq!(modes.get("b"), Some(&ConnMode::Ssh));
+    }
+
+    /// Host-var `ansible_connection: local` must override a play's
+    /// `connection: ssh`. Ansible's precedence is host-var > play-level,
+    /// and we mirror that — the would-be conflict ("local-pinned host
+    /// targeted by an ssh play") is NOT an error.
+    #[test]
+    fn host_var_local_overrides_play_level_ssh() {
+        let mut inv = make_inv(&["a"]);
+        inv.hosts.get_mut("a").unwrap().inline_vars.insert(
+            "ansible_connection".into(),
+            serde_json::Value::String("local".into()),
+        );
+        let pb = playbook::parse(
+            r#"
+- name: p
+  hosts: all
+  connection: ssh
+  tasks:
+    - name: t
+      shell: echo
+"#,
+        )
+        .unwrap();
+        let mut world = WorldVars::default();
+        world
+            .hostvars
+            .insert("a".to_string(), inv.hosts["a"].inline_vars.clone());
+        let targets: BTreeSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        let modes = resolve_host_connection_modes(&pb, &inv, &world, &targets).unwrap();
+        assert_eq!(modes.get("a"), Some(&ConnMode::Local));
     }
 
     #[test]
@@ -5941,6 +7967,7 @@ mod tests {
             tasks_changed: 0,
             tasks_skipped: 0,
             tasks_ok: 0,
+            timing: crate::run_metrics::RunMetricsSnapshot::default(),
         };
         let next_seq = Arc::new(AtomicU32::new(1));
         let env = Arc::new(template::make_env());
@@ -6024,6 +8051,7 @@ mod tests {
             tasks_changed: 0,
             tasks_skipped: 0,
             tasks_ok: 0,
+            timing: crate::run_metrics::RunMetricsSnapshot::default(),
         };
         let next_seq = Arc::new(AtomicU32::new(1));
         let env = Arc::new(template::make_env());
@@ -6399,6 +8427,231 @@ mod tests {
         assert_eq!(items, vec![JsonValue::from(1), JsonValue::from(2), JsonValue::from(3)]);
     }
 
+    /// Regression: `apt: { name: "{{ pkg_list }}" }` where
+    /// `pkg_list` is a list var must splat into separate package
+    /// names, not get rendered as the literal string `'["curl",
+    /// "git", ...]'`. Caught during the gothab drill — apt failed
+    /// with "Unable to correct problems, you have held broken
+    /// packages" because the entire stringified list was being
+    /// sent as a single argv element.
+    #[test]
+    fn render_string_or_list_sources_splats_list_var() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.set_facts.insert(
+            "pkg_list".into(),
+            serde_json::json!(["curl", "git", "vim"]),
+        );
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_string_or_list_sources(
+            &env,
+            &["{{ pkg_list }}".to_string()],
+            &view,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec!["curl".to_string(), "git".to_string(), "vim".to_string()],
+            "pure-expression list var must splat into separate names",
+        );
+    }
+
+    /// A plain string source still resolves to a single name —
+    /// the splat path only triggers when the source is a pure
+    /// `{{ ... }}` expression resolving to a sequence.
+    #[test]
+    fn render_string_or_list_sources_keeps_literal_strings_as_single_name() {
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into());
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_string_or_list_sources(
+            &env,
+            &["curl".to_string(), "git".to_string()],
+            &view,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["curl".to_string(), "git".to_string()]);
+    }
+
+    /// A pure-expression source resolving to a scalar string is
+    /// added as a single name — no splat for non-sequence values.
+    #[test]
+    fn render_string_or_list_sources_scalar_expression_stays_single() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.set_facts
+            .insert("pkg".into(), serde_json::json!("nginx"));
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_string_or_list_sources(
+            &env,
+            &["{{ pkg }}".to_string()],
+            &view,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["nginx".to_string()]);
+    }
+
+    /// Regression: `render_str` must follow vars-referencing-vars
+    /// until the output stabilizes. Caught in the gothab live drill —
+    /// monitoring-host's defaults say
+    /// `monitoring_vmalert_version: "{{ monitoring_vm_version }}"`,
+    /// and a get_url task's URL referenced
+    /// `{{ monitoring_vmalert_version }}`. A single-pass render
+    /// returned the URL with the literal `{{ monitoring_vm_version }}`
+    /// still in it, which then 404'd against GitHub. Real Ansible
+    /// follows the indirection via lazy Templar templates; we get the
+    /// same result by re-rendering whenever the output still contains
+    /// template markers.
+    #[test]
+    fn render_str_follows_vars_referencing_vars() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.role_defaults
+            .insert("inner".into(), serde_json::json!("v1.143.0"));
+        // `outer` references `inner` — classic defaults indirection.
+        ctx.role_defaults
+            .insert("outer".into(), serde_json::json!("{{ inner }}"));
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_str(&env, "version={{ outer }}", &view).unwrap();
+        assert_eq!(
+            out, "version=v1.143.0",
+            "render_str must chase vars-of-vars to a stable value, \
+             not stop after one pass with a literal `{{{{ inner }}}}` \
+             in the output"
+        );
+    }
+
+    /// Pathological case: a var graph that cycles (`a = "{{ b }}"`,
+    /// `b = "{{ a }}"`) must terminate. The var-resolution pass
+    /// stabilizes at the cycle's fixed point (both vars resolve to a
+    /// literal template-looking string), and the body render then
+    /// renders that fixed point literally. The non-hang property is
+    /// what matters; the visible output is the cycled literal, which
+    /// makes the bug obvious to the playbook author.
+    #[test]
+    fn render_str_terminates_on_circular_var_references() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.role_defaults
+            .insert("a".into(), serde_json::json!("{{ b }}"));
+        ctx.role_defaults
+            .insert("b".into(), serde_json::json!("{{ a }}"));
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        // Must not hang and must not error — the resolver stabilizes
+        // and the body render emits the literal stuck value.
+        let out = render_str(&env, "{{ a }}", &view).unwrap();
+        // The exact fixed-point string is implementation-dependent
+        // (either `{{ a }}` or `{{ b }}` depending on iteration
+        // order), but it MUST still look like an unresolved template
+        // — that's the signal to the playbook author that they have
+        // a cycle.
+        assert!(
+            out.contains("{{") && out.contains("}}"),
+            "circular var should leave template-looking literal in output, got: {out:?}"
+        );
+    }
+
+    /// Body templates that intentionally emit Jinja-looking literals
+    /// (Prometheus / vmalert alert rules say
+    /// `summary: "down on {{{{ '{{{{' }}}} $labels.instance {{{{ '}}}}' }}}}"`,
+    /// expecting the rendered file to literally contain `{{ $labels.instance }}`)
+    /// must NOT be re-rendered — that would treat `$labels.instance`
+    /// as a Jinja expression and error on parse. Caught in the gothab
+    /// live drill: the first render-until-stable fix broke vmalert's
+    /// `gothab.yml.j2` rule file with `template parse: syntax error`.
+    #[test]
+    fn render_str_does_not_re_render_jinja_looking_body_output() {
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into());
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let body = "summary: \"gothab-server down on {{ '{{' }} $labels.instance {{ '}}' }}\"";
+        let out = render_str(&env, body, &view).unwrap();
+        assert_eq!(
+            out, "summary: \"gothab-server down on {{ $labels.instance }}\"",
+            "body render must run exactly once — Prometheus-style \
+             escapes that resolve to `{{{{ ... }}}}` text must not \
+             be re-fed to minijinja"
+        );
+    }
+
+    /// Bug 18: `resolve_view_var_templates` historically only walked
+    /// the top level of the vars map. A role default like
+    /// `patroni_pg_hba: ["host all all {{ vswitch_cidr }} scram-sha-256"]`
+    /// passed straight into minijinja with the inner `{{ vswitch_cidr }}`
+    /// unrendered, so iterating it in a template emitted literal
+    /// Jinja text. That broke gothab's Postgres cluster in production
+    /// (literal `{{ vswitch_cidr }}` ended up in Patroni's DCS, then
+    /// in `pg_hba.conf`, and postmaster refused to start with
+    /// "invalid authentication method 'vswitch_cidr'"). Recovery
+    /// playbook: `gothab/ansible/playbooks/recover-patroni-pg-hba.yml`.
+    #[test]
+    fn render_str_renders_jinja_in_list_elements() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.role_defaults
+            .insert("vswitch_cidr".into(), serde_json::json!("10.10.0.0/16"));
+        ctx.role_defaults.insert(
+            "patroni_pg_hba".into(),
+            serde_json::json!(["host all all {{ vswitch_cidr }} scram-sha-256"]),
+        );
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_str(
+            &env,
+            "{% for e in patroni_pg_hba %}{{ e }}{% endfor %}",
+            &view,
+        )
+        .unwrap();
+        assert_eq!(
+            out, "host all all 10.10.0.0/16 scram-sha-256",
+            "list elements containing `{{{{ … }}}}` must be expanded \
+             before the body render reads them — Ansible's Templar \
+             does this lazily on every access regardless of depth"
+        );
+    }
+
+    /// Symmetric Bug 18 case: the same recursion must apply to dict
+    /// values. Without it, `{{ wrapper.key }}` emits literal
+    /// `{{ inner }}` instead of `value`.
+    #[test]
+    fn render_str_renders_jinja_in_dict_values() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.role_defaults
+            .insert("inner".into(), serde_json::json!("value"));
+        ctx.role_defaults.insert(
+            "wrapper".into(),
+            serde_json::json!({"key": "x-{{ inner }}-y"}),
+        );
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_str(&env, "{{ wrapper.key }}", &view).unwrap();
+        assert_eq!(out, "x-value-y");
+    }
+
+    /// Bug 18, multi-pass convergence: a list element references a
+    /// top-level var which itself references another top-level var.
+    /// First pass resolves the top-level chain, second pass picks up
+    /// the now-resolved value inside the list. Pre-fix the list
+    /// element was simply never visited.
+    #[test]
+    fn render_str_renders_jinja_through_layered_container_indirection() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.role_defaults
+            .insert("base".into(), serde_json::json!("10.10.0.0/16"));
+        ctx.role_defaults
+            .insert("cidr".into(), serde_json::json!("{{ base }}"));
+        ctx.role_defaults
+            .insert("rules".into(), serde_json::json!(["allow {{ cidr }}"]));
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let out = render_str(
+            &env,
+            "{% for r in rules %}{{ r }}{% endfor %}",
+            &view,
+        )
+        .unwrap();
+        assert_eq!(out, "allow 10.10.0.0/16");
+    }
+
     #[test]
     fn render_op_omit_collapses_to_empty_string() {
         // `default(omit)` on an undefined var should erase the field.
@@ -6452,16 +8705,115 @@ mod tests {
             src: None,
             content: Some("hello {{ name }}\n".into()),
             dest: "/etc/greeting".into(),
-            mode: 0o644,
+            mode: crate::playbook::ModeField::Literal(0o644),
             owner: None,
             group: None,
             body: None,
+            validate: None,
+            remote_src: false,
+            search_dirs: Vec::new(),
         });
         let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
         match rendered {
             TaskOp::Copy(c) => {
                 assert_eq!(c.body.as_deref(), Some(b"hello world\n".as_ref()));
                 assert_eq!(c.dest, "/etc/greeting");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Regression: `mode: "{{ item.mode }}"` must Jinja-render at
+    /// dispatch and end up as a `ModeField::Literal(parsed)` on the
+    /// rendered op. Guards the entire ModeField-template plumbing —
+    /// parse-side detection of Jinja in mode strings, orchestrator-side
+    /// resolve_mode/resolve_mode_opt rendering, and post-render parsing
+    /// of the octal value.
+    #[test]
+    fn render_op_resolves_mode_template_to_literal() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.set_facts.insert(
+            "item".into(),
+            serde_json::json!({"mode": "0750"}),
+        );
+        let op = TaskOp::Copy(CopyOp {
+            src: None,
+            content: Some("body\n".into()),
+            dest: "/etc/x".into(),
+            mode: crate::playbook::ModeField::Template("{{ item.mode }}".into()),
+            owner: None,
+            group: None,
+            body: None,
+            validate: None,
+            remote_src: false,
+            search_dirs: Vec::new(),
+        });
+        let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
+        match rendered {
+            TaskOp::Copy(c) => {
+                assert_eq!(c.mode, crate::playbook::ModeField::Literal(0o750));
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Regression for the `Deploy vmagent bearer-token file` failure:
+    /// `copy: ... owner: "{{ vmagent_user }}"` was shipping the literal
+    /// Jinja string to the agent, which then rejected the wire op with
+    /// `unknown owner "{{ vmagent_user }}"`. The Copy arm of
+    /// `render_op` was carrying `c.owner.clone()` through unchanged —
+    /// every other arm that takes owner/group renders it (WriteFile,
+    /// Template). This test pins the fix: a Jinja-bearing owner/group
+    /// on a copy task must end up rendered on the wire-bound op.
+    #[test]
+    fn render_op_copy_renders_owner_and_group_templates() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        ctx.set_facts.insert("vmagent_user".into(), serde_json::json!("vmagent"));
+        // Content form (remote_src=false).
+        let op = TaskOp::Copy(CopyOp {
+            src: None,
+            content: Some("token\n".into()),
+            dest: "/etc/vmagent/secrets/remote-write-token".into(),
+            mode: crate::playbook::ModeField::Literal(0o600),
+            owner: Some("{{ vmagent_user }}".into()),
+            group: Some("{{ vmagent_user }}".into()),
+            body: None,
+            validate: None,
+            remote_src: false,
+            search_dirs: Vec::new(),
+        });
+        let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
+        match rendered {
+            TaskOp::Copy(c) => {
+                assert_eq!(c.owner.as_deref(), Some("vmagent"),
+                    "owner Jinja must be rendered before wire dispatch");
+                assert_eq!(c.group.as_deref(), Some("vmagent"),
+                    "group Jinja must be rendered before wire dispatch");
+            }
+            _ => panic!(),
+        }
+
+        // remote_src form takes a separate branch — guard it too.
+        let op = TaskOp::Copy(CopyOp {
+            src: Some("/etc/src".into()),
+            content: None,
+            dest: "/etc/dst".into(),
+            mode: crate::playbook::ModeField::Literal(0o600),
+            owner: Some("{{ vmagent_user }}".into()),
+            group: Some("{{ vmagent_user }}".into()),
+            body: None,
+            validate: None,
+            remote_src: true,
+            search_dirs: Vec::new(),
+        });
+        let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
+        match rendered {
+            TaskOp::Copy(c) => {
+                assert!(c.remote_src);
+                assert_eq!(c.owner.as_deref(), Some("vmagent"));
+                assert_eq!(c.group.as_deref(), Some("vmagent"));
             }
             _ => panic!(),
         }
@@ -6786,6 +9138,7 @@ all:
             loop_control: None,
             tags: Vec::new(),
             delegate_to: None,
+            delegate_facts: false,
             run_once: false,
             notify: Vec::new(),
             role_dir: None,
@@ -6889,6 +9242,7 @@ all:
             basic_constraints: vec![],
             basic_constraints_critical: false,
             key_usage_critical: false,
+            digest: String::new(),
         };
         let result = synth_csr_pipe_from_pem(&op, key_pem);
         let rv = match result {
@@ -6926,6 +9280,7 @@ all:
             basic_constraints: vec![],
             basic_constraints_critical: false,
             key_usage_critical: false,
+            digest: String::new(),
         };
         match synth_csr_pipe_from_pem(&op, b"not a pem file".to_vec()) {
             BodyResult::Failed { reason, .. } => {
@@ -6965,6 +9320,11 @@ all:
             provider: "selfsigned".into(),
             valid_for_days: 30,
             selfsigned_digest: String::new(),
+            ownca_content: String::new(),
+            ownca_privatekey_content: String::new(),
+            ownca_privatekey_path: String::new(),
+            ownca_digest: String::new(),
+            not_after_template: String::new(),
         };
         let rv = match synth_cert_pipe(&op) {
             BodyResult::Ok { register, .. } => register,
@@ -6986,21 +9346,272 @@ all:
     }
 
     #[test]
-    fn synth_cert_pipe_rejects_non_selfsigned_provider() {
+    fn synth_cert_pipe_signs_csr_via_ownca_provider() {
+        // End-to-end ownca path: build a CA (key + self-signed cert),
+        // then a separate leaf key + CSR, then synth_cert_pipe with
+        // provider="ownca" should hand back a parseable cert.
+        let ca_key = crate::x509::generate_privkey(&crate::x509::PrivkeyParams {
+            kind: crate::x509::PrivkeyType::Ed25519,
+            size: 0,
+        })
+        .unwrap();
+        let ca_csr = crate::x509::generate_csr(&crate::x509::CsrParams {
+            privkey_pem: ca_key.clone(),
+            common_name: "Test CA".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
+            subject_alt_name: vec![],
+            key_usage: vec![],
+            extended_key_usage: vec![],
+            basic_constraints: vec![],
+        })
+        .unwrap();
+        let ca_cert = crate::x509::generate_selfsigned_cert(
+            &crate::x509::SelfSignedCertParams {
+                privkey_pem: ca_key.clone(),
+                csr_pem: ca_csr,
+                valid_for_days: 365,
+            },
+        )
+        .expect("CA self-signed cert");
+
+        let leaf_key = crate::x509::generate_privkey(&crate::x509::PrivkeyParams {
+            kind: crate::x509::PrivkeyType::Ed25519,
+            size: 0,
+        })
+        .unwrap();
+        let leaf_csr = crate::x509::generate_csr(&crate::x509::CsrParams {
+            privkey_pem: leaf_key,
+            common_name: "etcd-peer-0".into(),
+            country_name: String::new(),
+            organization_name: String::new(),
+            organizational_unit_name: String::new(),
+            subject_alt_name: vec!["DNS:etcd0.example".into()],
+            key_usage: vec![],
+            extended_key_usage: vec![],
+            basic_constraints: vec![],
+        })
+        .unwrap();
+
+        let op = X509CertificatePipeOp {
+            csr_content: String::from_utf8(leaf_csr).unwrap(),
+            // ownca path doesn't need the leaf's privkey, but the
+            // parser still requires one to be set. Use the leaf key
+            // we just generated (the synth fn ignores it for ownca).
+            privatekey_content: String::new(),
+            privatekey_path: String::new(),
+            provider: "ownca".into(),
+            valid_for_days: 30,
+            selfsigned_digest: String::new(),
+            ownca_content: String::from_utf8(ca_cert).unwrap(),
+            ownca_privatekey_content: String::from_utf8(ca_key).unwrap(),
+            ownca_privatekey_path: String::new(),
+            ownca_digest: String::new(),
+            not_after_template: String::new(),
+        };
+        let rv = match synth_cert_pipe(&op) {
+            BodyResult::Ok { register, .. } => register,
+            BodyResult::Failed { reason, .. } => panic!("got: {reason}"),
+        };
+        let cert = rv
+            .extra
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("register.content present");
+        assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(cert.trim_end().ends_with("-----END CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn synth_cert_pipe_rejects_unknown_provider() {
+        // Provider validity is checked at parse time, but the synth
+        // helper is also defensive: an unknown provider that
+        // somehow made it through must fail with a clear reason.
         let op = X509CertificatePipeOp {
             csr_content: "x".into(),
             privatekey_content: "y".into(),
             privatekey_path: String::new(),
-            provider: "ownca".into(),
+            provider: "acme".into(),
             valid_for_days: 1,
             selfsigned_digest: String::new(),
+            ownca_content: String::new(),
+            ownca_privatekey_content: String::new(),
+            ownca_privatekey_path: String::new(),
+            ownca_digest: String::new(),
+            not_after_template: String::new(),
         };
         match synth_cert_pipe(&op) {
             BodyResult::Failed { reason, .. } => {
-                assert!(reason.contains("selfsigned"), "got: {reason}");
+                assert!(
+                    reason.contains("provider") || reason.contains("acme"),
+                    "got: {reason}"
+                );
             }
             BodyResult::Ok { .. } => panic!("expected provider rejection"),
         }
+    }
+
+    // ---------- postgres composite helpers ----------
+
+    #[test]
+    fn quote_pg_ident_doubles_internal_double_quotes() {
+        assert_eq!(quote_pg_ident("gothab").unwrap(), "\"gothab\"");
+        // Mixed-case preserved.
+        assert_eq!(quote_pg_ident("MyRole").unwrap(), "\"MyRole\"");
+        // Internal " is doubled.
+        assert_eq!(quote_pg_ident(r#"weird"name"#).unwrap(), r#""weird""name""#);
+        // NUL is rejected (postgres can't store it).
+        assert!(quote_pg_ident("nul\0byte").is_err());
+    }
+
+    #[test]
+    fn quote_pg_string_literal_doubles_internal_single_quotes() {
+        assert_eq!(quote_pg_string_literal("hello"), "'hello'");
+        // Internal ' is doubled.
+        assert_eq!(quote_pg_string_literal("it's"), "'it''s'");
+        // Backslash is passed through literally — standard_conforming_strings=on.
+        assert_eq!(quote_pg_string_literal(r"a\b"), r"'a\b'");
+    }
+
+    #[test]
+    fn mask_password_in_sql_redacts_password_clause() {
+        let sql = "CREATE ROLE \"gothab\" WITH LOGIN PASSWORD 'super-secret-123'";
+        let masked = mask_password_in_sql(sql);
+        assert!(!masked.contains("super-secret"), "got: {masked}");
+        assert!(masked.contains("'<masked>'"), "got: {masked}");
+        assert!(masked.contains("\"gothab\""), "got: {masked}");
+    }
+
+    #[test]
+    fn mask_password_in_sql_handles_doubled_single_quote() {
+        // Password is `pa''ss` — the doubled single-quote is the SQL
+        // escape for one literal '. Masking must consume the whole
+        // literal (not stop at the inner '').
+        let sql = "ALTER ROLE \"x\" WITH PASSWORD 'pa''ss'";
+        let masked = mask_password_in_sql(sql);
+        assert!(!masked.contains("pa''ss"), "got: {masked}");
+        assert!(masked.contains("'<masked>'"), "got: {masked}");
+    }
+
+    #[test]
+    fn resolved_role_attrs_renders_create_clause() {
+        let attrs = ResolvedRoleAttrs::from_flags_str(
+            "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB",
+        )
+        .unwrap();
+        let clause = attrs.render_create_clause();
+        // Order is fixed by the rendering function; just check
+        // membership rather than spelling.
+        for kw in ["LOGIN", "NOSUPERUSER", "NOCREATEROLE", "NOCREATEDB"] {
+            assert!(clause.contains(kw), "got: {clause}");
+        }
+    }
+
+    #[test]
+    fn resolved_role_attrs_diff_only_emits_divergent_attrs() {
+        let attrs = ResolvedRoleAttrs::from_flags_str(
+            "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB",
+        )
+        .unwrap();
+        // Probe says the role is in the requested state already for
+        // 3 of 4 attrs; only LOGIN differs.
+        let probe = PgAuthidRow {
+            super_: false,
+            createrole: false,
+            createdb: false,
+            canlogin: false, // ← request was LOGIN, this differs
+            inherit: true,
+            replication: false,
+            bypassrls: false,
+            connlimit: -1,
+            rolpassword: None,
+        };
+        let diff = attrs.diff_against_probe(&probe);
+        assert!(diff.contains("LOGIN"));
+        assert!(!diff.contains("SUPERUSER"));
+        assert!(!diff.contains("CREATEROLE"));
+        assert!(!diff.contains("CREATEDB"));
+    }
+
+    #[test]
+    fn resolved_role_attrs_diff_empty_when_role_matches() {
+        let attrs = ResolvedRoleAttrs::from_flags_str(
+            "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB",
+        )
+        .unwrap();
+        let probe = PgAuthidRow {
+            super_: false,
+            createrole: false,
+            createdb: false,
+            canlogin: true,
+            inherit: true,
+            replication: false,
+            bypassrls: false,
+            connlimit: -1,
+            rolpassword: None,
+        };
+        assert!(attrs.diff_against_probe(&probe).is_empty());
+    }
+
+    #[test]
+    fn decide_password_alter_skips_when_password_empty() {
+        assert!(!decide_password_alter("", "user", Some("md5abc")));
+        assert!(!decide_password_alter("", "user", None));
+    }
+
+    #[test]
+    fn decide_password_alter_emits_when_password_set() {
+        // v1: always re-set when password is provided (SCRAM-faithful).
+        assert!(decide_password_alter("pw", "user", None));
+        assert!(decide_password_alter("pw", "user", Some("md5deadbeef")));
+        assert!(decide_password_alter(
+            "pw",
+            "user",
+            Some("SCRAM-SHA-256$4096:salt$storedkey:serverkey")
+        ));
+    }
+
+    #[test]
+    fn parse_pg_authid_row_decodes_text_columns() {
+        // tokio-postgres simple_query returns every column as a text
+        // string; the agent's envelope reflects that. The parser must
+        // accept both string form (the real shape) and bool form
+        // (defensive).
+        let env: JsonValue = serde_json::from_str(
+            r#"{
+                "query_result": [{
+                    "rolsuper": "f",
+                    "rolcreaterole": "f",
+                    "rolcreatedb": "f",
+                    "rolcanlogin": "t",
+                    "rolinherit": "t",
+                    "rolreplication": "f",
+                    "rolbypassrls": "f",
+                    "rolconnlimit": "-1",
+                    "rolpassword": null
+                }],
+                "rowcount": 1,
+                "statusmessage": "SELECT 1"
+            }"#,
+        )
+        .unwrap();
+        let row = parse_pg_authid_row(&env).unwrap().expect("one row");
+        assert!(!row.super_);
+        assert!(!row.createrole);
+        assert!(!row.createdb);
+        assert!(row.canlogin);
+        assert!(row.inherit);
+        assert_eq!(row.connlimit, -1);
+        assert!(row.rolpassword.is_none());
+    }
+
+    #[test]
+    fn parse_pg_authid_row_returns_none_for_empty_result() {
+        let env: JsonValue =
+            serde_json::from_str(r#"{"query_result":[],"rowcount":0,"statusmessage":"SELECT 0"}"#)
+                .unwrap();
+        assert!(parse_pg_authid_row(&env).unwrap().is_none());
     }
 
     // ---------- block / rescue / always executor matrix ----------
@@ -7022,6 +9633,7 @@ all:
             loop_control: None,
             tags: Vec::new(),
             delegate_to: None,
+            delegate_facts: false,
             run_once: false,
             notify: Vec::new(),
             role_dir: None,

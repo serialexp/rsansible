@@ -23,10 +23,10 @@
 use anyhow::{anyhow, Result};
 use rsansible_wire::{
     msg::{
-        op_async_status, op_authorized_key, op_blockinfile, op_exec, op_file, op_gather_facts,
-        op_get_url, op_getent, op_group, op_hostname, op_iptables, op_lineinfile, op_package,
-        op_postgresql_ext, op_postgresql_query, op_repository, op_shell, op_stat, op_systemd,
-        op_ufw, op_uri, op_user, op_wait_for, op_write_file,
+        op_async_status, op_authorized_key, op_blockinfile, op_copy_target, op_exec, op_file,
+        op_gather_facts, op_get_url, op_getent, op_group, op_hostname, op_iptables, op_lineinfile,
+        op_package, op_postgresql_ext, op_postgresql_query, op_repository, op_shell, op_stat,
+        op_systemd, op_timezone, op_ufw, op_uri, op_user, op_wait_for, op_write_file,
     },
     Op,
 };
@@ -34,7 +34,9 @@ use serde::{de::Error as _, Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-mod shared;
+pub(crate) mod shared;
+
+pub use shared::{parse_rendered_mode, ModeField};
 mod shell;
 mod exec;
 mod command;
@@ -51,14 +53,15 @@ mod authorized_key;
 mod getent;
 mod group;
 mod hostname;
+mod timezone;
 mod package;
 mod repository;
 mod user;
 mod iptables;
 mod ufw;
 mod uri;
-mod openssl;
-mod postgresql;
+pub(crate) mod openssl;
+pub(crate) mod postgresql;
 mod get_url;
 mod slurp;
 mod unarchive;
@@ -78,10 +81,14 @@ pub use authorized_key::{AuthorizedKeyOp, AuthorizedKeyState};
 pub use getent::GetentOp;
 pub use group::{GroupOp, GroupState};
 pub use hostname::HostnameOp;
+pub use timezone::TimezoneOp;
 pub use package::{PackageManager, PackageOp, PackageState};
 pub use repository::{RepositoryManager, RepositoryOp, RepositoryState};
 pub use user::{UserOp, UserState};
-pub use postgresql::{classify_sql_readonly, PostgresqlExtOp, PostgresqlQueryOp};
+pub use postgresql::{
+    classify_sql_readonly, PostgresqlDbOp, PostgresqlExtOp, PostgresqlMembershipOp,
+    PostgresqlQueryOp, PostgresqlUserOp,
+};
 pub use shell::ShellOp;
 pub use slurp::SlurpOp;
 pub use stat::StatOp;
@@ -122,6 +129,14 @@ pub struct Task {
     /// runs against this host's connection, but register/set_fact effects
     /// land in the *originating* host's context (Ansible semantics).
     pub delegate_to: Option<String>,
+    /// `delegate_facts: false` (default) — facts/registers/set_facts land
+    /// on the *originating* host (the host the task is iterating against).
+    /// `delegate_facts: true` would route them onto the delegate host
+    /// instead; not yet implemented and refused at parse time. The default
+    /// matches both Ansible and rsansible's current delegate_to behavior,
+    /// so explicit `delegate_facts: false` is a no-op we accept silently
+    /// (see ANSIBLE_COMPAT.md if delegate_facts:true ever needs to land).
+    pub delegate_facts: bool,
     /// `run_once: true` — exactly one host (the first targeted, or the
     /// `delegate_to` target) runs the task; the resulting register/set_fact
     /// is broadcast to every other targeted host.
@@ -416,6 +431,9 @@ pub enum TaskOp {
     /// `hostname:` — set the system hostname. Idempotent: reads the
     /// running hostname before mutating.
     Hostname(HostnameOp),
+    /// `timezone:` — set the system timezone (zoneinfo name).
+    /// Idempotent: reads the current timezone before mutating.
+    Timezone(TimezoneOp),
     /// `ufw:` — Uncomplicated Firewall control. One op covers one of
     /// rule / enable / disable / reset / default / reload / logging.
     Ufw(UfwOp),
@@ -478,6 +496,27 @@ pub enum TaskOp {
     /// Probe-then-DDL idempotency. Version updates not implemented in
     /// v1.
     PostgresqlExt(PostgresqlExtOp),
+    /// `postgresql_user:` — manage a PostgreSQL login role.
+    /// Maps Ansible's `community.postgresql.postgresql_user` (subset).
+    ///
+    /// **Implemented as a controller-side composite** dispatching one
+    /// or two `OpPostgresqlQuery` wire ops per task: probe `pg_authid`,
+    /// then conditional CREATE/ALTER/DROP ROLE. Idempotent re-runs
+    /// cost one roundtrip. See `run_postgresql_user_composite` and
+    /// the TODO entry "collapse postgres composites to 1 wire op."
+    PostgresqlUser(PostgresqlUserOp),
+    /// `postgresql_db:` — manage a PostgreSQL database. Same
+    /// composite shape as `postgresql_user`: probe `pg_database` then
+    /// conditional CREATE/DROP/ALTER OWNER. Encoding/collate/ctype
+    /// mismatch on an existing DB errors (postgres can't change them
+    /// post-CREATE).
+    PostgresqlDb(PostgresqlDbOp),
+    /// `postgresql_membership:` — manage role membership (GRANT/
+    /// REVOKE `<group>` TO `<target_role>`). Same composite shape
+    /// as the other postgresql_* ops; probes `pg_auth_members` per
+    /// (group, target) pair and emits at most one GRANT/REVOKE per
+    /// divergent pair.
+    PostgresqlMembership(PostgresqlMembershipOp),
     /// `get_url:` — HTTP file downloader. Maps Ansible's
     /// `ansible.builtin.get_url` (subset). The agent does stat-skip on
     /// existing dest (with optional checksum match), atomic-renames a
@@ -529,6 +568,7 @@ const BODY_KEYS: &[&str] = &[
     "authorized_key",
     "getent",
     "hostname",
+    "timezone",
     "async_status",
     "iptables",
     "ufw",
@@ -538,6 +578,9 @@ const BODY_KEYS: &[&str] = &[
     "x509_certificate_pipe",
     "postgresql_query",
     "postgresql_ext",
+    "postgresql_user",
+    "postgresql_db",
+    "postgresql_membership",
     "get_url",
     "slurp",
     "unarchive",
@@ -569,6 +612,7 @@ const METADATA_KEYS: &[&str] = &[
     "loop_control",
     "tags",
     "delegate_to",
+    "delegate_facts",
     "run_once",
     "notify",
     "become",
@@ -657,14 +701,20 @@ impl<'de> Deserialize<'de> for Task {
             map.insert(bare_yaml, val);
         }
 
+        // `name:` is optional in Ansible (most idiomatic playbooks set
+        // one, but `- import_tasks: foo.yml` without a name is legal
+        // and gothab uses it). When absent, we leave name empty here
+        // and synthesize a "(unnamed <kind>)" placeholder after we
+        // know the body kind — keeps log output readable without
+        // requiring playbook authors to name every line.
         let name = match map.remove("name") {
             Some(serde_yaml::Value::String(s)) => s,
+            Some(serde_yaml::Value::Null) | None => String::new(),
             Some(other) => {
                 return Err(D::Error::custom(format!(
                     "task `name` must be a string, got: {other:?}"
                 )));
             }
-            None => return Err(D::Error::missing_field("name")),
         };
 
         // Extract metadata fields.
@@ -688,6 +738,25 @@ impl<'de> Deserialize<'de> for Task {
                 .map_err(|e| D::Error::custom(format!("task {name:?}: tags: {e}")))?,
         };
         let delegate_to = take_optional_string(&mut map, "delegate_to", &name)?;
+        // `delegate_facts:` — accept `false` (default), refuse `true` as
+        // not yet implemented. We don't yet route facts onto the delegate
+        // host. See ANSIBLE_COMPAT.md if this needs to land.
+        let delegate_facts = match map.remove("delegate_facts") {
+            None => false,
+            Some(serde_yaml::Value::Bool(false)) => false,
+            Some(serde_yaml::Value::Bool(true)) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `delegate_facts: true` is not yet implemented — \
+                     facts/registers always land on the originating host. \
+                     File an issue if you need this."
+                )))
+            }
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "task {name:?}: `delegate_facts` must be a bool, got: {other:?}"
+                )))
+            }
+        };
         let become_ = match map.remove("become") {
             None => None,
             Some(serde_yaml::Value::Bool(b)) => Some(b),
@@ -1047,6 +1116,13 @@ impl<'de> Deserialize<'de> for Task {
                     hostname::parse_hostname_body::<D::Error>(map)?,
                 ))
             }
+            "timezone" => {
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Timezone(
+                    timezone::parse_timezone_body::<D::Error>(map)?,
+                ))
+            }
             "iptables" => TaskBody::Op(TaskOp::Iptables(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
@@ -1072,6 +1148,15 @@ impl<'de> Deserialize<'de> for Task {
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "postgresql_ext" => TaskBody::Op(TaskOp::PostgresqlExt(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "postgresql_user" => TaskBody::Op(TaskOp::PostgresqlUser(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "postgresql_db" => TaskBody::Op(TaskOp::PostgresqlDb(
+                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
+            )),
+            "postgresql_membership" => TaskBody::Op(TaskOp::PostgresqlMembership(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
             "get_url" => TaskBody::Op(TaskOp::GetUrl(
@@ -1286,6 +1371,14 @@ impl<'de> Deserialize<'de> for Task {
                 )));
             }
         }
+        // Synthesize a display name when the playbook author omitted
+        // `name:`. We prefer the body kind so logs read sensibly
+        // ("(unnamed import_tasks)" rather than just an empty string).
+        let name = if name.is_empty() {
+            format!("(unnamed {kind})")
+        } else {
+            name
+        };
         Ok(Task {
             name,
             body,
@@ -1295,6 +1388,7 @@ impl<'de> Deserialize<'de> for Task {
             loop_control,
             tags,
             delegate_to,
+            delegate_facts,
             run_once,
             notify,
             role_dir: None,
@@ -1741,9 +1835,12 @@ impl TaskOp {
             }
             TaskOp::WriteFile(w) => Ok(op_write_file(
                 w.path.clone(),
-                w.mode,
+                w.mode.expect_resolved("write_file.mode")?,
                 false,
                 w.content.as_bytes().to_vec(),
+                w.validate.clone().unwrap_or_default(),
+                w.owner.clone().unwrap_or_default(),
+                w.group.clone().unwrap_or_default(),
             )),
             // `template:` is desugared to `OpWriteFile` by the orchestrator
             // (after rendering the template body), so we should never see
@@ -1752,17 +1849,51 @@ impl TaskOp {
                 "internal: TaskOp::Template reached to_wire_op without being desugared to TaskOp::WriteFile"
             )),
             TaskOp::Copy(c) => {
-                // `copy:` keeps its variant through render_op (rather
-                // than desugaring to WriteFile) so we can ship bytes
-                // verbatim — WriteFileOp.content is String, which would
-                // lossy-convert binary blobs.
+                if c.remote_src {
+                    // `remote_src: true` — the controller never reads
+                    // the bytes; the agent copies src → dest on the
+                    // target host. The orchestrator already rendered
+                    // any Jinja in `src`/`dest` so we ship the
+                    // resolved strings verbatim.
+                    let src = c.src.clone().ok_or_else(|| {
+                        anyhow!("internal: copy.remote_src=true with no src at to_wire_op time")
+                    })?;
+                    let mode = match &c.mode {
+                        crate::playbook::ModeField::Literal(m) => Some(*m),
+                        crate::playbook::ModeField::Template(_) => {
+                            return Err(anyhow!(
+                                "internal: copy.mode template not resolved at to_wire_op time"
+                            ))
+                        }
+                    };
+                    return Ok(op_copy_target(
+                        src,
+                        c.dest.clone(),
+                        mode,
+                        c.owner.clone().unwrap_or_default(),
+                        c.group.clone().unwrap_or_default(),
+                        c.validate.clone().unwrap_or_default(),
+                    ));
+                }
+                // Controller-side `copy:` keeps its variant through
+                // render_op (rather than desugaring to WriteFile) so we
+                // can ship bytes verbatim — WriteFileOp.content is
+                // String, which would lossy-convert binary blobs.
                 let body = c.body.as_ref().ok_or_else(|| {
                     anyhow!(
                         "internal: TaskOp::Copy src {:?} body not resolved at to_wire_op time",
                         c.src
                     )
                 })?;
-                Ok(op_write_file(c.dest.clone(), c.mode, false, body.clone()))
+                Ok(op_write_file(
+                    c.dest.clone(),
+                    c.mode.expect_resolved("copy.mode")?,
+                    false,
+                    body.clone(),
+                    c.validate.clone().unwrap_or_default(),
+                    c.owner.clone().unwrap_or_default(),
+                    c.group.clone().unwrap_or_default(),
+                ))
             }
             TaskOp::GatherFacts => Ok(op_gather_facts()),
             TaskOp::Stat(s) => Ok(op_stat(s.path.clone(), s.follow)),
@@ -1778,7 +1909,10 @@ impl TaskOp {
             TaskOp::File(f) => Ok(op_file(
                 f.path.clone(),
                 f.state.wire_byte(),
-                f.mode,
+                f.mode
+                    .as_ref()
+                    .map(|m| m.expect_resolved("file.mode"))
+                    .transpose()?,
                 f.owner.clone().unwrap_or_default(),
                 f.group.clone().unwrap_or_default(),
                 f.recurse,
@@ -1788,11 +1922,12 @@ impl TaskOp {
                 l.regexp.clone(),
                 l.line.clone(),
                 l.state.wire_byte(),
-                l.mode,
+                l.mode.as_ref().map(|m| m.expect_resolved("lineinfile.mode")).transpose()?,
                 l.create,
                 l.insertbefore.clone(),
                 l.insertafter.clone(),
                 l.backrefs,
+                l.validate.clone().unwrap_or_default(),
             )),
             TaskOp::BlockInFile(b) => Ok(op_blockinfile(
                 b.path.clone(),
@@ -1801,10 +1936,11 @@ impl TaskOp {
                 b.marker_begin.clone(),
                 b.marker_end.clone(),
                 b.state.wire_byte(),
-                b.mode,
+                b.mode.as_ref().map(|m| m.expect_resolved("blockinfile.mode")).transpose()?,
                 b.create,
                 b.insertbefore.clone(),
                 b.insertafter.clone(),
+                b.validate.clone().unwrap_or_default(),
             )),
             TaskOp::Systemd(s) => Ok(op_systemd(
                 s.name.clone(),
@@ -1832,7 +1968,7 @@ impl TaskOp {
                 r.repo.clone(),
                 r.state.wire_byte(),
                 r.filename.clone(),
-                r.mode,
+                r.mode.as_ref().map(|m| m.expect_resolved("repository.mode")).transpose()?.unwrap_or(0),
                 r.update_cache,
             )),
             TaskOp::Group(g) => Ok(op_group(g.name.clone(), g.state.wire_byte(), g.system)),
@@ -1860,6 +1996,7 @@ impl TaskOp {
                 g.split.clone(),
             )),
             TaskOp::Hostname(h) => Ok(op_hostname(h.name.clone())),
+            TaskOp::Timezone(z) => Ok(op_timezone(z.name.clone())),
             TaskOp::AsyncStatus(a) => {
                 // `jid` has already been rendered to its final string
                 // form by the orchestrator's render_op pass; we just
@@ -1962,6 +2099,15 @@ impl TaskOp {
                 p.positional_args.clone(),
                 p.read_only,
             )),
+            TaskOp::PostgresqlUser(_) => Err(anyhow!(
+                "internal: TaskOp::PostgresqlUser reached to_wire_op — this op is a controller-side composite, should be intercepted earlier"
+            )),
+            TaskOp::PostgresqlDb(_) => Err(anyhow!(
+                "internal: TaskOp::PostgresqlDb reached to_wire_op — this op is a controller-side composite, should be intercepted earlier"
+            )),
+            TaskOp::PostgresqlMembership(_) => Err(anyhow!(
+                "internal: TaskOp::PostgresqlMembership reached to_wire_op — this op is a controller-side composite, should be intercepted earlier"
+            )),
             TaskOp::PostgresqlExt(p) => Ok(op_postgresql_ext(
                 p.name.clone(),
                 p.state,
@@ -1985,7 +2131,7 @@ impl TaskOp {
                     g.url.clone(),
                     g.dest.clone(),
                     g.checksum.clone(),
-                    g.mode,
+                    g.mode.as_ref().map(|m| m.expect_resolved("get_url.mode")).transpose()?.unwrap_or(0),
                     g.owner.clone(),
                     g.group.clone(),
                     header_keys,
@@ -2004,8 +2150,8 @@ impl TaskOp {
                 s.max_bytes,
             )),
             TaskOp::Unarchive(u) => {
-                let (has_mode, mode_bits) = match u.mode {
-                    Some(m) => (1u8, m),
+                let (has_mode, mode_bits) = match &u.mode {
+                    Some(m) => (1u8, m.expect_resolved("unarchive.mode")?),
                     None => (0u8, 0u32),
                 };
                 Ok(rsansible_wire::msg::op_unarchive(
@@ -2572,6 +2718,21 @@ write_file:
     }
 
     #[test]
+    fn accepts_task_without_name_synthesizing_display_name() {
+        // gothab's postgres-exporter/tasks/main.yml has bare
+        // `- ansible.builtin.import_tasks: install.yml` entries with
+        // no `name:`. Parser must accept them — Ansible does — and
+        // synthesize a readable display name.
+        let t = parse_task(
+            r#"
+import_tasks: install.yml
+tags: [postgres-exporter]
+"#,
+        );
+        assert!(t.name.contains("import_tasks"), "got: {:?}", t.name);
+    }
+
+    #[test]
     fn rejects_missing_body() {
         let err = try_parse_task(
             r#"
@@ -2623,6 +2784,42 @@ shell: echo
 "#,
         );
         assert_eq!(t.delegate_to.as_deref(), Some("{{ groups['etcd'][0] }}"));
+    }
+
+    #[test]
+    fn parses_delegate_facts_false_is_accepted() {
+        // Default rsansible behavior (facts land on originating host)
+        // matches `delegate_facts: false`. Explicit `false` is a no-op
+        // we accept silently — refusing it would break any playbook
+        // that's just being self-documenting.
+        let t = parse_task(
+            r#"
+name: t
+delegate_to: localhost
+delegate_facts: false
+shell: echo
+"#,
+        );
+        assert!(!t.delegate_facts);
+    }
+
+    #[test]
+    fn rejects_delegate_facts_true_as_not_implemented() {
+        // Regression: `delegate_facts: true` would route registers /
+        // set_facts onto the delegate host instead of the originator.
+        // We don't implement that yet — fail loudly at parse so users
+        // don't get a silently wrong run.
+        let yaml = r#"
+name: t
+delegate_to: web1
+delegate_facts: true
+shell: echo
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        assert!(
+            format!("{err}").contains("not yet implemented"),
+            "got: {err}"
+        );
     }
 
     #[test]

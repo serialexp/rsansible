@@ -179,6 +179,7 @@ mod tests {
             loop_control: None,
             tags: vec![],
             delegate_to: None,
+            delegate_facts: false,
             run_once: false,
             notify: vec![],
             role_dir: None,

@@ -279,6 +279,7 @@ fn expand_one(
             loop_control: None,
             tags: Vec::new(),
             delegate_to: None,
+            delegate_facts: false,
             run_once: false,
             notify: Vec::new(),
             role_dir: Some(role_dir),
@@ -391,6 +392,19 @@ fn resolve_template_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
     let TaskBody::Op(TaskOp::Template(t)) = &mut task.body else {
         return Ok(());
     };
+    // Always capture the search dirs — even when we eagerly load the
+    // body, the body itself may contain `{% include "name" %}`
+    // statements that need to be resolved against the same templates/
+    // tree at render time. The orchestrator installs a path loader
+    // keyed on this list.
+    t.search_dirs = template_search_base_dirs(task.role_dir.as_deref(), base_dir);
+    // Defer loading when `src:` contains Jinja — resolution against
+    // `item`, host vars, etc. needs the per-host template context
+    // we don't have at load time. The dispatch site will render src
+    // then probe `search_dirs` to find the file.
+    if crate::playbook::task_op::shared::string_is_jinja(&t.src) {
+        return Ok(());
+    }
     let candidates = file_search_paths(&t.src, task.role_dir.as_deref(), base_dir, "templates");
     for path in &candidates {
         if path.is_file() {
@@ -436,11 +450,23 @@ fn resolve_copy_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
     let TaskBody::Op(TaskOp::Copy(c)) = &mut task.body else {
         return Ok(());
     };
+    // `remote_src: true` — `src:` is a path on the target host, not
+    // in the playbook tree. The agent reads it directly; the
+    // controller has no business resolving or loading the bytes.
+    if c.remote_src {
+        return Ok(());
+    }
     // `content:` form is resolved at dispatch (Jinja-render inline
     // content), nothing to load from disk here.
     let Some(src) = c.src.as_deref() else {
         return Ok(());
     };
+    // Defer loading when `src:` contains Jinja — capture search dirs
+    // so the dispatch site can render src and probe them.
+    if crate::playbook::task_op::shared::string_is_jinja(src) {
+        c.search_dirs = copy_search_base_dirs(task.role_dir.as_deref(), base_dir);
+        return Ok(());
+    }
     let candidates = file_search_paths(src, task.role_dir.as_deref(), base_dir, "files");
     for path in &candidates {
         if path.is_file() {
@@ -464,6 +490,34 @@ fn resolve_copy_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
 
 /// Build the candidate path list for a role-relative file lookup.
 /// `subdir` is `"templates"` for `template:` or `"files"` for `copy:`.
+/// Base directories (in resolution priority order) to probe when a
+/// Jinja-templated `template.src` is rendered at dispatch time. The
+/// orchestrator joins `<base>/<rendered_src>` for each entry and uses
+/// the first file that exists. Mirrors the load-time order in
+/// `file_search_paths` minus the `<base_dir>/<src>` fallback (we
+/// always go through `templates/`).
+fn template_search_base_dirs(role_dir: Option<&Path>, base_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(3);
+    if let Some(rd) = role_dir {
+        out.push(rd.join("templates"));
+    }
+    out.push(base_dir.join("templates"));
+    out.push(base_dir.to_path_buf());
+    out
+}
+
+/// Same as `template_search_base_dirs` but for `copy:` — looks in
+/// `files/` subdirectories instead of `templates/`.
+fn copy_search_base_dirs(role_dir: Option<&Path>, base_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(3);
+    if let Some(rd) = role_dir {
+        out.push(rd.join("files"));
+    }
+    out.push(base_dir.join("files"));
+    out.push(base_dir.to_path_buf());
+    out
+}
+
 fn file_search_paths(
     src: &str,
     role_dir: Option<&Path>,

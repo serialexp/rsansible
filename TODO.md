@@ -239,21 +239,127 @@ Tried `rsansible validate` against every gothab playbook + one live run.
 - [x] **drill-restore.yml** (7 tasks) — parses cleanly. Not run
   (triggers a real drill on app-1).
 
-- [ ] **drill-valkey-failover.yml** parse error: `when:` accepts a
-  YAML sequence in Ansible (AND-joins entries), rsansible rejects
-  it as "`when` must be a string." Fix at `Task::deserialize` —
-  detect Sequence and join with `(a) and (b)`. Small.
+- [x] **drill-valkey-failover.yml** — `when:` YAML sequences now
+  AND-joined at parse time. Parses cleanly (29 tasks).
 
-- [ ] **pgbackrest.yml** parse error: `copy:` with the `content:`
-  form (inline content rather than `src:`). Need to add a `content`
-  field to `CopyOp` and let `src` be optional when `content` is
-  set. Small.
+- [ ] **pgbackrest.yml** new blocker: `template:` task uses
+  `src: "{{ item.template }}"` (loop-templated source). Resolver
+  rejects at parse because it can't locate a literal template.
+  Fix path: when `src` contains Jinja, defer resolution to dispatch
+  time (render against per-host view + loop item, then walk the
+  same search path: role templates/ → playbook templates/ →
+  playbook dir). The post-Phase mode/copy/systemd/failed_when work
+  unblocked the OTHER tasks in this file. Medium.
 
-- [ ] **site.yml** parse error: `community.general.timezone` module
-  unsupported. The FQCN stripping works fine (it's the bare
-  `timezone` that's unknown). Easiest path: implement a `timezone:`
-  module that writes `/etc/timezone` + `timedatectl set-timezone`
-  via the existing exec channel. Medium.
+- [x] **site.yml** `community.general.timezone` — implemented as
+  `OpTimezone` (kind=27). Wire schema + agent module + ctl parser.
+  Now hits a NEW blocker: `apt: update_cache: true` standalone
+  form (no `name:`). Parser requires `name`; needs to be optional
+  when only update_cache/upgrade is set. Small.
+
+### Fixed this session (2026-05-19, gothab site.yml iteration)
+
+- [x] `delegate_facts:` task-level metadata (parsed, currently ignored;
+  semantic enforcement TBD when a playbook actually needs it).
+- [x] `ufw: policy:` accepted as alias for `default:` (error if both
+  set); rule/direction/proto enum validation now defers when value is
+  a Jinja template.
+- [x] `copy: remote_src:` — new wire op `OpCopyTarget` (kind=28).
+  Controller doesn't load bytes when `remote_src: true`; agent reads
+  src on target, atomic-writes to dest with owner/group/mode/validate.
+- [x] `openssl_privatekey: owner: / group:` parsed (stored; OpWriteFile
+  carrying them is a follow-up — see existing TODO entry).
+- [x] `openssl_csr_pipe: digest:` parsed (rcgen picks digest from key
+  type today — honored indirectly).
+- [x] `x509_certificate_pipe: provider: ownca` implemented end-to-end:
+  ownca_content / ownca_privatekey_content / ownca_privatekey_path /
+  ownca_digest / ownca_not_after fields with per-provider required-
+  field validation. rcgen 0.13 workaround: reconstruct issuer cert
+  via `CertificateParams::from_ca_cert_pem` → `self_signed(&ca_key)`
+  since `Issuer::from_ca_cert_pem` is a 0.14 API. Regression tests:
+  ownca_signed_cert_carries_csr_subject, synth_cert_pipe_signs_csr_via_ownca_provider.
+- [x] `selfsigned_not_after:` / `ownca_not_after:` accept Jinja
+  templates — `not_after_template: String` stores the deferred form,
+  render arm renders + parses at dispatch.
+- [x] `wait_for: port:` accepts Jinja templates — `port_template:
+  String` stores the deferred form, render arm renders + parses at
+  dispatch. validate.rs updated to count port_template as TCP mode.
+
+### Next: postgresql_user + postgresql_db as controller-side composites
+
+gothab's `postgres-node/tasks/app-database.yml` uses two unimplemented
+postgresql modules. Implementing them as **controller-side composites**
+that dispatch the existing `OpPostgresqlQuery` wire op instead of
+shipping fresh agent modules — pattern already established by
+`synth_cert_pipe` and the openssl_privatekey/csr_pipe composite.
+
+Shape (per task): probe via `SELECT … FROM pg_authid` / `pg_database`,
+controller diffs against requested state, conditional mutating
+statement bundles all ALTER clauses or the CREATE. Idempotent
+re-runs cost 1 roundtrip; divergence cost 2.
+
+- [ ] **`postgresql_user`** — name, password, role_attr_flags,
+  state=present/absent, login_unix_socket | login_host+port,
+  login_user / login_password, db, conn_limit, no_password_changes.
+- [ ] **`postgresql_db`** — name, owner, encoding, lc_collate,
+  lc_ctype, template, state=present/absent, login_unix_socket | …
+  Owner divergence → ALTER DATABASE OWNER TO. Encoding/collate/ctype
+  diverging from existing DB → error (postgres can't change them
+  post-CREATE).
+
+### Optimization: collapse postgres composites to 1 wire op
+
+The composite shape above costs 2 wire-dispatch roundtrips in the
+divergence path (probe SELECT + conditional mutating DDL). An
+in-process agent module would do the same two SQL roundtrips
+end-to-end but only **one** wire dispatch — saving ~1ms of framing +
+ssh-channel cost per task. Acceptable for v1 (steady-state runs
+trigger the idempotent fast-path with 1 roundtrip anyway, and the
+gothab playbooks only hit these tasks a handful of times). Revisit
+if a profiling pass shows postgres composite tasks dominating run
+time, or if we end up adding a third + fourth composite (membership,
+privs) — at that point the right move is probably either:
+
+  - A new agent module that takes a "probe SELECT + conditional
+    mutating SQL" pair in one dispatch and runs both in-process. Reads
+    + writes only one roundtrip. Wire shape: `{probe_sql, probe_args,
+    mutating_sql_template, mutating_args, diff_jq_or_similar}` is
+    awkward — needs careful design.
+  - A `OpPostgresqlBatch` that takes a flat `Vec<{sql, args,
+    read_only}>` and runs them serially in one tokio-postgres
+    connection, returning all results. Less elegant API but
+    composes well for membership-style modules.
+
+Either way, **not v1**.
+
+### Fixed earlier this week (2026-05-18)
+
+- [x] `when:` YAML sequence AND-join
+- [x] `copy: content:` inline form (Jinja-rendered at dispatch)
+- [x] `systemd: daemon_reload:` without `name:` (unit-agnostic form)
+- [x] `failed_when:` / `changed_when:` YAML sequences
+- [x] `mode:` field accepts Jinja templates (e.g. `mode: "{{ item.mode }}"`).
+  ModeField enum + resolve_mode/resolve_mode_opt at dispatch. Applies to
+  template/copy/file/lineinfile/blockinfile/repository/openssl_privkey/
+  get_url/unarchive/write_file (every op carrying a `mode:` field).
+- [x] `timezone:` module (`community.general.timezone`). New wire op
+  kind=27, ctl parser, agent module with timedatectl-or-symlink-fallback
+  + zoneinfo existence check. 6 ctl tests, 5 agent tests with stub
+  timedatectl.
+
+- [ ] **`openssl_privatekey: owner: / group:`** — accepted at parse
+  time but not yet honored at dispatch. The op ships via
+  `OpWriteFile`, which doesn't carry owner/group yet. Two ways to
+  fix: extend `OpWriteFile` with `owner`/`group` (benefits copy and
+  template's "parsed but not honored" caveats too) or follow the
+  write with an `OpFile { state: file, owner, group }` chown. The
+  former is the cleaner refactor.
+
+- [ ] **`OpWriteFile` owner/group**: copy and template both have
+  `owner: Option<String>` / `group: Option<String>` parsed but not
+  yet applied at dispatch (see the doc comments on `CopyOp` /
+  `TemplateOp`). Same root cause as the openssl_privatekey entry
+  above. Picking one fix solves all three at once.
 
 - [ ] **Doubled log output**: every tracing line prints twice when
   running `rsansible run` (e.g. "agent up host=…" appears 2×).

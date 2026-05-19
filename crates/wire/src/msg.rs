@@ -46,13 +46,24 @@ pub fn op_shell(
     })
 }
 
-pub fn op_write_file(path: String, mode: u32, only_if_missing: bool, content: Vec<u8>) -> Op {
+pub fn op_write_file(
+    path: String,
+    mode: u32,
+    only_if_missing: bool,
+    content: Vec<u8>,
+    validate: String,
+    owner: String,
+    group: String,
+) -> Op {
     Op::OpWriteFile(OpWriteFileOutput {
         kind: 2,
         path,
         mode,
         only_if_missing: if only_if_missing { 1 } else { 0 },
         content,
+        validate,
+        owner,
+        group,
     })
 }
 
@@ -147,6 +158,7 @@ pub fn op_lineinfile(
     insertbefore: String,
     insertafter: String,
     backrefs: bool,
+    validate: String,
 ) -> Op {
     let (has_mode, mode_val) = match mode {
         Some(m) => (1u8, m),
@@ -164,6 +176,7 @@ pub fn op_lineinfile(
         insertbefore,
         insertafter,
         backrefs: if backrefs { 1 } else { 0 },
+        validate,
     })
 }
 
@@ -186,6 +199,7 @@ pub fn op_blockinfile(
     create: bool,
     insertbefore: String,
     insertafter: String,
+    validate: String,
 ) -> Op {
     let (has_mode, mode_val) = match mode {
         Some(m) => (1u8, m),
@@ -204,6 +218,7 @@ pub fn op_blockinfile(
         create: if create { 1 } else { 0 },
         insertbefore,
         insertafter,
+        validate,
     })
 }
 
@@ -424,6 +439,10 @@ pub fn op_getent(database: String, key: String, fail_key: bool, split: String) -
 
 pub fn op_hostname(name: String) -> Op {
     Op::OpHostname(OpHostnameOutput { kind: 26, name })
+}
+
+pub fn op_timezone(name: String) -> Op {
+    Op::OpTimezone(OpTimezoneOutput { kind: 27, name })
 }
 
 /// `op:` byte values for `OpUfw`.
@@ -771,6 +790,31 @@ pub fn op_unarchive(
         list_files,
         include,
         exclude,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_copy_target(
+    src: String,
+    dest: String,
+    mode: Option<u32>,
+    owner: String,
+    group: String,
+    validate: String,
+) -> Op {
+    let (has_mode, mode_val) = match mode {
+        Some(m) => (1u8, m),
+        None => (0u8, 0u32),
+    };
+    Op::OpCopyTarget(OpCopyTargetOutput {
+        kind: 28,
+        src,
+        dest,
+        has_mode,
+        mode: mode_val,
+        owner,
+        group,
+        validate,
     })
 }
 

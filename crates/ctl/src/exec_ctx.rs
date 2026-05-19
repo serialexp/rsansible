@@ -9,6 +9,7 @@
 //! `loop:` expressions, `assert.that:` expressions) all evaluate against
 //! the merged view returned by `build_template_ctx`.
 
+use crate::run_metrics::RunMetrics;
 use crate::wire_cost::{WireCost, WireStrategy};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,6 +113,16 @@ pub struct HostCtx {
     /// exit from the rescue arm. `None` when the failure had no
     /// register payload (e.g. `when:` render error).
     pub ansible_failed_result: Option<RegisterValue>,
+    /// Run-shared timing aggregator. All per-host walkers hold the
+    /// same `Arc<RunMetrics>` (lock-free atomics), updated once per
+    /// completed wire round-trip in
+    /// `orchestrator::run_op_body`. Snapshotted into `RunReport` at
+    /// end-of-run for the timing summary line.
+    ///
+    /// Defaults to a fresh empty `RunMetrics` so that `HostCtx::new`
+    /// can stand on its own in tests; production seeds every host's
+    /// ctx with the run-level shared instance at run startup.
+    pub run_metrics: Arc<RunMetrics>,
 }
 
 impl HostCtx {
@@ -135,6 +146,7 @@ impl HostCtx {
             privkey_pem_cache: BTreeMap::new(),
             ansible_failed_task: None,
             ansible_failed_result: None,
+            run_metrics: Arc::new(RunMetrics::default()),
         }
     }
 
@@ -153,6 +165,13 @@ pub struct RegisterValue {
     pub stdout: String,
     pub stderr: String,
     pub stdout_lines: Vec<String>,
+    /// Mirror of `stdout_lines` for stderr. Ansible's command/shell
+    /// register exposes both; rsansible historically only carried
+    /// `stdout_lines`, which made `register.stderr_lines` resolve to
+    /// `undefined` in templates and broke common patterns like
+    /// `msg: "{{ r.stdout_lines + r.stderr_lines }}"` (caught in the
+    /// gothab etcd verify task).
+    pub stderr_lines: Vec<String>,
     /// `Some(_)` iff `stdout` parses as JSON. Lets `register.json.field`
     /// work in `when:` clauses without an explicit `from_json` filter.
     pub json: Option<JsonValue>,
@@ -191,6 +210,15 @@ impl RegisterValue {
             "stdout_lines".into(),
             JsonValue::Array(
                 self.stdout_lines
+                    .iter()
+                    .map(|s| JsonValue::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        m.insert(
+            "stderr_lines".into(),
+            JsonValue::Array(
+                self.stderr_lines
                     .iter()
                     .map(|s| JsonValue::String(s.clone()))
                     .collect(),
@@ -254,6 +282,20 @@ impl RegisterValue {
         } else {
             stdout_lines
         };
+        let stderr_lines_raw: Vec<String> = stderr
+            .split('\n')
+            .filter(|s| !s.is_empty() || stderr.ends_with('\n'))
+            .map(|s| s.to_string())
+            .collect();
+        let stderr_lines = if stderr.ends_with('\n') {
+            let mut v = stderr_lines_raw;
+            if v.last().map(|s| s.is_empty()).unwrap_or(false) {
+                v.pop();
+            }
+            v
+        } else {
+            stderr_lines_raw
+        };
         let json = serde_json::from_str::<JsonValue>(stdout.trim()).ok();
         Self {
             changed,
@@ -261,6 +303,7 @@ impl RegisterValue {
             stdout,
             stderr,
             stdout_lines,
+            stderr_lines,
             json,
             took_ms,
             skipped,
@@ -537,6 +580,39 @@ mod tests {
         assert_eq!(j["stdout"], "hi\n");
         assert_eq!(j["stdout_lines"], json!(["hi"]));
         assert_eq!(j["failed"], false);
+    }
+
+    /// Regression for the etcd verify `Show local endpoint-health
+    /// output` template error: `r.stdout_lines + r.stderr_lines`
+    /// failed with "unsupported types sequence and undefined" because
+    /// RegisterValue carried `stdout_lines` but not `stderr_lines`.
+    /// Both must appear on the JSON shape templates see, and both
+    /// must split lines the same way (drop trailing empty from a
+    /// final newline).
+    #[test]
+    fn register_exposes_stderr_lines_alongside_stdout_lines() {
+        let rv = RegisterValue::from_exec(
+            0,
+            false,
+            5,
+            b"line1\nline2\n",
+            b"err1\nerr2\n",
+        );
+        assert_eq!(rv.stderr_lines, vec!["err1".to_string(), "err2".to_string()]);
+        let j = rv.to_json();
+        assert_eq!(j["stderr_lines"], json!(["err1", "err2"]),
+            "regression: register.stderr_lines must be defined for command/shell registers");
+        assert_eq!(j["stdout_lines"], json!(["line1", "line2"]));
+    }
+
+    /// Empty stderr → empty stderr_lines array (not [""], not
+    /// missing). Pins the trailing-empty stripping behavior for
+    /// stderr the same way the stdout test pins it.
+    #[test]
+    fn register_stderr_lines_empty_when_stderr_empty() {
+        let rv = RegisterValue::from_exec(0, false, 1, b"", b"");
+        let j = rv.to_json();
+        assert_eq!(j["stderr_lines"], json!([]));
     }
 
     #[test]

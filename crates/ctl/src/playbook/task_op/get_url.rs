@@ -1,6 +1,8 @@
 //! `get_url:` task body.
 
-use super::shared::{parse_ansible_bool, parse_octal_mode, take_optional_string};
+use super::shared::{parse_ansible_bool, take_optional_mode, take_optional_string, ModeField};
+#[allow(unused_imports)]
+use super::shared::parse_octal_mode;
 use rsansible_wire::msg::uri_follow;
 use serde::{de::Error as _, Deserialize, Deserializer};
 use std::collections::BTreeMap;
@@ -14,8 +16,9 @@ pub struct GetUrlOp {
     pub dest: String,
     /// `<algo>:<hex>` (sha256/sha1/md5). Empty = no verification.
     pub checksum: String,
-    /// Octal file mode applied to dest after rename. 0 = leave alone.
-    pub mode: u32,
+    /// Octal file mode applied to dest after rename. `None` = leave
+    /// alone. Accepts a Jinja template; resolved at dispatch.
+    pub mode: Option<ModeField>,
     /// Owner name (resolved to uid agent-side). Empty = leave alone.
     pub owner: String,
     /// Group name (resolved to gid agent-side). Empty = leave alone.
@@ -73,26 +76,9 @@ impl<'de> Deserialize<'de> for GetUrlOp {
             }
         };
 
-        // mode — Ansible accepts octal strings ("0644") AND raw ints.
-        let mode = match map.remove("mode") {
-            None | Some(serde_yaml::Value::Null) => 0u32,
-            Some(serde_yaml::Value::String(s)) => parse_octal_mode::<D::Error>(&s)?,
-            Some(serde_yaml::Value::Number(n)) => {
-                // Bare ints in YAML are decimal — treat as decimal mode
-                // (Ansible's behaviour when you write `mode: 644` is to
-                // interpret it as 0o1204 which is a bug; we follow the
-                // string-form recommendation. For numeric input we just
-                // take the bits as given.)
-                n.as_u64()
-                    .ok_or_else(|| D::Error::custom(format!("get_url.mode: bad number {n:?}")))?
-                    as u32
-            }
-            Some(other) => {
-                return Err(D::Error::custom(format!(
-                    "get_url.mode: expected octal string or int, got: {other:?}"
-                )))
-            }
-        };
+        // mode — Ansible accepts octal strings ("0644"), raw ints, and
+        // Jinja templates. Shared helper handles all three.
+        let mode = take_optional_mode::<D::Error>(&mut map, "mode")?;
 
         let owner = match map.remove("owner") {
             None | Some(serde_yaml::Value::Null) => String::new(),
@@ -255,7 +241,7 @@ get_url:
         assert_eq!(g.url, "https://example.com/x.tar.gz");
         assert_eq!(g.dest, "/tmp/x.tar.gz");
         assert_eq!(g.checksum, "");
-        assert_eq!(g.mode, 0);
+        assert_eq!(g.mode, None);
         assert!(!g.force);
         assert!(g.validate_certs);
         assert_eq!(g.follow_redirects, uri_follow::ALL);
@@ -285,7 +271,7 @@ get_url:
         );
         let TaskBody::Op(TaskOp::GetUrl(g)) = t.body else { panic!() };
         assert_eq!(g.checksum, "sha256:abc123");
-        assert_eq!(g.mode, 0o644);
+        assert_eq!(g.mode, Some(super::super::ModeField::Literal(0o644)));
         assert_eq!(g.owner, "root");
         assert_eq!(g.group, "wheel");
         assert_eq!(g.headers.get("Authorization").unwrap(), "Bearer xyz");

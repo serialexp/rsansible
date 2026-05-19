@@ -30,7 +30,7 @@ futures = "0.3"
 russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "rsa"] }
 
 # templates
-minijinja = { version = "2", default-features = false, features = ["builtins", "loader", "serde"] }
+minijinja = { version = "2", default-features = false, features = ["builtins", "loader", "multi_template", "serde"] }
 # Python-method compatibility shim for minijinja — enables `.strip()`,
 # `.split()`, `.replace()`, `.startswith()`, etc. as called from Ansible
 # playbooks. Wired up via `set_unknown_method_callback` in `make_env()`.

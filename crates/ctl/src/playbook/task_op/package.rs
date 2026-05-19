@@ -169,14 +169,13 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
     };
     let label = manager.label();
 
-    // `name:` is required and may be a string or a list of strings.
-    // Ansible also accepts `pkg:` as an alias under `apt:` / `package:`.
+    // `name:` is normally required and may be a string or a list of
+    // strings. Ansible also accepts `pkg:` as an alias under `apt:` /
+    // `package:`. The "must be present" check is deferred to the end of
+    // parsing — for apt, the side-effect-only forms (`update_cache:
+    // true`, `autoremove: true`) are valid without any package names.
     let names = match map.remove("name").or_else(|| map.remove("pkg")) {
-        None => {
-            return Err(E::custom(format!(
-                "{label}: missing required field `name`"
-            )))
-        }
+        None => Vec::new(),
         Some(serde_yaml::Value::String(s)) => vec![s],
         Some(serde_yaml::Value::Sequence(seq)) => {
             let mut out = Vec::with_capacity(seq.len());
@@ -340,9 +339,13 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
         )));
     }
 
-    if names.is_empty() {
+    // Names may be empty *only* if some side-effect-only action is set
+    // (apt's `update_cache: true` or `autoremove: true`). Otherwise the
+    // op has nothing to do and is almost certainly an authoring mistake.
+    if names.is_empty() && !update_cache && !autoremove {
         return Err(E::custom(format!(
-            "{label}.name: must specify at least one package"
+            "{label}: missing required field `name` \
+             (or set `update_cache: true` / `autoremove: true` for a side-effect-only invocation)"
         )));
     }
     for n in &names {
@@ -422,6 +425,64 @@ apt:
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn apt_update_cache_only_parses_without_name() {
+        // Side-effect-only form: `apt: update_cache: true` with no
+        // `name:` is valid in Ansible (it's just `apt-get update`).
+        // Regression for "missing required field `name`" rejecting
+        // this form unconditionally.
+        let t = parse_task(
+            r#"
+name: refresh apt cache
+apt:
+  update_cache: true
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Package(p)) => {
+                assert_eq!(p.manager, PackageManager::Apt);
+                assert!(p.names.is_empty());
+                assert!(p.update_cache);
+                assert!(!p.autoremove);
+            }
+            _ => panic!("expected Package"),
+        }
+    }
+
+    #[test]
+    fn apt_autoremove_only_parses_without_name() {
+        let t = parse_task(
+            r#"
+name: sweep orphans
+apt:
+  autoremove: true
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Package(p)) => {
+                assert!(p.names.is_empty());
+                assert!(p.autoremove);
+                assert!(!p.update_cache);
+            }
+            _ => panic!("expected Package"),
+        }
+    }
+
+    #[test]
+    fn apt_rejects_no_name_and_no_side_effect_action() {
+        // A bare `apt:` with no name, no update_cache, no autoremove is
+        // still an authoring error — there's nothing to do.
+        let yaml = r#"
+name: t
+apt:
+  state: present
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("missing required field `name`"), "got: {err}");
+        assert!(msg.contains("update_cache"), "got: {err}");
     }
 
     #[test]

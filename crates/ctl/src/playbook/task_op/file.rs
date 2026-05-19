@@ -1,6 +1,6 @@
 //! `file:` task body.
 
-use super::shared::{deserialize_ansible_bool, deserialize_file_mode};
+use super::shared::{deserialize_ansible_bool, deserialize_mode_field_opt, ModeField};
 use serde::Deserialize;
 
 /// `file: { path: …, state: directory, mode: "0755", owner: root,
@@ -10,11 +10,12 @@ use serde::Deserialize;
 pub struct FileOp {
     pub path: String,
     pub state: FileState,
-    /// `mode: "0755"` (string), `mode: 0o755` (int) — Ansible playbooks
-    /// use both. Parsed by `deserialize_file_mode` into a 12-bit perm
-    /// value. Absent → don't chmod.
-    #[serde(default, deserialize_with = "deserialize_file_mode")]
-    pub mode: Option<u32>,
+    /// `mode: "0755"` (string), `mode: 0o755` (int), or a Jinja
+    /// expression like `"{{ item.mode }}"`. Templates are resolved by
+    /// the orchestrator at dispatch (see `ModeField`). Absent →
+    /// don't chmod.
+    #[serde(default, deserialize_with = "deserialize_mode_field_opt")]
+    pub mode: Option<ModeField>,
     /// Owner / group as user-resolvable names. Empty → don't chown.
     #[serde(default)]
     pub owner: Option<String>,
@@ -75,7 +76,7 @@ file:
                 assert_eq!(f.state, FileState::Directory);
                 assert_eq!(f.owner.as_deref(), Some("root"));
                 assert_eq!(f.group.as_deref(), Some("root"));
-                assert_eq!(f.mode, Some(0o755));
+                assert_eq!(f.mode, Some(ModeField::Literal(0o755)));
                 assert!(!f.recurse);
             }
             other => panic!("got {other:?}"),
@@ -151,7 +152,7 @@ file:
 "#,
         );
         match t.body {
-            TaskBody::Op(TaskOp::File(f)) => assert_eq!(f.mode, Some(0o644)),
+            TaskBody::Op(TaskOp::File(f)) => assert_eq!(f.mode, Some(ModeField::Literal(0o644))),
             other => panic!("got {other:?}"),
         }
         // String form with leading 0.
@@ -165,7 +166,7 @@ file:
 "#,
         );
         match t.body {
-            TaskBody::Op(TaskOp::File(f)) => assert_eq!(f.mode, Some(0o644)),
+            TaskBody::Op(TaskOp::File(f)) => assert_eq!(f.mode, Some(ModeField::Literal(0o644))),
             other => panic!("got {other:?}"),
         }
     }
@@ -206,7 +207,7 @@ file:
         let t = TaskOp::File(FileOp {
             path: "/tmp/x".into(),
             state: FileState::Directory,
-            mode: Some(0o755),
+            mode: Some(ModeField::Literal(0o755)),
             owner: Some("root".into()),
             group: Some("root".into()),
             recurse: true,

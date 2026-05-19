@@ -178,7 +178,29 @@ fn apply(bin: &str, op: &OpSystemdOutput, check_mode: bool) -> Result<bool, Syst
             changed = true;
         }
         STATE_RELOADED => {
-            do_mutate(&["reload", name])?;
+            // Match Ansible's systemd_service: `state: reloaded` on an
+            // inactive unit falls back to `start`, not a hard error.
+            // This is the documented Ansible behavior and what
+            // playbooks expect when a `notify: Reload foo` handler
+            // fires on the first install — the unit has never been
+            // started, so there's nothing to reload yet, but the
+            // intent ("after this, foo is running with current
+            // config") still has to land. Caught in the gothab
+            // drill: vmalert's first-install handler `state:
+            // reloaded` fired before any `state: started`, and
+            // `systemctl reload vmalert` failed with "is not active,
+            // cannot reload" — leaving the service un-started even
+            // though every config it needed was already on disk.
+            if probe_is_active(&bin, name)? {
+                do_mutate(&["reload", name])?;
+            } else {
+                let mut args = vec!["start"];
+                if op.no_block != 0 {
+                    args.insert(0, "--no-block");
+                }
+                args.push(name);
+                do_mutate(&args)?;
+            }
             changed = true;
         }
         other => {
@@ -370,6 +392,50 @@ esac
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("restart foo.service"), "log={log:?}");
+    }
+
+    /// Regression for the gothab vmalert first-install handler:
+    /// a `notify: Reload vmalert` fires before any `state: started`
+    /// has run, so the unit is inactive when `state: reloaded` lands.
+    /// Bare `systemctl reload` fails on inactive units; Ansible's
+    /// systemd_service module falls back to `start` in this case
+    /// (and reports changed=true). rsansible must mirror that.
+    #[test]
+    fn reloaded_on_inactive_unit_falls_back_to_start() {
+        let stub = Stub::new("reload-inactive", None, None);
+        let changed = apply(stub.path().to_str().unwrap(), &op("vmalert.service", STATE_RELOADED), false).unwrap();
+        assert!(changed, "reload-on-inactive must report changed");
+        let log = stub.log();
+        // Must NOT have tried `reload` — systemctl would have failed.
+        assert!(
+            !log.contains("\nreload "),
+            "reload-on-inactive must not call `systemctl reload`: log={log:?}"
+        );
+        // Must have called `start` as the fallback.
+        assert!(
+            log.contains("start vmalert.service"),
+            "reload-on-inactive must fall back to start: log={log:?}"
+        );
+    }
+
+    /// Symmetric: when the unit IS active, reloaded still does a
+    /// real reload (not a restart). This pins the don't-overreach
+    /// side of the fallback — vmalert reloads SHOULD avoid the
+    /// in-flight `for:` timer drop a full restart would cause.
+    #[test]
+    fn reloaded_on_active_unit_calls_reload() {
+        let stub = Stub::new("reload-active", Some("active\n"), None);
+        let changed = apply(stub.path().to_str().unwrap(), &op("vmalert.service", STATE_RELOADED), false).unwrap();
+        assert!(changed);
+        let log = stub.log();
+        assert!(
+            log.contains("reload vmalert.service"),
+            "reload-on-active must call `systemctl reload`: log={log:?}"
+        );
+        assert!(
+            !log.contains("start vmalert.service"),
+            "reload-on-active must not fall back to start: log={log:?}"
+        );
     }
 
     #[test]

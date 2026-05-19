@@ -1,7 +1,7 @@
 //! `ufw:` task body.
 
 use super::shared::{
-    take_optional_ansible_bool, take_optional_field_string, take_optional_port,
+    string_is_jinja, take_optional_ansible_bool, take_optional_field_string, take_optional_port,
 };
 use serde::{de::Error as _, Deserialize, Deserializer};
 
@@ -63,7 +63,22 @@ impl<'de> Deserialize<'de> for UfwOp {
 
         let state = take_optional_field_string(&mut map, "state")?;
         let rule_field = take_optional_field_string(&mut map, "rule")?;
-        let default_field = take_optional_field_string(&mut map, "default")?;
+        // `community.general.ufw` documents `policy:` as an alias for
+        // `default:` — both spell "set the default policy for a
+        // direction." Accept either; refuse both at once so a
+        // playbook with conflicting values surfaces at parse time
+        // rather than silently dropping one.
+        let default_raw = take_optional_field_string(&mut map, "default")?;
+        let policy_raw = take_optional_field_string(&mut map, "policy")?;
+        let default_field = match (default_raw, policy_raw) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "ufw: `default` and `policy` are aliases — set only one",
+                ))
+            }
+            (Some(d), None) | (None, Some(d)) => Some(d),
+            (None, None) => None,
+        };
         let logging_field = take_optional_field_string(&mut map, "logging")?;
         let direction = take_optional_field_string(&mut map, "direction")?.unwrap_or_default();
         let proto = take_optional_field_string(&mut map, "proto")?.unwrap_or_default();
@@ -111,7 +126,7 @@ impl<'de> Deserialize<'de> for UfwOp {
                 .collect();
             return Err(D::Error::custom(format!(
                 "ufw: unknown field(s): {unknown:?}; expected one of \
-                 [state, rule, default, logging, direction, proto, from, from_ip, src, from_port, to, to_ip, dest, to_port, port, interface, if, comment, delete, insert]"
+                 [state, rule, default, policy, logging, direction, proto, from, from_ip, src, from_port, to, to_ip, dest, to_port, port, interface, if, comment, delete, insert]"
             )));
         }
 
@@ -141,39 +156,50 @@ impl<'de> Deserialize<'de> for UfwOp {
             }
         };
 
-        // Validation per kind.
+        // Validation per kind. Enum checks are skipped when the
+        // value is a Jinja template — the orchestrator renders these
+        // at dispatch and the agent enforces the final shape. A
+        // playbook that writes `policy: "{{ common_ufw_default }}"`
+        // must parse, even though the literal `{{ ... }}` text isn't
+        // a valid policy name.
         match op_kind {
             UfwOpKind::Rule => {
-                let r = rule.to_ascii_lowercase();
-                if !matches!(r.as_str(), "allow" | "deny" | "limit" | "reject") {
-                    return Err(D::Error::custom(format!(
-                        "ufw.rule: expected one of [allow, deny, limit, reject], got: {rule:?}"
-                    )));
+                if !string_is_jinja(&rule) {
+                    let r = rule.to_ascii_lowercase();
+                    if !matches!(r.as_str(), "allow" | "deny" | "limit" | "reject") {
+                        return Err(D::Error::custom(format!(
+                            "ufw.rule: expected one of [allow, deny, limit, reject], got: {rule:?}"
+                        )));
+                    }
                 }
             }
             UfwOpKind::Default => {
-                let r = rule.to_ascii_lowercase();
-                if !matches!(r.as_str(), "allow" | "deny" | "reject") {
-                    return Err(D::Error::custom(format!(
-                        "ufw.default: expected one of [allow, deny, reject], got: {rule:?}"
-                    )));
+                if !string_is_jinja(&rule) {
+                    let r = rule.to_ascii_lowercase();
+                    if !matches!(r.as_str(), "allow" | "deny" | "reject") {
+                        return Err(D::Error::custom(format!(
+                            "ufw.default: expected one of [allow, deny, reject], got: {rule:?}"
+                        )));
+                    }
                 }
             }
             UfwOpKind::Logging => {
-                let r = rule.to_ascii_lowercase();
-                if !matches!(
-                    r.as_str(),
-                    "on" | "off" | "low" | "medium" | "high" | "full"
-                ) {
-                    return Err(D::Error::custom(format!(
-                        "ufw.logging: expected one of [on, off, low, medium, high, full], got: {rule:?}"
-                    )));
+                if !string_is_jinja(&rule) {
+                    let r = rule.to_ascii_lowercase();
+                    if !matches!(
+                        r.as_str(),
+                        "on" | "off" | "low" | "medium" | "high" | "full"
+                    ) {
+                        return Err(D::Error::custom(format!(
+                            "ufw.logging: expected one of [on, off, low, medium, high, full], got: {rule:?}"
+                        )));
+                    }
                 }
             }
             _ => {}
         }
 
-        if !direction.is_empty() {
+        if !direction.is_empty() && !string_is_jinja(&direction) {
             let d = direction.to_ascii_lowercase();
             if !matches!(
                 d.as_str(),
@@ -184,7 +210,7 @@ impl<'de> Deserialize<'de> for UfwOp {
                 )));
             }
         }
-        if !proto.is_empty() {
+        if !proto.is_empty() && !string_is_jinja(&proto) {
             let p = proto.to_ascii_lowercase();
             if !matches!(p.as_str(), "any" | "tcp" | "udp" | "esp" | "ah" | "ipv6" | "igmp") {
                 return Err(D::Error::custom(format!(
@@ -273,6 +299,97 @@ ufw:
             }
             _ => panic!(),
         }
+    }
+
+    /// `community.general.ufw` documents `policy:` as an alias for
+    /// `default:`. gothab spells it `policy:`. Both must parse the
+    /// same shape.
+    #[test]
+    fn parses_ufw_policy_as_alias_for_default() {
+        let t = parse_task(
+            r#"
+name: t
+ufw:
+  direction: incoming
+  policy: deny
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Ufw(u)) => {
+                assert_eq!(u.op, UfwOpKind::Default);
+                assert_eq!(u.rule, "deny");
+                assert_eq!(u.direction, "incoming");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Regression: `policy: "{{ var }}"` must parse without
+    /// triggering the [allow, deny, reject] allowlist — the literal
+    /// `{{ ... }}` isn't a valid policy, but the value is templated
+    /// and gets resolved at dispatch. gothab's firewall.yml writes
+    /// `policy: "{{ common_ufw_default_input }}"` for exactly this
+    /// case.
+    #[test]
+    fn parses_ufw_policy_with_jinja_template() {
+        let t = parse_task(
+            r#"
+name: t
+ufw:
+  direction: incoming
+  policy: "{{ common_ufw_default_input }}"
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Ufw(u)) => {
+                assert_eq!(u.op, UfwOpKind::Default);
+                assert_eq!(u.rule, "{{ common_ufw_default_input }}");
+                assert_eq!(u.direction, "incoming");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Templated `direction:` and `proto:` must also defer
+    /// validation, so a rule like `proto: "{{ allowed_proto }}"`
+    /// parses cleanly.
+    #[test]
+    fn parses_ufw_direction_and_proto_with_jinja() {
+        let t = parse_task(
+            r#"
+name: t
+ufw:
+  rule: allow
+  direction: "{{ dir }}"
+  proto: "{{ proto }}"
+  port: 22
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::Ufw(u)) => {
+                assert_eq!(u.direction, "{{ dir }}");
+                assert_eq!(u.proto, "{{ proto }}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Setting both `default:` and `policy:` is ambiguous — surface
+    /// at parse time rather than silently picking one.
+    #[test]
+    fn ufw_rejects_both_default_and_policy() {
+        let yaml = r#"
+name: t
+ufw:
+  default: deny
+  policy: allow
+  direction: in
+"#;
+        let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
+        assert!(
+            format!("{err}").contains("aliases"),
+            "got: {err}"
+        );
     }
 
     #[test]

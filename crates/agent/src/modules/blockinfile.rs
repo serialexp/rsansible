@@ -34,6 +34,7 @@ use regex::Regex;
 use rsansible_wire::generated::OpBlockInFileOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
 
+use super::validate_helper::{validate_tmp, ValidateError};
 use super::{emit_error, Context};
 
 const STATE_PRESENT: u8 = 0;
@@ -179,15 +180,53 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput, check_mode: b
 
     if changed {
         if !check_mode {
-            if let Err(e) = write_atomic(path, new_text.as_bytes(), mode, !file_existed) {
-                emit_error(
-                    ctx,
-                    seq,
-                    err::IO,
-                    format!("blockinfile: writing {}: {e}", path.display()),
-                )
-                .await;
-                return Ok(());
+            match write_atomic(
+                path,
+                new_text.as_bytes(),
+                mode,
+                !file_existed,
+                if op.validate.is_empty() { None } else { Some(op.validate.as_str()) },
+            ) {
+                Ok(()) => {}
+                Err(WriteError::Io(e)) => {
+                    emit_error(
+                        ctx,
+                        seq,
+                        err::IO,
+                        format!("blockinfile: writing {}: {e}", path.display()),
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(WriteError::Validate(ve)) => {
+                    let (code, reason) = match ve {
+                        ValidateError::BadRequest(m) => (err::BAD_REQUEST, m),
+                        ValidateError::Failed { code: c, stderr } => {
+                            let trimmed = stderr.trim();
+                            let r = if trimmed.is_empty() {
+                                format!(
+                                    "blockinfile: validate exited {c} for {} — leaving dest untouched",
+                                    path.display()
+                                )
+                            } else {
+                                format!(
+                                    "blockinfile: validate exited {c} for {} — leaving dest untouched: {trimmed}",
+                                    path.display()
+                                )
+                            };
+                            (err::BAD_REQUEST, r)
+                        }
+                        ValidateError::Spawn(e) => (
+                            err::IO,
+                            format!(
+                                "blockinfile: validate spawn failed for {}: {e}",
+                                path.display()
+                            ),
+                        ),
+                    };
+                    emit_error(ctx, seq, code, reason).await;
+                    return Ok(());
+                }
             }
         }
     } else if let Some(m) = mode {
@@ -365,7 +404,25 @@ fn join_lines(lines: &[String], trailing_newline: bool) -> String {
     s
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>, created: bool) -> std::io::Result<()> {
+/// See lineinfile::WriteError — same shape, same rationale.
+pub(crate) enum WriteError {
+    Io(std::io::Error),
+    Validate(ValidateError),
+}
+
+impl From<std::io::Error> for WriteError {
+    fn from(e: std::io::Error) -> Self {
+        WriteError::Io(e)
+    }
+}
+
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    created: bool,
+    validate: Option<&str>,
+) -> Result<(), WriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let pid = std::process::id();
     let nonce: u64 = now_unix_ns();
@@ -388,6 +445,12 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>, created: bool) -> 
     } else if !created {
         if let Ok(meta) = fs::metadata(path) {
             fs::set_permissions(&tmp, meta.permissions())?;
+        }
+    }
+    if let Some(v) = validate {
+        if let Err(ve) = validate_tmp(v, &tmp) {
+            let _ = fs::remove_file(&tmp);
+            return Err(WriteError::Validate(ve));
         }
     }
     fs::rename(&tmp, path)?;

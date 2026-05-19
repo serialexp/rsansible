@@ -512,6 +512,23 @@ where
                 .map_err(|e| format!("hardlink {} → {}: {e}", abs.display(), target_abs.display()))?;
             changed = true;
         } else if header_kind.is_file() {
+            // Unlink-before-create so we extract correctly into sticky
+            // directories (most commonly `/tmp/`) when a prior entry
+            // is owned by someone other than the current EUID. The
+            // kernel's `fs.protected_regular` sysctl (default-on since
+            // Linux 4.19) blocks `open(O_CREAT|O_TRUNC)` on existing
+            // regular files in sticky dirs when the file owner differs
+            // from the opener — even for root. GNU tar's
+            // `--overwrite` default sidesteps the same issue by
+            // unlinking first; we do the same. Caught in the gothab
+            // drill (vmutils tarball extracted into `/tmp/` where a
+            // prior bart-owned `vmalert-tool-prod` blocked the
+            // root-running rsansible agent with EACCES). `remove_file`
+            // failures are ignored — if the path doesn't exist (the
+            // common case) we proceed; if it exists and we can't
+            // remove it (e.g. it's a directory we don't expect), the
+            // subsequent `create` surfaces a clear error.
+            let _ = std::fs::remove_file(&abs);
             let mut out =
                 std::fs::File::create(&abs).map_err(|e| format!("create {}: {e}", abs.display()))?;
             std::io::copy(&mut entry, &mut out)
@@ -593,6 +610,10 @@ fn extract_zip(
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("create parent of {}: {e}", abs.display()))?;
             }
+            // Unlink-before-create — see the tar arm above for the
+            // `fs.protected_regular` rationale. Same hardening applies
+            // to zip extraction into sticky directories.
+            let _ = std::fs::remove_file(&abs);
             let mut out =
                 std::fs::File::create(&abs).map_err(|e| format!("create {}: {e}", abs.display()))?;
             std::io::copy(&mut entry, &mut out)
@@ -646,43 +667,10 @@ fn zip_datetime_to_unix(dt: &zip::DateTime) -> i64 {
         + (dt.second() as i64)
 }
 
-fn chown_user_only(path: &Path, uid: u32) -> Result<(), String> {
-    let spec = format!("{uid}");
-    let out = std::process::Command::new("chown")
-        .arg("-h")
-        .arg("--")
-        .arg(&spec)
-        .arg(path)
-        .output()
-        .map_err(|e| format!("spawn chown: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "chown -h {spec} {}: {}",
-            path.display(),
-            String::from_utf8_lossy(out.stderr.trim_ascii_end())
-        ));
-    }
-    Ok(())
-}
-
-fn chown_group_only(path: &Path, gid: u32) -> Result<(), String> {
-    let spec = format!(":{gid}");
-    let out = std::process::Command::new("chown")
-        .arg("-h")
-        .arg("--")
-        .arg(&spec)
-        .arg(path)
-        .output()
-        .map_err(|e| format!("spawn chown: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "chown -h {spec} {}: {}",
-            path.display(),
-            String::from_utf8_lossy(out.stderr.trim_ascii_end())
-        ));
-    }
-    Ok(())
-}
+// `chown_user_only` and `chown_group_only` were moved to
+// `super::file` so `write_file` can share them. Re-export under the
+// same path so existing call sites in this module stay short.
+use super::file::{chown_group_only, chown_user_only};
 
 #[allow(clippy::too_many_arguments)]
 async fn emit_envelope(
@@ -909,6 +897,73 @@ mod tests {
         assert_eq!(
             std::fs::read(dest.join("nested/world.txt")).unwrap(),
             b"world\n".to_vec()
+        );
+    }
+
+    /// Regression: extraction must unlink-before-create so that the
+    /// new entry's bytes land even when the existing target is
+    /// non-writable to the calling EUID. Caught in the gothab live
+    /// drill: a bart-owned `/tmp/vmalert-tool-prod` left over from an
+    /// earlier non-become drill blocked a subsequent root-running
+    /// unarchive with `EACCES`, because the kernel's
+    /// `fs.protected_regular` sysctl denies `open(O_CREAT|O_TRUNC)` on
+    /// existing regular files in sticky dirs when the file's owner
+    /// differs from the opener — even for root. We can't simulate
+    /// cross-uid + sticky-dir in a non-root test, but we can pin the
+    /// same shape: a pre-existing read-only target (0o444) would make
+    /// a bare `File::create` (= `open(O_WRONLY|O_CREAT|O_TRUNC)`)
+    /// fail with EACCES; the unlink-first path removes it, then
+    /// creates a fresh file with default mode. If the regression
+    /// returns this test fails with `EACCES` on `create …`.
+    #[tokio::test]
+    async fn tar_overwrites_readonly_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        // Plant a read-only existing target that bare File::create
+        // would fail on.
+        let target = dest.join("payload.bin");
+        std::fs::write(&target, b"stale\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let archive_bytes = build_tar_gz(&[("payload.bin", b"fresh\n")]);
+        let archive_path = dir.path().join("a.tar.gz");
+        std::fs::write(&archive_path, &archive_bytes).unwrap();
+
+        let (ctx, mut rx) = make_ctx();
+        run(
+            &ctx,
+            1,
+            op(
+                archive_path.to_str().unwrap(),
+                dest.to_str().unwrap(),
+                unarchive_format::AUTO,
+                false,
+                false,
+                vec![],
+                vec![],
+                "",
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+        drop(ctx);
+
+        let msgs = drain(&mut rx).await;
+        // Must not have surfaced a TaskError on the agent.
+        if let Some(err) = error_of(&msgs) {
+            panic!(
+                "unexpected TaskError: code={} msg={}",
+                err.code, err.message
+            );
+        }
+        let done = done_of(&msgs).expect("TaskDone");
+        assert_eq!(done.exit_code, 0, "agent reported failure");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"fresh\n".to_vec(),
+            "extracted bytes should replace the read-only stale file"
         );
     }
 

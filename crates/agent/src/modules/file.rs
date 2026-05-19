@@ -402,6 +402,50 @@ pub(crate) fn lchown_path(path: &Path, uid: u32, gid: u32) -> Result<(), String>
     Ok(())
 }
 
+/// `chown -h <uid> <path>` — set owner only, leave group untouched.
+/// Lives here rather than in `unarchive` (the original home) so
+/// `write_file` can share it for `template:` / `copy:` dispatches that
+/// specify `owner:` without `group:`.
+pub(crate) fn chown_user_only(path: &Path, uid: u32) -> Result<(), String> {
+    let spec = format!("{uid}");
+    let out = std::process::Command::new("chown")
+        .arg("-h")
+        .arg("--")
+        .arg(&spec)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn chown: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "chown -h {spec} {}: {}",
+            path.display(),
+            String::from_utf8_lossy(out.stderr.trim_ascii_end())
+        ));
+    }
+    Ok(())
+}
+
+/// `chown -h :<gid> <path>` — set group only, leave owner untouched.
+/// Symmetric to `chown_user_only`.
+pub(crate) fn chown_group_only(path: &Path, gid: u32) -> Result<(), String> {
+    let spec = format!(":{gid}");
+    let out = std::process::Command::new("chown")
+        .arg("-h")
+        .arg("--")
+        .arg(&spec)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn chown: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "chown -h {spec} {}: {}",
+            path.display(),
+            String::from_utf8_lossy(out.stderr.trim_ascii_end())
+        ));
+    }
+    Ok(())
+}
+
 /// Walk an `:`-delimited file (passwd or group), find the row whose
 /// first column matches `name`, return the value at `field_idx` parsed
 /// as u32. Lines starting with `#` are skipped.

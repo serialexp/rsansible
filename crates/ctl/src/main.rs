@@ -301,6 +301,29 @@ async fn cmd_run(
             ch = report.tasks_changed,
         );
     }
+    // Wire-time breakdown. `agent` is real work the agent did; `rtt` is
+    // skew-corrected outbound+inbound time the operator spent waiting
+    // for bits to move; the sum of those two per-op equals each op's
+    // wall time. `wall` is the sum across ALL ops, NOT the run's
+    // wall-clock duration (tasks on different hosts overlap), so the
+    // % numbers describe "across the work the orchestrator dispatched,
+    // where did the time go" — they answer "is this run agent-bound or
+    // wire-bound?" not "how long did the run take."
+    let t = &report.timing;
+    if t.op_count > 0 {
+        let wall = t.wall_ns_total.max(1) as f64;
+        let agent_pct = (t.agent_ns_total as f64 / wall) * 100.0;
+        let rtt_ns = t.round_trip_ns_total();
+        let rtt_pct = (rtt_ns as f64 / wall) * 100.0;
+        eprintln!(
+            "timing: ops={ops} agent={agent:.2}s rtt={rtt:.2}s wall={wall_s:.2}s \
+             (agent={agent_pct:.1}% rtt={rtt_pct:.1}%)",
+            ops = t.op_count,
+            agent = t.agent_ns_total as f64 / 1e9,
+            rtt = rtt_ns as f64 / 1e9,
+            wall_s = t.wall_ns_total as f64 / 1e9,
+        );
+    }
     if failed + unreachable > 0 || report.stopped_early {
         Ok(ExitCode::FAILURE)
     } else {

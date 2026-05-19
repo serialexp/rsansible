@@ -1,7 +1,7 @@
 //! `blockinfile:` task body.
 
 use super::shared::{
-    take_optional_ansible_bool, take_optional_field_string, take_optional_mode,
+    take_optional_ansible_bool, take_optional_field_string, take_optional_mode, ModeField,
 };
 use serde::{de::Error as _, Deserialize, Deserializer};
 
@@ -18,10 +18,15 @@ pub struct BlockInFileOp {
     pub marker_begin: String,
     pub marker_end: String,
     pub state: BlockInFileState,
-    pub mode: Option<u32>,
+    pub mode: Option<ModeField>,
     pub create: bool,
     pub insertbefore: String,
     pub insertafter: String,
+    /// Optional validator command (Ansible `validate:`). When set, the
+    /// agent runs the command against the staged tmp file before the
+    /// rename; non-zero exit aborts the write. `%s` is substituted by
+    /// the tmp path. Empty / `None` = no validation.
+    pub validate: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +100,7 @@ impl<'de> Deserialize<'de> for BlockInFileOp {
 
         let mode = take_optional_mode(&mut map, "mode")?;
         let create = take_optional_ansible_bool(&mut map, "create")?.unwrap_or(false);
+        let validate = take_optional_field_string(&mut map, "validate")?;
 
         if !map.is_empty() {
             let unknown: Vec<String> = map
@@ -103,7 +109,7 @@ impl<'de> Deserialize<'de> for BlockInFileOp {
                 .collect();
             return Err(D::Error::custom(format!(
                 "blockinfile: unknown field(s): {unknown:?}; expected one of \
-                 [path, block, marker, marker_begin, marker_end, state, mode, create, insertbefore, insertafter]"
+                 [path, block, marker, marker_begin, marker_end, state, mode, create, insertbefore, insertafter, validate]"
             )));
         }
 
@@ -129,6 +135,7 @@ impl<'de> Deserialize<'de> for BlockInFileOp {
             create,
             insertbefore,
             insertafter,
+            validate,
         })
     }
 }
@@ -185,7 +192,7 @@ blockinfile:
                 assert_eq!(b.marker_begin, "TOP");
                 assert_eq!(b.marker_end, "BOT");
                 assert!(b.create);
-                assert_eq!(b.mode, Some(0o640));
+                assert_eq!(b.mode, Some(crate::playbook::ModeField::Literal(0o640)));
             }
             _ => panic!(),
         }
@@ -233,10 +240,11 @@ blockinfile:
             marker_begin: "BEGIN".into(),
             marker_end: "END".into(),
             state: BlockInFileState::Present,
-            mode: Some(0o600),
+            mode: Some(crate::playbook::ModeField::Literal(0o600)),
             create: true,
             insertbefore: String::new(),
             insertafter: "EOF".into(),
+            validate: None,
         });
         let wire = t.to_wire_op().unwrap();
         let rsansible_wire::generated::Op::OpBlockInFile(o) = wire else {

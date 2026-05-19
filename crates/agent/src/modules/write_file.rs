@@ -3,15 +3,24 @@
 //! - Writes the payload to a sibling `*.rsansible.tmp.<pid>.<seq>` file with the
 //!   requested mode, fsyncs it, then renames over the target. Rename within
 //!   the same directory is atomic on POSIX filesystems.
+//! - When `validate` is non-empty, the command is run against the staged tmp
+//!   file before the rename. Non-zero exit code: unlink tmp, leave dest
+//!   untouched, fail the task with the validator's stderr. The literal token
+//!   `%s` in `validate` is substituted with the tmp path (matches Ansible's
+//!   `validate:` semantics on `copy`/`template`/`lineinfile`/`blockinfile`).
 //! - `changed` is reported true iff the target's prior content or mode differed
 //!   from what we just wrote. Matches Ansible's `copy` module semantics.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use rsansible_wire::generated::OpWriteFileOutput;
 use rsansible_wire::msg::{self, now_unix_ns};
 use tokio::io::AsyncWriteExt;
 
+use super::file::{
+    chown_group_only, chown_user_only, lchown_path, resolve_group, resolve_user,
+};
+use super::validate_helper::{validate_tmp, ValidateError};
 use super::{emit_error, Context};
 
 pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: bool) -> anyhow::Result<()> {
@@ -66,14 +75,70 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: boo
             return Ok(());
         }
     };
-    let prior_mode = match tokio::fs::metadata(&path).await {
-        Ok(m) => Some(m.permissions().mode() & 0o7777),
-        Err(_) => None,
+    // Capture prior mode + ownership in one stat — both feed into the
+    // `would_change` heuristic. We don't separate the two stats because
+    // the file is already touched here on the read path above; one
+    // metadata() is no cheaper than coalescing here.
+    let prior_meta = tokio::fs::metadata(&path).await.ok();
+    let prior_mode = prior_meta.as_ref().map(|m| m.permissions().mode() & 0o7777);
+    let prior_uid = prior_meta.as_ref().map(|m| m.uid());
+    let prior_gid = prior_meta.as_ref().map(|m| m.gid());
+
+    // Resolve owner/group up front so we can fail before touching the
+    // dest with a clear BAD_REQUEST if either is unknown. Empty
+    // string = don't chown (matches OpCopyTarget / OpFile semantics).
+    let target_uid: Option<u32> = if op.owner.is_empty() {
+        None
+    } else {
+        match resolve_user(&op.owner) {
+            Ok(uid) => Some(uid),
+            Err(name) => {
+                emit_error(
+                    ctx,
+                    seq,
+                    msg::err::BAD_REQUEST,
+                    format!("unknown owner {name:?} for {}", op.path),
+                )
+                .await;
+                return Ok(());
+            }
+        }
     };
+    let target_gid: Option<u32> = if op.group.is_empty() {
+        None
+    } else {
+        match resolve_group(&op.group) {
+            Ok(gid) => Some(gid),
+            Err(name) => {
+                emit_error(
+                    ctx,
+                    seq,
+                    msg::err::BAD_REQUEST,
+                    format!("unknown group {name:?} for {}", op.path),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    };
+
     // Compute the would-change diff up front; both the check-mode path
-    // and the normal post-write path use it.
-    let would_change = prior.as_deref() != Some(op.content.as_slice())
-        || prior_mode.map(|m| m != (mode & 0o7777)).unwrap_or(true);
+    // and the normal post-write path use it. A request to chown to a
+    // different uid/gid (or to chown a file that doesn't yet exist)
+    // counts as a change.
+    let content_diff = prior.as_deref() != Some(op.content.as_slice());
+    let mode_diff = prior_mode.map(|m| m != (mode & 0o7777)).unwrap_or(true);
+    let uid_diff = match (target_uid, prior_uid) {
+        (Some(want), Some(have)) => want != have,
+        (Some(_), None) => true, // file doesn't exist yet
+        (None, _) => false,
+    };
+    let gid_diff = match (target_gid, prior_gid) {
+        (Some(want), Some(have)) => want != have,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let would_change = content_diff || mode_diff || uid_diff || gid_diff;
 
     // Dry-run: report what we'd change without touching the file. The
     // diff is exact (we read prior content and mode above) so the
@@ -124,7 +189,6 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: boo
         drop(f);
 
         tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode)).await?;
-        tokio::fs::rename(&tmp_path, &path).await?;
         Ok::<_, std::io::Error>(())
     }
     .await;
@@ -139,6 +203,105 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: boo
             seq,
             map_io_err(&e),
             format!("write {}: {e}", op.path),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Apply chown to the staged tmp before the rename — landing the
+    // final ownership atomically with the swap. Mirrors OpCopyTarget's
+    // contract: empty owner / group means "don't change"; non-empty
+    // values are resolved on the agent host and applied. Anchoring the
+    // chown to the tmp (rather than chown'ing the post-rename dest)
+    // means an in-flight reader of `path` never sees a transient
+    // root-owned file when the playbook asked for caddy-owned. Caught
+    // in the gothab drill: Caddyfile deployed as root:root despite
+    // playbook saying `group: caddy`, so `systemctl reload caddy`
+    // failed with `permission denied` because caddy can't read its
+    // own config.
+    // Three combinations: owner+group (both → lchown_path), owner only
+    // (chown_user_only — leaves group intact), group only
+    // (chown_group_only — leaves owner intact). Single-side variants
+    // delegate to `chown :<gid>` / `chown <uid>` semantics so the
+    // unspecified field carries through from the staged tmp without
+    // needing to know the agent's current EUID/EGID.
+    let chown_result = match (target_uid, target_gid) {
+        (Some(uid), Some(gid)) => lchown_path(&tmp_path, uid, gid),
+        (Some(uid), None) => chown_user_only(&tmp_path, uid),
+        (None, Some(gid)) => chown_group_only(&tmp_path, gid),
+        (None, None) => Ok(()),
+    };
+    if let Err(msg_text) = chown_result {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        emit_error(
+            ctx,
+            seq,
+            msg::err::IO,
+            format!("chown {}: {msg_text}", op.path),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Validate the staged tmp file before swapping it into place. If the
+    // validator fails (non-zero exit, missing binary, no `%s` to substitute,
+    // ...), the dest is left untouched and the task fails. This is the
+    // *whole point* of `validate:` — broken sudoers / nginx config / sshd
+    // config never reaches the real path. Run the (sync) validator on the
+    // blocking pool so we don't park the agent's I/O reactor on it.
+    if !op.validate.is_empty() {
+        let validate_str = op.validate.clone();
+        let tmp_for_validate = tmp_path.clone();
+        let validate_result = tokio::task::spawn_blocking(move || {
+            validate_tmp(&validate_str, &tmp_for_validate)
+        })
+        .await
+        .expect("validate task panicked");
+        match validate_result {
+            Ok(()) => { /* fall through to rename */ }
+            Err(ValidateError::BadRequest(msg_text)) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                emit_error(ctx, seq, msg::err::BAD_REQUEST, msg_text).await;
+                return Ok(());
+            }
+            Err(ValidateError::Failed { code, stderr }) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                let trimmed = stderr.trim();
+                let reason = if trimmed.is_empty() {
+                    format!(
+                        "validate command exited {code} for {} — leaving dest untouched",
+                        op.path
+                    )
+                } else {
+                    format!(
+                        "validate command exited {code} for {} — leaving dest untouched: {trimmed}",
+                        op.path
+                    )
+                };
+                emit_error(ctx, seq, msg::err::BAD_REQUEST, reason).await;
+                return Ok(());
+            }
+            Err(ValidateError::Spawn(e)) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                emit_error(
+                    ctx,
+                    seq,
+                    msg::err::IO,
+                    format!("validate spawn failed for {}: {e}", op.path),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
+
+    if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        emit_error(
+            ctx,
+            seq,
+            map_io_err(&e),
+            format!("rename {} -> {}: {e}", tmp_path.display(), op.path),
         )
         .await;
         return Ok(());

@@ -386,7 +386,20 @@ fn glob_to_regex(glob: &str) -> Result<regex::Regex, HostPatternError> {
 
 fn expand_term_kind(kind: &TermKind, inv: &Inventory) -> Vec<String> {
     match kind {
-        TermKind::All => inv.hosts.keys().cloned().collect(),
+        // `hosts: all` expands to the `all` group, NOT every key in
+        // `inv.hosts`. The difference matters for the implicit
+        // localhost: Ansible adds an auto-localhost entry but
+        // deliberately excludes it from `all`, so plays targeting
+        // `hosts: all` don't accidentally try to manage the
+        // controller. We mirror that. Falls back to every host
+        // only if (somehow) no `all` group was declared — keeps
+        // hand-built test inventories working without a synthetic
+        // `all`.
+        TermKind::All => inv
+            .groups
+            .get("all")
+            .cloned()
+            .unwrap_or_else(|| inv.hosts.keys().cloned().collect()),
         TermKind::Name(name) => {
             if let Some(members) = inv.groups.get(name) {
                 let mut out = Vec::with_capacity(members.len());
@@ -491,6 +504,47 @@ mod tests {
                 member_of,
             },
         )
+    }
+
+    /// Regression: `hosts: all` (and the `all` keyword in a
+    /// pattern) must resolve to the `all` group's declared members,
+    /// NOT every key in `inv.hosts`. The implicit localhost auto-
+    /// injected by `inventory::parse` sits in `inv.hosts` but NOT
+    /// in `groups["all"]`, mirroring Ansible — and plays targeting
+    /// `hosts: all` would otherwise pick it up unintentionally.
+    ///
+    /// Caught during the gothab live drill: the first play
+    /// (`hosts: all`) was managing the controller laptop as a
+    /// side effect, then dying on the first `become: true` task.
+    #[test]
+    fn all_keyword_excludes_implicit_localhost() {
+        let mut hosts = BTreeMap::new();
+        let (k, v) = host("web1", &["webservers"]);
+        hosts.insert(k, v);
+        // Implicit localhost: present in `inv.hosts`, NOT in any group.
+        hosts.insert(
+            "localhost".to_string(),
+            Host {
+                host: "127.0.0.1".into(),
+                port: 22,
+                user: "u".into(),
+                key_path: None::<PathBuf>,
+                inline_vars: BTreeMap::new(),
+                member_of: Vec::new(),
+            },
+        );
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        groups.insert("all".into(), vec!["web1".into()]);
+        groups.insert("webservers".into(), vec!["web1".into()]);
+        let inv = Inventory {
+            hosts,
+            groups,
+            all_vars: BTreeMap::new(),
+            group_inline_vars: BTreeMap::new(),
+        };
+        let resolved = HostPattern::parse("all").unwrap().resolve(&inv);
+        assert_eq!(resolved, vec!["web1".to_string()]);
+        assert!(!resolved.iter().any(|h| h == "localhost"));
     }
 
     fn fixture() -> Inventory {

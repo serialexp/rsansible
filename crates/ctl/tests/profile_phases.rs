@@ -127,7 +127,10 @@ async fn profile_three_host_run() -> Result<()> {
                 0o644,
                 false,
                 b"hello from rsansible\n".to_vec(),
-            ),
+                String::new(),
+            
+                String::new(),
+                String::new(),),
         ),
     )
     .await?;

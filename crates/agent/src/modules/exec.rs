@@ -52,10 +52,18 @@ pub async fn run_exec(ctx: &Context, seq: u32, op: OpExecOutput, check_mode: boo
         .await;
         return Ok(());
     }
-    // env_clear() so the spawned process is hermetic — only what the
-    // controller passes in. Ansible behaves similarly for the `environment`
-    // task keyword.
-    cmd.env_clear();
+    // OVERLAY semantics — match Ansible's `environment:` keyword and
+    // the symmetric run_shell path below. The spawned process inherits
+    // the agent's env (PATH, HOME, LANG, …) so binaries resolve
+    // normally; controller-supplied env_keys/values then layer on top.
+    //
+    // We previously used `env_clear()` here for "hermetic" execution,
+    // but that broke `command: netplan apply` (and similarly for any
+    // sbin binary) when PATH wasn't explicitly passed — argv[0]
+    // lookup uses the child's PATH, which was empty after the clear.
+    // Caught in the gothab drill on monitor-1. Ansible's command
+    // module preserves the connection env by default, so this aligns
+    // us with that behavior.
     for (k, v) in op.env_keys.iter().zip(op.env_values.iter()) {
         cmd.env(k, v);
     }

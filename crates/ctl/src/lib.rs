@@ -14,6 +14,7 @@ pub mod local;
 pub mod orchestrator;
 pub mod playbook;
 pub mod pool;
+pub mod run_metrics;
 pub mod ssh;
 pub mod tags;
 pub mod template;

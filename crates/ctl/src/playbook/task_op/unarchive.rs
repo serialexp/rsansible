@@ -1,6 +1,6 @@
 //! `unarchive:` task body.
 
-use super::shared::{parse_ansible_bool, parse_mode_str};
+use super::shared::{parse_ansible_bool, take_optional_mode, ModeField};
 use serde::{de::Error as _, Deserialize, Deserializer};
 
 /// `unarchive:` parsed form. v1 requires `remote_src: yes` (the
@@ -31,7 +31,7 @@ pub struct UnarchiveOp {
     pub dest: String,
     pub format: u8,
     pub creates: String,
-    pub mode: Option<u32>,
+    pub mode: Option<ModeField>,
     pub owner: String,
     pub group: String,
     pub keep_newer: bool,
@@ -144,27 +144,9 @@ impl<'de> Deserialize<'de> for UnarchiveOp {
             }
         };
 
-        let mode = match map.remove("mode") {
-            None | Some(serde_yaml::Value::Null) => None,
-            Some(serde_yaml::Value::String(s)) => Some(
-                parse_mode_str(&s)
-                    .map_err(|e| D::Error::custom(format!("unarchive.mode: {e}")))?,
-            ),
-            Some(serde_yaml::Value::Number(n)) => {
-                // Numeric mode in YAML is treated as octal-looking
-                // decimal (matches Ansible behaviour: `mode: 0755`).
-                let s = n.to_string();
-                Some(
-                    parse_mode_str(&s)
-                        .map_err(|e| D::Error::custom(format!("unarchive.mode: {e}")))?,
-                )
-            }
-            Some(other) => {
-                return Err(D::Error::custom(format!(
-                    "unarchive.mode: expected string or number, got: {other:?}"
-                )))
-            }
-        };
+        // Shared helper handles literal octal forms (number or string)
+        // and Jinja templates. Templates resolve at dispatch.
+        let mode = take_optional_mode::<D::Error>(&mut map, "mode")?;
 
         let keep_newer = parse_ansible_bool::<D::Error>(
             map.remove("keep_newer"),
@@ -294,7 +276,7 @@ unarchive:
         assert!(u.list_files);
         assert_eq!(u.owner, "root");
         assert_eq!(u.group, "root");
-        assert_eq!(u.mode, Some(0o755));
+        assert_eq!(u.mode, Some(super::super::ModeField::Literal(0o755)));
         assert_eq!(u.include, vec!["etcd".to_string(), "etcdctl".to_string()]);
         assert_eq!(u.exclude, vec!["README.md".to_string()]);
     }
@@ -380,7 +362,7 @@ unarchive:
             dest: "/usr/local/bin".into(),
             format: rsansible_wire::msg::unarchive_format::TAR_GZ,
             creates: "/usr/local/bin/etcd".into(),
-            mode: Some(0o755),
+            mode: Some(super::super::ModeField::Literal(0o755)),
             owner: "root".into(),
             group: "root".into(),
             keep_newer: true,

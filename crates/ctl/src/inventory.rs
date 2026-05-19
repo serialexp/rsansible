@@ -94,7 +94,7 @@ struct RawRoot {
     all: RawAll,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAll {
     #[serde(default)]
@@ -105,7 +105,7 @@ struct RawAll {
     children: BTreeMap<String, RawGroup>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGroup {
     #[serde(default)]
@@ -134,30 +134,43 @@ impl Default for RawHostEntry {
 /// Parse + flatten an inventory file. `host_vars/` and `group_vars/` on
 /// disk are NOT loaded by this entry point — use [`load_with_vars`] for
 /// the full picture.
+///
+/// Accepts both a single YAML file and a directory of YAML files. When
+/// `path` is a directory, every `*.yml` / `*.yaml` file at its top level
+/// is parsed as a RawRoot and merged (alphabetical order, last writer
+/// wins on conflicting keys). Nested `host_vars/` / `group_vars/`
+/// subdirectories are honored only by [`load_with_vars`].
 pub fn load(path: &Path) -> Result<Inventory> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading inventory {}", path.display()))?;
-    parse(&text).with_context(|| format!("parsing inventory {}", path.display()))
+    let raw = load_raw_root(path)?;
+    let pre = flatten_pre_hosts(raw)
+        .with_context(|| format!("parsing inventory {}", path.display()))?;
+    assemble_inventory(pre, None)
+        .with_context(|| format!("assembling inventory {}", path.display()))
 }
 
 /// Parse + flatten + discover adjacent `host_vars/` and `group_vars/`.
 ///
 /// `vault_password` is used to decrypt any `$ANSIBLE_VAULT;…` files
 /// encountered. If `None`, encrypted files are skipped with a warning.
+///
+/// Directory inventories: when `path` is a directory, every top-level
+/// `*.yml` / `*.yaml` file in it is treated as an inventory source and
+/// merged. The directory itself becomes the base for `host_vars/` /
+/// `group_vars/` discovery (matches Ansible's behavior).
 pub fn load_with_vars(
     path: &Path,
     vault_password: Option<&str>,
 ) -> Result<(Inventory, InventoryVars)> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading inventory {}", path.display()))?;
-    let raw: RawRoot = serde_yaml::from_str(&text)
-        .with_context(|| format!("parsing inventory {}: schema", path.display()))?;
+    let raw = load_raw_root(path)?;
     let pre = flatten_pre_hosts(raw)
         .with_context(|| format!("parsing inventory {}", path.display()))?;
-    let base = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
     let group_names: Vec<String> = pre.groups.keys().cloned().collect();
     let host_names: Vec<String> = pre.hosts_raw.keys().cloned().collect();
     let vars = discover_vars_named(&base, &group_names, &host_names, vault_password)
@@ -165,6 +178,100 @@ pub fn load_with_vars(
     let inv = assemble_inventory(pre, Some(&vars))
         .with_context(|| format!("assembling inventory {}", path.display()))?;
     Ok((inv, vars))
+}
+
+/// Read one inventory source (file or directory) into a single RawRoot.
+///
+/// File case: trivial — `std::fs::read_to_string` + `serde_yaml`.
+///
+/// Directory case: every top-level `*.yml` / `*.yaml` file is parsed
+/// individually and merged into one RawRoot. Subdirectories (including
+/// `host_vars/` and `group_vars/`) are skipped — they're handled by
+/// `discover_vars_named` later. Files are merged in alphabetical order;
+/// on key conflict, later files override earlier ones. Empty directory
+/// or a directory with no YAML files returns an empty inventory rather
+/// than failing, matching Ansible.
+fn load_raw_root(path: &Path) -> Result<RawRoot> {
+    if path.is_dir() {
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(path)
+            .with_context(|| format!("reading inventory directory {}", path.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!("reading entry in inventory directory {}", path.display())
+            })?;
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            match p.extension().and_then(|s| s.to_str()) {
+                Some("yml") | Some("yaml") => files.push(p),
+                _ => {}
+            }
+        }
+        files.sort();
+        let mut merged = RawRoot {
+            all: RawAll::default(),
+        };
+        for file in &files {
+            let text = std::fs::read_to_string(file)
+                .with_context(|| format!("reading inventory file {}", file.display()))?;
+            // The YAML inventory schema requires a top-level `all:`
+            // mapping. Skip files that lack it — they're a sibling
+            // file in the inventory directory used for something else
+            // (e.g. gothab's subnets.yml, IPAM contract data). Ansible
+            // achieves the same outcome through ansible.cfg
+            // `ignore_patterns`; rsansible doesn't read ansible.cfg
+            // but the schema check is a clean enough signal that the
+            // file isn't intended as an inventory source. Parse
+            // errors INSIDE a file that does have an `all:` key still
+            // surface loudly.
+            let probe: serde_yaml::Value = match serde_yaml::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !probe
+                .as_mapping()
+                .map(|m| m.contains_key("all"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let raw: RawRoot = serde_yaml::from_str(&text)
+                .with_context(|| format!("parsing inventory {}: schema", file.display()))?;
+            merge_raw_root(&mut merged, raw);
+        }
+        Ok(merged)
+    } else {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading inventory {}", path.display()))?;
+        serde_yaml::from_str(&text)
+            .with_context(|| format!("parsing inventory {}: schema", path.display()))
+    }
+}
+
+/// Merge `src` into `dst` in-place. `all.vars` and `all.hosts` use
+/// last-writer-wins per key; `all.children` recurses one level (group
+/// vars and group hosts also last-writer-wins). This matches what
+/// Ansible does when its inventory plugin chain processes a directory
+/// — sources are independent, conflicting keys resolve to the last one
+/// loaded (alphabetical here).
+fn merge_raw_root(dst: &mut RawRoot, src: RawRoot) {
+    for (k, v) in src.all.vars {
+        dst.all.vars.insert(k, v);
+    }
+    for (k, v) in src.all.hosts {
+        dst.all.hosts.insert(k, v);
+    }
+    for (gname, src_group) in src.all.children {
+        let dst_group = dst.all.children.entry(gname).or_insert_with(RawGroup::default);
+        for (k, v) in src_group.vars {
+            dst_group.vars.insert(k, v);
+        }
+        for (k, v) in src_group.hosts {
+            dst_group.hosts.insert(k, v);
+        }
+    }
 }
 
 /// Parse a YAML string. Same shape as [`load`] but with no filesystem I/O.
@@ -383,6 +490,29 @@ fn assemble_inventory(pre: PreHosts, disk: Option<&InventoryVars>) -> Result<Inv
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| "root".to_string());
+        // Match Ansible's auto-localhost: `ansible_connection: local`
+        // is set as a host var so any play targeting `hosts: all` (or
+        // `hosts: localhost` directly) executes locally on the
+        // controller instead of SSHing to 127.0.0.1. Without this,
+        // playbooks that worked under Ansible would silently start
+        // making real SSH connections to the controller's loopback
+        // and then trying to sudo to root — almost always failing
+        // because the controller doesn't have NOPASSWD sudo for the
+        // operator account.
+        let mut inline_vars = BTreeMap::new();
+        inline_vars.insert(
+            "ansible_connection".to_string(),
+            JsonValue::String("local".to_string()),
+        );
+        // The implicit localhost is NOT a member of `all` — match
+        // Ansible. From the Ansible docs: "Implicit localhost does
+        // not match the all group; that hostname must be specified
+        // as a play target." If we put it in `all`, every play
+        // targeting `hosts: all` would also try to manage the
+        // controller itself, which is rarely the intent and breaks
+        // the moment a task escalates with `become: true`
+        // (controller usually doesn't have NOPASSWD sudo for the
+        // operator account).
         hosts.insert(
             "localhost".to_string(),
             Host {
@@ -390,16 +520,10 @@ fn assemble_inventory(pre: PreHosts, disk: Option<&InventoryVars>) -> Result<Inv
                 port: 22,
                 user,
                 key_path: None,
-                inline_vars: BTreeMap::new(),
-                member_of: vec!["all".to_string()],
+                inline_vars,
+                member_of: Vec::new(),
             },
         );
-        // Keep the `all` group in sync. Append rather than rebuild
-        // — every other host already sits in declaration order.
-        let all_members = groups.entry("all".to_string()).or_default();
-        if !all_members.iter().any(|h| h == "localhost") {
-            all_members.push("localhost".to_string());
-        }
     }
 
     Ok(Inventory {
@@ -563,10 +687,56 @@ all:
         ));
         let h = inv.hosts.get("localhost").expect("implicit localhost");
         assert_eq!(h.host, "127.0.0.1");
-        assert_eq!(h.member_of, vec!["all".to_string()]);
-        assert!(inv.groups["all"].iter().any(|n| n == "localhost"));
+        // Implicit localhost is NOT a member of `all` — matches Ansible.
+        // Plays must target `hosts: localhost` explicitly to manage it.
+        assert!(h.member_of.is_empty(), "implicit localhost must not join any group");
+        assert!(
+            !inv.groups
+                .get("all")
+                .map(|m| m.iter().any(|n| n == "localhost"))
+                .unwrap_or(false),
+            "implicit localhost must not show up in the `all` group",
+        );
         // Real hosts still resolve normally.
         assert_eq!(inv.hosts["web1"].host, "10.0.0.1");
+    }
+
+    /// Regression: the implicit `localhost` injected when the
+    /// inventory doesn't declare one must carry
+    /// `ansible_connection: local` as an inline var so plays
+    /// targeting `hosts: all` execute locally instead of SSHing
+    /// to 127.0.0.1 and then trying to sudo to root. Caught when
+    /// running gothab's site.yml against the real fleet — every
+    /// "Baseline OS configuration" task on localhost died with
+    /// "agent ... closed stdout before sending Hello" once become
+    /// kicked in (controller laptop has no NOPASSWD sudo).
+    #[test]
+    fn implicit_localhost_pins_ansible_connection_to_local() {
+        let inv = ok(parse(
+            r#"
+all:
+  vars:
+    ansible_user: deploy
+  children:
+    web:
+      hosts:
+        web1:
+          ansible_host: 10.0.0.1
+"#,
+        ));
+        let h = inv.hosts.get("localhost").expect("implicit localhost");
+        assert_eq!(
+            h.inline_vars.get("ansible_connection").and_then(|v| v.as_str()),
+            Some("local"),
+            "implicit localhost must carry ansible_connection=local in inline_vars",
+        );
+        // Real hosts must NOT be silently pinned local.
+        assert!(
+            !inv.hosts["web1"]
+                .inline_vars
+                .contains_key("ansible_connection"),
+            "real hosts must not get an implicit ansible_connection",
+        );
     }
 
     #[test]
@@ -609,9 +779,9 @@ all:
         assert_eq!(h.user, "deploy");
         assert!(h.key_path.is_none());
         assert_eq!(h.member_of, vec!["all".to_string(), "web".to_string()]);
-        // `all` now also carries the implicit `localhost`; assert the
-        // real host is present without pinning the exact membership.
-        assert!(inv.groups["all"].iter().any(|n| n == "web1"));
+        // Implicit `localhost` does NOT join `all` (matches Ansible),
+        // so the `all` group is exactly the declared hosts.
+        assert_eq!(inv.groups["all"], vec!["web1"]);
         assert_eq!(inv.groups["web"], vec!["web1"]);
         assert_eq!(inv.all_vars.get("ansible_user").map(|v| v.as_str().unwrap()), Some("deploy"));
     }

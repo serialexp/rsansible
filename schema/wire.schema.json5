@@ -86,7 +86,7 @@
     },
 
     OpWriteFile: {
-      description: "Atomic write: tmp + fsync + rename. `changed` in TaskDone is set iff content or mode differed. `only_if_missing=1` makes the write a no-op when `path` already exists (agent reports changed=0 without reading or writing); used for ship-blind idempotent paths like generated private keys where a stat-then-write round trip is more expensive than just shipping the bytes.",
+      description: "Atomic write: tmp + fsync + rename. `changed` in TaskDone is set iff content, mode, owner, or group differed. `only_if_missing=1` makes the write a no-op when `path` already exists (agent reports changed=0 without reading or writing); used for ship-blind idempotent paths like generated private keys where a stat-then-write round trip is more expensive than just shipping the bytes. Empty `owner`/`group` mean don't chown (the staged tmp keeps whatever EUID/EGID the agent has at file-create time); non-empty values resolve via /etc/passwd /etc/group and chown the staged tmp before rename. `validate` is a shell command run against the staged tmp file before the rename — empty means no validation. The command is tokenized on whitespace and the literal token `%s` is replaced by the tmp file path (matches Ansible's `validate:` semantics on `copy`/`template`/`lineinfile`/`blockinfile`). On a non-zero exit code from validate, the tmp file is unlinked and the dest is left untouched; the task fails with a BAD_REQUEST-shaped TaskError carrying the validator's stderr. The classic use case is `validate: /usr/sbin/visudo -cf %s` on a sudoers drop-in: a broken file never reaches /etc/sudoers.d.",
       sequence: [
         { name: "kind", type: "uint8", const: 2 },
         { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
@@ -98,6 +98,17 @@
         // so the framing stays simple.
         { name: "only_if_missing", type: "uint8" },
         { name: "content", type: "bytes", kind: "length_prefixed", length_type: "uint32" },
+        // Empty string = no validation. Non-empty: run as `sh -c` after the
+        // tmp file is fsync'd and chmod'd, with `%s` substituted by the tmp
+        // path. Non-zero exit code → unlink tmp, dest untouched, task fails.
+        { name: "validate", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        // Owner / group POSIX names. Empty string = don't chown. Resolved
+        // against /etc/passwd and /etc/group on the agent host (no NSS) and
+        // applied via chown on the staged tmp before rename — same shape as
+        // OpCopyTarget. Honors Ansible's `template:` / `copy:` owner/group
+        // fields.
+        { name: "owner", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "group", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
       ],
     },
 
@@ -146,7 +157,7 @@
     },
 
     OpLineInFile: {
-      description: "Idempotent single-line edit in a text file. Maps Ansible's `ansible.builtin.lineinfile`. Semantics: `state=0 (present)` ensures a line matching `regexp` (or, when regexp is empty, matching `line` literally) is present in the file; when the match isn't found the line is appended unless `insertbefore`/`insertafter` redirects placement. `state=1 (absent)` removes every line matching `regexp` (or `line` literal). `create=1` creates the file (with `mode` if `has_mode=1`) when missing and state=present; create=0 + missing file is a no-op for absent and an error for present. `backrefs=1` substitutes regex backrefs from the match into `line` when replacing. Empty `insertbefore`/`insertafter` mean unused; the literal `EOF` for insertafter means append (Ansible convention). `changed=1` iff the on-disk bytes actually changed.",
+      description: "Idempotent single-line edit in a text file. Maps Ansible's `ansible.builtin.lineinfile`. Semantics: `state=0 (present)` ensures a line matching `regexp` (or, when regexp is empty, matching `line` literally) is present in the file; when the match isn't found the line is appended unless `insertbefore`/`insertafter` redirects placement. `state=1 (absent)` removes every line matching `regexp` (or `line` literal). `create=1` creates the file (with `mode` if `has_mode=1`) when missing and state=present; create=0 + missing file is a no-op for absent and an error for present. `backrefs=1` substitutes regex backrefs from the match into `line` when replacing. Empty `insertbefore`/`insertafter` mean unused; the literal `EOF` for insertafter means append (Ansible convention). `changed=1` iff the on-disk bytes actually changed. `validate` is an optional command run against the staged tmp file before the rename — same shape as OpWriteFile's `validate`: empty = no validation, otherwise tokenized on whitespace and `%s` is substituted by the tmp path; non-zero exit aborts the swap and leaves dest untouched.",
       sequence: [
         { name: "kind", type: "uint8", const: 7 },
         { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
@@ -159,11 +170,12 @@
         { name: "insertbefore", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
         { name: "insertafter", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
         { name: "backrefs", type: "uint8" },
+        { name: "validate", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
       ],
     },
 
     OpBlockInFile: {
-      description: "Idempotent multi-line block edit in a text file. Maps Ansible's `ansible.builtin.blockinfile`. A block is delimited by two marker comment lines whose text is built from `marker` with the literal token `{mark}` substituted for `marker_begin` (top marker) or `marker_end` (bottom marker). On state=present, the block body (the `block` field — possibly multi-line) is placed between fresh markers; if a previous block with the same markers exists it is replaced; otherwise placement follows `insertbefore`/`insertafter` (with the literal `EOF` for insertafter meaning append; default is append when both are empty). On state=absent the block and its markers are removed. `block` empty + state=present means \"remove the block if it exists.\" `create=1` creates the file (with `mode` if `has_mode=1`) when missing + state=present; create=0 + missing file is a no-op for absent and an error for present. `changed=1` iff bytes actually moved on disk.",
+      description: "Idempotent multi-line block edit in a text file. Maps Ansible's `ansible.builtin.blockinfile`. A block is delimited by two marker comment lines whose text is built from `marker` with the literal token `{mark}` substituted for `marker_begin` (top marker) or `marker_end` (bottom marker). On state=present, the block body (the `block` field — possibly multi-line) is placed between fresh markers; if a previous block with the same markers exists it is replaced; otherwise placement follows `insertbefore`/`insertafter` (with the literal `EOF` for insertafter meaning append; default is append when both are empty). On state=absent the block and its markers are removed. `block` empty + state=present means \"remove the block if it exists.\" `create=1` creates the file (with `mode` if `has_mode=1`) when missing + state=present; create=0 + missing file is a no-op for absent and an error for present. `changed=1` iff bytes actually moved on disk. `validate` is an optional command run against the staged tmp file before the rename — same shape as OpWriteFile's `validate`: empty = no validation, otherwise tokenized on whitespace and `%s` is substituted by the tmp path; non-zero exit aborts the swap and leaves dest untouched.",
       sequence: [
         { name: "kind", type: "uint8", const: 8 },
         { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
@@ -177,6 +189,7 @@
         { name: "create", type: "uint8" },
         { name: "insertbefore", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
         { name: "insertafter", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "validate", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
       ],
     },
 
@@ -333,6 +346,14 @@
       description: "Set the system hostname. Maps Ansible's `ansible.builtin.hostname` (subset). `name` is required. Idempotency: read the current hostname via `hostname` (or `/etc/hostname`); no-op if already equal. Otherwise: when `hostnamectl` is on PATH (systemd-init systems) call `hostnamectl set-hostname <name>` — that handles `/etc/hostname` and the kernel `sethostname()` in one shot. On non-systemd hosts fall back to rewriting `/etc/hostname` (mode 0644) and calling the `hostname` binary to update the running kernel value. `use:` is NOT supported on the wire today (we always auto-detect via hostnamectl-vs-fallback); pass-through of Ansible's `use:` is parse-time rejected. Wire kind=26.",
       sequence: [
         { name: "kind", type: "uint8", const: 26 },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+      ],
+    },
+
+    OpTimezone: {
+      description: "Set the system timezone. Maps `community.general.timezone` (subset). `name` is required — must be a valid zoneinfo identifier (e.g. `Europe/Amsterdam`, `UTC`). Idempotency: read the current timezone via `timedatectl show --property=Timezone --value` (or the symlink target of `/etc/localtime` as fallback); no-op if already equal. Otherwise: when `timedatectl` is on PATH (systemd-init systems) call `timedatectl set-timezone <name>` — that updates the kernel time-of-day handling, rewrites `/etc/localtime`, and writes `/etc/timezone` in one shot. On non-systemd hosts fall back to symlinking `/etc/localtime` -> `/usr/share/zoneinfo/<name>` and writing `<name>` to `/etc/timezone`. Wire kind=27.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 27 },
         { name: "name", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
       ],
     },
@@ -514,6 +535,20 @@
       ],
     },
 
+    OpCopyTarget: {
+      description: "Atomic file copy between two paths on the agent host. Maps Ansible's `copy:` module with `remote_src: yes` — the controller never reads the source bytes, the agent reads `src` and writes its contents to `dest` using the same tmp+fsync+rename ceremony as OpWriteFile. `has_mode=1` applies the low 12 bits of `mode` via chmod on the staged tmp before rename; `has_mode=0` skips chmod (the agent picks up whatever umask gives). Empty `owner`/`group` mean don't chown; non-empty values resolve via /etc/passwd /etc/group and chown the staged tmp before rename. `validate` follows OpWriteFile's contract: empty = no validation, non-empty = tokenize on whitespace + replace `%s` with the tmp path + run; non-zero exit aborts the rename and leaves dest untouched. Missing src → TaskError(NOT_FOUND). `changed=1` iff the on-disk bytes (or mode/owner/group) actually changed. Symlinks at `src` are followed (matches Ansible). Wire kind=28.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 28 },
+        { name: "src", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "dest", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "has_mode", type: "uint8" },
+        { name: "mode", type: "uint32" },
+        { name: "owner", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "group", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "validate", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+      ],
+    },
+
     // Op dispatch. Each variant is identified by its leading `kind` byte; the
     // peek discriminator reads that byte without consuming it.
     Op: {
@@ -548,6 +583,8 @@
         { type: "OpAuthorizedKey", when: "value === 24" },
         { type: "OpGetent", when: "value === 25" },
         { type: "OpHostname", when: "value === 26" },
+        { type: "OpTimezone", when: "value === 27" },
+        { type: "OpCopyTarget", when: "value === 28" },
       ],
     },
 
