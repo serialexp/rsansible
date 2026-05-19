@@ -326,6 +326,18 @@ pub fn make_env<'a>() -> Environment<'a> {
     // sources frequently end in `\n` and we don't want minijinja stripping
     // them silently. Matches Ansible's behavior.
     env.set_keep_trailing_newline(true);
+    // Ansible's Jinja env defaults to `trim_blocks=True`, which strips the
+    // newline immediately after a block tag (`{% if %}`, `{% endif %}`,
+    // `{% for %}`, etc.). Templates authored against Ansible rely on this
+    // — without it, a conditional block leaves a blank line in the
+    // output. Sometimes harmless cosmetic noise, sometimes load-bearing:
+    // a systemd unit file using `\`-line-continuation cannot survive a
+    // blank line between continued lines, the parser truncates ExecStart
+    // at the gap. Caught in the gothab drill — vmalert.service.j2's
+    // `{% if monitoring_cross_notifier_url != 'TBD' %}` block dropped the
+    // `-notifier.url` flag silently, putting vmalert in a fatal crash
+    // loop. `lstrip_blocks` stays default-false to match Ansible.
+    env.set_trim_blocks(true);
     env.add_filter("mandatory", mandatory_filter);
     env.add_filter("subelements", subelements_filter);
     // Ansible-style filters; gothab uses these in role templates.
@@ -1746,6 +1758,34 @@ mod tests {
         let tmpl = env.template_from_str("hello {{ name }}").unwrap();
         let out = tmpl.render(context! { name => "world" }).unwrap();
         assert_eq!(out, "hello world");
+    }
+
+    /// Regression: Ansible's Jinja env defaults to `trim_blocks=True`,
+    /// which strips the newline immediately after a block tag
+    /// (`{% if %}`, `{% endif %}`, `{% for %}`, …). Pre-fix
+    /// `make_env()` did not set this, so a conditional block in a
+    /// template left a blank line in the output. Cosmetic in most
+    /// files, load-bearing in some: caught in the gothab drill when
+    /// `vmalert.service.j2`'s `{% if monitoring_cross_notifier_url
+    /// != 'TBD' %}` block produced a blank line between two
+    /// `\`-continued ExecStart args. systemd's parser cannot bridge
+    /// a `\`-line followed by a blank line; ExecStart was truncated
+    /// at the gap, the `-notifier.url=…` flag silently dropped, and
+    /// vmalert died on startup with "config contains alerting rules
+    /// but neither -notifier.url nor -notifier.config nor
+    /// -notifier.blackhole aren't set". ~3 hours of crash-looping
+    /// before someone noticed.
+    #[test]
+    fn make_env_trims_newline_after_block_tags_to_match_ansible() {
+        let env = make_env();
+        let src = "before\n{% if true %}\ninside\n{% endif %}\nafter\n";
+        let tmpl = env.template_from_str(src).unwrap();
+        let out = tmpl.render(context! {}).unwrap();
+        // With trim_blocks the `\n` immediately after `{% if true %}`
+        // and `{% endif %}` is stripped, leaving the natural
+        // continuation of the body. Without trim_blocks, we'd see two
+        // extra blank lines in the output.
+        assert_eq!(out, "before\ninside\nafter\n");
     }
 
     /// Regression: when `prepare_jinja_source` engages the slow path
