@@ -682,6 +682,30 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
         "forward-mode phase: read local binaries",
     );
 
+    // Open a long-lived OpenSSH ControlMaster up-front. Every
+    // subsequent `ssh` invocation in this run (cache probe, optional
+    // pushes, main session) will pass `-o ControlPath=<master>` so it
+    // multiplexes over this single TCP connection as a channel
+    // instead of paying a fresh TCP+KEX+auth handshake. Critical on
+    // high-RTT links (JP↔FI: 285ms RTT → ~1.5s per handshake) where
+    // running three independent ssh processes would otherwise
+    // serialize three handshakes.
+    let base_dial = forward_push::ForwarderDial {
+        user: args.forwarder.user.clone(),
+        host: args.forwarder.host.clone(),
+        port: args.forwarder.port,
+        control_path: None,
+    };
+    let t_mux = std::time::Instant::now();
+    let mux = forward_push::ControlMaster::open(base_dial)
+        .await
+        .context("opening ssh ControlMaster to forwarder")?;
+    tracing::info!(
+        elapsed_ms = t_mux.elapsed().as_millis() as u64,
+        "forward-mode phase: ControlMaster ready",
+    );
+    let dial = mux.dial().clone();
+
     // Pre-stage the binaries (or not). The cached path probes the
     // forwarder for which hashes are already in `/tmp/rsansible-cache/`,
     // pushes any misses in parallel, and returns the absolute remote
@@ -694,11 +718,6 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
         );
         None
     } else {
-        let dial = forward_push::ForwarderDial {
-            user: args.forwarder.user.clone(),
-            host: args.forwarder.host.clone(),
-            port: args.forwarder.port,
-        };
         let binaries = vec![
             forward_push::BinaryToStage {
                 kind: forward_push::BinaryKind::Ctl,
@@ -772,14 +791,23 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
         local_sock.display()
     );
     let t_spawn = std::time::Instant::now();
-    let mut child = tokio::process::Command::new("ssh")
+    let mut ssh_cmd = tokio::process::Command::new("ssh");
+    ssh_cmd
         .arg("-A")
         .arg("-R")
         .arg(&r_arg)
         .arg("-o")
         .arg("StreamLocalBindUnlink=yes")
         .arg("-o")
-        .arg("BatchMode=yes")
+        .arg("BatchMode=yes");
+    if let Some(cp) = &dial.control_path {
+        // Multiplex the main session over the master opened above —
+        // skips a fresh TCP+KEX+auth handshake (~1.5s on JP↔FI).
+        ssh_cmd
+            .arg("-o")
+            .arg(format!("ControlPath={}", cp.display()));
+    }
+    let mut child = ssh_cmd
         .arg("-p")
         .arg(args.forwarder.port.to_string())
         .arg(&dest)

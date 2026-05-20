@@ -58,11 +58,181 @@ pub struct StagedBinary {
 /// Coordinates the laptop uses to dial the forwarder for an
 /// out-of-band push session. Mirrors `ForwarderTarget` but split out
 /// here so this module doesn't depend on the parent.
+///
+/// `control_path` is the OpenSSH connection-multiplexing socket. When
+/// `Some`, every `ssh` invocation in this module passes
+/// `-o ControlPath=<path>` so it rides the existing master TCP
+/// connection as a fresh channel — ~1 RTT each instead of a full TCP
+/// + KEX + auth handshake per call. The master itself is opened
+/// up-front by [`ControlMaster::open`]; this struct just carries the
+/// path so probe + push + main-ssh in forward.rs can share it.
 #[derive(Debug, Clone)]
 pub struct ForwarderDial {
     pub user: String,
     pub host: String,
     pub port: u16,
+    pub control_path: Option<PathBuf>,
+}
+
+/// Apply the dial's shared SSH options (BatchMode, port, and the
+/// ControlPath when present) to a `Command`. Centralizes the
+/// "every SSH call must include these" discipline so a new call site
+/// can't forget the mux path and silently pay a fresh handshake.
+fn apply_ssh_opts(cmd: &mut tokio::process::Command, dial: &ForwarderDial) {
+    cmd.arg("-o").arg("BatchMode=yes");
+    if let Some(cp) = &dial.control_path {
+        cmd.arg("-o").arg(format!("ControlPath={}", cp.display()));
+    }
+    cmd.arg("-p").arg(dial.port.to_string());
+}
+
+/// Long-lived OpenSSH ControlMaster connection. The first time we
+/// touch the forwarder we pay one ~1.5–2s WAN handshake; every
+/// subsequent `ssh` call that passes the same `-o ControlPath=<path>`
+/// multiplexes over the existing TCP connection as a channel — ~1 RTT
+/// each, no new handshake.
+///
+/// On a fresh JP↔FI forward run that's the difference between three
+/// sequential 1.5s handshakes (probe + push + main = 4.5s) and one
+/// handshake amortized across the three invocations (~1.5s + 3×0.3s).
+///
+/// Lifecycle: [`open`] blocks until the master is up (the `-fN`
+/// child exits after auth completes). `ControlPersist=60` keeps the
+/// master alive for 60s after the last channel closes — so a
+/// back-to-back `rsansible run --forward` invocation from the same
+/// shell *also* skips the handshake. After 60s of idle the master
+/// collapses on its own and the socket file goes away.
+///
+/// We deliberately do NOT issue `ssh -O exit` on Drop. That would
+/// defeat the persistence (the whole point of persist=60), and would
+/// also race the probe-close against the main-open inside one
+/// forward run — if persist were 0 the master could exit between
+/// channels and the main session would pay a fresh handshake anyway.
+///
+/// [`open`]: ControlMaster::open
+pub struct ControlMaster {
+    #[allow(dead_code)] // held for lifetime semantics; the dial carries the active path
+    socket_path: PathBuf,
+    dial: ForwarderDial,
+}
+
+impl ControlMaster {
+    /// Pick a unique socket path and open the master connection.
+    /// Returns when auth has completed and the master is ready to
+    /// accept multiplexed channels.
+    pub async fn open(dial_in: ForwarderDial) -> Result<Self> {
+        // %C in ControlPath is OpenSSH's "hash of host+port+user+localuser"
+        // — a stable, collision-resistant identifier. We use it so
+        // two back-to-back `rsansible run --forward` invocations
+        // against the same forwarder land on the same socket path and
+        // the SECOND invocation finds the persisted master from the
+        // first. The PID prefix isn't included precisely because that
+        // would make every invocation pick a unique path and the
+        // persistence buys us nothing.
+        let socket_path = std::env::temp_dir().join("rsansible-mux-%C.sock");
+        let dial = ForwarderDial {
+            control_path: None,
+            ..dial_in
+        };
+        // `-fN`: fork into background after auth completes, never
+        // run a remote command. `-M`: become the master for this
+        // ControlPath. `ControlPersist=60`: stay alive 60s after the
+        // last channel closes — lets back-to-back forward runs share
+        // the master AND keeps the master up between probe-close and
+        // main-open inside one run. `BatchMode=yes` refuses
+        // interactive prompts; the operator's agent must have the key.
+        //
+        // `-A` on the master so agent forwarding is enabled for every
+        // multiplexed channel — the main session uses `-A` to let
+        // peer-target SSH dials from the forwarder reuse the
+        // operator's loaded keys; without it on the master, channel
+        // requests fail to allocate the auth-agent forwarding.
+        let dest = format!("{}@{}", dial.user, dial.host);
+
+        // First: is a master from a recent invocation still alive?
+        // `ssh -O check` exits 0 if there's a live master at the
+        // socket and non-zero otherwise. When ControlPersist=60 is in
+        // play, two `rsansible run --forward` invocations within a
+        // minute of each other hit this fast path and skip the WAN
+        // handshake entirely.
+        let mut check = tokio::process::Command::new("ssh");
+        check
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!("ControlPath={}", socket_path.display()))
+            .arg("-O")
+            .arg("check")
+            .arg("-p")
+            .arg(dial.port.to_string())
+            .arg(&dest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(status) = check.status().await {
+            if status.success() {
+                tracing::info!(
+                    socket = %socket_path.display(),
+                    "forward-mode phase: ssh ControlMaster already running (reusing persisted master)",
+                );
+                return Ok(Self {
+                    socket_path: socket_path.clone(),
+                    dial: ForwarderDial {
+                        control_path: Some(socket_path),
+                        ..dial
+                    },
+                });
+            }
+        }
+
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.arg("-M")
+            .arg("-N")
+            .arg("-f")
+            .arg("-A")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!("ControlPath={}", socket_path.display()))
+            .arg("-o")
+            .arg("ControlPersist=60")
+            .arg("-p")
+            .arg(dial.port.to_string())
+            .arg(&dest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let t = std::time::Instant::now();
+        let status = cmd
+            .status()
+            .await
+            .context("spawning ssh ControlMaster")?;
+        if !status.success() {
+            bail!(
+                "ssh ControlMaster open failed: {status} \
+                 (see forwarder stderr above)"
+            );
+        }
+        tracing::info!(
+            socket = %socket_path.display(),
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "forward-mode phase: ssh ControlMaster opened (mux ready)",
+        );
+        Ok(Self {
+            socket_path: socket_path.clone(),
+            dial: ForwarderDial {
+                control_path: Some(socket_path),
+                ..dial
+            },
+        })
+    }
+
+    /// The dial with `control_path` populated. Hand this to anyone
+    /// that wants to make multiplexed ssh calls against the
+    /// forwarder.
+    pub fn dial(&self) -> &ForwarderDial {
+        &self.dial
+    }
 }
 
 /// SHA-256 the binary bytes, lowercase hex. Used as the cache key
@@ -125,11 +295,9 @@ done
     let quoted = shlex::try_quote(&script)
         .context("shell-quoting probe script (internal: should never fail)")?;
     let remote_cmd = format!("bash -c {quoted}");
-    let output = tokio::process::Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-p")
-        .arg(dial.port.to_string())
+    let mut cmd = tokio::process::Command::new("ssh");
+    apply_ssh_opts(&mut cmd, dial);
+    let output = cmd
         .arg(&dest)
         .arg(&remote_cmd)
         .stdin(Stdio::null())
@@ -186,11 +354,9 @@ mv "/tmp/rsansible-cache/{tmp_name}" "/tmp/rsansible-cache/{hash}"
     let quoted = shlex::try_quote(&script)
         .context("shell-quoting push script (internal: should never fail)")?;
     let remote_cmd = format!("bash -c {quoted}");
-    let mut child = tokio::process::Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-p")
-        .arg(dial.port.to_string())
+    let mut cmd = tokio::process::Command::new("ssh");
+    apply_ssh_opts(&mut cmd, dial);
+    let mut child = cmd
         .arg(&dest)
         .arg(&remote_cmd)
         .stdin(Stdio::piped())
