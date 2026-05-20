@@ -235,7 +235,15 @@ impl RegisterValue {
             m.insert("json".into(), j.clone());
         }
         m.insert("took_ms".into(), JsonValue::from(self.took_ms));
-        m.insert("skipped".into(), JsonValue::Bool(self.skipped));
+        // Match Ansible's per-iteration result shape: `skipped` is OMITTED
+        // for iterations that ran, and present as `true` only for skipped
+        // iterations. Playbooks rely on this for `rejectattr('skipped',
+        // 'defined')` to filter loop results — emitting `skipped: false`
+        // unconditionally turns that filter into a reject-all. See
+        // ANSIBLE_COMPAT (and the loop+when interaction in orchestrator.rs).
+        if self.skipped {
+            m.insert("skipped".into(), JsonValue::Bool(true));
+        }
         m.insert("failed".into(), JsonValue::Bool(self.failed));
         if let Some(results) = &self.results {
             m.insert(
@@ -781,5 +789,28 @@ mod tests {
         assert!(!rv.failed);
         let j = rv.to_json();
         assert_eq!(j["skipped"], true);
+    }
+
+    /// Regression: a non-skipped RegisterValue must NOT emit a
+    /// `skipped: false` key. Ansible's per-iteration result shape
+    /// omits the key for iterations that ran; playbooks rely on
+    /// `rejectattr('skipped', 'defined')` to drop the skipped items
+    /// from a `loop + when` result. With `skipped: false` always
+    /// present, that filter rejects every iteration and renders
+    /// empty content.
+    #[test]
+    fn ran_iteration_omits_skipped_key() {
+        let rv = RegisterValue::from_exec(0, false, 1, b"hello", b"");
+        assert!(!rv.skipped);
+        let j = rv.to_json();
+        assert!(
+            j.get("skipped").is_none(),
+            "non-skipped iterations must not emit `skipped: false` — \
+             `rejectattr('skipped', 'defined')` would otherwise reject \
+             every loop result. Got: {j}"
+        );
+        // Skipped marker still emits skipped: true.
+        let rv = RegisterValue::skipped_marker();
+        assert_eq!(rv.to_json().get("skipped"), Some(&JsonValue::Bool(true)));
     }
 }

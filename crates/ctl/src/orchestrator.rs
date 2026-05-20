@@ -1790,33 +1790,44 @@ async fn run_task_on_one_host(
 
     timing.add(&timing.task_vars_ns, t_task_vars.elapsed());
 
-    // when: evaluation — bypasses everything else if false.
-    let t_when = Instant::now();
-    let when_result = eval_when(&env, task.when.as_deref(), &ctx, &world);
-    timing.add(&timing.eval_when_ns, t_when.elapsed());
-    match when_result {
-        Ok(true) => {}
-        Ok(false) => {
-            timing.incr(&timing.when_false_count);
-            if let Some(reg) = &task.register {
-                ctx.record_register(reg, RegisterValue::skipped_marker());
+    // when: evaluation. For non-looped tasks, evaluate once at task
+    // entry — false means the entire task is skipped. For looped
+    // tasks, we DEFER evaluation to the per-iteration body below,
+    // because `when:` commonly references `item` (the loop var) and
+    // would render as undefined here. (See ANSIBLE_COMPAT for the
+    // per-iteration semantics — Ansible does the same; the loop+when
+    // result shape is "results: [...]" with each iteration tagged
+    // skipped:true individually.) Block tasks follow the same rule:
+    // non-looped block → eval at entry; looped block → eval inside
+    // the block driver's per-iteration arm.
+    if task.loop_spec.is_none() {
+        let t_when = Instant::now();
+        let when_result = eval_when(&env, task.when.as_deref(), &ctx, &world);
+        timing.add(&timing.eval_when_ns, t_when.elapsed());
+        match when_result {
+            Ok(true) => {}
+            Ok(false) => {
+                timing.incr(&timing.when_false_count);
+                if let Some(reg) = &task.register {
+                    ctx.record_register(reg, RegisterValue::skipped_marker());
+                }
+                debug!(host = %name, task = %task.name, "skipped (when=false)");
+                return PerHostTaskResult {
+                    name,
+                    ctx,
+                    outcome: HostTaskOutcome::Skipped,
+                    conn_alive: true,
+                };
             }
-            debug!(host = %name, task = %task.name, "skipped (when=false)");
-            return PerHostTaskResult {
-                name,
-                ctx,
-                outcome: HostTaskOutcome::Skipped,
-                conn_alive: true,
-            };
-        }
-        Err(e) => {
-            let reason = format!("when: {e:#}");
-            return PerHostTaskResult {
-                name,
-                ctx,
-                outcome: HostTaskOutcome::Failed { reason, register: None },
-                conn_alive: true,
-            };
+            Err(e) => {
+                let reason = format!("when: {e:#}");
+                return PerHostTaskResult {
+                    name,
+                    ctx,
+                    outcome: HostTaskOutcome::Failed { reason, register: None },
+                    conn_alive: true,
+                };
+            }
         }
     }
 
@@ -1980,6 +1991,37 @@ async fn run_task_on_one_host(
     let mut any_failed: Option<String> = None;
     for item in items {
         ctx.iter_item = Some((loop_var.clone(), item));
+        // Per-iteration `when:` evaluation. With `iter_item` now bound
+        // we can resolve expressions like `when: item != inventory_hostname`
+        // correctly. A false here records a skipped marker for THIS
+        // iteration only and moves on; other iterations still run. A
+        // render error fails this iteration (matching Ansible).
+        if task.when.is_some() {
+            let t_when = Instant::now();
+            let when_result = eval_when(&env, task.when.as_deref(), &ctx, &world);
+            timing.add(&timing.eval_when_ns, t_when.elapsed());
+            match when_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    timing.incr(&timing.when_false_count);
+                    iter_registers.push(RegisterValue::skipped_marker());
+                    continue;
+                }
+                Err(e) => {
+                    let reason = format!("when: {e:#}");
+                    if any_failed.is_none() {
+                        any_failed = Some(reason.clone());
+                    }
+                    iter_registers.push(RegisterValue {
+                        failed: true,
+                        rc: -1,
+                        stderr: reason,
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            }
+        }
         if !own_conn_alive && task.delegate_to.is_none() {
             iter_registers.push(RegisterValue {
                 failed: true,
@@ -2588,6 +2630,39 @@ async fn run_block_on_one_host(
 
         if let Some(item) = maybe_item {
             ctx.iter_item = Some((loop_var.clone(), item));
+        }
+
+        // Per-iteration `when:` for looped blocks. The outer entry
+        // (`run_task_on_one_host`) deferred this eval because
+        // `loop_spec.is_some()`; with `iter_item` now bound we can
+        // resolve `when:` expressions that reference the loop var.
+        // Single-shot blocks (no loop) had `when:` evaluated at task
+        // entry already — `block_task.loop_spec.is_some()` gates us
+        // to the looped case only.
+        if block_task.loop_spec.is_some() && block_task.when.is_some() {
+            match eval_when(&env, block_task.when.as_deref(), &ctx, &world) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // This iteration is skipped wholesale — neither
+                    // block.tasks nor rescue nor always run for it.
+                    debug!(
+                        host = %name,
+                        task = %block_task.name,
+                        "block iteration skipped (when=false)"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    if overall_failure.is_none() {
+                        overall_failure = Some((
+                            block_task.name.clone(),
+                            format!("when: {e:#}"),
+                            None,
+                        ));
+                    }
+                    continue;
+                }
+            }
         }
 
         // 1. Run block.tasks
@@ -10819,6 +10894,117 @@ all:
             elapsed >= std::time::Duration::from_millis(1000),
             "expected >= 1000ms virtual elapsed (clamp), got {elapsed:?}"
         );
+    }
+
+    /// Regression: `loop: [...] + when: item != x` must evaluate
+    /// `when:` PER ITERATION with `item` bound to that iteration's
+    /// value — not once at task entry where `item` is undefined.
+    ///
+    /// The pre-fix bug: when:-evaluated-once-at-task-entry meant
+    /// `item != inventory_hostname` rendered against an undefined
+    /// `item`, evaluated truthy, and ran every iteration including
+    /// the host's own entry. Downstream `rejectattr('skipped',
+    /// 'defined')` then matched zero results because every
+    /// iteration emitted `skipped: false`. Cumulative effect: a
+    /// rendered file with the host's own entry included, exactly
+    /// the wrong shape for a "list of peers" file.
+    ///
+    /// This test drives a controller-side body (`set_fact`) so the
+    /// mock-pool dead handle is never touched — the loop+when
+    /// machinery is in `run_task_on_one_host` itself. We use a
+    /// set_fact whose value is `"{{ item }}"`, register the
+    /// aggregate, and check the per-iteration `results[*].skipped`
+    /// flags directly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loop_when_skips_only_matching_iterations() {
+        use crate::playbook::SetFactMap;
+        let mut m = BTreeMap::new();
+        m.insert(
+            "noted".into(),
+            serde_yaml::from_str::<serde_yaml::Value>(r#""{{ item }}""#).unwrap(),
+        );
+        let mut t = plain_task("note-each", TaskBody::SetFact(SetFactMap(m)));
+        t.register = Some("agg".into());
+        // `inventory_hostname` is "h1" (set by the drive() helper);
+        // skip just that one iteration.
+        t.when = Some("item != inventory_hostname".into());
+        t.loop_spec = Some(LoopSpec::Items(vec![
+            serde_yaml::Value::String("h1".into()),
+            serde_yaml::Value::String("peer-a".into()),
+            serde_yaml::Value::String("peer-b".into()),
+        ]));
+
+        let r = drive(&t).await;
+        assert_ok(&r);
+        let agg = r
+            .ctx
+            .registers
+            .get("agg")
+            .expect("register 'agg' was recorded");
+        let results = agg.results.as_ref().expect("loop produces results array");
+        assert_eq!(results.len(), 3, "one register per loop item");
+        assert!(
+            results[0].skipped,
+            "iteration with item == inventory_hostname must be skipped, got {:?}",
+            results[0]
+        );
+        assert!(
+            !results[1].skipped,
+            "iteration with item != inventory_hostname must NOT be skipped"
+        );
+        assert!(
+            !results[2].skipped,
+            "iteration with item != inventory_hostname must NOT be skipped"
+        );
+
+        // And the per-iteration JSON shape must omit `skipped` for
+        // the ones that ran (so `rejectattr('skipped', 'defined')`
+        // keeps them) and emit `skipped: true` for the one that
+        // didn't (so the filter drops it).
+        let j = agg.to_json();
+        let res = j.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(res[0].get("skipped"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            res[1].get("skipped").is_none(),
+            "ran iteration must omit `skipped` key, got: {}",
+            res[1]
+        );
+        assert!(
+            res[2].get("skipped").is_none(),
+            "ran iteration must omit `skipped` key, got: {}",
+            res[2]
+        );
+    }
+
+    /// Regression: when EVERY iteration of a `loop:` is skipped by
+    /// the per-iteration `when:`, the outer task reports
+    /// `skipped: true` overall (Ansible behavior — a fully-skipped
+    /// looped task counts as one skipped task in the play recap,
+    /// not as one ok).
+    #[tokio::test(flavor = "current_thread")]
+    async fn loop_when_all_skipped_reports_outer_skipped() {
+        use crate::playbook::SetFactMap;
+        let mut m = BTreeMap::new();
+        m.insert(
+            "noted".into(),
+            serde_yaml::from_str::<serde_yaml::Value>(r#""{{ item }}""#).unwrap(),
+        );
+        let mut t = plain_task("note-each", TaskBody::SetFact(SetFactMap(m)));
+        t.when = Some("false".into());
+        t.loop_spec = Some(LoopSpec::Items(vec![
+            serde_yaml::Value::String("a".into()),
+            serde_yaml::Value::String("b".into()),
+        ]));
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { skipped, .. } => {
+                assert!(
+                    *skipped,
+                    "loop with all iterations skipped must report outer skipped=true"
+                );
+            }
+            other => panic!("expected Ok {{ skipped: true }}, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
