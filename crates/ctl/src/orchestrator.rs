@@ -7562,6 +7562,11 @@ async fn run_one_task_op(
     check_mode: bool,
     metrics: &crate::run_metrics::RunMetrics,
 ) -> Result<OpExecOutcome> {
+    // Capture the static op-name BEFORE moving `op` into the
+    // dispatch frame — used to bucket per-op timing in RunMetrics
+    // so the run summary can answer "where did the agents spend
+    // their time, by task type?".
+    let op_name = op.name();
     let dispatch = task_dispatch(seq, check_mode, op);
     write_frame(&mut conn.stream, &dispatch)
         .await
@@ -7629,6 +7634,7 @@ async fn run_one_task_op(
                     dispatched_unix_ns,
                     received_unix_ns,
                     clock_offset_ns,
+                    op_name,
                 );
                 return Ok(OpExecOutcome {
                     done: d,

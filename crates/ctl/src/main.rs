@@ -475,6 +475,10 @@ async fn cmd_run(
     if print_timing {
         eprintln!("timing breakdown:");
         eprint!("{}", report.timing_breakdown.format());
+        let per_op = report.timing.per_op_breakdown();
+        if !per_op.is_empty() {
+            eprint!("{}", per_op);
+        }
     }
     if failed + unreachable > 0 || report.stopped_early {
         Ok(ExitCode::FAILURE)
@@ -559,6 +563,10 @@ async fn cmd_run_forwarded(
     if print_timing {
         eprintln!("timing breakdown:");
         eprint!("{}", report.timing_breakdown.format());
+        let per_op = report.timing.per_op_breakdown();
+        if !per_op.is_empty() {
+            eprint!("{}", per_op);
+        }
     }
     if report.any_failed() || report.stopped_early {
         Ok(ExitCode::FAILURE)
