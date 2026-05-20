@@ -5990,8 +5990,30 @@ fn render_op(
     // pass at the top is sufficient. See the `render_op_ns` /
     // `wire_dispatch_ns` split in `crates/ctl/src/timing.rs` and the
     // perf write-up.
+    let timing = ctx.timing.clone();
+    let t_build = Instant::now();
     let view = build_template_ctx(ctx, world);
+    timing.add(&timing.render_op_build_ctx_ns, t_build.elapsed());
+    let t_resolve = Instant::now();
     let view = resolve_view_var_templates(env, &view)?;
+    timing.add(&timing.render_op_resolve_ns, t_resolve.elapsed());
+    let t_fields = Instant::now();
+    let result = render_op_inner(op, env, view.as_ref());
+    timing.add(&timing.render_op_fields_ns, t_fields.elapsed());
+    result
+}
+
+/// Per-field rendering body of `render_op`. Split out so the timing
+/// guard around field renders is a clean before/after, without
+/// needing a scope-guard dependency just for the early-return shape
+/// of the original match. Keeps the resolve+build_ctx wrappers in
+/// the public `render_op`.
+fn render_op_inner(
+    op: &TaskOp,
+    env: &Environment<'static>,
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<TaskOp> {
+    let view = view; // keep the existing inner code reading from `view`
     Ok(match op {
         TaskOp::Shell(s) => {
             let cmd = render_str_resolved(env, s.command(), &view)?;
@@ -6969,6 +6991,18 @@ fn render_str_resolved(
     src: &str,
     resolved_view: &BTreeMap<String, JsonValue>,
 ) -> Result<String> {
+    // Literal-string fast path. Most task-op fields are plain text:
+    // file modes (`"0644"`), state markers (`"present"`), package
+    // names, fixed paths, command argv elements. Profiling on the
+    // gothab drill showed minijinja's parse+render of a Jinja-free
+    // string still costs ~hundreds of microseconds per call; with
+    // ~200 tasks × ~10 fields/task that's seconds of wasted work
+    // rendering text that has no `{{` or `{%` at all. Short-circuit
+    // here so the only cost on the literal path is two `contains`
+    // scans + a `to_string`.
+    if !src.contains("{{") && !src.contains("{%") {
+        return Ok(src.to_string());
+    }
     let prepared = crate::template::prepare_jinja_source(src);
     let tmpl = env
         .template_from_str(&prepared)
@@ -7071,13 +7105,20 @@ fn render_str(
     // and a get_url task referencing `{{ monitoring_vmalert_version }}`
     // was producing a URL with the literal `{{ monitoring_vm_version }}`
     // still in it. The fix is var-side, not render-side.
+    //
+    // Literal-string fast path: if the source has no Jinja markers at
+    // all, skip the resolve fixpoint AND the minijinja parse+render.
+    // See `render_str_resolved` for the same fast path rationale.
+    if !src.contains("{{") && !src.contains("{%") {
+        return Ok(src.to_string());
+    }
     let resolved = resolve_view_var_templates(env, view)?;
     let prepared = crate::template::prepare_jinja_source(src);
     let tmpl = env
         .template_from_str(&prepared)
         .map_err(|e| anyhow!("template parse: {e}"))?;
     let out = tmpl
-        .render(&resolved)
+        .render(resolved.as_ref())
         .map_err(|e| anyhow!("template render: {e}"))?;
     // Ansible-style `default(omit)` support: if the entire rendered
     // result is exactly the omit sentinel, collapse to empty string.
@@ -7114,10 +7155,26 @@ fn render_str(
 /// the source (a constant-Jinja literal in a var, or a cycle that
 /// hits its fixed point) are left as-is and don't trigger another
 /// pass — `MAX_PASSES` exhaustion only fires on true non-convergence.
-fn resolve_view_var_templates(
+fn resolve_view_var_templates<'a>(
     env: &Environment<'static>,
-    view: &BTreeMap<String, JsonValue>,
-) -> Result<BTreeMap<String, JsonValue>> {
+    view: &'a BTreeMap<String, JsonValue>,
+) -> Result<std::borrow::Cow<'a, BTreeMap<String, JsonValue>>> {
+    // Fast path: walk the view once with no allocation, looking for
+    // *any* string value (at any depth) that contains Jinja markers.
+    // If none, the resolve fixpoint has nothing to do and we can hand
+    // back a borrow of the input view.
+    //
+    // Why this matters: previously the function did `view.clone()`
+    // unconditionally, then on the first fixpoint pass did another
+    // `current.clone()` for the snapshot — two deep clones of a
+    // BTreeMap containing the entire hostvars JsonValue::Object —
+    // every render_op call. The gothab db-1 drill measured 13.6s out
+    // of 13.9s render_op going to this function despite the playbook
+    // having only a handful of var-of-var references. The
+    // pre-scan is O(view contents) in CPU but allocates nothing.
+    if !view_values_contain_jinja(view) {
+        return Ok(std::borrow::Cow::Borrowed(view));
+    }
     const MAX_PASSES: u32 = 8;
     let mut current: BTreeMap<String, JsonValue> = view.clone();
     for _ in 0..MAX_PASSES {
@@ -7127,13 +7184,30 @@ fn resolve_view_var_templates(
             resolve_strings_in_value(env, k, v, &snapshot, &mut changed)?;
         }
         if !changed {
-            return Ok(current);
+            return Ok(std::borrow::Cow::Owned(current));
         }
     }
     Err(anyhow!(
         "var-template resolution did not stabilize after {MAX_PASSES} passes \
          (likely a circular variable reference)"
     ))
+}
+
+/// Allocation-free scan: does any string value, recursively, inside
+/// the view contain a Jinja marker? Used by
+/// [`resolve_view_var_templates`] to decide whether the resolve
+/// fixpoint needs to run at all.
+fn view_values_contain_jinja(view: &BTreeMap<String, JsonValue>) -> bool {
+    view.values().any(value_contains_jinja)
+}
+
+fn value_contains_jinja(v: &JsonValue) -> bool {
+    match v {
+        JsonValue::String(s) => s.contains("{{") || s.contains("{%"),
+        JsonValue::Array(items) => items.iter().any(value_contains_jinja),
+        JsonValue::Object(map) => map.values().any(value_contains_jinja),
+        _ => false,
+    }
 }
 
 /// Walk a JSON value in place, rendering every string scalar that
@@ -7163,8 +7237,22 @@ fn resolve_strings_in_value(
             let tmpl = env
                 .template_from_str(&prepared)
                 .map_err(|e| anyhow!("var {path:?} template parse: {e}"))?;
+            // Render against a SLIM context containing only the
+            // top-level identifiers this template references. The full
+            // view is dominated by the hostvars JsonValue::Object —
+            // serializing that into minijinja's internal Value on every
+            // render costs ~3ms even for a one-key template. With a
+            // slim context the same render is microseconds.
+            // `undeclared_variables(false)` returns just the top-level
+            // identifier set — `{{ hostvars[h].x }}` lists `hostvars`
+            // (we still need to include it, then), `{{ b }}` lists `b`.
+            let needed = tmpl.undeclared_variables(false);
+            let slim: BTreeMap<&str, &JsonValue> = needed
+                .iter()
+                .filter_map(|n| view.get(n).map(|v| (n.as_str(), v)))
+                .collect();
             let rendered = tmpl
-                .render(view)
+                .render(&slim)
                 .map_err(|e| anyhow!("var {path:?} template render: {e}"))?;
             if &rendered != s {
                 *s = rendered;

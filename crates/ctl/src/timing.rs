@@ -105,6 +105,15 @@ pub struct TaskTimingAggregator {
     /// env values, etc.). Builds a fresh template ctx each call,
     /// which clones `WorldVars` including the `hostvars` snapshot.
     pub render_op_ns: AtomicU64,
+    /// Subset of `render_op_ns`: time spent in `build_template_ctx`
+    /// flattening the per-host variable layers into a BTreeMap.
+    pub render_op_build_ctx_ns: AtomicU64,
+    /// Subset of `render_op_ns`: time spent in
+    /// `resolve_view_var_templates` (the var-of-var fixpoint).
+    pub render_op_resolve_ns: AtomicU64,
+    /// Subset of `render_op_ns`: everything else — the per-field
+    /// `render_str_resolved` calls plus the op-shape match.
+    pub render_op_fields_ns: AtomicU64,
     /// Inside `run_op_body`: the actual `run_one_task_op` call —
     /// hand wire op to agent, await response. Should ~match
     /// `RunMetrics.wall_ns_total` for non-composite ops.
@@ -145,6 +154,9 @@ impl TaskTimingAggregator {
             resolve_target_ns: AtomicU64::new(0),
             body_dispatch_ns: AtomicU64::new(0),
             render_op_ns: AtomicU64::new(0),
+            render_op_build_ctx_ns: AtomicU64::new(0),
+            render_op_resolve_ns: AtomicU64::new(0),
+            render_op_fields_ns: AtomicU64::new(0),
             wire_dispatch_ns: AtomicU64::new(0),
             notify_enqueue_ns: AtomicU64::new(0),
             task_barrier_count: AtomicU64::new(0),
@@ -185,6 +197,9 @@ impl TaskTimingAggregator {
             resolve_target_ms: ms(&self.resolve_target_ns),
             body_dispatch_ms: ms(&self.body_dispatch_ns),
             render_op_ms: ms(&self.render_op_ns),
+            render_op_build_ctx_ms: ms(&self.render_op_build_ctx_ns),
+            render_op_resolve_ms: ms(&self.render_op_resolve_ns),
+            render_op_fields_ms: ms(&self.render_op_fields_ns),
             wire_dispatch_ms: ms(&self.wire_dispatch_ns),
             notify_enqueue_ms: ms(&self.notify_enqueue_ns),
             task_barrier_count: count(&self.task_barrier_count),
@@ -209,6 +224,9 @@ pub struct TimingBreakdown {
     pub resolve_target_ms: f64,
     pub body_dispatch_ms: f64,
     pub render_op_ms: f64,
+    pub render_op_build_ctx_ms: f64,
+    pub render_op_resolve_ms: f64,
+    pub render_op_fields_ms: f64,
     pub wire_dispatch_ms: f64,
     pub notify_enqueue_ms: f64,
     pub task_barrier_count: u64,
@@ -255,6 +273,9 @@ impl TimingBreakdown {
         out.push_str(&format!("    resolve_target        {:>9.2} ms\n", self.resolve_target_ms));
         out.push_str(&format!("    body_dispatch         {:>9.2} ms  (= render_op + wire_dispatch + composite/post)\n", self.body_dispatch_ms));
         out.push_str(&format!("      render_op           {:>9.2} ms  (controller Jinja)\n", self.render_op_ms));
+        out.push_str(&format!("        build_ctx         {:>9.2} ms  (flatten layers + clone cached JSON)\n", self.render_op_build_ctx_ms));
+        out.push_str(&format!("        resolve           {:>9.2} ms  (var-of-var fixpoint)\n", self.render_op_resolve_ms));
+        out.push_str(&format!("        fields            {:>9.2} ms  (per-field render_str)\n", self.render_op_fields_ms));
         out.push_str(&format!("      wire_dispatch       {:>9.2} ms  (~ RunMetrics agent+rtt)\n", self.wire_dispatch_ms));
         out.push_str(&format!("    notify_enqueue        {:>9.2} ms\n", self.notify_enqueue_ms));
         out.push_str(&format!(
