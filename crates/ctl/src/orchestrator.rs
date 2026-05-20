@@ -3011,11 +3011,12 @@ async fn run_body_once(
 ///   field stays at 0 — single-attempt tasks don't surface
 ///   `register.attempts` at all (see `RegisterValue::to_json`).
 ///
-/// Note: `until` and `failed_when` (when we ship the latter) are
-/// independent. `failed_when` would post-process the body's Ok/Failed
-/// outcome BEFORE this function decides whether to break — the
-/// integration point is to apply `failed_when` to `result` right after
-/// each `run_body_once` call returns. Not in scope here.
+/// Note: `until` and `failed_when` / `changed_when` are independent.
+/// The latter two post-process the body's Ok/Failed outcome BEFORE
+/// this function decides whether to break — see
+/// [`apply_changed_failed_when`]. `until:` then evaluates against
+/// the post-override register, so a body that `failed_when: false`
+/// rescued exits the retry loop on Ok.
 async fn run_body_with_retries(
     task: &Task,
     target_conn: &ConnHandle,
@@ -3050,7 +3051,8 @@ async fn run_body_with_retries(
     // Single-attempt fast path — no delay parsing, no extra logic. This
     // is the hot path for every task that doesn't use retries.
     if !retry_active {
-        return run_body_once(task, target_conn, ctx, env, world, next_seq).await;
+        let result = run_body_once(task, target_conn, ctx, env, world, next_seq).await;
+        return apply_changed_failed_when(env, task, ctx, world, result);
     }
 
     // Delay (only consulted when retries are active).
@@ -3081,6 +3083,13 @@ async fn run_body_with_retries(
     loop {
         attempts_made += 1;
         let result = run_body_once(task, target_conn, ctx, env, world, next_seq).await;
+        // Apply `failed_when:` / `changed_when:` BEFORE stashing the
+        // register and BEFORE the `until:` check, so that:
+        //   - `register_name.failed` / `.changed` in subsequent
+        //     attempts' `until:` expressions reflects the override;
+        //   - `until:` sees the post-override outcome (a body that
+        //     `failed_when: false` rescues exits the loop on Ok).
+        let result = apply_changed_failed_when(env, task, ctx, world, result);
 
         // Stash register on ctx so `until` can see it. Even on a Failed
         // attempt we record under the user's register name when there's
@@ -7369,6 +7378,155 @@ fn eval_when(
     Ok(val.is_true())
 }
 
+/// Evaluate a boolean Jinja expression against a pre-built view.
+/// Used by `changed_when:` / `failed_when:` which need the body's
+/// register-shape fields overlaid on the standard host view.
+fn eval_bool_with_view(
+    env: &Environment<'static>,
+    expr: &str,
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<bool> {
+    let prepared = crate::template::prepare_jinja_source(expr);
+    let compiled = env
+        .compile_expression(&prepared)
+        .map_err(|e| anyhow!("compile: {e}"))?;
+    let val = compiled
+        .eval(view)
+        .map_err(|e| anyhow!("eval: {e}"))?;
+    Ok(val.is_true())
+}
+
+/// Apply `failed_when:` and `changed_when:` overrides to a fresh
+/// `BodyResult`, mirroring Ansible's semantics:
+///
+/// - **`failed_when:`** is evaluated FIRST. Truthy forces the task
+///   to Failed (even if the body succeeded). Falsy forces the task
+///   to Ok (even if the body failed — provided there's a register
+///   payload to promote into). `register.failed` is updated to
+///   match the new verdict.
+///
+/// - **`changed_when:`** is evaluated SECOND against the
+///   post-`failed_when` result. Truthy → `changed=true`, falsy →
+///   `changed=false`. Affects only the `changed` flag (both the
+///   outer `BodyResult::Ok.changed` and `register.changed`), never
+///   the failure verdict.
+///
+/// Both expressions render against a context that overlays the
+/// body's register fields (`rc`, `stdout`, `stderr`, `changed`,
+/// `failed`, `stdout_lines`, etc.) at the top level — so users can
+/// write `changed_when: "rc != 0"` without setting `register:`.
+/// Other Jinja vars in scope (inventory, set_facts, prior
+/// registers, `iter_item`) all remain available.
+///
+/// Render or eval failures convert the result to `BodyResult::Failed`
+/// with a prefixed reason (`changed_when: ...` / `failed_when: ...`),
+/// matching `when:` / `until:`'s failure shape.
+///
+/// **Integration point:** called from `run_body_with_retries` right
+/// after each `run_body_once` and BEFORE the `until:` check, so
+/// `until:` evaluates against the post-override register (matching
+/// the comment that has lived on `run_body_with_retries` since the
+/// retry feature landed).
+fn apply_changed_failed_when(
+    env: &Environment<'static>,
+    task: &Task,
+    ctx: &HostCtx,
+    world: &WorldVars,
+    result: BodyResult,
+) -> BodyResult {
+    if task.changed_when.is_none() && task.failed_when.is_none() {
+        return result;
+    }
+
+    // Materialize the body's register (if any) so we can overlay
+    // its top-level fields onto the eval view AND keep a copy to
+    // attach to render-error failures.
+    let body_register: Option<RegisterValue> = match &result {
+        BodyResult::Ok { register, .. } => Some(register.clone()),
+        BodyResult::Failed { register, .. } => register.clone(),
+    };
+
+    let mut view = build_template_ctx(ctx, world);
+    if let Some(rv) = &body_register {
+        if let JsonValue::Object(reg_map) = rv.to_json() {
+            for (k, v) in reg_map {
+                view.insert(k, v);
+            }
+        }
+    }
+
+    // ---- Step 1: failed_when (variant-level override) ----
+    let result = if let Some(expr) = task.failed_when.as_deref() {
+        match eval_bool_with_view(env, expr, &view) {
+            Ok(true) => match result {
+                BodyResult::Ok { register, .. } => BodyResult::Failed {
+                    reason: "failed_when: evaluated true".to_string(),
+                    register: Some(RegisterValue { failed: true, ..register }),
+                    conn_alive: true,
+                },
+                BodyResult::Failed { reason, register, conn_alive } => BodyResult::Failed {
+                    reason,
+                    register: register.map(|r| RegisterValue { failed: true, ..r }),
+                    conn_alive,
+                },
+            },
+            Ok(false) => match result {
+                BodyResult::Ok { register, changed, skipped } => BodyResult::Ok {
+                    register: RegisterValue { failed: false, ..register },
+                    changed,
+                    skipped,
+                },
+                BodyResult::Failed { register: Some(rv), .. } => BodyResult::Ok {
+                    changed: rv.changed,
+                    skipped: rv.skipped,
+                    register: RegisterValue { failed: false, ..rv },
+                },
+                BodyResult::Failed { register: None, reason, conn_alive } => {
+                    // No register to promote — keep failed. This
+                    // covers controller-side pre-dispatch failures
+                    // (vars: render error, etc.) where there's
+                    // nothing for `failed_when: false` to override.
+                    BodyResult::Failed { register: None, reason, conn_alive }
+                }
+            },
+            Err(e) => {
+                return BodyResult::Failed {
+                    reason: format!("failed_when: {e:#}"),
+                    register: body_register,
+                    conn_alive: true,
+                };
+            }
+        }
+    } else {
+        result
+    };
+
+    // ---- Step 2: changed_when (changed-flag override) ----
+    if let Some(expr) = task.changed_when.as_deref() {
+        match eval_bool_with_view(env, expr, &view) {
+            Ok(c) => match result {
+                BodyResult::Ok { register, skipped, .. } => BodyResult::Ok {
+                    register: RegisterValue { changed: c, ..register },
+                    changed: c,
+                    skipped,
+                },
+                BodyResult::Failed { reason, register, conn_alive } => BodyResult::Failed {
+                    reason,
+                    register: register.map(|r| RegisterValue { changed: c, ..r }),
+                    conn_alive,
+                },
+            },
+            Err(e) => BodyResult::Failed {
+                reason: format!("changed_when: {e:#}"),
+                register: body_register,
+                conn_alive: true,
+            },
+        }
+    } else {
+        result
+    }
+}
+
 fn resolve_loop_items(
     env: &Environment<'static>,
     spec: Option<&LoopSpec>,
@@ -11004,6 +11162,170 @@ all:
                 );
             }
             other => panic!("expected Ok {{ skipped: true }}, got {other:?}"),
+        }
+    }
+
+    // ---------- changed_when: / failed_when: matrix ----------
+    //
+    // These tests pin the override contract documented on
+    // `apply_changed_failed_when`. They use controller-side bodies
+    // (`set_fact`, `assert_true`, `fail`) so the mock pool's dead
+    // handle is never touched.
+
+    /// Regression for the gothab `ssh-keyscan` task: `shell:` /
+    /// `command:` bodies report `changed=true` naturally because the
+    /// agent ran them, but the playbook puts `changed_when: false`
+    /// to tag the call as diagnostic. Pre-fix, rsansible parsed the
+    /// field but the executor never read it, so back-to-back drills
+    /// always reported the task changed. Now `changed_when: false`
+    /// must rewrite the outer outcome AND the register's `changed`
+    /// flag to false.
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_when_false_clears_outer_and_register_changed() {
+        let mut t = set_fact("note", "x", "1");
+        t.register = Some("r".into());
+        t.changed_when = Some("false".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { changed, .. } => assert!(
+                !*changed,
+                "changed_when: false must override the body's natural changed=true"
+            ),
+            other => panic!("expected Ok with changed=false, got {other:?}"),
+        }
+        let rv = r.ctx.registers.get("r").expect("register recorded");
+        assert!(
+            !rv.changed,
+            "register.changed must match the post-override outcome"
+        );
+    }
+
+    /// `changed_when:` accepts a Jinja expression referencing the
+    /// body's result fields at the top level (e.g. `rc != 0`),
+    /// matching Ansible's implicit-register exposure inside this
+    /// clause. No `register:` setup required.
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_when_can_reference_body_fields_without_register() {
+        // assert_true body produces Ok with changed=false, rc=0
+        // (the synthetic register's default). `rc == 0` evaluates
+        // truthy → changed becomes true.
+        let mut t = assert_true("synth");
+        t.changed_when = Some("rc == 0".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { changed, .. } => assert!(
+                *changed,
+                "changed_when must see register fields at the top level"
+            ),
+            other => panic!("expected Ok with changed=true, got {other:?}"),
+        }
+    }
+
+    /// `failed_when: false` on a body that natively failed must
+    /// promote the outcome to Ok (rescue-style). Used when the
+    /// playbook author knows a non-zero rc isn't actually a
+    /// failure for their use case.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_when_false_promotes_failed_to_ok() {
+        let mut t = fail_task("intentional", "boom");
+        t.failed_when = Some("false".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { .. } => {}
+            other => panic!("expected Ok (failed_when:false rescues), got {other:?}"),
+        }
+    }
+
+    /// `failed_when: true` on a body that succeeded must demote
+    /// to Failed. Used when a body returns 0 but the playbook
+    /// author wants stricter pass criteria (e.g.
+    /// `failed_when: "'error' in stdout"`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_when_true_demotes_ok_to_failed() {
+        let mut t = set_fact("would-be-ok", "x", "1");
+        t.failed_when = Some("true".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Failed { reason, .. } => {
+                assert!(
+                    reason.contains("failed_when"),
+                    "reason should name failed_when: {reason}"
+                );
+            }
+            other => panic!("expected Failed (failed_when:true), got {other:?}"),
+        }
+    }
+
+    /// Order is failed_when then changed_when: a body that
+    /// failed_when:false rescues, then changed_when:false marks
+    /// not-changed. The final outcome is Ok+unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_when_then_changed_when_compose() {
+        let mut t = fail_task("intentional", "noise");
+        t.failed_when = Some("false".into());
+        t.changed_when = Some("false".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { changed, .. } => assert!(
+                !*changed,
+                "changed_when:false after failed_when:false should yield unchanged Ok"
+            ),
+            other => panic!("expected Ok unchanged, got {other:?}"),
+        }
+    }
+
+    /// Render errors in `changed_when:` / `failed_when:` surface
+    /// as a Failed outcome with a prefixed reason, matching the
+    /// shape that `when:` / `until:` use.
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_when_render_error_fails_task_with_named_reason() {
+        let mut t = set_fact("would-be-ok", "x", "1");
+        t.changed_when = Some("this is { not jinja".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Failed { reason, .. } => {
+                assert!(
+                    reason.starts_with("changed_when:"),
+                    "reason should be tagged: {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Per-iteration `changed_when:` in a `loop:` — the override
+    /// applies to every iteration's register (via the
+    /// run_body_with_retries integration point inside the loop
+    /// body in run_task_on_one_host). All `results[*].changed`
+    /// must reflect the override. This is the shape that
+    /// gothab's ssh-keyscan task uses (loop + changed_when: false).
+    #[tokio::test(flavor = "current_thread")]
+    async fn loop_changed_when_applies_per_iteration() {
+        let mut t = set_fact("each", "x", "1");
+        t.register = Some("agg".into());
+        t.changed_when = Some("false".into());
+        t.loop_spec = Some(LoopSpec::Items(vec![
+            serde_yaml::Value::String("a".into()),
+            serde_yaml::Value::String("b".into()),
+            serde_yaml::Value::String("c".into()),
+        ]));
+        let r = drive(&t).await;
+        // Aggregate outcome: nothing changed.
+        match &r.outcome {
+            HostTaskOutcome::Ok { changed, .. } => assert!(
+                !*changed,
+                "loop aggregate must report changed=false when every iteration's changed_when:false"
+            ),
+            other => panic!("expected Ok unchanged, got {other:?}"),
+        }
+        let agg = r.ctx.registers.get("agg").expect("register recorded");
+        let results = agg.results.as_ref().expect("loop produces results array");
+        assert_eq!(results.len(), 3);
+        for (i, rv) in results.iter().enumerate() {
+            assert!(
+                !rv.changed,
+                "iteration {i}'s register.changed must reflect changed_when:false"
+            );
         }
     }
 
