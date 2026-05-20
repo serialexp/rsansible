@@ -78,7 +78,7 @@ pub fn should_probe_first(cost: &WireCost, size_bytes: usize) -> bool {
 
 /// Hard override of the heuristic, plumbed in from the `--wire-strategy`
 /// CLI flag. `Auto` defers to `should_probe_first`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum WireStrategy {
     #[default]
     Auto,

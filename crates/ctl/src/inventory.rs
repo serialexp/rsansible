@@ -43,7 +43,12 @@ use crate::exec_ctx::yaml_to_json;
 use crate::vault;
 
 /// Fully-parsed inventory.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` is implemented so forward mode can ship the
+/// laptop-resolved inventory (including secrets read from a
+/// `vault.yml` that's been excluded from the workspace tarball) to
+/// the forwarder without re-reading it there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Inventory {
     /// Every host that appears anywhere in the tree, with its connection
     /// coordinates pre-resolved (host/port/user/key_path) plus the raw
@@ -64,7 +69,7 @@ pub struct Inventory {
 /// connection coordinates lifted out of the inline mapping; everything
 /// else (other than `ansible_ssh_private_key_file` and the four above)
 /// lands in `inline_vars` so it participates in the precedence chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Host {
     pub host: String,
     pub port: u16,
@@ -80,7 +85,7 @@ pub struct Host {
 
 /// Companion to [`Inventory`] holding the on-disk var files. Indexed by
 /// group/host name; absent groups/hosts simply don't have entries.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InventoryVars {
     pub group_vars: BTreeMap<String, BTreeMap<String, JsonValue>>,
     pub host_vars: BTreeMap<String, BTreeMap<String, JsonValue>>,

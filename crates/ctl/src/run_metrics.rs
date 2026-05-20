@@ -101,7 +101,7 @@ impl RunMetrics {
 }
 
 /// Plain-old-data snapshot of `RunMetrics` for inclusion in `RunReport`.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RunMetricsSnapshot {
     pub op_count: u64,
     pub agent_ns_total: u64,

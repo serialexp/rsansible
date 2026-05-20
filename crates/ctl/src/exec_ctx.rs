@@ -123,6 +123,12 @@ pub struct HostCtx {
     /// can stand on its own in tests; production seeds every host's
     /// ctx with the run-level shared instance at run startup.
     pub run_metrics: Arc<RunMetrics>,
+    /// Run-shared phase timing aggregator. Same Arc-everywhere pattern
+    /// as `run_metrics`, but captures controller-side overhead that
+    /// the agent-dispatch window doesn't (template renders, become
+    /// resolves, hostvars merges, …). See `crate::timing` for
+    /// rationale.
+    pub timing: Arc<crate::timing::TaskTimingAggregator>,
 }
 
 impl HostCtx {
@@ -147,6 +153,7 @@ impl HostCtx {
             ansible_failed_task: None,
             ansible_failed_result: None,
             run_metrics: Arc::new(RunMetrics::default()),
+            timing: crate::timing::TaskTimingAggregator::new(),
         }
     }
 
@@ -338,7 +345,7 @@ impl RegisterValue {
 /// exposes `{{ hostvars[h].something }}`. Both are computed once at
 /// orchestrator startup and shared via `Arc` since every host sees the
 /// same content.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct WorldVars {
     pub groups: BTreeMap<String, Vec<String>>,
     /// Each host's resolved inventory_vars view (precedence steps 1..=4).
@@ -353,11 +360,110 @@ pub struct WorldVars {
     /// Surfaced to templates as `{{ inventory_dir }}`. Same caveats as
     /// `playbook_dir`.
     pub inventory_dir: Option<String>,
+    /// Memoized `JsonValue::Object` form of `groups`. Built lazily on
+    /// first access by `build_template_ctx` so per-call rendering
+    /// doesn't re-materialize the map. Safe to share across hosts:
+    /// `groups` is a function of the inventory and never mutates
+    /// after `WorldVars` is constructed.
+    cached_groups_json: std::sync::OnceLock<JsonValue>,
+    /// Memoized `JsonValue::Object` form of `hostvars`. Same caveat
+    /// as `cached_groups_json` — the dynamic hostvars overlay
+    /// (registers / set_facts / facts) is layered in by
+    /// `merge_dynamic_hostvars`, which produces a fresh `WorldVars`
+    /// each task barrier; within one task barrier this cache is
+    /// stable. Saves the deep iter+clone of every host's vars on
+    /// every render_op call.
+    cached_hostvars_json: std::sync::OnceLock<JsonValue>,
 }
 
 impl WorldVars {
     pub fn empty() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Construct a `WorldVars` from its public components. The cached
+    /// JSON forms are initialized empty and built lazily on first
+    /// access. Use this in place of the struct literal — the cache
+    /// fields are intentionally private so callers can't accidentally
+    /// hand-feed stale memoization.
+    pub fn new(
+        groups: BTreeMap<String, Vec<String>>,
+        hostvars: BTreeMap<String, BTreeMap<String, JsonValue>>,
+        playbook_dir: Option<String>,
+        inventory_dir: Option<String>,
+    ) -> Self {
+        Self {
+            groups,
+            hostvars,
+            playbook_dir,
+            inventory_dir,
+            cached_groups_json: std::sync::OnceLock::new(),
+            cached_hostvars_json: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Materialize `groups` as a `JsonValue::Object` once and cache.
+    /// Returns `None` if `groups` is empty (the caller skips inserting
+    /// the key in that case).
+    pub(crate) fn groups_json(&self) -> Option<&JsonValue> {
+        if self.groups.is_empty() {
+            return None;
+        }
+        Some(self.cached_groups_json.get_or_init(|| {
+            let map: serde_json::Map<String, JsonValue> = self
+                .groups
+                .iter()
+                .map(|(g, hs)| {
+                    (
+                        g.clone(),
+                        JsonValue::Array(
+                            hs.iter().cloned().map(JsonValue::String).collect(),
+                        ),
+                    )
+                })
+                .collect();
+            JsonValue::Object(map)
+        }))
+    }
+
+    /// Materialize `hostvars` as a `JsonValue::Object` once and cache.
+    pub(crate) fn hostvars_json(&self) -> Option<&JsonValue> {
+        if self.hostvars.is_empty() {
+            return None;
+        }
+        Some(self.cached_hostvars_json.get_or_init(|| {
+            let map: serde_json::Map<String, JsonValue> = self
+                .hostvars
+                .iter()
+                .map(|(h, vars)| {
+                    let obj: serde_json::Map<String, JsonValue> = vars
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    (h.clone(), JsonValue::Object(obj))
+                })
+                .collect();
+            JsonValue::Object(map)
+        }))
+    }
+}
+
+// Manual `Clone` because `OnceLock` is not `Clone`. The cached JSON
+// forms are intentionally NOT copied — the clone starts fresh and
+// rebuilds on first access. This is the right semantics: a cloned
+// `WorldVars` is almost always a per-task derivative (see
+// `merge_dynamic_hostvars`) where the hostvars overlay differs from
+// the source, so reusing the cache would serve stale data.
+impl Clone for WorldVars {
+    fn clone(&self) -> Self {
+        Self {
+            groups: self.groups.clone(),
+            hostvars: self.hostvars.clone(),
+            playbook_dir: self.playbook_dir.clone(),
+            inventory_dir: self.inventory_dir.clone(),
+            cached_groups_json: std::sync::OnceLock::new(),
+            cached_hostvars_json: std::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -409,33 +515,19 @@ pub fn build_template_ctx(
         "inventory_hostname".into(),
         JsonValue::String(ctx.host_name.clone()),
     );
-    // World-scoped lookups.
-    if !world.groups.is_empty() {
-        let groups_json: serde_json::Map<String, JsonValue> = world
-            .groups
-            .iter()
-            .map(|(g, hs)| {
-                (
-                    g.clone(),
-                    JsonValue::Array(hs.iter().cloned().map(JsonValue::String).collect()),
-                )
-            })
-            .collect();
-        out.insert("groups".into(), JsonValue::Object(groups_json));
+    // World-scoped lookups. The JsonValue forms of `groups` and
+    // `hostvars` are memoized on `WorldVars` so we pay the materialize
+    // cost once per WorldVars lifetime, not once per render_op call.
+    // The clone here is the irreducible part — `serde_json::Map` doesn't
+    // do COW, so handing the map to minijinja requires owning the
+    // outer value. We're still saving the iter-and-rebuild step, which
+    // was dominant for large inventories. Lazy-lookup (item 3 in the
+    // perf todo list) would eliminate the clone entirely.
+    if let Some(gj) = world.groups_json() {
+        out.insert("groups".into(), gj.clone());
     }
-    if !world.hostvars.is_empty() {
-        let hv_json: serde_json::Map<String, JsonValue> = world
-            .hostvars
-            .iter()
-            .map(|(h, vars)| {
-                let obj: serde_json::Map<String, JsonValue> = vars
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                (h.clone(), JsonValue::Object(obj))
-            })
-            .collect();
-        out.insert("hostvars".into(), JsonValue::Object(hv_json));
+    if let Some(hj) = world.hostvars_json() {
+        out.insert("hostvars".into(), hj.clone());
     }
     if let Some(dir) = &world.playbook_dir {
         out.insert("playbook_dir".into(), JsonValue::String(dir.clone()));

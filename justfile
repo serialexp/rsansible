@@ -36,6 +36,16 @@ build-agent-musl:
     cargo build -p rsansible-agent --profile agent --target x86_64-unknown-linux-musl
     @ls -lh target/x86_64-unknown-linux-musl/agent/rsansible-agent
 
+# Build the controller for x86_64 Linux musl, release.
+#
+# Used by forward mode: argv[0] is shipped over SSH to the forwarder, so
+# the local binary must be musl-static + Linux x86_64 to be portable to
+# the remote. Same binary serves local + remote roles (subcommands
+# `remote-run`, `local-agent`).
+build-ctl-musl:
+    cargo build -p rsansible-ctl --release --target x86_64-unknown-linux-musl
+    @ls -lh target/x86_64-unknown-linux-musl/release/rsansible
+
 # Record the agent binary's stripped size at the current HEAD into
 # agent-size-history.tsv. No-op if HEAD's short SHA is already there.
 size:

@@ -69,7 +69,7 @@ const DEFAULT_MAX_CONCURRENT_HOSTS: usize = 50;
 const MAX_CAPTURED_BYTES: usize = 1024 * 1024;
 
 /// Why a particular host ended up in this state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HostOutcome {
     /// Every task targeted at this host completed (or was skipped) without
     /// a failure.
@@ -138,6 +138,33 @@ pub struct RunSpec {
     /// Absolute path to the directory containing the inventory source file.
     /// Surfaced to templates as `{{ inventory_dir }}`.
     pub inventory_dir: Option<String>,
+    /// Forward-mode context. `None` for normal runs (laptop-driven).
+    /// `Some` for `remote-run` invocations on a forwarder, in which case:
+    ///   * the host name equal to `forwarder_hostname` (if it's in the
+    ///     target set) is connected via `Local` regardless of its
+    ///     `connection:` setting — we ARE that host, an SSH-to-self is
+    ///     silly;
+    ///   * hosts with `ConnMode::Local` use the back-channel pool
+    ///     (unix socket at `back_channel_socket`) rather than spawning
+    ///     a local agent subprocess. `connection: local` MUST mean
+    ///     "the operator's laptop" even when the controller is on a
+    ///     remote forwarder (design decision #4).
+    pub forward_mode: Option<ForwardModeContext>,
+}
+
+/// Forward-mode wiring passed into [`run`] by `remote-run` on the
+/// forwarder. See the field-level doc on [`RunSpec::forward_mode`].
+#[derive(Debug, Clone)]
+pub struct ForwardModeContext {
+    /// The inventory hostname of THIS machine (the forwarder). Used to
+    /// auto-promote self-targets to `Local` and to recognize when
+    /// `connection: local` would dispatch to the forwarder vs. should
+    /// flip to the back-channel.
+    pub forwarder_hostname: String,
+    /// Filesystem path of the unix socket on THIS machine whose other
+    /// end (via SSH `-R`) is the operator's laptop. `ConnMode::Local`
+    /// hosts that aren't the forwarder itself dispatch over this socket.
+    pub back_channel_socket: std::path::PathBuf,
 }
 
 impl RunSpec {
@@ -156,12 +183,13 @@ impl RunSpec {
             check_mode: false,
             playbook_dir: None,
             inventory_dir: None,
+            forward_mode: None,
         }
     }
 }
 
 /// The final outcome of a run.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct RunReport {
     pub host_outcomes: BTreeMap<String, HostOutcome>,
     pub stopped_early: bool,
@@ -184,6 +212,15 @@ pub struct RunReport {
     /// the default for tests / paths that never dispatched a wire op.
     /// See `crate::run_metrics` for what each field measures.
     pub timing: crate::run_metrics::RunMetricsSnapshot,
+    /// End-of-run snapshot of the per-phase orchestrator timing
+    /// aggregator. Where `timing` measures the agent-dispatch window
+    /// (open-channel → response), `timing_breakdown` attributes the
+    /// controller-side phases AROUND that window — render `when:`,
+    /// resolve become / delegate_to, merge hostvars, apply per-host
+    /// result. See `crate::timing` for what each field measures and
+    /// for the rationale behind keeping it separate from `timing`.
+    #[serde(default)]
+    pub timing_breakdown: crate::timing::TimingBreakdown,
 }
 
 impl RunReport {
@@ -208,6 +245,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         check_mode,
         playbook_dir,
         inventory_dir,
+        forward_mode,
     } = spec;
     // Plumbed through to per-task dispatch so privkey (and any future
     // composite-dispatch op) can override the auto heuristic. Cheap to
@@ -295,7 +333,17 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         let bin = agent_binary.clone();
         let sem = semaphore.clone();
         let name_owned = name.clone();
-        let mode = *conn_modes.get(name).unwrap_or(&ConnMode::Ssh);
+        let mut mode = *conn_modes.get(name).unwrap_or(&ConnMode::Ssh);
+        // Forward-mode promotion: the host that IS the forwarder
+        // never dials itself over SSH. Auto-promote to Local even if
+        // inventory marks it as `connection: ssh`. See
+        // `RunSpec::forward_mode` docstring.
+        if let Some(fm) = &forward_mode {
+            if name_owned == fm.forwarder_hostname {
+                mode = ConnMode::Local;
+            }
+        }
+        let fm = forward_mode.clone();
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore not closed");
             let r = match mode {
@@ -305,11 +353,39 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                         .await
                         .with_context(|| format!("connecting to {name_owned}"))
                 }
-                ConnMode::Local => AgentPool::open_local(name_owned.clone(), &bin)
-                    .await
-                    .with_context(|| {
-                        format!("spawning local agent for {name_owned}")
-                    }),
+                ConnMode::Local => {
+                    // In forward mode, `connection: local` for any host
+                    // that's NOT the forwarder itself dispatches over
+                    // the back-channel to the laptop. The forwarder-self
+                    // case was already promoted to Local above and
+                    // takes the open_local path below.
+                    if let Some(fm) = fm.as_ref() {
+                        if name_owned != fm.forwarder_hostname {
+                            AgentPool::open_back_channel(
+                                name_owned.clone(),
+                                fm.back_channel_socket.clone(),
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "opening back-channel to laptop for {name_owned}"
+                                )
+                            })
+                        } else {
+                            AgentPool::open_local(name_owned.clone(), &bin)
+                                .await
+                                .with_context(|| {
+                                    format!("spawning local agent for {name_owned}")
+                                })
+                        }
+                    } else {
+                        AgentPool::open_local(name_owned.clone(), &bin)
+                            .await
+                            .with_context(|| {
+                                format!("spawning local agent for {name_owned}")
+                            })
+                    }
+                }
             };
             (name_owned, r)
         });
@@ -352,6 +428,13 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // every per-host ctx so per-host walkers can record without
     // synchronizing. Snapshotted into `RunReport` at end-of-run.
     let run_metrics = Arc::new(crate::run_metrics::RunMetrics::default());
+    // Run-shared phase-level timing aggregator. Captures the
+    // orchestrator-side overhead AROUND the agent-dispatch window
+    // (`run_metrics` already measures the window itself). Cloned into
+    // every per-host ctx so per-task walkers can record without
+    // synchronizing. Snapshotted into `RunReport.timing_breakdown`
+    // at end-of-run.
+    let timing_agg = crate::timing::TaskTimingAggregator::new();
 
     // Build per-host execution contexts. Lives across the whole run so
     // set_facts and registers persist across plays (Ansible-faithful).
@@ -389,6 +472,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         // per-host setup needed; updates inside dispatch are
         // atomic-only.
         ctx.run_metrics = run_metrics.clone();
+        ctx.timing = timing_agg.clone();
         ctxs.insert(name.clone(), ctx);
     }
 
@@ -403,6 +487,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         // every per-host walker has joined. Zero here is a sentinel,
         // not a measurement.
         timing: crate::run_metrics::RunMetricsSnapshot::default(),
+        timing_breakdown: crate::timing::TimingBreakdown::default(),
     };
 
     let next_seq = Arc::new(AtomicU32::new(1));
@@ -526,6 +611,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // walker has joined. Reads are Relaxed but there is no more
     // concurrent write — the strategy futures are all awaited above.
     report.timing = run_metrics.snapshot();
+    report.timing_breakdown = timing_agg.summary();
 
     Ok(report)
 }
@@ -625,12 +711,7 @@ fn build_world_vars(inv: &Inventory, vars: &InventoryVars) -> WorldVars {
         }
         hostvars.insert(name.clone(), view);
     }
-    WorldVars {
-        groups: inv.groups.clone(),
-        hostvars,
-        playbook_dir: None,
-        inventory_dir: None,
-    }
+    WorldVars::new(inv.groups.clone(), hostvars, None, None)
 }
 
 /// Clear any prior play's `role_defaults` from each host's ctx and seed
@@ -664,12 +745,12 @@ fn build_world_vars_for_play(base: &WorldVars, play: &Play) -> WorldVars {
             view.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
-    WorldVars {
-        groups: base.groups.clone(),
+    WorldVars::new(
+        base.groups.clone(),
         hostvars,
-        playbook_dir: base.playbook_dir.clone(),
-        inventory_dir: base.inventory_dir.clone(),
-    }
+        base.playbook_dir.clone(),
+        base.inventory_dir.clone(),
+    )
 }
 
 /// Rebuild `world.hostvars` overlaying each host's **dynamic** state
@@ -738,12 +819,12 @@ fn merge_dynamic_hostvars(
             JsonValue::String(ctx.host_name.clone()),
         );
     }
-    WorldVars {
-        groups: base.groups.clone(),
+    WorldVars::new(
+        base.groups.clone(),
         hostvars,
-        playbook_dir: base.playbook_dir.clone(),
-        inventory_dir: base.inventory_dir.clone(),
-    }
+        base.playbook_dir.clone(),
+        base.inventory_dir.clone(),
+    )
 }
 
 /// Per-walker hostvars snapshot for the `per_play` strategy.
@@ -807,12 +888,12 @@ async fn merge_dynamic_hostvars_locked(
             overlay(&*guard, view);
         }
     }
-    WorldVars {
-        groups: base.groups.clone(),
+    WorldVars::new(
+        base.groups.clone(),
         hostvars,
-        playbook_dir: base.playbook_dir.clone(),
-        inventory_dir: base.inventory_dir.clone(),
-    }
+        base.playbook_dir.clone(),
+        base.inventory_dir.clone(),
+    )
 }
 
 /// Render `play.vars` against each host's (role_defaults ∪ inventory_vars
@@ -1076,13 +1157,30 @@ async fn run_play_per_task(
     world: &Arc<WorldVars>,
     tag_filter: &Arc<crate::tags::TagFilter>,
 ) -> Result<bool> {
+    // Pull the run-shared timing aggregator off any ctx (all share the
+    // same Arc). If we have no live ctxs yet (very small playbooks),
+    // fall back to a fresh aggregator — it just becomes garbage at
+    // end-of-play.
+    let timing = ctxs
+        .values()
+        .next()
+        .map(|c| c.timing.clone())
+        .unwrap_or_else(crate::timing::TaskTimingAggregator::new);
+
     for task in &play.tasks {
+        // Per-task barrier instrumentation. The existing RunMetrics
+        // covers the agent-dispatch window (open-channel→response);
+        // this captures phases AROUND it: hostvars merge, render `when`,
+        // resolve become/delegate_to, fanout setup, apply_per_host_result.
         // Refresh `world.hostvars` from every host's current state
         // BEFORE this task fans out. Any registers / set_facts / facts
         // a prior task established are now visible cross-host via
         // `{{ hostvars[<peer>].… }}`. See `merge_dynamic_hostvars` for
         // precedence + rationale.
+        let t_merge = Instant::now();
         let world = Arc::new(merge_dynamic_hostvars(world, ctxs));
+        timing.add(&timing.merge_hostvars_ns, t_merge.elapsed());
+        timing.incr(&timing.task_barrier_count);
 
         // `meta: flush_handlers` is not dispatched to hosts — it's a
         // control-flow marker that drains the per-host pending queue.
@@ -1119,6 +1217,9 @@ async fn run_play_per_task(
             break;
         }
 
+        timing
+            .host_task_count
+            .fetch_add(live.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let any_failed = if task.run_once {
             run_task_once_per_task(task, &live, pools, ctxs, report, next_seq, env, &world, play)
                 .await?
@@ -1149,6 +1250,15 @@ async fn run_task_fanout(
     world: &Arc<WorldVars>,
     play: &Play,
 ) -> Result<bool> {
+    // Pull the run-shared aggregator off any live ctx (all share). If
+    // ctxs is empty by the time we're here, the caller is broken —
+    // but defensively fall back to a fresh agg rather than panic.
+    let timing = ctxs
+        .values()
+        .next()
+        .map(|c| c.timing.clone())
+        .unwrap_or_else(crate::timing::TaskTimingAggregator::new);
+    let t_setup = Instant::now();
     let mut set: JoinSet<PerHostTaskResult> = JoinSet::new();
     // Allocate a per-fanout coord covering this task's subtree. For
     // leaf tasks the coord has one slot (unused). For block tasks the
@@ -1194,10 +1304,13 @@ async fn run_task_fanout(
             .await
         });
     }
+    timing.add(&timing.fanout_setup_ns, t_setup.elapsed());
     let mut any_failed = false;
     while let Some(joined) = set.join_next().await {
         let r = joined.context("per-host task panicked")?;
+        let t_apply = Instant::now();
         let host_failed = apply_per_host_result(play, task, r, pools, ctxs, report).await;
+        timing.add(&timing.apply_per_host_result_ns, t_apply.elapsed());
         any_failed = any_failed || host_failed;
     }
     Ok(any_failed)
@@ -1650,6 +1763,7 @@ async fn run_task_on_one_host(
     is_runner: bool,
 ) -> PerHostTaskResult {
     let name = ctx.host_name.clone();
+    let timing = ctx.timing.clone();
 
     // Task-scoped `vars:` come into effect *before* anything else
     // (including `when:`). Each entry is rendered in BTreeMap order
@@ -1659,6 +1773,7 @@ async fn run_task_on_one_host(
     // same constraint that play.vars already lives with). Clears
     // any prior task's slot so vars never bleed across tasks.
     ctx.task_vars.clear();
+    let t_task_vars = Instant::now();
     if !task.vars.is_empty() {
         if let Err(e) = apply_task_vars(&task.vars, &mut ctx, &env, &world) {
             return PerHostTaskResult {
@@ -1673,10 +1788,16 @@ async fn run_task_on_one_host(
         }
     }
 
+    timing.add(&timing.task_vars_ns, t_task_vars.elapsed());
+
     // when: evaluation — bypasses everything else if false.
-    match eval_when(&env, task.when.as_deref(), &ctx, &world) {
+    let t_when = Instant::now();
+    let when_result = eval_when(&env, task.when.as_deref(), &ctx, &world);
+    timing.add(&timing.eval_when_ns, t_when.elapsed());
+    match when_result {
         Ok(true) => {}
         Ok(false) => {
+            timing.incr(&timing.when_false_count);
             if let Some(reg) = &task.register {
                 ctx.record_register(reg, RegisterValue::skipped_marker());
             }
@@ -1729,7 +1850,10 @@ async fn run_task_on_one_host(
     }
 
     // Resolve loop items (None → run once with no iter_item).
-    let items: Vec<JsonValue> = match resolve_loop_items(&env, task.loop_spec.as_ref(), &ctx, &world) {
+    let t_loop = Instant::now();
+    let loop_items_result = resolve_loop_items(&env, task.loop_spec.as_ref(), &ctx, &world);
+    timing.add(&timing.resolve_loop_items_ns, t_loop.elapsed());
+    let items: Vec<JsonValue> = match loop_items_result {
         Ok(items) => items,
         Err(e) => {
             return PerHostTaskResult {
@@ -1763,6 +1887,7 @@ async fn run_task_on_one_host(
     macro_rules! resolve_target {
         ($ctx:expr) => {{
             let ctx_ref: &HostCtx = $ctx;
+            let t_resolve = Instant::now();
             let res: Result<ConnHandle, String> = async {
                 let eff = become_::effective(task, ctx_ref, &env, &world)
                     .map_err(|e| format!("become resolve: {e:#}"))?;
@@ -1784,6 +1909,7 @@ async fn run_task_on_one_host(
                     .map_err(|e| format!("spawn agent for {}: {e:#}", key.label()))
             }
             .await;
+            timing.add(&timing.resolve_target_ns, t_resolve.elapsed());
             res
         }};
     }
@@ -1803,14 +1929,19 @@ async fn run_task_on_one_host(
                 };
             }
         };
+        let t_body = Instant::now();
         let exec =
             run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
+        timing.add(&timing.body_dispatch_ns, t_body.elapsed());
+        timing.incr(&timing.body_dispatch_count);
         let outcome = match exec {
             BodyResult::Ok { register, changed, skipped } => {
                 if let Some(reg_name) = &task.register {
                     ctx.record_register(reg_name, register);
                 }
+                let t_notify = Instant::now();
                 enqueue_notifies(task, changed, false, &mut ctx, &env, &world);
+                timing.add(&timing.notify_enqueue_ns, t_notify.elapsed());
                 HostTaskOutcome::Ok { changed, skipped }
             }
             BodyResult::Failed { reason, register, conn_alive } => {
@@ -1873,8 +2004,11 @@ async fn run_task_on_one_host(
                 continue;
             }
         };
+        let t_body = Instant::now();
         let exec =
             run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
+        timing.add(&timing.body_dispatch_ns, t_body.elapsed());
+        timing.incr(&timing.body_dispatch_count);
         match exec {
             BodyResult::Ok { register, changed: _, skipped: _ } => {
                 iter_registers.push(register);
@@ -1911,7 +2045,9 @@ async fn run_task_on_one_host(
     }
     let outcome = match any_failed {
         None => {
+            let t_notify = Instant::now();
             enqueue_notifies(task, any_changed, false, &mut ctx, &env, &world);
+            timing.add(&timing.notify_enqueue_ns, t_notify.elapsed());
             HostTaskOutcome::Ok { changed: any_changed, skipped: all_skipped }
         }
         Some(reason) => {
@@ -2969,9 +3105,12 @@ async fn run_op_body(
     world: &WorldVars,
     next_seq: &Arc<AtomicU32>,
 ) -> BodyResult {
+    let timing = ctx.timing.clone();
+    let t_render = Instant::now();
     let mut rendered = match render_op(op, ctx, env, world) {
         Ok(r) => r,
         Err(e) => {
+            timing.add(&timing.render_op_ns, t_render.elapsed());
             return BodyResult::Failed {
                 reason: format!("template render: {e:#}"),
                 register: None,
@@ -2979,6 +3118,7 @@ async fn run_op_body(
             };
         }
     };
+    timing.add(&timing.render_op_ns, t_render.elapsed());
 
     // `command:` / `shell:` idempotency probes — `creates:` / `removes:`.
     // If either marker is set, stat the path on the agent first and
@@ -3267,6 +3407,7 @@ async fn run_op_body(
     // Effective per-task check_mode: task field wins both directions,
     // otherwise inherit the run-level flag.
     let check_mode = task.check_mode.unwrap_or(ctx.check_mode);
+    let t_wire = Instant::now();
     let mut result = run_one_task_op(
         conn,
         seq,
@@ -3277,6 +3418,7 @@ async fn run_op_body(
         &ctx.run_metrics,
     )
     .await;
+    timing.add(&timing.wire_dispatch_ns, t_wire.elapsed());
 
     // Async poll loop: when `async: N, poll: M (M>0)`, the orchestrator
     // blocks on the same connection, dispatching OpAsyncStatus every M
@@ -5838,10 +5980,21 @@ fn render_op(
     env: &Environment<'static>,
     world: &WorldVars,
 ) -> Result<TaskOp> {
+    // Build the view ONCE per task body, resolve var-of-var templates
+    // ONCE, then render every per-field expression against the resolved
+    // view. Previously each `render_str` re-ran the resolve fixpoint
+    // (which itself clones the view twice), so a task with N templated
+    // fields paid 2N+ deep BTreeMap clones for behavior that's
+    // identical across all N renders. The fixpoint output only depends
+    // on the view contents, not on the template being rendered, so one
+    // pass at the top is sufficient. See the `render_op_ns` /
+    // `wire_dispatch_ns` split in `crates/ctl/src/timing.rs` and the
+    // perf write-up.
     let view = build_template_ctx(ctx, world);
+    let view = resolve_view_var_templates(env, &view)?;
     Ok(match op {
         TaskOp::Shell(s) => {
-            let cmd = render_str(env, s.command(), &view)?;
+            let cmd = render_str_resolved(env, s.command(), &view)?;
             TaskOp::Shell(match s {
                 ShellOp::Simple(_) => ShellOp::Simple(cmd),
                 ShellOp::Detailed { timeout_ms, .. } => ShellOp::Detailed {
@@ -5854,17 +6007,17 @@ fn render_op(
             let argv = e
                 .argv
                 .iter()
-                .map(|a| render_str(env, a, &view))
+                .map(|a| render_str_resolved(env, a, &view))
                 .collect::<Result<Vec<_>>>()?;
             let mut env_out = std::collections::BTreeMap::new();
             for (k, v) in &e.env {
-                env_out.insert(k.clone(), render_str(env, v, &view)?);
+                env_out.insert(k.clone(), render_str_resolved(env, v, &view)?);
             }
             let cwd = match &e.cwd {
-                Some(c) => Some(render_str(env, c, &view)?),
+                Some(c) => Some(render_str_resolved(env, c, &view)?),
                 None => None,
             };
-            let stdin = render_str(env, &e.stdin, &view)?;
+            let stdin = render_str_resolved(env, &e.stdin, &view)?;
             TaskOp::Exec(ExecOp {
                 argv,
                 env: env_out,
@@ -5880,7 +6033,7 @@ fn render_op(
             // argv-list form keeps per-element rendering since the user
             // explicitly told us how to slice it.
             let argv = if let Some(raw) = c.raw_cmd.as_deref() {
-                let rendered = render_str(env, raw, &view)?;
+                let rendered = render_str_resolved(env, raw, &view)?;
                 let v = shlex::split(&rendered).ok_or_else(|| {
                     anyhow!(
                         "command.cmd: shlex parse failed on rendered command \
@@ -5896,13 +6049,13 @@ fn render_op(
             } else {
                 c.argv
                     .iter()
-                    .map(|a| render_str(env, a, &view))
+                    .map(|a| render_str_resolved(env, a, &view))
                     .collect::<Result<Vec<_>>>()?
             };
-            let chdir = render_str(env, &c.chdir, &view)?;
-            let creates = render_str(env, &c.creates, &view)?;
-            let removes = render_str(env, &c.removes, &view)?;
-            let stdin = render_str(env, &c.stdin, &view)?;
+            let chdir = render_str_resolved(env, &c.chdir, &view)?;
+            let creates = render_str_resolved(env, &c.creates, &view)?;
+            let removes = render_str_resolved(env, &c.removes, &view)?;
+            let stdin = render_str_resolved(env, &c.stdin, &view)?;
             TaskOp::Command(crate::playbook::CommandOp {
                 argv,
                 // raw_cmd was the *source* for the rendered argv above;
@@ -5916,23 +6069,23 @@ fn render_op(
             })
         }
         TaskOp::WriteFile(w) => {
-            let path = render_str(env, &w.path, &view)?;
-            let content = render_str(env, &w.content, &view)?;
+            let path = render_str_resolved(env, &w.path, &view)?;
+            let content = render_str_resolved(env, &w.content, &view)?;
             let validate = match &w.validate {
-                Some(v) => Some(render_str(env, v, &view)?),
+                Some(v) => Some(render_str_resolved(env, v, &view)?),
                 None => None,
             };
             let owner = match &w.owner {
-                Some(s) => Some(render_str(env, s, &view)?),
+                Some(s) => Some(render_str_resolved(env, s, &view)?),
                 None => None,
             };
             let group = match &w.group {
-                Some(s) => Some(render_str(env, s, &view)?),
+                Some(s) => Some(render_str_resolved(env, s, &view)?),
                 None => None,
             };
             TaskOp::WriteFile(WriteFileOp {
                 path,
-                mode: resolve_mode(env, &w.mode, &view)?,
+                mode: resolve_mode_resolved(env, &w.mode, &view)?,
                 content,
                 validate,
                 owner,
@@ -5949,7 +6102,7 @@ fn render_op(
             let body_ref: &str = if let Some(b) = t.body.as_deref() {
                 b
             } else {
-                let rendered_src = render_str(env, &t.src, &view)?;
+                let rendered_src = render_str_resolved(env, &t.src, &view)?;
                 let p = std::path::PathBuf::from(&rendered_src);
                 let mut located: Option<std::path::PathBuf> = None;
                 if p.is_absolute() {
@@ -5990,7 +6143,7 @@ fn render_op(
                 })?;
                 &body_string
             };
-            let dest = render_str(env, &t.dest, &view)?;
+            let dest = render_str_resolved(env, &t.dest, &view)?;
             // The body render needs to resolve `{% include "name" %}`
             // statements against the role's templates dirs captured at
             // load time. We can't mutate the shared env, so build a
@@ -5998,7 +6151,7 @@ fn render_op(
             // (dest, validate, mode) keep using the shared env — they
             // are scalar strings unlikely to carry includes.
             let content = if t.search_dirs.is_empty() {
-                render_str(env, body_ref, &view)?
+                render_str_resolved(env, body_ref, &view)?
             } else {
                 let mut local_env: minijinja::Environment<'static> =
                     crate::template::make_env();
@@ -6006,23 +6159,23 @@ fn render_op(
                     &mut local_env,
                     t.search_dirs.clone(),
                 );
-                render_str(&local_env, body_ref, &view)?
+                render_str_resolved(&local_env, body_ref, &view)?
             };
             let validate = match &t.validate {
-                Some(v) => Some(render_str(env, v, &view)?),
+                Some(v) => Some(render_str_resolved(env, v, &view)?),
                 None => None,
             };
             let owner = match &t.owner {
-                Some(s) => Some(render_str(env, s, &view)?),
+                Some(s) => Some(render_str_resolved(env, s, &view)?),
                 None => None,
             };
             let group = match &t.group {
-                Some(s) => Some(render_str(env, s, &view)?),
+                Some(s) => Some(render_str_resolved(env, s, &view)?),
                 None => None,
             };
             TaskOp::WriteFile(WriteFileOp {
                 path: dest,
-                mode: resolve_mode(env, &t.mode, &view)?,
+                mode: resolve_mode_resolved(env, &t.mode, &view)?,
                 content,
                 validate,
                 owner,
@@ -6042,9 +6195,9 @@ fn render_op(
             //     host. Render src+dest+validate through Jinja, leave
             //     body=None; `to_wire_op` emits `OpCopyTarget` and the
             //     agent reads the bytes itself.
-            let dest = render_str(env, &c.dest, &view)?;
+            let dest = render_str_resolved(env, &c.dest, &view)?;
             let validate = match &c.validate {
-                Some(v) => Some(render_str(env, v, &view)?),
+                Some(v) => Some(render_str_resolved(env, v, &view)?),
                 None => None,
             };
             // Render owner/group up front — both Copy branches need
@@ -6054,16 +6207,16 @@ fn render_op(
             // The TaskOp::WriteFile / TaskOp::Template arms already
             // do this; Copy was the one that was forgotten.
             let owner = match &c.owner {
-                Some(s) => Some(render_str(env, s, &view)?),
+                Some(s) => Some(render_str_resolved(env, s, &view)?),
                 None => None,
             };
             let group = match &c.group {
-                Some(s) => Some(render_str(env, s, &view)?),
+                Some(s) => Some(render_str_resolved(env, s, &view)?),
                 None => None,
             };
             if c.remote_src {
                 let src = match &c.src {
-                    Some(s) => Some(render_str(env, s, &view)?),
+                    Some(s) => Some(render_str_resolved(env, s, &view)?),
                     None => {
                         return Err(anyhow!(
                             "internal: copy task dest {:?} has remote_src=true but no src (should have been caught at parse)",
@@ -6075,7 +6228,7 @@ fn render_op(
                     src,
                     content: None,
                     dest,
-                    mode: resolve_mode(env, &c.mode, &view)?,
+                    mode: resolve_mode_resolved(env, &c.mode, &view)?,
                     owner,
                     group,
                     body: None,
@@ -6091,7 +6244,7 @@ fn render_op(
                     } else {
                         // Deferred load: src was Jinja, render and probe
                         // the search_dirs captured at load time.
-                        let rendered_src = render_str(env, src, &view)?;
+                        let rendered_src = render_str_resolved(env, src, &view)?;
                         let p = std::path::PathBuf::from(&rendered_src);
                         let mut located: Option<std::path::PathBuf> = None;
                         if p.is_absolute() {
@@ -6129,7 +6282,7 @@ fn render_op(
                     }
                 }
                 (None, Some(template)) => {
-                    let rendered = render_str(env, template, &view)?;
+                    let rendered = render_str_resolved(env, template, &view)?;
                     rendered.into_bytes()
                 }
                 (None, None) => {
@@ -6143,7 +6296,7 @@ fn render_op(
                 src: c.src.clone(),
                 content: c.content.clone(),
                 dest,
-                mode: resolve_mode(env, &c.mode, &view)?,
+                mode: resolve_mode_resolved(env, &c.mode, &view)?,
                 owner,
                 group,
                 body: Some(body),
@@ -6154,7 +6307,7 @@ fn render_op(
         }
         TaskOp::GatherFacts => TaskOp::GatherFacts,
         TaskOp::Stat(s) => {
-            let path = render_str(env, &s.path, &view)?;
+            let path = render_str_resolved(env, &s.path, &view)?;
             TaskOp::Stat(StatOp {
                 path,
                 follow: s.follow,
@@ -6162,16 +6315,16 @@ fn render_op(
         }
         TaskOp::WaitFor(w) => {
             let host = match &w.host {
-                Some(h) => Some(render_str(env, h, &view)?),
+                Some(h) => Some(render_str_resolved(env, h, &view)?),
                 None => None,
             };
             let path = match &w.path {
-                Some(p) => Some(render_str(env, p, &view)?),
+                Some(p) => Some(render_str_resolved(env, p, &view)?),
                 None => None,
             };
             // If `port:` was a Jinja template, render+parse it now.
             let port = if !w.port_template.is_empty() {
-                let rendered = render_str(env, &w.port_template, &view)?;
+                let rendered = render_str_resolved(env, &w.port_template, &view)?;
                 let n: u32 = rendered.trim().parse().map_err(|e| {
                     anyhow::anyhow!(
                         "wait_for.port: rendered {rendered:?} (from template \
@@ -6201,29 +6354,29 @@ fn render_op(
             })
         }
         TaskOp::File(f) => {
-            let path = render_str(env, &f.path, &view)?;
+            let path = render_str_resolved(env, &f.path, &view)?;
             let owner = match &f.owner {
-                Some(o) => Some(render_str(env, o, &view)?),
+                Some(o) => Some(render_str_resolved(env, o, &view)?),
                 None => None,
             };
             let group = match &f.group {
-                Some(g) => Some(render_str(env, g, &view)?),
+                Some(g) => Some(render_str_resolved(env, g, &view)?),
                 None => None,
             };
             TaskOp::File(FileOp {
                 path,
                 state: f.state,
-                mode: resolve_mode_opt(env, &f.mode, &view)?,
+                mode: resolve_mode_opt_resolved(env, &f.mode, &view)?,
                 owner,
                 group,
                 recurse: f.recurse,
             })
         }
         TaskOp::LineInFile(l) => {
-            let path = render_str(env, &l.path, &view)?;
-            let line = render_str(env, &l.line, &view)?;
+            let path = render_str_resolved(env, &l.path, &view)?;
+            let line = render_str_resolved(env, &l.line, &view)?;
             let validate = match &l.validate {
-                Some(v) => Some(render_str(env, v, &view)?),
+                Some(v) => Some(render_str_resolved(env, v, &view)?),
                 None => None,
             };
             TaskOp::LineInFile(LineInFileOp {
@@ -6231,7 +6384,7 @@ fn render_op(
                 regexp: l.regexp.clone(),
                 line,
                 state: l.state,
-                mode: resolve_mode_opt(env, &l.mode, &view)?,
+                mode: resolve_mode_opt_resolved(env, &l.mode, &view)?,
                 create: l.create,
                 insertbefore: l.insertbefore.clone(),
                 insertafter: l.insertafter.clone(),
@@ -6240,10 +6393,10 @@ fn render_op(
             })
         }
         TaskOp::BlockInFile(b) => {
-            let path = render_str(env, &b.path, &view)?;
-            let block = render_str(env, &b.block, &view)?;
+            let path = render_str_resolved(env, &b.path, &view)?;
+            let block = render_str_resolved(env, &b.block, &view)?;
             let validate = match &b.validate {
-                Some(v) => Some(render_str(env, v, &view)?),
+                Some(v) => Some(render_str_resolved(env, v, &view)?),
                 None => None,
             };
             TaskOp::BlockInFile(BlockInFileOp {
@@ -6253,7 +6406,7 @@ fn render_op(
                 marker_begin: b.marker_begin.clone(),
                 marker_end: b.marker_end.clone(),
                 state: b.state,
-                mode: resolve_mode_opt(env, &b.mode, &view)?,
+                mode: resolve_mode_opt_resolved(env, &b.mode, &view)?,
                 create: b.create,
                 insertbefore: b.insertbefore.clone(),
                 insertafter: b.insertafter.clone(),
@@ -6261,7 +6414,7 @@ fn render_op(
             })
         }
         TaskOp::Systemd(s) => {
-            let name = render_str(env, &s.name, &view)?;
+            let name = render_str_resolved(env, &s.name, &view)?;
             TaskOp::Systemd(SystemdOp {
                 name,
                 state: s.state,
@@ -6279,7 +6432,7 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             TaskOp::Package(PackageOp {
@@ -6301,20 +6454,20 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             TaskOp::Repository(RepositoryOp {
                 manager: r.manager,
-                repo: render_str(env, &r.repo, &view)?,
+                repo: render_str_resolved(env, &r.repo, &view)?,
                 state: r.state,
                 filename: render_if(&r.filename)?,
-                mode: resolve_mode_opt(env, &r.mode, &view)?,
+                mode: resolve_mode_opt_resolved(env, &r.mode, &view)?,
                 update_cache: r.update_cache,
             })
         }
         TaskOp::Group(g) => TaskOp::Group(GroupOp {
-            name: render_str(env, &g.name, &view)?,
+            name: render_str_resolved(env, &g.name, &view)?,
             state: g.state,
             system: g.system,
         }),
@@ -6322,22 +6475,22 @@ fn render_op(
             let render_opt = |o: &Option<String>| -> Result<Option<String>> {
                 match o {
                     None => Ok(None),
-                    Some(s) => Ok(Some(render_str(env, s, &view)?)),
+                    Some(s) => Ok(Some(render_str_resolved(env, s, &view)?)),
                 }
             };
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             let mut groups = Vec::with_capacity(u.groups.len());
             for g in &u.groups {
-                groups.push(render_str(env, g, &view)?);
+                groups.push(render_str_resolved(env, g, &view)?);
             }
             TaskOp::User(UserOp {
-                name: render_str(env, &u.name, &view)?,
+                name: render_str_resolved(env, &u.name, &view)?,
                 state: u.state,
                 system: u.system,
                 shell: render_opt(&u.shell)?,
@@ -6349,33 +6502,33 @@ fn render_op(
             })
         }
         TaskOp::AuthorizedKey(a) => TaskOp::AuthorizedKey(AuthorizedKeyOp {
-            user: render_str(env, &a.user, &view)?,
-            key: render_str(env, &a.key, &view)?,
+            user: render_str_resolved(env, &a.user, &view)?,
+            key: render_str_resolved(env, &a.key, &view)?,
             state: a.state,
             exclusive: a.exclusive,
         }),
         TaskOp::Getent(g) => TaskOp::Getent(GetentOp {
-            database: render_str(env, &g.database, &view)?,
-            key: render_str(env, &g.key, &view)?,
+            database: render_str_resolved(env, &g.database, &view)?,
+            key: render_str_resolved(env, &g.key, &view)?,
             fail_key: g.fail_key,
             split: if g.split.is_empty() {
                 String::new()
             } else {
-                render_str(env, &g.split, &view)?
+                render_str_resolved(env, &g.split, &view)?
             },
         }),
         TaskOp::Hostname(h) => TaskOp::Hostname(HostnameOp {
-            name: render_str(env, &h.name, &view)?,
+            name: render_str_resolved(env, &h.name, &view)?,
         }),
         TaskOp::Timezone(z) => TaskOp::Timezone(crate::playbook::task_op::TimezoneOp {
-            name: render_str(env, &z.name, &view)?,
+            name: render_str_resolved(env, &z.name, &view)?,
         }),
         TaskOp::Ufw(u) => {
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             TaskOp::Ufw(UfwOp {
@@ -6394,7 +6547,7 @@ fn render_op(
             })
         }
         TaskOp::AsyncStatus(a) => {
-            let jid = render_str(env, &a.jid, &view)?;
+            let jid = render_str_resolved(env, &a.jid, &view)?;
             TaskOp::AsyncStatus(AsyncStatusOp { jid })
         }
         TaskOp::Iptables(i) => {
@@ -6402,7 +6555,7 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             TaskOp::Iptables(IptablesOp {
@@ -6427,22 +6580,22 @@ fn render_op(
             // url, header values, and body all support Jinja. Header
             // keys are not rendered (header names aren't useful Jinja
             // targets and `:` would be ambiguous with regex syntax).
-            let url = render_str(env, &u.url, &view)?;
+            let url = render_str_resolved(env, &u.url, &view)?;
             let mut headers = BTreeMap::new();
             for (k, v) in &u.headers {
-                headers.insert(k.clone(), render_str(env, v, &view)?);
+                headers.insert(k.clone(), render_str_resolved(env, v, &view)?);
             }
             let body = if u.body.is_empty() {
                 String::new()
             } else {
-                render_str(env, &u.body, &view)?
+                render_str_resolved(env, &u.body, &view)?
             };
             // mTLS / CA paths are Jinja-templatable so a per-host
             // path (e.g. `/etc/pki/{{ inventory_hostname }}.crt`)
             // works. Bytes are read at to_wire_op time, not here.
-            let client_cert = render_str(env, &u.client_cert, &view)?;
-            let client_key = render_str(env, &u.client_key, &view)?;
-            let ca_path = render_str(env, &u.ca_path, &view)?;
+            let client_cert = render_str_resolved(env, &u.client_cert, &view)?;
+            let client_key = render_str_resolved(env, &u.client_key, &view)?;
+            let ca_path = render_str_resolved(env, &u.ca_path, &view)?;
             TaskOp::Uri(UriOp {
                 url,
                 method: u.method,
@@ -6463,29 +6616,29 @@ fn render_op(
             // `path:` is Jinja-templatable so a per-host destination
             // works. Everything else (kind/size/mode/force_probe) is
             // a scalar — no rendering needed.
-            let path = render_str(env, &p.path, &view)?;
+            let path = render_str_resolved(env, &p.path, &view)?;
             TaskOp::OpenSslPrivkey(OpenSslPrivkeyOp { path, ..p.clone() })
         }
         TaskOp::OpenSslCsrPipe(c) => {
             // All string fields are templatable; SAN entries individually
             // so a Jinja-loop over `groups['etcd']` produces fresh SANs
             // per host.
-            let privatekey_path = render_str(env, &c.privatekey_path, &view)?;
-            let common_name = render_str(env, &c.common_name, &view)?;
+            let privatekey_path = render_str_resolved(env, &c.privatekey_path, &view)?;
+            let common_name = render_str_resolved(env, &c.common_name, &view)?;
             let subject_alt_name = c
                 .subject_alt_name
                 .iter()
-                .map(|s| render_str(env, s, &view))
+                .map(|s| render_str_resolved(env, s, &view))
                 .collect::<Result<Vec<_>>>()?;
             let key_usage = c
                 .key_usage
                 .iter()
-                .map(|s| render_str(env, s, &view))
+                .map(|s| render_str_resolved(env, s, &view))
                 .collect::<Result<Vec<_>>>()?;
             let extended_key_usage = c
                 .extended_key_usage
                 .iter()
-                .map(|s| render_str(env, s, &view))
+                .map(|s| render_str_resolved(env, s, &view))
                 .collect::<Result<Vec<_>>>()?;
             // DN fields are typically literal but accept Jinja so things
             // like `organization_name: "{{ org }}"` work without ceremony.
@@ -6493,7 +6646,7 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             let country_name = render_if(&c.country_name)?;
@@ -6506,7 +6659,7 @@ fn render_op(
             let basic_constraints = c
                 .basic_constraints
                 .iter()
-                .map(|s| render_str(env, s, &view))
+                .map(|s| render_str_resolved(env, s, &view))
                 .collect::<Result<Vec<_>>>()?;
             TaskOp::OpenSslCsrPipe(OpenSslCsrPipeOp {
                 privatekey_path,
@@ -6527,12 +6680,12 @@ fn render_op(
             // CSR + key PEMs / paths almost always come from
             // previous-task registers via Jinja, so they MUST be
             // rendered before we hand them to rcgen / the filesystem.
-            let csr_content = render_str(env, &c.csr_content, &view)?;
+            let csr_content = render_str_resolved(env, &c.csr_content, &view)?;
             let render_if = |s: &str| -> Result<String> {
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             let privatekey_content = render_if(&c.privatekey_content)?;
@@ -6544,7 +6697,7 @@ fn render_op(
             // duration: deferred at parse time when it contained Jinja.
             // Render then parse now, override valid_for_days.
             let valid_for_days = if !c.not_after_template.is_empty() {
-                let rendered = render_str(env, &c.not_after_template, &view)?;
+                let rendered = render_str_resolved(env, &c.not_after_template, &view)?;
                 crate::playbook::task_op::openssl::parse_relative_duration_days(&rendered)
                     .map_err(|e| anyhow::anyhow!(e))?
             } else {
@@ -6569,10 +6722,10 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
-            let query = render_str(env, &p.query, &view)?;
+            let query = render_str_resolved(env, &p.query, &view)?;
             // SQL classification was done at parse time on the literal
             // query text. After Jinja renders, the resulting SQL might
             // differ — e.g. a Jinja-templated query that produces
@@ -6582,7 +6735,7 @@ fn render_op(
             let positional_args = p
                 .positional_args
                 .iter()
-                .map(|a| render_str(env, a, &view))
+                .map(|a| render_str_resolved(env, a, &view))
                 .collect::<Result<Vec<_>>>()?;
             TaskOp::PostgresqlQuery(PostgresqlQueryOp {
                 query,
@@ -6602,11 +6755,11 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             TaskOp::PostgresqlExt(PostgresqlExtOp {
-                name: render_str(env, &p.name, &view)?,
+                name: render_str_resolved(env, &p.name, &view)?,
                 state: p.state,
                 version: render_if(&p.version)?,
                 ext_schema: render_if(&p.ext_schema)?,
@@ -6624,11 +6777,11 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             TaskOp::PostgresqlUser(PostgresqlUserOp {
-                name: render_str(env, &u.name, &view)?,
+                name: render_str_resolved(env, &u.name, &view)?,
                 password: render_if(&u.password)?,
                 role_attr_flags: render_if(&u.role_attr_flags)?,
                 state: u.state,
@@ -6647,11 +6800,11 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             TaskOp::PostgresqlDb(PostgresqlDbOp {
-                name: render_str(env, &d.name, &view)?,
+                name: render_str_resolved(env, &d.name, &view)?,
                 owner: render_if(&d.owner)?,
                 encoding: render_if(&d.encoding)?,
                 lc_collate: render_if(&d.lc_collate)?,
@@ -6670,16 +6823,16 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             let mut groups = Vec::with_capacity(m.groups.len());
             for g in &m.groups {
-                groups.push(render_str(env, g, &view)?);
+                groups.push(render_str_resolved(env, g, &view)?);
             }
             let mut target_roles = Vec::with_capacity(m.target_roles.len());
             for t in &m.target_roles {
-                target_roles.push(render_str(env, t, &view)?);
+                target_roles.push(render_str_resolved(env, t, &view)?);
             }
             TaskOp::PostgresqlMembership(PostgresqlMembershipOp {
                 groups,
@@ -6699,18 +6852,18 @@ fn render_op(
                 if s.is_empty() {
                     Ok(String::new())
                 } else {
-                    render_str(env, s, &view)
+                    render_str_resolved(env, s, &view)
                 }
             };
             let mut rendered_headers = BTreeMap::new();
             for (k, v) in &g.headers {
-                rendered_headers.insert(k.clone(), render_str(env, v, &view)?);
+                rendered_headers.insert(k.clone(), render_str_resolved(env, v, &view)?);
             }
             TaskOp::GetUrl(GetUrlOp {
-                url: render_str(env, &g.url, &view)?,
-                dest: render_str(env, &g.dest, &view)?,
+                url: render_str_resolved(env, &g.url, &view)?,
+                dest: render_str_resolved(env, &g.dest, &view)?,
                 checksum: render_if(&g.checksum)?,
-                mode: resolve_mode_opt(env, &g.mode, &view)?,
+                mode: resolve_mode_opt_resolved(env, &g.mode, &view)?,
                 owner: render_if(&g.owner)?,
                 group: render_if(&g.group)?,
                 headers: rendered_headers,
@@ -6724,28 +6877,28 @@ fn render_op(
             })
         }
         TaskOp::Slurp(s) => TaskOp::Slurp(SlurpOp {
-            src: render_str(env, &s.src, &view)?,
+            src: render_str_resolved(env, &s.src, &view)?,
             max_bytes: s.max_bytes,
         }),
         TaskOp::Unarchive(u) => {
             let include = u
                 .include
                 .iter()
-                .map(|p| render_str(env, p, &view))
+                .map(|p| render_str_resolved(env, p, &view))
                 .collect::<Result<Vec<_>>>()?;
             let exclude = u
                 .exclude
                 .iter()
-                .map(|p| render_str(env, p, &view))
+                .map(|p| render_str_resolved(env, p, &view))
                 .collect::<Result<Vec<_>>>()?;
             TaskOp::Unarchive(UnarchiveOp {
-                src: render_str(env, &u.src, &view)?,
-                dest: render_str(env, &u.dest, &view)?,
+                src: render_str_resolved(env, &u.src, &view)?,
+                dest: render_str_resolved(env, &u.dest, &view)?,
                 format: u.format,
-                creates: render_str(env, &u.creates, &view)?,
-                mode: resolve_mode_opt(env, &u.mode, &view)?,
-                owner: render_str(env, &u.owner, &view)?,
-                group: render_str(env, &u.group, &view)?,
+                creates: render_str_resolved(env, &u.creates, &view)?,
+                mode: resolve_mode_opt_resolved(env, &u.mode, &view)?,
+                owner: render_str_resolved(env, &u.owner, &view)?,
+                group: render_str_resolved(env, &u.group, &view)?,
                 keep_newer: u.keep_newer,
                 list_files: u.list_files,
                 include,
@@ -6757,13 +6910,13 @@ fn render_op(
             // is `suffix: "_{{ inventory_hostname }}"` or a Jinja-rendered
             // parent `path:`.
             let path = match &t.path {
-                Some(p) => Some(render_str(env, p, &view)?),
+                Some(p) => Some(render_str_resolved(env, p, &view)?),
                 None => None,
             };
             TaskOp::Tempfile(TempfileOp {
                 state: t.state,
-                suffix: render_str(env, &t.suffix, &view)?,
-                prefix: render_str(env, &t.prefix, &view)?,
+                suffix: render_str_resolved(env, &t.suffix, &view)?,
+                prefix: render_str_resolved(env, &t.prefix, &view)?,
                 path,
             })
         }
@@ -6802,6 +6955,95 @@ fn resolve_mode_opt(
 ) -> Result<Option<crate::playbook::ModeField>> {
     match m {
         Some(m) => Ok(Some(resolve_mode(env, m, view)?)),
+        None => Ok(None),
+    }
+}
+
+/// Render `src` against a view that has ALREADY had
+/// [`resolve_view_var_templates`] applied. Skips the per-call resolve
+/// step — call this in hot loops where the view is stable across many
+/// renders (e.g. `render_op`, which renders N field expressions per
+/// task body against the same view).
+fn render_str_resolved(
+    env: &Environment<'static>,
+    src: &str,
+    resolved_view: &BTreeMap<String, JsonValue>,
+) -> Result<String> {
+    let prepared = crate::template::prepare_jinja_source(src);
+    let tmpl = env
+        .template_from_str(&prepared)
+        .map_err(|e| anyhow!("template parse: {e}"))?;
+    let out = tmpl
+        .render(resolved_view)
+        .map_err(|e| anyhow!("template render: {e}"))?;
+    if out == crate::template::OMIT_SENTINEL {
+        return Ok(String::new());
+    }
+    Ok(out)
+}
+
+/// Like [`render_int_field`] but against a pre-resolved view.
+fn render_int_field_resolved(
+    env: &Environment<'static>,
+    src: &str,
+    resolved_view: &BTreeMap<String, JsonValue>,
+) -> Result<i64> {
+    if let Ok(n) = src.trim().parse::<i64>() {
+        return Ok(n);
+    }
+    let rendered = render_str_resolved(env, src, resolved_view)?;
+    rendered
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| anyhow!("expected integer after rendering, got {rendered:?}: {e}"))
+}
+
+/// Like [`render_float_field`] but against a pre-resolved view.
+#[allow(dead_code)]
+fn render_float_field_resolved(
+    env: &Environment<'static>,
+    src: &str,
+    resolved_view: &BTreeMap<String, JsonValue>,
+) -> Result<f64> {
+    if let Ok(n) = src.trim().parse::<f64>() {
+        return Ok(n);
+    }
+    let rendered = render_str_resolved(env, src, resolved_view)?;
+    rendered
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| anyhow!("expected number after rendering, got {rendered:?}: {e}"))
+}
+
+/// Like [`resolve_mode`] but against a pre-resolved view.
+fn resolve_mode_resolved(
+    env: &Environment<'static>,
+    m: &crate::playbook::ModeField,
+    resolved_view: &BTreeMap<String, JsonValue>,
+) -> Result<crate::playbook::ModeField> {
+    use crate::playbook::ModeField;
+    match m {
+        ModeField::Literal(_) => Ok(m.clone()),
+        ModeField::Template(t) => {
+            let rendered = render_str_resolved(env, t, resolved_view)?;
+            let trimmed = rendered.trim();
+            let n = crate::playbook::parse_rendered_mode(trimmed).map_err(|e| {
+                anyhow!("mode template {t:?} rendered to {rendered:?}: {e}")
+            })?;
+            Ok(ModeField::Literal(n))
+        }
+    }
+}
+
+/// Like [`resolve_mode_opt`] but against a pre-resolved view.
+#[allow(dead_code)]
+fn resolve_mode_opt_resolved(
+    env: &Environment<'static>,
+    m: &Option<crate::playbook::ModeField>,
+    resolved_view: &BTreeMap<String, JsonValue>,
+) -> Result<Option<crate::playbook::ModeField>> {
+    match m {
+        Some(m) => Ok(Some(resolve_mode_resolved(env, m, resolved_view)?)),
         None => Ok(None),
     }
 }
@@ -7614,7 +7856,7 @@ fn resolve_host_connection_modes(
     Ok(out)
 }
 
-fn compute_all_targeted_hosts(playbook: &Playbook, inv: &Inventory) -> BTreeSet<String> {
+pub fn compute_all_targeted_hosts(playbook: &Playbook, inv: &Inventory) -> BTreeSet<String> {
     let mut acc = BTreeSet::new();
     for play in &playbook.plays {
         for name in resolve_play_targets(&play.hosts, inv) {
@@ -7820,12 +8062,7 @@ mod tests {
             all_members.push(name.to_string());
         }
         groups.insert("all".into(), all_members);
-        WorldVars {
-            groups,
-            hostvars,
-            playbook_dir: None,
-            inventory_dir: None,
-        }
+        WorldVars::new(groups, hostvars, None, None)
     }
 
     #[test]
@@ -7968,6 +8205,7 @@ mod tests {
             tasks_skipped: 0,
             tasks_ok: 0,
             timing: crate::run_metrics::RunMetricsSnapshot::default(),
+            timing_breakdown: crate::timing::TimingBreakdown::default(),
         };
         let next_seq = Arc::new(AtomicU32::new(1));
         let env = Arc::new(template::make_env());
@@ -8052,6 +8290,7 @@ mod tests {
             tasks_skipped: 0,
             tasks_ok: 0,
             timing: crate::run_metrics::RunMetricsSnapshot::default(),
+            timing_breakdown: crate::timing::TimingBreakdown::default(),
         };
         let next_seq = Arc::new(AtomicU32::new(1));
         let env = Arc::new(template::make_env());

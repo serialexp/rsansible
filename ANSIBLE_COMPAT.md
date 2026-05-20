@@ -468,6 +468,50 @@ explicitly told us how to slice, so we don't second-guess it.
 
 ---
 
+## 11. `internal_ansible_host` / `internal_ansible_port` — per-host dial-from-inside addresses
+
+| Aspect | Ansible | rsansible |
+|---|---|---|
+| Magic var for "dial address when inside the target network" | none | `internal_ansible_host` (string), `internal_ansible_port` (int) |
+| Applied | n/a | Forward mode only (`rsansible run --forward …`). Non-forward runs ignore the var. |
+| Resolution scope | n/a | Per-host `inline_vars` (highest), then on-disk `host_vars/<name>.yml`. Group_vars not yet honored — extend if a real use case shows up. |
+| Failure mode | n/a | Non-string `internal_ansible_host` or non-integer / out-of-range `internal_ansible_port` errors loudly at run start, before any SSH dial. |
+
+### Why
+
+Forward mode relocates the controller from the operator's laptop to a
+forwarder *inside* the target network. The laptop reaches each host
+over one address (typically a public IP); the forwarder reaches the
+same hosts over a different address (typically a private vnet IP).
+Ansible has no native way to express both addresses on the same
+inventory entry — operators normally maintain two parallel inventory
+files or jump-host configs. rsansible models them as paired per-host
+vars so a single inventory carries both facts about the same host.
+
+### How it interacts with the rest of the pipeline
+
+- **Forwarder selection** runs on the laptop *before* the override,
+  using `ansible_host` (public). The forwarder we SSH into must be
+  reachable from the laptop, so this ordering is mandatory.
+- **Inventory shipping**: the laptop mutates each host's `host` /
+  `port` to the internal value *after* selection, *before* the
+  Inventory is serialized into the WorkflowPayload. The forwarder
+  receives an Inventory that already uses internal addresses and
+  never sees the public ones.
+- **The forwarder host itself** can have an `internal_ansible_host`
+  set and it'll be overwritten like any other; harmless, since the
+  forwarder uses a `Local` pool to dispatch to itself (no SSH to
+  itself ever happens).
+
+### Where this lives
+
+- `crates/ctl/src/forward.rs` — `INTERNAL_HOST_VAR` /
+  `INTERNAL_HOST_PORT_VAR` constants and
+  `apply_internal_host_overrides()`, called once at the top of
+  `run_forwarded`.
+
+---
+
 ## When you add a new divergence
 
 1. **Document it here first.** Add a `## N. <one-line summary>`

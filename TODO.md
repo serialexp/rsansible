@@ -396,3 +396,26 @@ Either way, **not v1**.
   the test helpers, OR a single shared write_script helper that
   serialises across the binary. Out of scope for now — flake is
   rare enough that it's noise, not a blocker.
+
+## Forward mode: dedicated controller↔forwarder wire format
+
+Today forward mode ships `WorkflowPayload` as serde JSON + a tarball of
+the playbook tree on the SSH stdin. That works, but the JSON sidecar is
+constrained by what's `Serialize`-able — which is why the playbook AST
+is re-parsed on the forwarder rather than shipped resolved (the AST has
+~25 custom `Deserialize` impls for Ansible-flavored YAML input that
+don't round-trip through `derive(Serialize)` without writing matching
+custom Serialize impls).
+
+The right long-term shape is a dedicated controller↔forwarder wire
+format modeled on the binschema we already use for ctl↔agent:
+canonical positional encoding, schemas for every type, no dependence on
+serde derives. Lets us:
+- Ship the resolved playbook AST end-to-end (forwarder skips re-parse).
+- Same forward-compat / back-compat discipline as the agent wire.
+- A natural home for forward-mode-specific frames (BackChannelHandshake,
+  LogRecord, RunReportFrame) without cramming everything into JSON.
+
+Out of scope for the initial forward-mode landing — re-parse on the
+forwarder is cheap (~100ms) and the JSON+tar shape gets us to a working
+end-to-end. Worth picking up once we have real users hitting it.

@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::back_channel::{self, BackChannelSession};
 use crate::become_::BecomeKey;
 use crate::local::{self, LocalSession};
 use crate::ssh::{self, AgentConn, ConnectOptions, SshSession};
@@ -77,6 +78,12 @@ pub enum PoolTransport {
     /// fresh child against the materialized agent path; each slot
     /// owns its own `Child` via `TransportKeepalive::Local`.
     Local(LocalSession),
+    /// Back-channel unix-socket transport (forward mode). The socket
+    /// is reverse-forwarded from the operator's laptop by SSH `-R`;
+    /// each `get_or_spawn` opens a fresh unix-socket connection that
+    /// tunnels back to the laptop's `local-agent --listen` process.
+    /// One connection per `BecomeKey`, same shape as the SSH variant.
+    BackChannel(BackChannelSession),
     /// Test-only transport that refuses to spawn. Used by
     /// controller-only unit tests (block dispatch, set_fact, fail,
     /// …) which never dispatch a wire op but do call
@@ -148,6 +155,17 @@ impl AgentPool {
                         self.label
                     )
                 })?,
+            PoolTransport::BackChannel(session) => {
+                back_channel::spawn_back_channel_conn(session, key)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "opening back-channel connection for {} on {}",
+                            key.label(),
+                            self.label
+                        )
+                    })?
+            }
             PoolTransport::Mock => {
                 // Mock: vend a dead handle (inner Option=None) for
                 // every key on demand. Controller-only unit tests
@@ -208,6 +226,25 @@ impl AgentPool {
         };
         let conn = local::spawn_agent_process(&session, &BecomeKey::None).await?;
         let mut pool = AgentPool::new(label, PoolTransport::Local(session));
+        let handle = pool.seed(BecomeKey::None, conn);
+        Ok((pool, handle))
+    }
+
+    /// Open a back-channel-backed pool for `connection: local` tasks
+    /// in forward mode. Eagerly opens the `BecomeKey::None` connection
+    /// (tunnels through SSH `-R` back to the laptop's `local-agent`)
+    /// and seeds it into the pool. Become-keyed slots populate lazily
+    /// the first time a task with `become:` against this host runs.
+    pub async fn open_back_channel(
+        label: String,
+        socket_path: std::path::PathBuf,
+    ) -> Result<(Self, ConnHandle)> {
+        let session = BackChannelSession {
+            label: label.clone(),
+            socket_path,
+        };
+        let conn = back_channel::spawn_back_channel_conn(&session, &BecomeKey::None).await?;
+        let mut pool = AgentPool::new(label, PoolTransport::BackChannel(session));
         let handle = pool.seed(BecomeKey::None, conn);
         Ok((pool, handle))
     }

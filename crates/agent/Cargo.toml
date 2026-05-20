@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "rsansible agent — pushed to a host, executes ops, deletes itself."
 
+[lib]
+name = "rsansible_agent"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rsansible-agent"
 path = "src/main.rs"
