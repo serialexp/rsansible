@@ -7448,7 +7448,23 @@ fn apply_changed_failed_when(
 
     let mut view = build_template_ctx(ctx, world);
     if let Some(rv) = &body_register {
-        if let JsonValue::Object(reg_map) = rv.to_json() {
+        let rv_json = rv.to_json();
+        // Overlay the body's register under its user-declared name
+        // (if any) so expressions like `failed_when:
+        // "pgbackrest_stanza_create.rc != 0"` see the JUST-completed
+        // body's result rather than the previous attempt's recorded
+        // value. Without this, register-by-name lookups inside
+        // changed_when/failed_when resolve against ctx.registers,
+        // which doesn't get updated until AFTER these clauses
+        // evaluate — so the first invocation would see undefined.
+        if let Some(reg_name) = &task.register {
+            view.insert(reg_name.clone(), rv_json.clone());
+        }
+        // Also expose the register fields at the top level, mirroring
+        // Ansible's "implicit register" exposure inside these
+        // clauses. Lets users write `changed_when: "rc != 0"` even
+        // without a `register:` on the task.
+        if let JsonValue::Object(reg_map) = rv_json {
             for (k, v) in reg_map {
                 view.insert(k, v);
             }
@@ -11198,6 +11214,30 @@ all:
             !rv.changed,
             "register.changed must match the post-override outcome"
         );
+    }
+
+    /// `failed_when:` / `changed_when:` must also see the
+    /// just-completed body's register under the user-declared
+    /// `register:` NAME — not just as top-level fields. Surfaced
+    /// by gothab's pgbackrest stanza-create task which writes
+    /// `failed_when: pgbackrest_stanza_create.rc != 0`. Without
+    /// the name-overlay, `pgbackrest_stanza_create` resolves to
+    /// the previous attempt's value (or undefined on the first
+    /// attempt), so a Successful first-attempt body still
+    /// evaluated truthy and falsely flagged the task failed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_when_resolves_body_register_by_declared_name() {
+        let mut t = set_fact("synthetic", "x", "1");
+        t.register = Some("my_reg".into());
+        // `my_reg.failed` should be false on the body's Ok result.
+        // Pre-fix: my_reg was undefined → expression errored or
+        // evaluated truthy. Post-fix: my_reg.failed == false.
+        t.failed_when = Some("my_reg.failed".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { .. } => {}
+            other => panic!("expected Ok (my_reg.failed=false), got {other:?}"),
+        }
     }
 
     /// `changed_when:` accepts a Jinja expression referencing the
