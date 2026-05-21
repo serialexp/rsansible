@@ -4677,11 +4677,17 @@ fn run_set_fact_body(
     for (k, v) in to_set {
         ctx.set_facts.insert(k, v);
     }
-    // set_fact synthesizes a changed=true register so notify-on-set_fact
-    // fires (matches Ansible).
+    // `set_fact` reports `changed=false`, matching modern Ansible
+    // (≥2.5): the task always lands as "ok" in the play recap, never
+    // as "changed". A side effect is that `notify:` on a plain
+    // `set_fact:` is a no-op — to fire a handler from a set_fact you
+    // must write `changed_when: true` explicitly. This matches what
+    // Ansible documents and is what the gothab steady-state drill
+    // expects (`pgbackrest_leader_host` set_fact would otherwise show
+    // as a phantom "changed" on every run). See ANSIBLE_COMPAT.md.
     BodyResult::Ok {
         register: RegisterValue::synthetic_ok(),
-        changed: true,
+        changed: false,
         skipped: false,
     }
 }
@@ -11311,6 +11317,52 @@ all:
                 "changed_when:false after failed_when:false should yield unchanged Ok"
             ),
             other => panic!("expected Ok unchanged, got {other:?}"),
+        }
+    }
+
+    /// `set_fact` reports `changed=false` — it lands as "ok" in the
+    /// recap, never "changed". Matches Ansible ≥2.5. A user who
+    /// genuinely wants a set_fact to fire a handler must opt in with
+    /// `changed_when: true`.
+    ///
+    /// Regression: surfaced via the gothab pgbackrest drill —
+    /// `Set fact — current Patroni leader hostname` was inflating
+    /// the changed count by 1 every run. The earlier implementation
+    /// hardcoded `changed: true` "so notify-on-set_fact fires"; that
+    /// claim doesn't match modern Ansible and broke parity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_fact_reports_changed_false() {
+        let t = set_fact("set a fact", "x", "1");
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { changed, skipped } => {
+                assert!(!*changed, "set_fact must report changed=false");
+                assert!(!*skipped);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // The fact itself still landed on the host's set_facts dict.
+        assert_eq!(
+            r.ctx.set_facts.get("x"),
+            Some(&serde_json::Value::Number(1.into()))
+        );
+    }
+
+    /// Counterpart to the above: a user can OPT IN to "set_fact
+    /// counts as changed" via `changed_when: true`. The override
+    /// path (which runs the same regardless of body kind) flips it
+    /// back. Lets old playbooks that relied on `notify:` on a
+    /// set_fact keep working with a one-line annotation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_fact_with_changed_when_true_can_opt_in_to_changed() {
+        let mut t = set_fact("set a fact", "x", "1");
+        t.changed_when = Some("true".into());
+        let r = drive(&t).await;
+        match &r.outcome {
+            HostTaskOutcome::Ok { changed, .. } => {
+                assert!(*changed, "changed_when: true should force changed=true");
+            }
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 
