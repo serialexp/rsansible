@@ -212,33 +212,62 @@ fn compute_desired(
             }
         });
     }
-    // Non-exclusive: keep all unrelated lines, add or remove the one we
-    // were asked about.
+    // Non-exclusive: walk existing lines. For `state: present` we
+    // replace a matching key IN PLACE (preserving its position) so
+    // that re-running the task on an already-correct file produces
+    // byte-identical output — idempotency requires position
+    // stability, not just set membership. The earlier implementation
+    // stripped the match and re-appended at end; with multiple keys
+    // in the file that flipped the ordering on every run, causing
+    // `changed=true` even when the set of keys was unchanged.
+    // Surfaced via the gothab pgbackrest ssh-mesh task that loops
+    // over peers and self, calling authorized_key once per key:
+    // back-to-back runs reported all 2N iterations as changed because
+    // every invocation rotated its key to the end of the file.
+    //
+    // Matches Ansible's `posix.authorized_key` semantics: comment-
+    // only diffs still rewrite the line (so an updated comment
+    // shows up), but identical-content writes are no-ops.
     let mut kept: Vec<String> = Vec::new();
     let mut found = false;
     for line in existing.lines() {
         if key_matches(line, new_key) {
-            found = true;
-            // Drop matching line for now; we'll re-add canonicalised one
-            // below if state=present.
+            match state {
+                STATE_PRESENT => {
+                    // Replace in place on the first match. Subsequent
+                    // duplicates (rare, but possible if the file was
+                    // hand-edited) are dropped — the canonical line
+                    // we just emitted is the source of truth.
+                    if !found {
+                        kept.push(new_key.full.clone());
+                    }
+                    found = true;
+                }
+                STATE_ABSENT => {
+                    // Drop the matching line.
+                    found = true;
+                }
+                other => {
+                    return Err(AuthorizedKeyError::BadRequest(format!(
+                        "authorized_key: unknown state byte {other}"
+                    )))
+                }
+            }
             continue;
         }
         kept.push(line.to_string());
     }
     match state {
         STATE_PRESENT => {
-            // Add canonicalised line. If it was already present, we
-            // re-insert the line verbatim from the op (so a comment
-            // tweak DOES rewrite the line — Ansible behaves the same).
-            kept.push(new_key.full.clone());
             if !found {
-                // No-op signal: matches `changed=true`. Caller computes
-                // via text equality.
+                // Not present anywhere; append.
+                kept.push(new_key.full.clone());
             }
         }
         STATE_ABSENT => {
-            // `kept` already excludes the matching line; if it wasn't
-            // found, kept == existing.lines(), text equality → no-op.
+            // `kept` already excludes any matching lines; if it
+            // wasn't found, kept == existing.lines(), text equality
+            // → no-op.
         }
         other => {
             return Err(AuthorizedKeyError::BadRequest(format!(
@@ -497,6 +526,38 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
             AuthorizedKeyError::BadRequest(m) => assert!(m.contains("does not exist")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn idempotent_with_multiple_keys_preserves_position() {
+        // Regression: the earlier compute_desired stripped a matching key
+        // and re-appended at end. With K1 present BEFORE K2 in the file,
+        // a `state: present` on K1 would move K1 to the end, flipping the
+        // file to `K2\nK1\n` and reporting `changed=true`. Subsequent
+        // runs would keep rotating. The fix replaces in place so the
+        // bytes are unchanged across repeated runs.
+        //
+        // Surfaced via the gothab pgbackrest ssh-mesh task that loops
+        // over every peer's public key (including self) once per host —
+        // back-to-back drills reported every iteration as changed.
+        let stub = build_stub("posstable", "alice");
+        std::fs::create_dir_all(stub.home.join(".ssh")).unwrap();
+        let initial = format!("{K1}\n{K2}\n");
+        std::fs::write(
+            stub.home.join(".ssh").join("authorized_keys"),
+            &initial,
+        )
+        .unwrap();
+        // Re-add K1 (already first in file). Should be a no-op.
+        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false)
+            .unwrap();
+        assert!(!changed, "re-adding K1 to position 0 should be idempotent");
+        assert_eq!(read_keys(&stub), initial, "file content must be byte-identical");
+        // Re-add K2 (already second in file). Should also be a no-op.
+        let changed = apply_with_paths(&stub.bins, &op("alice", K2, STATE_PRESENT, false), false)
+            .unwrap();
+        assert!(!changed, "re-adding K2 to position 1 should be idempotent");
+        assert_eq!(read_keys(&stub), initial, "file content must remain byte-identical");
     }
 
     #[test]
