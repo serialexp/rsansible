@@ -1,0 +1,25 @@
+[package]
+name = "rsansible-declarative-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Paper-exercise spike for a Pulumi-style declarative front-end. No engine — types and signatures only, stress-tested by the examples."
+
+[dependencies]
+# Intentionally none. This crate must remain a pure-types spike so the
+# API shape is the only thing under review.
+
+[[example]]
+name = "nginx"
+path = "examples/nginx.rs"
+
+[[example]]
+name = "postgres"
+path = "examples/postgres.rs"
+
+[[example]]
+name = "postgres_with_roles"
+path = "examples/postgres_with_roles.rs"

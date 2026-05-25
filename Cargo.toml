@@ -5,6 +5,7 @@ members = [
     "crates/wire-runtime",
     "crates/agent",
     "crates/ctl",
+    "crates/declarative-spike",
 ]
 
 [workspace.package]

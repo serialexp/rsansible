@@ -2790,6 +2790,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsansible-declarative-spike"
+version = "0.0.1"
+
+[[package]]
 name = "rsansible-wire"
 version = "0.0.1"
 dependencies = [
