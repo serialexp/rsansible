@@ -68,3 +68,13 @@ lint:
 
 fmt:
     cargo fmt --all
+
+# Build the documentation site (mdBook) into docs/book/.
+#
+# Requires `mdbook` on PATH: `cargo install mdbook`.
+docs:
+    cd docs && mdbook build
+
+# Serve the docs locally with live reload on http://localhost:3000.
+docs-serve:
+    cd docs && mdbook serve --open

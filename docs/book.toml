@@ -1,0 +1,17 @@
+[book]
+title = "rsansible"
+description = "An Ansible-shaped configuration tool that avoids Ansible's per-task SSH cost."
+authors = ["Bart Riepe"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/serialexp/rsansible"
+edit-url-template = "https://github.com/serialexp/rsansible/edit/main/docs/{path}"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
