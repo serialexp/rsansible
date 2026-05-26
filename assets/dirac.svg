@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!--
+    Dirac (Blish variant) — the Dirac transmitter: one pulse, every
+    message ever sent compressed into it. Central dot is the "beep";
+    rays in 8 directions are the contained transmissions emerging
+    when decoded. Cool blue, same family as the spike variant.
+  -->
+  <g stroke="#0066cc" stroke-width="3" stroke-linecap="round">
+    <!-- four cardinal rays (longer) -->
+    <line x1="32" y1="32" x2="32" y2="8"/>
+    <line x1="32" y1="32" x2="32" y2="56"/>
+    <line x1="32" y1="32" x2="8" y2="32"/>
+    <line x1="32" y1="32" x2="56" y2="32"/>
+    <!-- four diagonal rays (slightly shorter — gives the burst more dimension) -->
+    <line x1="32" y1="32" x2="16" y2="16"/>
+    <line x1="32" y1="32" x2="48" y2="16"/>
+    <line x1="32" y1="32" x2="16" y2="48"/>
+    <line x1="32" y1="32" x2="48" y2="48"/>
+  </g>
+  <!-- central pulse -->
+  <circle cx="32" cy="32" r="5" fill="#0066cc"/>
+</svg>

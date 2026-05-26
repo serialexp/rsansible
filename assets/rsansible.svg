@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!--
+    rsansible — the ansible: instant communication radiating outward.
+    Three concentric arcs as the "signal," a solid origin dot at the
+    source. Rust-orange to anchor the language association without
+    being garish.
+  -->
+  <g fill="none" stroke="#cc5500" stroke-width="3.5" stroke-linecap="round">
+    <path d="M 18 40 A 14 14 0 0 1 46 40"/>
+    <path d="M 24 40 A 8 8 0 0 1 40 40"/>
+  </g>
+  <path d="M 12 40 A 20 20 0 0 1 52 40" fill="none" stroke="#cc5500" stroke-width="3.5" stroke-linecap="round"/>
+  <circle cx="32" cy="40" r="4" fill="#cc5500"/>
+</svg>
