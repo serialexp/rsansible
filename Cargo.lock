@@ -2720,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "rsansible-agent"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "rsansible-ctl"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -2791,11 +2791,11 @@ dependencies = [
 
 [[package]]
 name = "rsansible-declarative-spike"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "rsansible-wire"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "binschema-runtime",

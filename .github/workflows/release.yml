@@ -1,0 +1,168 @@
+name: release
+
+# Tag-triggered release pipeline. Pushing a tag like `v0.1.0` builds the
+# controller for every supported platform, bundles the (x86_64 musl) agent
+# into each tarball, and publishes a GitHub Release with checksums.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed by the release job to create the GitHub Release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The agent is x86_64 musl only (v1). Build it once; every controller
+  # tarball — regardless of its own arch — bundles this same binary, because
+  # it's pushed to x86_64 Linux targets.
+  agent:
+    name: build agent (x86_64 musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cmake clang
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build agent
+        run: cargo build -p rsansible-agent --profile agent --target x86_64-unknown-linux-musl
+
+      - name: Strip
+        run: strip target/x86_64-unknown-linux-musl/agent/rsansible-agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsansible-agent
+          path: target/x86_64-unknown-linux-musl/agent/rsansible-agent
+          if-no-files-found: error
+
+  controller:
+    name: build controller (${{ matrix.target }})
+    needs: agent
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            os: linux
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            os: linux
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (Linux)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cmake clang
+
+      - name: Install build deps (macOS)
+        if: matrix.os == 'macos'
+        run: brew install cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Derive version from tag
+        id: ver
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          cargo_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$cargo_ver" != "$version" ]; then
+            echo "::warning::tag version ($version) does not match Cargo.toml version ($cargo_ver)"
+          fi
+
+      - name: Build controller
+        run: cargo build -p rsansible-ctl --release --target ${{ matrix.target }}
+
+      - name: Download agent artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rsansible-agent
+          path: agent-bin
+
+      - name: Assemble tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.version }}"
+          target="${{ matrix.target }}"
+          stage="rsansible-${version}-${target}"
+          mkdir -p "$stage"
+
+          cp "target/${target}/release/rsansible" "$stage/"
+          strip "$stage/rsansible" || true
+          cp agent-bin/rsansible-agent "$stage/"
+          chmod +x "$stage/rsansible" "$stage/rsansible-agent"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+
+          tar -czf "${stage}.tar.gz" "$stage"
+          # Portable sha256 (Linux: sha256sum, macOS: shasum).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          else
+            shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          fi
+          ls -l "${stage}.tar.gz" "${stage}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            rsansible-*.tar.gz
+            rsansible-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: controller
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # Strip the per-file .sha256 paths down to bare filenames so the
+          # combined file verifies cleanly from within the release dir.
+          cat *.tar.gz.sha256 | sed 's# .*/# #' > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rsansible-*.tar.gz
+            dist/rsansible-*.tar.gz.sha256
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

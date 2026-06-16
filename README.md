@@ -14,6 +14,25 @@ homelab (postgres + Patroni + pgbackrest + valkey + monitoring) is the
 working reference workload — steady-state drills match `ansible-playbook`'s
 PLAY RECAP shape `ok=N changed=M failed=0` exactly.
 
+## Install
+
+```
+curl -fsSL https://raw.githubusercontent.com/serialexp/rsansible/main/install.sh | sh
+```
+
+Detects your OS/arch, downloads the matching release tarball, verifies
+its checksum, and drops the `rsansible` controller plus the
+`rsansible-agent` binary into `~/.local/bin` (override with
+`RSANSIBLE_INSTALL_DIR`). Pin a version with `RSANSIBLE_VERSION=v0.1.0`.
+
+Prebuilt for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+and `aarch64-apple-darwin`. Other platforms (Intel macOS, Windows):
+build from source — see [Building](#building).
+
+The agent shipped in the tarball is x86_64 musl — it's the binary
+pushed to your (x86_64 Linux) targets via `-a`, regardless of the
+controller's own arch.
+
 ## What's in the box
 
 ### Playbook surface
@@ -224,3 +243,11 @@ Every deliberate Ansible divergence belongs in
 `ANSIBLE_COMPAT.md` in the same commit. Every preferred-spelling
 shim belongs in `RSANSIBLE_IDIOMS.md`. The litmus test:
 observable behavior change → COMPAT, no-op behavior shim → IDIOMS.
+
+## License
+
+Dual-licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
+or [MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this
+crate by you, as defined in the Apache-2.0 license, shall be dual-licensed
+as above, without any additional terms or conditions.

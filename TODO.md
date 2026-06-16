@@ -397,6 +397,43 @@ Either way, **not v1**.
   serialises across the binary. Out of scope for now — flake is
   rare enough that it's noise, not a blocker.
 
+- [ ] **Temp-dir collision in `pip` Stub tests (same root cause class).**
+  `pip::tests` build per-test temp dirs named
+  `rsansible-pip-{label}-{pid}-{now_unix_ns()}`. Under `cargo test`'s
+  in-process parallel runner the pid is shared and two stubs created in
+  the same nanosecond land in the same dir, clobbering each other's
+  `installed` DB — `check_mode_reports_would_install` then sees a
+  sibling's `pip install` and its `!db.contains("redis")` assertion
+  fails. Same family as the ETXTBSY flake above (parallel stub tests),
+  different symptom. nextest doesn't hit it (process-per-test → distinct
+  pid); plain `cargo test` does.
+  - **Current mitigation:** CI and the `just test` fallback run
+    `cargo test ... -- --test-threads=1` (serial → no race, full
+    coverage). Verified green across repeated runs.
+  - **Proper fix:** make these test temp dirs collision-proof (atomic
+    counter in the name, or a `tempfile::tempdir()` guard) so the suite
+    can run parallel again, then drop `--test-threads=1` from CI and
+    `just test`.
+
+## CI / toolchain hygiene (deferred — see ci.yml)
+
+The `ci.yml` gate currently runs fmt + clippy as **informational,
+non-blocking** steps. Make them gating once the tree is clean:
+
+- [ ] **`cargo fmt` drift.** `cargo fmt --all --check` reports ~965
+  diff lines across ~100 files against current `@stable` (rustc 1.95).
+  There's no `rustfmt.toml` and no pinned toolchain, so this is
+  `@stable` drift from the 1.75 MSRV, not deliberate non-formatting.
+  Fix: run `cargo fmt --all` in a dedicated formatting-only commit
+  (keep it off feature diffs), then flip the CI fmt step to gating.
+- [ ] **324 clippy warnings.** Mix of genuine lints and MSRV-drift
+  noise (many are "stable since 1.80/1.83" against a 1.75 MSRV). Triage:
+  fix the real ones, `#[allow]` or raise MSRV for the drift, then flip
+  the CI clippy step to gating.
+- [ ] **Consider pinning the toolchain** (`rust-toolchain.toml`) so
+  fmt/clippy are reproducible between local and CI instead of chasing a
+  moving `@stable`. Decide the pinned version with Bart.
+
 ## Forward mode: dedicated controller↔forwarder wire format
 
 Today forward mode ships `WorkflowPayload` as serde JSON + a tarball of

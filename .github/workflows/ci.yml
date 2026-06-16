@@ -1,0 +1,62 @@
+name: ci
+
+# Lean gate on main so we never tag-and-ship binaries that don't build or
+# whose tests fail. fmt + clippy run as informational (non-blocking) steps:
+# the tree isn't yet clean against current `@stable` (toolchain drift from
+# the 1.75 MSRV), so enforcing them today would be red for reasons unrelated
+# to real breakage. See TODO.md — once the tree is fmt/clippy-clean these
+# steps flip to gating.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cmake clang
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --- gating steps ---
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # Serial execution: several agent-crate tests build per-test temp dirs
+      # keyed by pid + timestamp, which collide under the in-process parallel
+      # runner (same pid, same nanosecond) and flake. Single-threaded removes
+      # the race with full coverage. Proper fix (collision-proof temp dirs so
+      # tests can run parallel again) is tracked in TODO.md.
+      - name: Test
+        run: cargo test --workspace -- --test-threads=1
+
+      # Smoke-build the pushed agent in its real (musl) profile so musl
+      # breakage surfaces here, not at release time.
+      - name: Build agent (musl smoke)
+        run: cargo build -p rsansible-agent --profile agent --target x86_64-unknown-linux-musl
+
+      # --- informational, non-blocking (see TODO.md) ---
+      - name: Format (informational)
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      - name: Clippy (informational)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
