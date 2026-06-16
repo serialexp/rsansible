@@ -114,7 +114,7 @@ impl<'de> Deserialize<'de> for WaitForOp {
         let delay_ms = take_seconds_ms(&mut map, "delay", 0)?;
         let sleep_ms = take_seconds_ms(&mut map, "sleep", 1_000)?;
         // `msg:` is the Ansible-style custom message on timeout. We
-        // accept and discard it for now — gothab sets it but the
+        // accept and discard it for now — acme sets it but the
         // agent-side error already names the resource. Drop it from
         // the map so the unknown-field check doesn't trip.
         let _ = map.remove("msg");
@@ -232,7 +232,7 @@ wait_for:
         );
     }
 
-    /// Regression: gothab spells the etcd verify port as
+    /// Regression: acme spells the etcd verify port as
     /// `port: "{{ etcd_client_port }}"`. The literal string isn't a
     /// valid u32 — parse-time validation must store the template and
     /// defer parsing to the render arm.

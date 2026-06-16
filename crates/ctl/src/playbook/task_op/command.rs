@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn command_cmd_with_jinja_defers_shlex_split() {
-        // The exact case from gothab/drill-failover that motivated the
+        // The exact case from acme/drill-failover that motivated the
         // deferred-split design: `{{ var }}` arguments would shlex into
         // three separate `{{`, `var`, `}}` tokens, and `{{` alone fails
         // template precompile with "unexpected end of input".

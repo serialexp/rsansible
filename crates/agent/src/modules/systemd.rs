@@ -185,7 +185,7 @@ fn apply(bin: &str, op: &OpSystemdOutput, check_mode: bool) -> Result<bool, Syst
             // fires on the first install — the unit has never been
             // started, so there's nothing to reload yet, but the
             // intent ("after this, foo is running with current
-            // config") still has to land. Caught in the gothab
+            // config") still has to land. Caught in the acme
             // drill: vmalert's first-install handler `state:
             // reloaded` fired before any `state: started`, and
             // `systemctl reload vmalert` failed with "is not active,
@@ -394,7 +394,7 @@ esac
         assert!(log.contains("restart foo.service"), "log={log:?}");
     }
 
-    /// Regression for the gothab vmalert first-install handler:
+    /// Regression for the acme vmalert first-install handler:
     /// a `notify: Reload vmalert` fires before any `state: started`
     /// has run, so the unit is inactive when `state: reloaded` lands.
     /// Bare `systemctl reload` fails on inactive units; Ansible's

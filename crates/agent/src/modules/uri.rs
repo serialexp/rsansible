@@ -367,7 +367,7 @@ fn build_request(
 fn normalize_headers(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
     // Ansible lowercases response-header keys and joins multi-valued
     // headers with `, ` (Set-Cookie excepted in Ansible, but we don't
-    // need that special case for the gothab consumers). We follow the
+    // need that special case for the acme consumers). We follow the
     // same shape.
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in headers.iter() {

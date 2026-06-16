@@ -12,7 +12,7 @@ like Ansible's linear strategy, just fast.
 
 ## Status
 
-**pre-v0**, but already runs real Ansible playbooks. The gothab
+**pre-v0**, but already runs real Ansible playbooks. A production
 homelab (postgres + Patroni + pgbackrest + valkey + monitoring) is the
 working reference workload — steady-state drills match
 `ansible-playbook`'s PLAY RECAP shape `ok=N changed=M failed=0`

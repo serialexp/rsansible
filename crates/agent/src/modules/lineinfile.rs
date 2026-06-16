@@ -5,7 +5,7 @@
 //! atomically (tmpfile + rename) if so. `changed=1` iff bytes actually
 //! moved on disk; identical content → `changed=0`.
 //!
-//! Supported features (the subset gothab uses):
+//! Supported features (the subset acme uses):
 //!   * `state=present` — ensure a line exists; replace the first line
 //!     matching `regexp` (or, when regexp is empty, the first line
 //!     literally equal to `line`); otherwise append (or place via

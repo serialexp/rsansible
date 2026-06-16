@@ -177,7 +177,7 @@ pub struct RegisterValue {
     /// `stdout_lines`, which made `register.stderr_lines` resolve to
     /// `undefined` in templates and broke common patterns like
     /// `msg: "{{ r.stdout_lines + r.stderr_lines }}"` (caught in the
-    /// gothab etcd verify task).
+    /// acme etcd verify task).
     pub stderr_lines: Vec<String>,
     /// `Some(_)` iff `stdout` parses as JSON. Lets `register.json.field`
     /// work in `when:` clauses without an explicit `from_json` filter.

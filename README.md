@@ -9,10 +9,10 @@ in the agent binary, not separate scripts. Hosts execute in lockstep — per-
 task barrier by default — so it feels like Ansible's linear strategy,
 just fast.
 
-Status: **pre-v0**, but already runs real Ansible playbooks. The gothab
-homelab (postgres + Patroni + pgbackrest + valkey + monitoring) is the
-working reference workload — steady-state drills match `ansible-playbook`'s
-PLAY RECAP shape `ok=N changed=M failed=0` exactly.
+Status: **pre-v0**, but already runs real Ansible playbooks. A
+production homelab (postgres + Patroni + pgbackrest + valkey + monitoring)
+is the working reference workload — steady-state drills match
+`ansible-playbook`'s PLAY RECAP shape `ok=N changed=M failed=0` exactly.
 
 ## Install
 

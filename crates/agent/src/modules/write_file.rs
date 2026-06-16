@@ -215,7 +215,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: boo
     // chown to the tmp (rather than chown'ing the post-rename dest)
     // means an in-flight reader of `path` never sees a transient
     // root-owned file when the playbook asked for caddy-owned. Caught
-    // in the gothab drill: Caddyfile deployed as root:root despite
+    // in the acme drill: Caddyfile deployed as root:root despite
     // playbook saying `group: caddy`, so `systemctl reload caddy`
     // failed with `permission denied` because caddy can't read its
     // own config.

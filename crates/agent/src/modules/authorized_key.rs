@@ -220,7 +220,7 @@ fn compute_desired(
     // stripped the match and re-appended at end; with multiple keys
     // in the file that flipped the ordering on every run, causing
     // `changed=true` even when the set of keys was unchanged.
-    // Surfaced via the gothab pgbackrest ssh-mesh task that loops
+    // Surfaced via the acme pgbackrest ssh-mesh task that loops
     // over peers and self, calling authorized_key once per key:
     // back-to-back runs reported all 2N iterations as changed because
     // every invocation rotated its key to the end of the file.
@@ -537,7 +537,7 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
         // runs would keep rotating. The fix replaces in place so the
         // bytes are unchanged across repeated runs.
         //
-        // Surfaced via the gothab pgbackrest ssh-mesh task that loops
+        // Surfaced via the acme pgbackrest ssh-mesh task that loops
         // over every peer's public key (including self) once per host —
         // back-to-back drills reported every iteration as changed.
         let stub = build_stub("posstable", "alice");

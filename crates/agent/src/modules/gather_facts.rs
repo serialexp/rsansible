@@ -116,7 +116,7 @@ fn title_case(s: &str) -> String {
 }
 
 /// Format the current system time as a small JSON object matching the subset
-/// of Ansible's `ansible_date_time` that gothab and similar playbooks rely on.
+/// of Ansible's `ansible_date_time` that acme and similar playbooks rely on.
 /// `iso8601` is the field commonly templated; the others are cheap extras.
 fn date_time_json() -> Value {
     let now = SystemTime::now()

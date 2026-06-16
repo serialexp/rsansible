@@ -186,7 +186,7 @@ pub struct PostgresqlMembershipOp {
 /// Classify a SQL statement as read-only or potentially-mutating, used
 /// by `--check` to decide whether to dispatch the task or skip it
 /// outright on the controller. Heuristic — not a full SQL parser — but
-/// sufficient for the well-formed SQL gothab issues:
+/// sufficient for the well-formed SQL acme issues:
 ///
 /// 1. Strip leading whitespace, `-- line comments`, and `/* block */`
 ///    comments (with nesting; postgres supports nested `/* */`).
@@ -1465,14 +1465,14 @@ postgresql_ext:
             r#"
 name: t
 postgresql_user:
-  name: gothab
+  name: acme
   password: secret123
   role_attr_flags: "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB"
   login_unix_socket: /var/run/postgresql
 "#,
         );
         let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else { panic!() };
-        assert_eq!(u.name, "gothab");
+        assert_eq!(u.name, "acme");
         assert_eq!(u.password, "secret123");
         assert_eq!(u.role_attr_flags, "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB");
         assert_eq!(u.state, 0); // present
@@ -1549,8 +1549,8 @@ postgresql_user:
             r#"
 name: t
 postgresql_db:
-  name: gothab
-  owner: gothab
+  name: acme
+  owner: acme
   encoding: UTF8
   lc_collate: en_US.UTF-8
   lc_ctype: en_US.UTF-8
@@ -1559,8 +1559,8 @@ postgresql_db:
 "#,
         );
         let TaskBody::Op(TaskOp::PostgresqlDb(d)) = t.body else { panic!() };
-        assert_eq!(d.name, "gothab");
-        assert_eq!(d.owner, "gothab");
+        assert_eq!(d.name, "acme");
+        assert_eq!(d.owner, "acme");
         assert_eq!(d.encoding, "UTF8");
         assert_eq!(d.lc_collate, "en_US.UTF-8");
         assert_eq!(d.lc_ctype, "en_US.UTF-8");

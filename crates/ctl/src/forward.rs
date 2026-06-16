@@ -1206,7 +1206,7 @@ mod tests {
 
     #[test]
     fn internal_host_override_reads_from_host_vars() {
-        // Matches the gothab shape: host_vars/db-2.yml carries the
+        // Matches the acme shape: host_vars/db-2.yml carries the
         // internal IP, inventory's inline mapping only has the public.
         let h = host("db-2", "135.181.x.x").1;
         let mut inv = inv_with(vec![("db-2".into(), h)]);

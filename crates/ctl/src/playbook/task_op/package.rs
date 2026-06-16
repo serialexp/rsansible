@@ -256,7 +256,7 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
                     .unwrap_or(false);
             // Accept and discard `force_apt_get` — we always use apt-get.
             let _ = map.remove("force_apt_get");
-            // Accept and discard `install_recommends` for now; gothab
+            // Accept and discard `install_recommends` for now; acme
             // doesn't set it. (Ansible's default ON matches apt-get's
             // default ON.)
             let _ = map.remove("install_recommends");

@@ -513,7 +513,7 @@ mod tests {
     /// in `groups["all"]`, mirroring Ansible — and plays targeting
     /// `hosts: all` would otherwise pick it up unintentionally.
     ///
-    /// Caught during the gothab live drill: the first play
+    /// Caught during the acme live drill: the first play
     /// (`hosts: all`) was managing the controller laptop as a
     /// side effect, then dying on the first `become: true` task.
     #[test]

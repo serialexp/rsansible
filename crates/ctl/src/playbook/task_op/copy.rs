@@ -331,7 +331,7 @@ copy:
         assert!(format!("{err}").contains("not resolved"), "got: {err}");
     }
 
-    /// Regression: gothab uses `copy: remote_src: true` extensively
+    /// Regression: acme uses `copy: remote_src: true` extensively
     /// to install upstream binaries (extract tarball → copy into
     /// /usr/local/bin). The parser must accept `remote_src: true`
     /// without trying to resolve `src:` against the controller's

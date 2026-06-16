@@ -302,7 +302,7 @@ ufw:
     }
 
     /// `community.general.ufw` documents `policy:` as an alias for
-    /// `default:`. gothab spells it `policy:`. Both must parse the
+    /// `default:`. acme spells it `policy:`. Both must parse the
     /// same shape.
     #[test]
     fn parses_ufw_policy_as_alias_for_default() {
@@ -327,7 +327,7 @@ ufw:
     /// Regression: `policy: "{{ var }}"` must parse without
     /// triggering the [allow, deny, reject] allowlist — the literal
     /// `{{ ... }}` isn't a valid policy, but the value is templated
-    /// and gets resolved at dispatch. gothab's firewall.yml writes
+    /// and gets resolved at dispatch. acme's firewall.yml writes
     /// `policy: "{{ common_ufw_default_input }}"` for exactly this
     /// case.
     #[test]

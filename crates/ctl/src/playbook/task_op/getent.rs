@@ -63,8 +63,8 @@ mod tests {
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
 
     #[test]
-    fn parses_minimal_gothab_shape() {
-        // From gothab postgres-node/user.yml.
+    fn parses_minimal_acme_shape() {
+        // From acme postgres-node/user.yml.
         let t = parse_task(
             r#"
 name: t

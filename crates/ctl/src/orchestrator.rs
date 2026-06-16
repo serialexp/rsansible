@@ -2865,7 +2865,7 @@ fn enqueue_notifies(
 /// host view. Returns the parsed retry-count, or an error string suitable
 /// for surfacing as a BodyResult::Failed reason.
 ///
-/// Plain integer literals short-circuit the template render (gothab has
+/// Plain integer literals short-circuit the template render (acme has
 /// many `retries: 5`-style sites; we don't want to spin up a jinja
 /// template for those). Negative values are not rejected here — the
 /// retry-policy code clamps to 0.
@@ -3437,7 +3437,7 @@ async fn run_op_body(
             }
             _ => {
                 // Soft no-op for ops without env slots. Could be made
-                // strict if it surprises users; today gothab only uses
+                // strict if it surprises users; today acme only uses
                 // environment: on command/shell which DO carry env.
             }
         }
@@ -4682,7 +4682,7 @@ fn run_set_fact_body(
     // as "changed". A side effect is that `notify:` on a plain
     // `set_fact:` is a no-op — to fire a handler from a set_fact you
     // must write `changed_when: true` explicitly. This matches what
-    // Ansible documents and is what the gothab steady-state drill
+    // Ansible documents and is what the acme steady-state drill
     // expects (`pgbackrest_leader_host` set_fact would otherwise show
     // as a phantom "changed" on every run). See ANSIBLE_COMPAT.md.
     BodyResult::Ok {
@@ -7084,7 +7084,7 @@ fn render_str_resolved(
     // Literal-string fast path. Most task-op fields are plain text:
     // file modes (`"0644"`), state markers (`"present"`), package
     // names, fixed paths, command argv elements. Profiling on the
-    // gothab drill showed minijinja's parse+render of a Jinja-free
+    // acme drill showed minijinja's parse+render of a Jinja-free
     // string still costs ~hundreds of microseconds per call; with
     // ~200 tasks × ~10 fields/task that's seconds of wasted work
     // rendering text that has no `{{` or `{%` at all. Short-circuit
@@ -7190,7 +7190,7 @@ fn render_str(
     // expression and explode. So the recursion is confined to the
     // var-resolution helper; the body render is one pass exactly.
     //
-    // Caught in the gothab live drill: vmalert's defaults say
+    // Caught in the acme live drill: vmalert's defaults say
     // `monitoring_vmalert_version: "{{ monitoring_vm_version }}"`,
     // and a get_url task referencing `{{ monitoring_vmalert_version }}`
     // was producing a URL with the literal `{{ monitoring_vm_version }}`
@@ -7233,7 +7233,7 @@ fn render_str(
 /// `patroni_pg_hba: ["host all all {{ vswitch_cidr }} scram-sha-256"]`
 /// passed into minijinja with the inner template still literal. The
 /// template-iteration body then emitted the literal Jinja text — and
-/// in gothab's case that text was a `pg_hba.conf` entry stored in
+/// in acme's case that text was a `pg_hba.conf` entry stored in
 /// Patroni's DCS, which postmaster then rejected as an "invalid
 /// authentication method 'vswitch_cidr'". Ansible's own Templar
 /// renders lazily on every variable access regardless of depth; this
@@ -7258,7 +7258,7 @@ fn resolve_view_var_templates<'a>(
     // unconditionally, then on the first fixpoint pass did another
     // `current.clone()` for the snapshot — two deep clones of a
     // BTreeMap containing the entire hostvars JsonValue::Object —
-    // every render_op call. The gothab db-1 drill measured 13.6s out
+    // every render_op call. The acme db-1 drill measured 13.6s out
     // of 13.9s render_op going to this function despite the playbook
     // having only a handful of var-of-var references. The
     // pre-scan is O(view contents) in CPU but allocates nothing.
@@ -7651,7 +7651,7 @@ fn mjvalue_to_json(v: &minijinja::Value) -> Result<JsonValue> {
 /// op then iterates over the list. minijinja's `template_from_str`
 /// always returns a string, so `render_str` on the same input would
 /// produce `'["curl", "git", ...]'` — a single literal string that
-/// then gets shipped as one bogus package name. Caught in the gothab
+/// then gets shipped as one bogus package name. Caught in the acme
 /// drill: `apt-get install -y '["curl", "git", ...]'` → "Unable to
 /// correct problems, you have held broken packages."
 fn render_string_or_list_sources(
@@ -8287,7 +8287,7 @@ mod tests {
     /// `ConnMode::Local` even when no play declares
     /// `connection: local` — host-var wins, matching Ansible.
     ///
-    /// Caught during the gothab live drill: site.yml's first play
+    /// Caught during the acme live drill: site.yml's first play
     /// (`hosts: all`) targeted localhost, rsansible SSH'd to
     /// bart@127.0.0.1, then died trying to spawn the as=root agent
     /// over a sudo that wasn't NOPASSWD on the controller laptop.
@@ -9018,7 +9018,7 @@ mod tests {
     /// Regression: `apt: { name: "{{ pkg_list }}" }` where
     /// `pkg_list` is a list var must splat into separate package
     /// names, not get rendered as the literal string `'["curl",
-    /// "git", ...]'`. Caught during the gothab drill — apt failed
+    /// "git", ...]'`. Caught during the acme drill — apt failed
     /// with "Unable to correct problems, you have held broken
     /// packages" because the entire stringified list was being
     /// sent as a single argv element.
@@ -9080,7 +9080,7 @@ mod tests {
     }
 
     /// Regression: `render_str` must follow vars-referencing-vars
-    /// until the output stabilizes. Caught in the gothab live drill —
+    /// until the output stabilizes. Caught in the acme live drill —
     /// monitoring-host's defaults say
     /// `monitoring_vmalert_version: "{{ monitoring_vm_version }}"`,
     /// and a get_url task's URL referenced
@@ -9144,18 +9144,18 @@ mod tests {
     /// `summary: "down on {{{{ '{{{{' }}}} $labels.instance {{{{ '}}}}' }}}}"`,
     /// expecting the rendered file to literally contain `{{ $labels.instance }}`)
     /// must NOT be re-rendered — that would treat `$labels.instance`
-    /// as a Jinja expression and error on parse. Caught in the gothab
+    /// as a Jinja expression and error on parse. Caught in the acme
     /// live drill: the first render-until-stable fix broke vmalert's
-    /// `gothab.yml.j2` rule file with `template parse: syntax error`.
+    /// `acme.yml.j2` rule file with `template parse: syntax error`.
     #[test]
     fn render_str_does_not_re_render_jinja_looking_body_output() {
         let env = template::make_env();
         let ctx = HostCtx::new("h".into());
         let view = build_template_ctx(&ctx, &WorldVars::default());
-        let body = "summary: \"gothab-server down on {{ '{{' }} $labels.instance {{ '}}' }}\"";
+        let body = "summary: \"acme-server down on {{ '{{' }} $labels.instance {{ '}}' }}\"";
         let out = render_str(&env, body, &view).unwrap();
         assert_eq!(
-            out, "summary: \"gothab-server down on {{ $labels.instance }}\"",
+            out, "summary: \"acme-server down on {{ $labels.instance }}\"",
             "body render must run exactly once — Prometheus-style \
              escapes that resolve to `{{{{ ... }}}}` text must not \
              be re-fed to minijinja"
@@ -9167,11 +9167,11 @@ mod tests {
     /// `patroni_pg_hba: ["host all all {{ vswitch_cidr }} scram-sha-256"]`
     /// passed straight into minijinja with the inner `{{ vswitch_cidr }}`
     /// unrendered, so iterating it in a template emitted literal
-    /// Jinja text. That broke gothab's Postgres cluster in production
+    /// Jinja text. That broke acme's Postgres cluster in production
     /// (literal `{{ vswitch_cidr }}` ended up in Patroni's DCS, then
     /// in `pg_hba.conf`, and postmaster refused to start with
     /// "invalid authentication method 'vswitch_cidr'"). Recovery
-    /// playbook: `gothab/ansible/playbooks/recover-patroni-pg-hba.yml`.
+    /// playbook: `acme/ansible/playbooks/recover-patroni-pg-hba.yml`.
     #[test]
     fn render_str_renders_jinja_in_list_elements() {
         let env = template::make_env();
@@ -9540,7 +9540,7 @@ mod tests {
     fn apply_task_vars_renders_in_order_and_chains() {
         // BTreeMap key order (alphabetical) means `all_attempts` lands
         // first, then `writer_aggregate_data` can reference it. This is
-        // the exact pattern the gothab drill-failover playbook uses.
+        // the exact pattern the acme drill-failover playbook uses.
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
         ctx.set_facts.insert("n".into(), serde_json::json!(3));
@@ -10044,7 +10044,7 @@ all:
 
     #[test]
     fn quote_pg_ident_doubles_internal_double_quotes() {
-        assert_eq!(quote_pg_ident("gothab").unwrap(), "\"gothab\"");
+        assert_eq!(quote_pg_ident("acme").unwrap(), "\"acme\"");
         // Mixed-case preserved.
         assert_eq!(quote_pg_ident("MyRole").unwrap(), "\"MyRole\"");
         // Internal " is doubled.
@@ -10064,11 +10064,11 @@ all:
 
     #[test]
     fn mask_password_in_sql_redacts_password_clause() {
-        let sql = "CREATE ROLE \"gothab\" WITH LOGIN PASSWORD 'super-secret-123'";
+        let sql = "CREATE ROLE \"acme\" WITH LOGIN PASSWORD 'super-secret-123'";
         let masked = mask_password_in_sql(sql);
         assert!(!masked.contains("super-secret"), "got: {masked}");
         assert!(masked.contains("'<masked>'"), "got: {masked}");
-        assert!(masked.contains("\"gothab\""), "got: {masked}");
+        assert!(masked.contains("\"acme\""), "got: {masked}");
     }
 
     #[test]
@@ -11194,7 +11194,7 @@ all:
     // (`set_fact`, `assert_true`, `fail`) so the mock pool's dead
     // handle is never touched.
 
-    /// Regression for the gothab `ssh-keyscan` task: `shell:` /
+    /// Regression for the acme `ssh-keyscan` task: `shell:` /
     /// `command:` bodies report `changed=true` naturally because the
     /// agent ran them, but the playbook puts `changed_when: false`
     /// to tag the call as diagnostic. Pre-fix, rsansible parsed the
@@ -11225,7 +11225,7 @@ all:
     /// `failed_when:` / `changed_when:` must also see the
     /// just-completed body's register under the user-declared
     /// `register:` NAME — not just as top-level fields. Surfaced
-    /// by gothab's pgbackrest stanza-create task which writes
+    /// by acme's pgbackrest stanza-create task which writes
     /// `failed_when: pgbackrest_stanza_create.rc != 0`. Without
     /// the name-overlay, `pgbackrest_stanza_create` resolves to
     /// the previous attempt's value (or undefined on the first
@@ -11325,7 +11325,7 @@ all:
     /// genuinely wants a set_fact to fire a handler must opt in with
     /// `changed_when: true`.
     ///
-    /// Regression: surfaced via the gothab pgbackrest drill —
+    /// Regression: surfaced via the acme pgbackrest drill —
     /// `Set fact — current Patroni leader hostname` was inflating
     /// the changed count by 1 every run. The earlier implementation
     /// hardcoded `changed: true` "so notify-on-set_fact fires"; that
@@ -11390,7 +11390,7 @@ all:
     /// run_body_with_retries integration point inside the loop
     /// body in run_task_on_one_host). All `results[*].changed`
     /// must reflect the override. This is the shape that
-    /// gothab's ssh-keyscan task uses (loop + changed_when: false).
+    /// acme's ssh-keyscan task uses (loop + changed_when: false).
     #[tokio::test(flavor = "current_thread")]
     async fn loop_changed_when_applies_per_iteration() {
         let mut t = set_fact("each", "x", "1");

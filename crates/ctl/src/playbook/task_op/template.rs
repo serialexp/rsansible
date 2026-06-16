@@ -59,7 +59,7 @@ pub struct TemplateOp {
     pub search_dirs: Vec<PathBuf>,
 }
 
-/// Ansible's `template:` default; matches the surveyed gothab usage
+/// Ansible's `template:` default; matches the surveyed acme usage
 /// where most templated files are non-executable config files.
 ///
 /// Re-used by `copy:` because the two ops share the same default.

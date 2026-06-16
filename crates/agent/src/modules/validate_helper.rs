@@ -71,12 +71,12 @@ pub fn validate_tmp(validate: &str, tmp_path: &Path) -> Result<(), ValidateError
         if tok.contains("%s") {
             // Replace `%s` anywhere inside the token. Matches
             // Ansible: `validate: 'vmagent -config=%s -dryRun'`
-            // (gothab's vmagent task) and `validate: 'visudo -cf
+            // (acme's vmagent task) and `validate: 'visudo -cf
             // %s'` (the canonical example with a standalone token)
             // are both valid forms. The previous "must equal `%s`
             // as a whole token" check rejected the embedded-arg
             // form, breaking real playbooks at module-validate
-            // time. Caught in the gothab drill.
+            // time. Caught in the acme drill.
             args.push(tok.replace("%s", &tmp_str));
             substituted = true;
         } else {
@@ -178,11 +178,11 @@ mod tests {
     /// Regression: `%s` must be substituted whether it stands alone
     /// (`visudo -cf %s`) OR is embedded in an argument
     /// (`vmagent -promscrape.config=%s -dryRun`). The latter is how
-    /// gothab's vmagent and many real-world validators are spelled,
+    /// acme's vmagent and many real-world validators are spelled,
     /// and rsansible used to reject those at module-validate time
     /// with "validate: command must contain `%s` placeholder"
     /// because we only matched the standalone-token form. Caught
-    /// in the gothab live drill.
+    /// in the acme live drill.
     #[test]
     fn substitutes_percent_s_embedded_in_argument() {
         let p = tmp_with_contents("embedded", b"x");

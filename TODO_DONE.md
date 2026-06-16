@@ -38,7 +38,7 @@ handlers. ~1500 LoC controller-side; lives in
   - Literal list (`loop: [a,b,c]`) or jinja string (`loop: "{{ xs }}"`).
   - Per-iteration register aggregated into `results: [...]` under the
     task's `register:`. `subelements` filter ships in template env.
-  - `include_tasks:` (runtime include) deferred — gothab uses
+  - `include_tasks:` (runtime include) deferred — acme uses
     `import_tasks` exclusively, per the survey.
 - [x] **`import_tasks:` (parse-time flattening)**
   - Recursive with cycle detection and 16-deep cap. Imports flatten
@@ -92,9 +92,9 @@ broadcast (the happy-path test), unknown-delegate failure path, and
 handler failure under `on_failure: stop` halting the play.
 
 The originally-named acceptance — running a hand-translated
-`bootstrap-etcd-ca.yml.port` from gothab — is deferred to a
+`bootstrap-etcd-ca.yml.port` from acme — is deferred to a
 follow-up: the per-feature e2e is more diagnostic, and porting the
-real gothab playbook is its own unit of work.
+real acme playbook is its own unit of work.
 
 ---
 
@@ -271,7 +271,7 @@ new wire framing roundtrip for `OpGatherFacts`.
   `when: foo.stat.exists` gating both positive and negative paths.
 - [x] **`OpFile`** — Ansible's `file:` task module. New wire op kind=5
   (`{path, state, has_mode, mode, owner, group, recurse}`); agent
-  module supports the four states gothab uses: `directory` (mkdir -p
+  module supports the four states acme uses: `directory` (mkdir -p
   + chmod/chown; recurse flag walks descendants), `absent` (rm -rf for
   dirs, unlink for files/symlinks; no-op when missing), `touch`
   (create-if-missing + bump atime/mtime, always-changed per Ansible's
@@ -474,7 +474,7 @@ config, ufw rules, netplan, sshd handlers fire on change).
   case: follow up to 10 hops iff the original request method is GET
   or HEAD; otherwise stop. NONE → `Policy::none()`; ALL →
   `Policy::limited(10)`. v1 does NOT strip Authorization on
-  cross-origin redirect (gothab uses static bearers against fixed
+  cross-origin redirect (acme uses static bearers against fixed
   hosts — flagged for v2 if needed).
 
   Controller side (`crates/ctl/src/playbook/task_op.rs`) adds `UriOp`
@@ -605,23 +605,23 @@ config, ufw rules, netplan, sshd handlers fire on change).
   !stopped_early), and a control playbook without `ignore_errors:`
   that halts under `on_failure: stop` (post marker absent, host
   Failed, stopped_early). v1 accepts a literal bool only; the 6
-  gothab uses are all literal `ignore_errors: true`, no Jinja.
+  acme uses are all literal `ignore_errors: true`, no Jinja.
 - [x] **Vault** — landed in Phase 2a (`crates/ctl/src/vault.rs`).
   rustcrypto stack (`aes`+`ctr`+`pbkdf2`+`hmac`+`sha2`+`subtle`+`hex`).
   Used by group_vars/host_vars discovery; one example is
   vault-encrypted in `examples/group_vars/web/secrets.yml`.
 - [x] **Bug 18 — recursive lazy templating of nested string vars**
-  (gothab live drill). `resolve_view_var_templates` in
+  (acme live drill). `resolve_view_var_templates` in
   `crates/ctl/src/orchestrator.rs` was walking only top-level keys of
   the view map, so a role default like
   `patroni_pg_hba: ["host all all {{ vswitch_cidr }} scram-sha-256"]`
   passed into minijinja with the inner `{{ vswitch_cidr }}` literal.
   When a template iterated the list, the literal Jinja text landed in
-  the rendered output — in gothab's case, that text was a
+  the rendered output — in acme's case, that text was a
   `pg_hba.conf` entry stored in Patroni's DCS, which postmaster then
   rejected as "invalid authentication method 'vswitch_cidr'", taking
   the cluster down. Recovery via plain Ansible:
-  `gothab/ansible/playbooks/recover-patroni-pg-hba.yml`. Fix: walk
+  `acme/ansible/playbooks/recover-patroni-pg-hba.yml`. Fix: walk
   the view recursively into arrays and objects per pass (sibling
   helper `resolve_strings_in_value` that renders in-place against a
   per-pass snapshot view, calls minijinja directly to avoid

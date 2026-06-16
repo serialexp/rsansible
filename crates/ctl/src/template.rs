@@ -57,7 +57,7 @@ pub const OMIT_SENTINEL: &str =
 /// index into a list / tuple. minijinja's lexer does not — it
 /// tokenizes `.0` as the start of a float literal and rejects the
 /// surrounding expression with "unexpected float, expected identifier
-/// or integer". Real-world Ansible playbooks (gothab being the
+/// or integer". Real-world Ansible playbooks (acme being the
 /// motivating case) lean heavily on `item.0` / `item.1` after a
 /// `subelements` loop, so blanket-translating that syntax saves every
 /// caller from porting templates by hand.
@@ -124,7 +124,7 @@ pub fn prepare_jinja_source(src: &str) -> std::borrow::Cow<'_, str> {
     // (`{`, `}`, `%`, `#`, quotes, `.`, digits, `\\`), and UTF-8
     // continuation/lead bytes (≥0x80) never collide with ASCII, so
     // walking bytes is safe. Only the output accumulation needed
-    // fixing. Caught in the gothab live drill (scrape.yml.j2 has an
+    // fixing. Caught in the acme live drill (scrape.yml.j2 has an
     // em-dash in a comment, and several `.<digit>` sequences elsewhere
     // that engaged the slow path).
     let mut out: Vec<u8> = Vec::with_capacity(src.len());
@@ -333,14 +333,14 @@ pub fn make_env<'a>() -> Environment<'a> {
     // output. Sometimes harmless cosmetic noise, sometimes load-bearing:
     // a systemd unit file using `\`-line-continuation cannot survive a
     // blank line between continued lines, the parser truncates ExecStart
-    // at the gap. Caught in the gothab drill — vmalert.service.j2's
+    // at the gap. Caught in the acme drill — vmalert.service.j2's
     // `{% if monitoring_cross_notifier_url != 'TBD' %}` block dropped the
     // `-notifier.url` flag silently, putting vmalert in a fatal crash
     // loop. `lstrip_blocks` stays default-false to match Ansible.
     env.set_trim_blocks(true);
     env.add_filter("mandatory", mandatory_filter);
     env.add_filter("subelements", subelements_filter);
-    // Ansible-style filters; gothab uses these in role templates.
+    // Ansible-style filters; acme uses these in role templates.
     env.add_filter("b64encode", b64encode_filter);
     env.add_filter("b64decode", b64decode_filter);
     env.add_filter("from_json", from_json_filter);
@@ -350,7 +350,7 @@ pub fn make_env<'a>() -> Environment<'a> {
     env.add_filter("to_json", to_json_filter);
     env.add_filter("regex_replace", regex_replace_filter);
     // Ansible's set-style list filters. minijinja doesn't ship these.
-    // Used heavily in gothab role templates for "every peer except me":
+    // Used heavily in acme role templates for "every peer except me":
     //   groups['pgbackrest'] | difference([inventory_hostname]) | first
     env.add_filter("difference", difference_filter);
     env.add_filter("intersect", intersect_filter);
@@ -362,7 +362,7 @@ pub fn make_env<'a>() -> Environment<'a> {
     //   - `match`  — Python's re.match (anchored at the start).
     //   - `search` — Python's re.search (anywhere in the string).
     //   - `regex`  — Ansible's alias for `search`.
-    // Caught in the gothab valkey verify task:
+    // Caught in the acme valkey verify task:
     //   {{ lines | select('match', '^role:') | list | first | ... }}
     // minijinja's built-in tests don't include these.
     env.add_test("match", regex_match_test);
@@ -384,7 +384,7 @@ pub fn make_env<'a>() -> Environment<'a> {
     // Ansible's `random` filter — `{{ 99 | random }}` returns an int
     // in [0, 99). When applied to a sequence it picks a random element.
     // No seed/salt args supported (Ansible's optional `start`/`step`
-    // args fall through to mandatory-default semantics that gothab
+    // args fall through to mandatory-default semantics that acme
     // doesn't use). See ANSIBLE_COMPAT.md.
     env.add_filter("random", random_filter);
     // `omit` global: see OMIT_SENTINEL doc above. Ansible playbooks rely
@@ -610,11 +610,11 @@ fn lookup_one(container: &MjValue, key: &MjValue) -> Result<MjValue, MjError> {
 /// `value | random` — Ansible's `random` filter.
 ///
 /// - On an integer N (>=0): returns a uniformly random integer in [0, N).
-///   `{{ 9999 | random }}` is the gothab idiom for unique IDs.
+///   `{{ 9999 | random }}` is the acme idiom for unique IDs.
 /// - On a sequence: returns one randomly selected element.
 ///
 /// We don't implement the optional `start:` / `step:` / `seed:` kwargs —
-/// gothab doesn't use them and Ansible's docs explicitly recommend
+/// acme doesn't use them and Ansible's docs explicitly recommend
 /// `set_fact` + a deterministic generator if you need reproducibility.
 fn random_filter(value: MjValue) -> Result<MjValue, MjError> {
     use rand::Rng as _;
@@ -666,7 +666,7 @@ fn b64encode_filter(value: MjValue) -> Result<MjValue, MjError> {
 
 /// `value | b64decode` — base64-decode a string and return the result as
 /// a UTF-8 string. Non-UTF-8 output errors out (matches Ansible — for
-/// raw bytes, gothab pipes through `copy:` with a pre-encoded file).
+/// raw bytes, acme pipes through `copy:` with a pre-encoded file).
 fn b64decode_filter(value: MjValue) -> Result<MjValue, MjError> {
     use base64::Engine as _;
     let s = value.as_str().ok_or_else(|| {
@@ -706,7 +706,7 @@ fn from_json_filter(value: MjValue) -> Result<MjValue, MjError> {
 
 /// `value | to_json` — Ansible alias for minijinja's built-in `tojson`.
 /// Returns the value as a compact JSON string. We deliberately do not
-/// accept an `indent` arg (the built-in `tojson` does); gothab doesn't
+/// accept an `indent` arg (the built-in `tojson` does); acme doesn't
 /// use it. Add if needed.
 fn to_json_filter(value: MjValue) -> Result<MjValue, MjError> {
     let s = serde_json::to_string(&value).map_err(|e| {
@@ -717,11 +717,11 @@ fn to_json_filter(value: MjValue) -> Result<MjValue, MjError> {
 
 /// `value | regex_replace(pattern, replacement)` — `regex::Regex::replace_all`
 /// applied to a string. Pattern is Rust regex syntax (close to PCRE for
-/// the cases gothab uses); replacement supports `$1` / `${name}`
+/// the cases acme uses); replacement supports `$1` / `${name}`
 /// backrefs.
 ///
 /// Ansible's filter also accepts an optional `multiline` / `ignorecase`
-/// flag; we don't yet (gothab doesn't use them). Easy to add via the
+/// flag; we don't yet (acme doesn't use them). Easy to add via the
 /// `(?i)` / `(?m)` inline flags in the meantime.
 /// Helper for the register-shape tests. Look up a named bool-valued
 /// attribute on a value; return `Ok(false)` for anything that isn't a
@@ -1368,7 +1368,7 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("lineinfile.validate: {e}"))?;
             }
             // regexp / insertbefore / insertafter are regex patterns —
-            // we don't Jinja-render those (gothab doesn't use Jinja
+            // we don't Jinja-render those (acme doesn't use Jinja
             // inside regex patterns, and `{{...}}` would be ambiguous
             // with regex syntax). If we ever need it, add it here.
         }
@@ -1765,7 +1765,7 @@ mod tests {
     /// (`{% if %}`, `{% endif %}`, `{% for %}`, …). Pre-fix
     /// `make_env()` did not set this, so a conditional block in a
     /// template left a blank line in the output. Cosmetic in most
-    /// files, load-bearing in some: caught in the gothab drill when
+    /// files, load-bearing in some: caught in the acme drill when
     /// `vmalert.service.j2`'s `{% if monitoring_cross_notifier_url
     /// != 'TBD' %}` block produced a blank line between two
     /// `\`-continued ExecStart args. systemd's parser cannot bridge
@@ -1795,7 +1795,7 @@ mod tests {
     /// codepoint and re-encodes as UTF-8 — corrupting every em-dash,
     /// every accented character, every emoji.
     ///
-    /// Caught in the gothab drill: vmagent's scrape.yml.j2 had
+    /// Caught in the acme drill: vmagent's scrape.yml.j2 had
     /// `version: 1.0`-style sequences (engaging the slow path) and an
     /// em-dash in a comment. The em-dash (`e2 80 94`) arrived on the
     /// agent as `c3 a2 c2 80 c2 94`, causing `vmagent -dryRun` to
@@ -1822,7 +1822,7 @@ mod tests {
 
     /// Regression: a template body containing non-ASCII UTF-8 (em-dash,
     /// U+2014, bytes `e2 80 94`) must round-trip verbatim through
-    /// minijinja's render path. Caught in the gothab drill — vmagent
+    /// minijinja's render path. Caught in the acme drill — vmagent
     /// scrape.yml.j2 has em-dash in a comment, and the rendered output
     /// was arriving on the agent as `c3 a2 c2 80 c2 94` (Latin-1-as-
     /// UTF-8 double encoding), making `vmagent -dryRun` reject it with
@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(out, "alice");
     }
 
-    /// Regression: gothab's `patroni.yml.j2` uses
+    /// Regression: acme's `patroni.yml.j2` uses
     /// `{% include "patroni-common.yml.j2" %}` to factor out shared
     /// chunks. Resolution must walk a per-task `search_dirs` list
     /// (role's `templates/` first, then playbook-level fallbacks).
@@ -2464,7 +2464,7 @@ mod tests {
 
     #[test]
     fn pycompat_until_expression_compiles() {
-        // The exact `until:` shape that surfaced this gap in gothab's
+        // The exact `until:` shape that surfaced this gap in acme's
         // drill-restore.yml: `drill_state.stdout.strip() != 'activating'`.
         // We compile-and-eval as an expression here because that's how
         // the orchestrator evaluates `until:` (see `eval_when`).
@@ -2611,18 +2611,18 @@ mod tests {
         precompile_all(&pb).unwrap();
     }
 
-    /// Regression for the gothab valkey verify task that did
+    /// Regression for the acme valkey verify task that did
     /// `{{ lines | select('match', '^role:') | list | first | default(...) }}`:
     /// minijinja shipped without `match`/`search`/`regex` tests, so the
     /// `select('match', ...)` call raised "unknown test" at render
     /// time and the debug task failed across all valkey nodes. Pin
     /// the test registrations.
-    /// Regression for the gothab pgbackrest.conf template that did
+    /// Regression for the acme pgbackrest.conf template that did
     /// `groups['pgbackrest'] | difference([inventory_hostname]) | first`
     /// to pick the peer node. minijinja shipped without `difference`
     /// (or `intersect`/`union`/`symmetric_difference`/`unique`/`flatten`).
     /// Pin the registrations.
-    /// Regression for the gothab pgbackrest-restore-drill task
+    /// Regression for the acme pgbackrest-restore-drill task
     /// `when: pgbackrest_drill_dockerfile is changed`: minijinja
     /// shipped without `is changed` / `is failed` / `is succeeded` /
     /// `is skipped` register tests. The when: render hit

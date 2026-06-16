@@ -520,7 +520,7 @@ where
             // regular files in sticky dirs when the file owner differs
             // from the opener — even for root. GNU tar's
             // `--overwrite` default sidesteps the same issue by
-            // unlinking first; we do the same. Caught in the gothab
+            // unlinking first; we do the same. Caught in the acme
             // drill (vmutils tarball extracted into `/tmp/` where a
             // prior bart-owned `vmalert-tool-prod` blocked the
             // root-running rsansible agent with EACCES). `remove_file`
@@ -902,7 +902,7 @@ mod tests {
 
     /// Regression: extraction must unlink-before-create so that the
     /// new entry's bytes land even when the existing target is
-    /// non-writable to the calling EUID. Caught in the gothab live
+    /// non-writable to the calling EUID. Caught in the acme live
     /// drill: a bart-owned `/tmp/vmalert-tool-prod` left over from an
     /// earlier non-become drill blocked a subsequent root-running
     /// unarchive with `EACCES`, because the kernel's

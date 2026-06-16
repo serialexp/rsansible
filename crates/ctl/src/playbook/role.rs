@@ -26,7 +26,7 @@
 //!
 //! A role directory must exist (else load fails). A role with no
 //! tasks/handlers/defaults at all (i.e. only templates/) is currently
-//! rejected — those don't show up in the gothab survey and the
+//! rejected — those don't show up in the acme survey and the
 //! ambiguity isn't worth carrying.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -579,7 +579,7 @@ fn resolve_role_dir(base_dir: &Path, name: &str) -> Result<PathBuf> {
     //
     //   2. `<base_dir>/../roles/<name>/` — playbook in a `playbooks/`
     //      subdirectory, roles as a sibling of that subdirectory. This
-    //      is gothab's layout, and matches Ansible's default
+    //      is acme's layout, and matches Ansible's default
     //      `roles_path` resolution when `ansible-playbook` is run from
     //      the project root (where `ansible.cfg` lives) with the
     //      playbook nested one level down.

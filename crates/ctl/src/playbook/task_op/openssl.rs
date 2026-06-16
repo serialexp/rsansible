@@ -623,7 +623,7 @@ openssl_privatekey:
     }
 
     /// Regression: Ansible's `openssl_privatekey` accepts `owner:`
-    /// and `group:`. gothab uses both on its CA/server key tasks.
+    /// and `group:`. acme uses both on its CA/server key tasks.
     /// We parse them (so playbooks don't trip on unknown-field
     /// rejection); they're not yet applied at dispatch — see
     /// TODO.md.
@@ -703,7 +703,7 @@ openssl_csr_pipe:
     }
 
     /// Regression: Ansible's `openssl_csr_pipe` accepts `digest:`.
-    /// gothab uses `digest: sha256` on every CSR task. We parse it
+    /// acme uses `digest: sha256` on every CSR task. We parse it
     /// for compat; rcgen picks the hash from the key type
     /// implicitly. See ANSIBLE_COMPAT.md §6.
     #[test]
@@ -734,7 +734,7 @@ openssl_csr_pipe:
   privatekey_path: /tmp/ca.key
   common_name: "rsansible test CA"
   country_name: FI
-  organization_name: Gothab
+  organization_name: Acme
   organizational_unit_name: etcd-ca
   basic_constraints: ["CA:TRUE"]
   basic_constraints_critical: true
@@ -745,7 +745,7 @@ openssl_csr_pipe:
         match t.body {
             TaskBody::Op(TaskOp::OpenSslCsrPipe(c)) => {
                 assert_eq!(c.country_name, "FI");
-                assert_eq!(c.organization_name, "Gothab");
+                assert_eq!(c.organization_name, "Acme");
                 assert_eq!(c.organizational_unit_name, "etcd-ca");
                 assert_eq!(c.basic_constraints, vec!["CA:TRUE"]);
                 assert!(c.basic_constraints_critical);
@@ -839,7 +839,7 @@ x509_certificate_pipe:
 
     #[test]
     fn x509_pipe_jinja_not_after_is_deferred() {
-        // gothab's etcd role spells the cert validity as a Jinja
+        // acme's etcd role spells the cert validity as a Jinja
         // template against a role var:
         //   selfsigned_not_after: "+{{ etcd_cert_validity_days }}d"
         // Parse-time validation must not reject the template — it

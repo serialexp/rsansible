@@ -224,7 +224,7 @@ fn load_raw_root(path: &Path) -> Result<RawRoot> {
             // The YAML inventory schema requires a top-level `all:`
             // mapping. Skip files that lack it — they're a sibling
             // file in the inventory directory used for something else
-            // (e.g. gothab's subnets.yml, IPAM contract data). Ansible
+            // (e.g. acme's subnets.yml, IPAM contract data). Ansible
             // achieves the same outcome through ansible.cfg
             // `ignore_patterns`; rsansible doesn't read ansible.cfg
             // but the schema check is a clean enough signal that the
@@ -316,7 +316,7 @@ fn flatten_pre_hosts(raw: RawRoot) -> Result<PreHosts> {
     let all_vars = yaml_map_to_json(all.vars).context("all.vars")?;
 
     // Reject hosts declared directly under `all.hosts` for the survey-driven
-    // simplification — gothab puts everything under children groups. Once
+    // simplification — acme puts everything under children groups. Once
     // we need to support ungrouped hosts we can flip this on, but unknown
     // shapes are better caught early.
     if !all.hosts.is_empty() {
@@ -711,7 +711,7 @@ all:
     /// `ansible_connection: local` as an inline var so plays
     /// targeting `hosts: all` execute locally instead of SSHing
     /// to 127.0.0.1 and then trying to sudo to root. Caught when
-    /// running gothab's site.yml against the real fleet — every
+    /// running acme's site.yml against the real fleet — every
     /// "Baseline OS configuration" task on localhost died with
     /// "agent ... closed stdout before sending Hello" once become
     /// kicked in (controller laptop has no NOPASSWD sudo).

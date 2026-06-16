@@ -703,7 +703,7 @@ impl<'de> Deserialize<'de> for Task {
 
         // `name:` is optional in Ansible (most idiomatic playbooks set
         // one, but `- import_tasks: foo.yml` without a name is legal
-        // and gothab uses it). When absent, we leave name empty here
+        // and acme uses it). When absent, we leave name empty here
         // and synthesize a "(unnamed <kind>)" placeholder after we
         // know the body kind — keeps log output readable without
         // requiring playbook authors to name every line.
@@ -2213,7 +2213,7 @@ mod tests {
 
     #[test]
     fn retries_jinja_string_form_parses() {
-        // This is the actual shape gothab's drill playbooks use.
+        // This is the actual shape acme's drill playbooks use.
         let yaml = r#"
 - name: wait
   shell: check.sh
@@ -2719,7 +2719,7 @@ write_file:
 
     #[test]
     fn accepts_task_without_name_synthesizing_display_name() {
-        // gothab's postgres-exporter/tasks/main.yml has bare
+        // acme's postgres-exporter/tasks/main.yml has bare
         // `- ansible.builtin.import_tasks: install.yml` entries with
         // no `name:`. Parser must accept them — Ansible does — and
         // synthesize a readable display name.

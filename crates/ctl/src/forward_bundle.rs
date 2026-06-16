@@ -96,7 +96,7 @@ pub fn build_workspace_tar_gz(opts: &BundleOptions) -> Result<Vec<u8>> {
         );
     }
 
-    // Stage to a buffer; the gothab tree is ~few MB which fits in RAM
+    // Stage to a buffer; the acme tree is ~few MB which fits in RAM
     // trivially and the SSH stdin write side already buffers the whole
     // payload anyway.
     let buf = Vec::<u8>::with_capacity(1024 * 1024);

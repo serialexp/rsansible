@@ -120,7 +120,7 @@ that the `until:` expression can evaluate against. Authors writing
 
 **Why diverge.** The implicit binding is a magic-name surface that
 makes the `until:` expression's meaning depend on hidden state. In
-real-world usage (verified across the entire gothab playbook tree —
+real-world usage (verified across the entire acme playbook tree —
 4 playbooks, 9 `until:` sites) **every single `until:` references a
 named registered variable** — `wait_new_primary.rc`,
 `drill_state.stdout`, `writer_status.finished`, etc. Nobody actually
@@ -152,7 +152,7 @@ controller path.
 against `hosts: db01 connection: ssh` creates `/tmp/<…>` on `db01`,
 and `register.path` is `db01`'s path.
 
-**Why we diverge.** The only Phase 1 consumer (gothab's
+**Why we diverge.** The only Phase 1 consumer (acme's
 `bootstrap-etcd-ca.yml`) runs `connection: local` against `localhost`,
 so the controller IS the target. Growing a target-side wire op
 (`OpTempfile` + agent handler + integration tests) is work we don't
@@ -199,7 +199,7 @@ output vs Ansible's. We surface the limitation up front.
 
 **Fix when porting an Ansible playbook.** Set
 `key_usage_critical: true` (and `basic_constraints_critical: true`
-when supplying BC). For the only Phase 1 consumer (gothab's etcd CA)
+when supplying BC). For the only Phase 1 consumer (acme's etcd CA)
 this matches what the playbook already wants — a CA's KeyUsage *must*
 be critical for openssl's chain validator to accept it.
 
@@ -219,7 +219,7 @@ requested digest.
 defaults rcgen picks line up with the Ansible defaults that any
 sane modern playbook would specify. Plumbing per-extension digest
 selection through rcgen is work we'd do when a playbook needs SHA-512
-or SHA-384, which gothab doesn't.
+or SHA-384, which acme doesn't.
 
 **Fix when porting an Ansible playbook.** If the playbook depends on
 a non-default digest, this won't yet do what you want — file an issue
@@ -380,7 +380,7 @@ LOG/REJECT targets, conntrack, owner-match, rate-limiting, and
 whole-chain operations (`flush:` / `policy:`). The full surface is a
 substantial agent module.
 
-The subset above covers what gothab and similar production playbooks
+The subset above covers what acme and similar production playbooks
 actually use: insert/remove DROP rules with a comment tag for
 idempotency, optionally scoped to a single interface, address, and
 port. The unsupported knobs are rejected **at parse time, loudly**,

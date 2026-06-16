@@ -5,7 +5,7 @@
 //!
 //! NOT supported (refused at parse time): `path`, `manage_dir`,
 //! `key_options`, `comment`, `validate_certs`, `follow`. The default
-//! path (`~user/.ssh/authorized_keys`) covers every gothab use case,
+//! path (`~user/.ssh/authorized_keys`) covers every acme use case,
 //! and the rest are rarely needed. Adding `key_options` if a real
 //! playbook wants it is straightforward — the wire format already
 //! preserves the full key line, so it's a parse-side change.
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn parses_operator_key_present() {
-        // Pattern from gothab roles/common/tasks/users.yml.
+        // Pattern from acme roles/common/tasks/users.yml.
         let t = parse_task(
             r#"
 name: t

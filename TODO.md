@@ -1,7 +1,7 @@
-# rsansible — roadmap to running gothab
+# rsansible — roadmap to running acme
 
 The v0 shipped (`shell`/`exec`/`write_file` over a pushed-agent framed
-protocol). To run the real Ansible flows in `~/Projects/gothab/ansible/`
+protocol). To run the real Ansible flows in `~/Projects/acme/ansible/`
 (4 playbooks, 8 roles, ~400 tasks, 17 Jinja templates), the controller
 needs a real programming model and the agent needs a wider module set.
 
@@ -16,7 +16,7 @@ and acceptance criteria live in `TODO_DONE.md`. What's left:
 
 ## Phase 2 — open follow-ups
 
-- [ ] **Nested groups / boolean selectors** — defer; gothab doesn't
+- [ ] **Nested groups / boolean selectors** — defer; acme doesn't
   use either. Add if/when something needs them.
 
 ---
@@ -164,7 +164,7 @@ Vault).
   (41ms)") would be a big quality bump.
 - [ ] **Ansible compat shim** — at some point, decide whether we want
   `rsansible run playbook.yaml` to **accept Ansible's exact YAML** or
-  diverge. Gothab is the test case. Aim for "accept what gothab uses"
+  diverge. Acme is the test case. Aim for "accept what acme uses"
   rather than "accept all of Ansible".
 
 ---
@@ -178,15 +178,15 @@ Vault).
 | 3 | ~1200 | +6 ops | site.yml `common` role | ✅ done |
 | 4 | ~600  | +1 op (`OpUri`); templates rendered controller-side | site.yml etcd role | ✅ done |
 | 5 | ~1500 | +3 ops (`OpPostgresql`, `OpAsync`, x509 family) | drill playbooks | done — x509 ✅, postgresql ✅, async ✅, get_url ✅, read_file ✅, unarchive ✅ |
-| **total** | **~5600 LoC** | **+13 ops** | full gothab | |
+| **total** | **~5600 LoC** | **+13 ops** | full acme | |
 
 For reference, v0 today is roughly 2000 LoC across all crates. So
-running gothab is a ~3.5× larger codebase than what's there now. Not
+running acme is a ~3.5× larger codebase than what's there now. Not
 absurd, but it's a real project, not a weekend.
 
 ## drill-failover blockers surfaced 2026-05-18
 
-Two `block:`-related orchestrator bugs found by running gothab's
+Two `block:`-related orchestrator bugs found by running acme's
 drill-failover.yml live and fixed in the same session; one
 playbook-level dependency surfaced after, NOT yet implemented:
 
@@ -224,9 +224,9 @@ playbook-level dependency surfaced after, NOT yet implemented:
      which matches per_play's no-barrier shape; documented in
      CLAUDE.md.
 
-## Gothab live-fire results (2026-05-18, commit 14107b8)
+## Acme live-fire results (2026-05-18, commit 14107b8)
 
-Tried `rsansible validate` against every gothab playbook + one live run.
+Tried `rsansible validate` against every acme playbook + one live run.
 
 - [x] **bootstrap-etcd-ca.yml** parses AND runs end-to-end on localhost.
   Correctly bailed at the "refuse to overwrite" assert because the CA
@@ -257,7 +257,7 @@ Tried `rsansible validate` against every gothab playbook + one live run.
   form (no `name:`). Parser requires `name`; needs to be optional
   when only update_cache/upgrade is set. Small.
 
-### Fixed this session (2026-05-19, gothab site.yml iteration)
+### Fixed this session (2026-05-19, acme site.yml iteration)
 
 - [x] `delegate_facts:` task-level metadata (parsed, currently ignored;
   semantic enforcement TBD when a playbook actually needs it).
@@ -287,7 +287,7 @@ Tried `rsansible validate` against every gothab playbook + one live run.
 
 ### Next: postgresql_user + postgresql_db as controller-side composites
 
-gothab's `postgres-node/tasks/app-database.yml` uses two unimplemented
+acme's `postgres-node/tasks/app-database.yml` uses two unimplemented
 postgresql modules. Implementing them as **controller-side composites**
 that dispatch the existing `OpPostgresqlQuery` wire op instead of
 shipping fresh agent modules — pattern already established by
@@ -315,7 +315,7 @@ in-process agent module would do the same two SQL roundtrips
 end-to-end but only **one** wire dispatch — saving ~1ms of framing +
 ssh-channel cost per task. Acceptable for v1 (steady-state runs
 trigger the idempotent fast-path with 1 roundtrip anyway, and the
-gothab playbooks only hit these tasks a handful of times). Revisit
+acme playbooks only hit these tasks a handful of times). Revisit
 if a profiling pass shows postgres composite tasks dominating run
 time, or if we end up adding a third + fourth composite (membership,
 privs) — at that point the right move is probably either:
@@ -368,7 +368,7 @@ Either way, **not v1**.
   being added twice. Cosmetic, but distracting in real-world output.
 
 - [ ] **Other unsupported FQCN modules surfaced by `grep -roE`** in
-  gothab roles (not yet hit because site.yml fails earlier, but will
+  acme roles (not yet hit because site.yml fails earlier, but will
   block once we land timezone):
   - `community.docker.docker_image`
   - `community.general.counter`

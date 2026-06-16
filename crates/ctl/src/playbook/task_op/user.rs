@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn parses_node_exporter_style_system_user() {
-        // Pattern lifted from gothab roles/node-exporter/tasks/main.yml.
+        // Pattern lifted from acme roles/node-exporter/tasks/main.yml.
         let t = parse_task(
             r#"
 name: t
@@ -213,7 +213,7 @@ user:
 
     #[test]
     fn parses_operator_user_with_supplementary_groups() {
-        // Pattern lifted from gothab roles/common/tasks/users.yml.
+        // Pattern lifted from acme roles/common/tasks/users.yml.
         let t = parse_task(
             r#"
 name: t
@@ -238,7 +238,7 @@ user:
 
     #[test]
     fn parses_etcd_style_with_primary_group() {
-        // Pattern lifted from gothab roles/etcd/tasks/user.yml.
+        // Pattern lifted from acme roles/etcd/tasks/user.yml.
         let t = parse_task(
             r#"
 name: t

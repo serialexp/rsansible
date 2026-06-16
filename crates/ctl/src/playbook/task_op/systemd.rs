@@ -87,7 +87,7 @@ impl<'de> Deserialize<'de> for SystemdOp {
         let daemon_reload = take_optional_ansible_bool(&mut map, "daemon_reload")?.unwrap_or(false);
         let no_block = take_optional_ansible_bool(&mut map, "no_block")?.unwrap_or(false);
         // Ansible's `scope:` accepts user/system; we silently drop
-        // user-scope as out of charter for now (gothab doesn't use it).
+        // user-scope as out of charter for now (acme doesn't use it).
         // Reject explicitly so the user knows.
         if let Some(scope) = map.remove("scope") {
             if let serde_yaml::Value::String(s) = &scope {

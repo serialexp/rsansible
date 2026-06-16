@@ -499,7 +499,7 @@ where
 }
 
 /// Strings like `"0755"` and `"755"` → 0o755. `"0o755"` and `"0755"`
-/// also accepted. No symbolic modes (`u=rwx,g=rx`) — gothab doesn't use
+/// also accepted. No symbolic modes (`u=rwx,g=rx`) — acme doesn't use
 /// them.
 pub(super) fn parse_mode_str(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -519,7 +519,7 @@ pub(super) fn parse_mode_str(s: &str) -> Result<u32, String> {
 
 /// Accept Ansible-flavored booleans: `true`, `false`, `yes`, `no`, `on`,
 /// `off` (case-insensitive). YAML 1.2 only accepts `true`/`false`, but
-/// every gothab playbook uses `yes`/`no` so we widen.
+/// every acme playbook uses `yes`/`no` so we widen.
 pub(crate) fn deserialize_ansible_bool<'de, D>(d: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,

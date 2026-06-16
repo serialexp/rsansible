@@ -65,7 +65,7 @@ This is **not** an evolution of rsansible-the-compat-tool. It's a
 sibling.
 
 - **rsansible (compat layer).** Runs your existing Ansible playbooks,
-  faster. Already at gothab parity. The migration on-ramp.
+  faster. Already at production-homelab parity. The migration on-ramp.
 - **Dirac.** Pulumi-style declarative, typed, real language,
   DAG-native. Greenfield-only — no YAML compat layer, no translation
   tool. If you want to migrate, you migrate once and rewrite, with

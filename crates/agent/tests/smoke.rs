@@ -145,7 +145,7 @@ async fn op_exec_with_env_and_cwd() {
 /// any other binary in /usr/sbin) because `execvp(argv[0], ...)`
 /// uses the child's PATH for resolution — with an empty PATH, the
 /// kernel returns ENOENT and the agent reports "spawn failed: No
-/// such file or directory". Caught in the gothab drill on
+/// such file or directory". Caught in the acme drill on
 /// monitor-1. The fix: drop `env_clear()` and overlay
 /// controller-supplied vars on top of the inherited env, matching
 /// the symmetric `run_shell` path and Ansible's `environment:`
