@@ -221,6 +221,7 @@ mod tests {
                 "root".into(),
                 "root".into(),
                 false,
+                String::new(),
             ),
         ))
         .await;
@@ -235,6 +236,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 true,
+                String::new(),
             ),
         ))
         .await;

@@ -84,6 +84,11 @@ day-to-day:
   shims; the canonical spelling is `controller_read_file(...)` /
   `controller_shell_stdout(...)` / `controller_env(...)`. See
   `RSANSIBLE_IDIOMS.md §1`.
+- `lookup('dotenv', 'KEY')` reads one key from a `.env`-style file
+  (default: a `.env.prod` auto-discovered by walking up from the
+  inventory dir; override with `--dotenv <path>`). Expansion is faithful
+  to bash `source`; a missing key is a hard error, not an empty string.
+  Lets a `group_vars`/vault key single-source its value from `.env.prod`.
 - Ansible-idiomatic numeric attribute subscripting (`item.0.name`
   rewrites to `item[0].name` at template-prepare time).
 - Jinja2 `include` for chunking templates (e.g. `patroni.yml.j2`'s

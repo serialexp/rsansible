@@ -599,6 +599,24 @@ visible misbehaved, there's a unit-level shape that demonstrates it
 — find that shape and lock it down. The fix isn't done until both
 the production symptom AND the unit-level reproduction are green.
 
+## Canonical binary: `~/.local/bin/rsansible` — and build before claiming broken
+
+`just install` builds the controller (native release) + agent (musl)
+and installs both to `~/.local/bin`. That pair is the canonical
+rsansible: invoke `~/.local/bin/rsansible`, not `target/release/…`
+paths. The sibling agent auto-resolves, so no `-a`.
+
+**Before concluding "rsansible doesn't support X" or "can't parse Y":
+`just install` (or at least `cargo build`) FIRST, then re-check against
+the freshly-built binary.** The installed binary lags the working
+tree, so testing a feature against a stale binary reports a false
+`unknown field` / "unsupported" error. This actually bit us: a stale
+`~/.local/bin/rsansible` made a session wrongly claim `file: state:
+link` (symlink) support was missing — while a parallel agent was
+mid-flight adding exactly that in the working tree. Corollary (global
+CLAUDE.md Rule #14): if `git status` shows changes you didn't make,
+don't rebuild over them — surface and ask.
+
 ## When you add a new convention here
 
 Keep entries short and rationale-first. The point of this file isn't

@@ -18,11 +18,31 @@
 //! `precompile_all` walks the playbook and compiles every Jinja string
 //! ahead of time so syntax errors surface at `validate`, not mid-run.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
 use minijinja::{Environment, Error as MjError, ErrorKind as MjKind, Value as MjValue};
+
+/// Controller-side path to the `.env`-style file backing `lookup('dotenv', KEY)`.
+///
+/// Write-once at process start (from the CLI `run` handler, resolved either
+/// from `--dotenv` or by auto-discovery next to the inventory). This is
+/// *config*, not cache — deliberately process-global in the same spirit as
+/// `controller_env` reading true process-global `std::env`. The parsed file
+/// *contents* are memoized in the per-run [`LookupCache`], which still dies
+/// with each `run()`; only the immutable path lives here.
+///
+/// Unset (e.g. in unit tests, or a run with no discoverable `.env`) means any
+/// `lookup('dotenv', …)` errors loudly rather than silently rendering empty.
+static DOTENV_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point `lookup('dotenv', …)` at `path`. Idempotent-ish: first writer wins
+/// (a `run()` sets it exactly once); later calls are ignored.
+pub fn configure_dotenv_file(path: PathBuf) {
+    let _ = DOTENV_FILE.set(path);
+}
 
 use crate::playbook::{
     AssertTask, ExecOp, LoopSpec, Playbook, ShellOp, Task, TaskBody, TaskOp,
@@ -491,6 +511,10 @@ type LookupCache = Arc<Mutex<HashMap<CacheKey, MjValue>>>;
 enum CacheKey {
     ReadFile(String),
     Env(String),
+    // The *parsed* `.env` file (whole map), memoized once per run so that
+    // N `lookup('dotenv', …)` calls read + parse the file once, not N times.
+    // Individual keys are indexed out of the cached map, not cached separately.
+    DotenvFile(PathBuf),
     // NOTE: no ShellStdout variant. `controller_shell_stdout` is
     // intentionally NOT cached — see its doc comment. If we add an
     // opt-in caching flag later, the variant goes here.
@@ -1056,6 +1080,222 @@ fn controller_env_impl(cache: &LookupCache, name: String) -> Result<MjValue, MjE
     Ok(v)
 }
 
+/// Read a single key out of the controller-side `.env` file configured via
+/// [`configure_dotenv_file`]. This is the `dotenv` `lookup` plugin — the way
+/// a `group_vars`/`vault.yml` key single-sources its value from `.env.prod`
+/// instead of holding its own copy:
+///
+/// ```yaml
+/// vault_valkey_password: "{{ lookup('dotenv', 'VALKEY_PASSWORD') }}"
+/// ```
+///
+/// **Path.** Taken from the `DOTENV_FILE` process-global (set once from the
+/// CLI). Unset → a loud error, never a silent empty value.
+///
+/// **Caching.** The *parsed file* is memoized per-run under
+/// `CacheKey::DotenvFile` so a 40-key vault reads + parses the file once, not
+/// forty times. Matches the memoization of `file`/`env` (see [`LookupCache`]).
+///
+/// **Missing key = error.** Unlike `env` (Ansible-lenient, missing = empty), a
+/// missing dotenv key is a hard error: a typo'd referral must fail the run
+/// loudly, not ship an empty password to a host.
+fn controller_dotenv_impl(cache: &LookupCache, key: String) -> Result<MjValue, MjError> {
+    let path = DOTENV_FILE.get().ok_or_else(|| {
+        MjError::new(
+            MjKind::InvalidOperation,
+            "lookup('dotenv'): no .env file configured — pass --dotenv <path> \
+             or place a .env.prod next to (or above) the inventory"
+                .to_string(),
+        )
+    })?;
+    controller_dotenv_at(cache, path, key)
+}
+
+/// The path-explicit core of the `dotenv` lookup, split out so it's testable
+/// without touching the process-global `DOTENV_FILE`.
+fn controller_dotenv_at(
+    cache: &LookupCache,
+    path: &std::path::Path,
+    key: String,
+) -> Result<MjValue, MjError> {
+    // Parse-once: the whole map is cached; individual keys index into it.
+    let ckey = CacheKey::DotenvFile(path.to_path_buf());
+    let map_val = if let Some(v) = cache_get(cache, &ckey) {
+        v
+    } else {
+        let bytes = std::fs::read(path).map_err(|e| {
+            MjError::new(
+                MjKind::InvalidOperation,
+                format!("lookup('dotenv'): reading {}: {e}", path.display()),
+            )
+        })?;
+        let text = String::from_utf8(bytes).map_err(|e| {
+            MjError::new(
+                MjKind::InvalidOperation,
+                format!("lookup('dotenv'): {} is not valid UTF-8: {e}", path.display()),
+            )
+        })?;
+        let parsed = parse_dotenv(&text);
+        let v = MjValue::from_serialize(&parsed);
+        cache_put(cache, ckey, v.clone());
+        v
+    };
+
+    let val = map_val
+        .get_item(&MjValue::from(key.clone()))
+        .unwrap_or(MjValue::UNDEFINED);
+    if val.is_undefined() {
+        return Err(MjError::new(
+            MjKind::InvalidOperation,
+            format!(
+                "lookup('dotenv', {key:?}): key not found in {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(val)
+}
+
+/// Parse a `.env`-style file into a key→value map, faithful to the bash
+/// `source` semantics that `deploy/pulumi/seed-config.sh` already relies on —
+/// so a value read via `lookup('dotenv', K)` equals the same value read via
+/// `source`.
+///
+/// Rules:
+/// - Blank lines and `#` comment lines are skipped (leading whitespace OK).
+/// - An optional `export ` prefix is stripped.
+/// - `KEY=VALUE`, split on the first `=`. A malformed line (no `=`, or an
+///   empty/invalid key) is skipped rather than fatal — matches how `source`
+///   tolerates stray lines.
+/// - Surrounding matching quotes are stripped. **Single quotes → literal**
+///   (no expansion). **Double quotes or unquoted → expand** `${VAR}` / `$VAR`
+///   against keys already parsed *earlier* in the file (forward-reference to a
+///   later key yields empty, exactly like `source`). `\$` escapes a literal
+///   `$` in double-quoted/unquoted values; an unknown key expands to empty.
+///
+/// Note: this is intentionally not a full POSIX shell parser (no command
+/// substitution, no arithmetic, no line continuations) — just the `KEY=VALUE`
+/// + variable-expansion subset that dotenv files in this repo actually use.
+fn parse_dotenv(text: &str) -> BTreeMap<String, String> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, rest)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !is_valid_env_key(key) {
+            continue;
+        }
+        let rest = rest.trim();
+        let value = if let Some(inner) = strip_matching_quotes(rest, '\'') {
+            // Single-quoted: literal, no expansion.
+            inner.to_string()
+        } else if let Some(inner) = strip_matching_quotes(rest, '"') {
+            expand_env_refs(inner, &map)
+        } else {
+            // Unquoted: strip a trailing inline comment? `source` does NOT —
+            // an unquoted `#` is part of the value unless preceded by
+            // whitespace it splits on words. Our values never contain spaces
+            // (hex tokens / URLs), so keep the token verbatim and expand.
+            expand_env_refs(rest, &map)
+        };
+        map.insert(key.to_string(), value);
+    }
+    map
+}
+
+/// A shell-legal env var name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_valid_env_key(k: &str) -> bool {
+    let mut chars = k.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// If `s` is wrapped in a matching pair of `q` quotes, return the inner slice;
+/// otherwise `None`.
+fn strip_matching_quotes(s: &str, q: char) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if s.len() >= 2 && bytes[0] == q as u8 && bytes[s.len() - 1] == q as u8 {
+        Some(&s[1..s.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Expand `${VAR}` / `$VAR` references against `vars` (already-parsed earlier
+/// keys), honoring `\$` as a literal dollar. Unknown vars expand to empty —
+/// matching `source` under `set -u` off (the default here).
+fn expand_env_refs(s: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // `\$` → literal `$`; any other `\x` keeps the backslash (bash
+            // in double-quotes only treats `\` special before `$ ` " \` — we
+            // only care about `\$` for our values).
+            match chars.peek() {
+                Some('$') => {
+                    out.push('$');
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            }
+            continue;
+        }
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        // `$` — parse a reference.
+        let name = if chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut n = String::new();
+            let mut closed = false;
+            for ch in chars.by_ref() {
+                if ch == '}' {
+                    closed = true;
+                    break;
+                }
+                n.push(ch);
+            }
+            if !closed {
+                // Unterminated `${` — emit verbatim, don't expand.
+                out.push_str("${");
+                out.push_str(&n);
+                continue;
+            }
+            n
+        } else {
+            // `$VAR` — consume a run of legal name chars.
+            let mut n = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    n.push(ch);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if n.is_empty() {
+                // A lone `$` not starting a name — literal.
+                out.push('$');
+                continue;
+            }
+            n
+        };
+        out.push_str(vars.get(&name).map(|s| s.as_str()).unwrap_or(""));
+    }
+    out
+}
+
 /// Ansible-compat shim for `lookup(plugin, ...args)`.
 ///
 /// Translates the god-function spelling into the appropriate
@@ -1076,7 +1316,7 @@ fn lookup_shim_impl(
     plugin: String,
     args: minijinja::value::Rest<MjValue>,
 ) -> Result<MjValue, MjError> {
-    let supported = "supported plugins: file, pipe, env";
+    let supported = "supported plugins: file, pipe, env, dotenv";
     // Pull arg[0] as a string with a plugin-aware error message.
     let arg0_str = |field: &str| -> Result<String, MjError> {
         let v = args.get(0).ok_or_else(|| {
@@ -1100,6 +1340,7 @@ fn lookup_shim_impl(
         "file" => controller_read_file_impl(cache, arg0_str("path")?),
         "pipe" => controller_shell_stdout_impl(cache, arg0_str("command")?),
         "env" => controller_env_impl(cache, arg0_str("name")?),
+        "dotenv" => controller_dotenv_impl(cache, arg0_str("key")?),
         other => Err(MjError::new(
             MjKind::InvalidOperation,
             format!("lookup({other:?}): unknown plugin ({supported})"),
@@ -2225,6 +2466,107 @@ mod tests {
             err.contains("vault") && err.contains("supported"),
             "unexpected error: {err}"
         );
+        // The supported-plugin list must now advertise `dotenv`.
+        assert!(err.contains("dotenv"), "supported list missing dotenv: {err}");
+    }
+
+    fn empty_cache() -> LookupCache {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn parse_dotenv_handles_export_quotes_comments_expansion() {
+        let text = "\
+# a comment
+export GOTHAB_DB_USER=gothab
+GOTHAB_DB_PASSWORD=\"deadbeef\"
+
+  # indented comment
+GOTHAB_DB_HOST=db.gothab.io
+GOTHAB_DB_PORT=5432
+GOTHAB_DB_NAME=gothab
+DATABASE_URL=\"postgres://${GOTHAB_DB_USER}:${GOTHAB_DB_PASSWORD}@${GOTHAB_DB_HOST}:${GOTHAB_DB_PORT}/${GOTHAB_DB_NAME}\"
+BARE=$GOTHAB_DB_USER-suffix
+ESCAPED=\"literal \\$NOT_EXPANDED\"
+";
+        let m = parse_dotenv(text);
+        assert_eq!(m.get("GOTHAB_DB_USER").unwrap(), "gothab");
+        assert_eq!(m.get("GOTHAB_DB_PASSWORD").unwrap(), "deadbeef");
+        assert_eq!(
+            m.get("DATABASE_URL").unwrap(),
+            "postgres://gothab:deadbeef@db.gothab.io:5432/gothab"
+        );
+        assert_eq!(m.get("BARE").unwrap(), "gothab-suffix");
+        assert_eq!(m.get("ESCAPED").unwrap(), "literal $NOT_EXPANDED");
+    }
+
+    #[test]
+    fn parse_dotenv_single_quotes_are_literal() {
+        let m = parse_dotenv("A=x\nB='${A}-raw'\n");
+        assert_eq!(m.get("A").unwrap(), "x");
+        // Single-quoted: no expansion.
+        assert_eq!(m.get("B").unwrap(), "${A}-raw");
+    }
+
+    #[test]
+    fn parse_dotenv_forward_reference_and_unknown_expand_empty() {
+        // `B` references `C` which is defined *later* → empty (source semantics),
+        // and `$UNKNOWN` is never defined → empty.
+        let m = parse_dotenv("B=${C}${UNKNOWN}\nC=late\n");
+        assert_eq!(m.get("B").unwrap(), "");
+        assert_eq!(m.get("C").unwrap(), "late");
+    }
+
+    #[test]
+    fn parse_dotenv_skips_malformed_and_invalid_keys() {
+        let m = parse_dotenv("no_equals_here\n1BAD=x\nGOOD=y\n=orphan\n");
+        assert!(m.get("GOOD").is_some());
+        assert!(m.get("1BAD").is_none());
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn dotenv_lookup_returns_value_and_errors_on_missing_key() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env.prod");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"VALKEY_PASSWORD=s3cr3t\n")
+            .unwrap();
+        let cache = empty_cache();
+
+        let v = controller_dotenv_at(&cache, &path, "VALKEY_PASSWORD".into()).unwrap();
+        assert_eq!(v.as_str().unwrap(), "s3cr3t");
+
+        let err = controller_dotenv_at(&cache, &path, "NOPE".into())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NOPE") && err.contains("not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dotenv_lookup_parses_once_and_caches() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env.prod");
+        std::fs::write(&path, b"K=first\n").unwrap();
+        let cache = empty_cache();
+
+        let v1 = controller_dotenv_at(&cache, &path, "K".into()).unwrap();
+        assert_eq!(v1.as_str().unwrap(), "first");
+
+        // Mutate the file on disk. Because the parsed map is cached per-run,
+        // the second lookup must still see the ORIGINAL value.
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"K=second\n")
+            .unwrap();
+        let v2 = controller_dotenv_at(&cache, &path, "K".into()).unwrap();
+        assert_eq!(v2.as_str().unwrap(), "first", "cache should have parsed once");
     }
 
     #[test]

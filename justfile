@@ -46,6 +46,20 @@ build-ctl-musl:
     cargo build -p rsansible-ctl --release --target x86_64-unknown-linux-musl
     @ls -lh target/x86_64-unknown-linux-musl/release/rsansible
 
+# Build the controller (native release) + agent (musl) and install BOTH to
+# ~/.local/bin — the canonical rsansible install everything should invoke.
+#
+# Run this before concluding "rsansible can't do X" / "won't parse Y": the
+# installed binary lags the working tree, so a stale binary will happily
+# report a feature-missing / unknown-field error that source already fixed.
+# `rsansible run` auto-resolves the sibling agent, so no `-a` is needed.
+install: build-agent-musl
+    cargo build -p rsansible-ctl --release
+    install -D -m 0755 target/release/rsansible "$HOME/.local/bin/rsansible"
+    install -D -m 0755 target/x86_64-unknown-linux-musl/agent/rsansible-agent "$HOME/.local/bin/rsansible-agent"
+    strip "$HOME/.local/bin/rsansible-agent" 2>/dev/null || true
+    @"$HOME/.local/bin/rsansible" --version
+
 # Record the agent binary's stripped size at the current HEAD into
 # agent-size-history.tsv. No-op if HEAD's short SHA is already there.
 size:

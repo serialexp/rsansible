@@ -6,6 +6,11 @@
 //!   - `touch`     — create empty file if missing; always bumps mtime/atime
 //!                   (Ansible reports touch as always-changed)
 //!   - `file`      — assert that a regular file exists; apply mode/owner/group
+//!   - `link`      — ensure `path` is a symlink pointing at `src`; create if
+//!                   missing, atomically repoint if it targets something else,
+//!                   no-op if already correct. Errors if `path` exists and is
+//!                   not a symlink (`force` is not supported). Owner/group are
+//!                   applied to the link itself via lchown; mode is ignored.
 //!
 //! `changed` semantics:
 //!   - directory: changed iff path was created, OR mode/owner/group changed,
@@ -13,6 +18,8 @@
 //!   - absent:    changed iff the path existed before this op
 //!   - touch:     always changed (Ansible's contract)
 //!   - file:      changed iff mode/owner/group changed
+//!   - link:      changed iff the link was created, its target repointed, or
+//!                its owner/group changed
 //!
 //! Owner/group resolution uses /etc/passwd and /etc/group — no NSS. That's
 //! fine for the targets we run on (Debian/Ubuntu/Alpine boxes where the
@@ -33,10 +40,12 @@ const STATE_DIRECTORY: u8 = 0;
 const STATE_ABSENT: u8 = 1;
 const STATE_TOUCH: u8 = 2;
 const STATE_FILE: u8 = 3;
+const STATE_LINK: u8 = 4;
 
 pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput, check_mode: bool) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
     let path = op.path;
+    let src = op.src;
     let mode = if op.has_mode != 0 { Some(op.mode & 0o7777) } else { None };
     let recurse = op.recurse != 0;
     let owner = if op.owner.is_empty() { None } else { Some(op.owner.as_str()) };
@@ -68,6 +77,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput, check_mode: bool) ->
         STATE_ABSENT => apply_absent(Path::new(&path), check_mode),
         STATE_TOUCH => apply_touch(Path::new(&path), mode, uid, gid, check_mode),
         STATE_FILE => apply_file(Path::new(&path), mode, uid, gid, check_mode),
+        STATE_LINK => apply_link(Path::new(&path), &src, uid, gid, check_mode),
         other => {
             emit_error(
                 ctx,
@@ -245,6 +255,102 @@ fn apply_file(
         )));
     }
     apply_mode_owner_group(path, mode, uid, gid, check_mode)
+}
+
+/// `state: link` — ensure `path` is a symlink pointing at `src`.
+///
+/// Idempotent: a symlink already pointing at `src` is a no-op; one pointing
+/// elsewhere is atomically repointed; a missing path is created. If `path`
+/// exists and is NOT a symlink we refuse (Ansible's `force: no` default) with
+/// BAD_REQUEST rather than clobbering a real file/dir. Owner/group (if given)
+/// are applied to the link itself via lchown; `mode` is ignored because chmod
+/// is meaningless on a symlink.
+fn apply_link(
+    path: &Path,
+    src: &str,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    check_mode: bool,
+) -> Result<bool, FileError> {
+    if src.is_empty() {
+        return Err(FileError::BadRequest(
+            "state=link requires a non-empty src (symlink target)".to_string(),
+        ));
+    }
+    let src_path = Path::new(src);
+    let pre = std::fs::symlink_metadata(path).ok();
+    let mut changed = false;
+    // Whether a symlink exists on disk after our action — gates the
+    // owner/group probe (skip it on the check_mode "would-create" path).
+    let mut link_on_disk = false;
+
+    match &pre {
+        Some(m) if m.file_type().is_symlink() => {
+            let cur = std::fs::read_link(path).map_err(FileError::from)?;
+            if cur != src_path {
+                if !check_mode {
+                    replace_symlink_atomic(src_path, path)?;
+                }
+                changed = true;
+            }
+            link_on_disk = true;
+        }
+        Some(m) => {
+            return Err(FileError::BadRequest(format!(
+                "state=link: {} exists and is not a symlink (type={:?}); \
+                 refusing to replace (force is not supported)",
+                path.display(),
+                m.file_type()
+            )));
+        }
+        None => {
+            if !check_mode {
+                replace_symlink_atomic(src_path, path)?;
+                link_on_disk = true;
+            }
+            changed = true;
+        }
+    }
+
+    // Owner/group on the link itself (lchown, never follows). mode=None so no
+    // chmod is attempted. apply_mode_owner_group already skips chmod for
+    // symlinks, but passing None makes the intent explicit and cheap.
+    if link_on_disk && (uid.is_some() || gid.is_some()) {
+        if apply_mode_owner_group(path, None, uid, gid, check_mode)? {
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+/// Create-or-repoint a symlink atomically: make the link under a temp name in
+/// the same directory, then `rename` it over `path` (an atomic replace on the
+/// same filesystem). Never leaves `path` pointing at a half-written target.
+fn replace_symlink_atomic(src: &Path, path: &Path) -> Result<(), FileError> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let fname = path.file_name().ok_or_else(|| {
+        FileError::BadRequest(format!(
+            "state=link: destination has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let tmp = parent.join(format!(
+        ".{}.rsansible-lnk-{}",
+        fname.to_string_lossy(),
+        now_unix_ns()
+    ));
+    // Clear any stale tmp from a previously crashed run before symlinking.
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(src, &tmp).map_err(FileError::from)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(FileError::from(e))
+        }
+    }
 }
 
 /// Apply mode/owner/group to `path` if they differ from current. Returns
@@ -629,6 +735,86 @@ mod tests {
         let changed = apply_touch(&p, Some(0o644), None, None, true).unwrap();
         assert!(changed, "touch is always-changed (Ansible contract)");
         assert!(!p.exists(), "check_mode must NOT create the file");
+    }
+
+    #[test]
+    fn link_creates_then_idempotent() {
+        let root = tempdir();
+        let target = root.join("real-target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = root.join("the-link");
+        let target_s = target.to_string_lossy().to_string();
+
+        let changed = apply_link(&link, &target_s, None, None, false).unwrap();
+        assert!(changed, "first apply creates the symlink");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        let changed = apply_link(&link, &target_s, None, None, false).unwrap();
+        assert!(!changed, "re-apply to same target is a no-op");
+    }
+
+    #[test]
+    fn link_repoints_when_target_differs() {
+        let root = tempdir();
+        let link = root.join("l");
+        std::os::unix::fs::symlink("/old/target", &link).unwrap();
+        let changed = apply_link(&link, "/new/target", None, None, false).unwrap();
+        assert!(changed, "different target should repoint");
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("/new/target"));
+        // Repoint preserves the symlink (didn't turn it into a regular file).
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn link_refuses_to_clobber_regular_file() {
+        let root = tempdir();
+        let p = root.join("real");
+        std::fs::write(&p, b"important").unwrap();
+        let err = apply_link(&p, "/some/target", None, None, false).unwrap_err();
+        match err {
+            FileError::BadRequest(m) => assert!(m.contains("not a symlink"), "got {m}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        // The real file is untouched.
+        assert_eq!(std::fs::read(&p).unwrap(), b"important");
+    }
+
+    #[test]
+    fn link_empty_src_is_bad_request() {
+        let root = tempdir();
+        let p = root.join("l");
+        let err = apply_link(&p, "", None, None, false).unwrap_err();
+        match err {
+            FileError::BadRequest(m) => assert!(m.contains("src"), "got {m}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_mode_link_reports_change_without_creating() {
+        let root = tempdir();
+        let p = root.join("would-link");
+        let changed = apply_link(&p, "/target", None, None, true).unwrap();
+        assert!(changed, "absent link should report would-change");
+        assert!(
+            std::fs::symlink_metadata(&p).is_err(),
+            "check_mode must NOT create the symlink"
+        );
+    }
+
+    #[test]
+    fn check_mode_link_repoint_does_not_apply() {
+        let root = tempdir();
+        let link = root.join("l");
+        std::os::unix::fs::symlink("/old", &link).unwrap();
+        let changed = apply_link(&link, "/new", None, None, true).unwrap();
+        assert!(changed, "target diff should report would-change");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("/old"),
+            "check_mode must NOT repoint"
+        );
     }
 
     #[test]

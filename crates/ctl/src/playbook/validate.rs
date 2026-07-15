@@ -534,6 +534,24 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
                     task.name
                 );
             }
+            // state=link needs a symlink target; src is meaningless otherwise.
+            // (src may be a Jinja template here, so only the empty/absent check
+            // is meaningful pre-render.)
+            if f.state == crate::playbook::FileState::Link {
+                if f.src.as_deref().unwrap_or("").is_empty() {
+                    bail!(
+                        "{}: task[{ti}] {:?}: file: state=link requires a non-empty src (symlink target)",
+                        where_,
+                        task.name
+                    );
+                }
+            } else if f.src.is_some() {
+                bail!(
+                    "{}: task[{ti}] {:?}: file: src is only valid with state=link",
+                    where_,
+                    task.name
+                );
+            }
             Ok(())
         }
         TaskOp::LineInFile(l) => {

@@ -151,6 +151,20 @@ impl From<OpExecOutput> for OpExecInput {
     }
 }
 
+impl From<OpExecInput> for OpExecOutput {
+    fn from(i: OpExecInput) -> Self {
+        Self {
+            kind: 0u8,
+            argv: i.argv,
+            env_keys: i.env_keys,
+            env_values: i.env_values,
+            cwd: i.cwd,
+            stdin: i.stdin,
+            timeout_ms: i.timeout_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpShellInput {
     pub command: std::string::String,
@@ -258,6 +272,18 @@ impl From<OpShellOutput> for OpShellInput {
             env_keys: o.env_keys,
             env_values: o.env_values,
             timeout_ms: o.timeout_ms,
+        }
+    }
+}
+
+impl From<OpShellInput> for OpShellOutput {
+    fn from(i: OpShellInput) -> Self {
+        Self {
+            kind: 1u8,
+            command: i.command,
+            env_keys: i.env_keys,
+            env_values: i.env_values,
+            timeout_ms: i.timeout_ms,
         }
     }
 }
@@ -391,6 +417,21 @@ impl From<OpWriteFileOutput> for OpWriteFileInput {
     }
 }
 
+impl From<OpWriteFileInput> for OpWriteFileOutput {
+    fn from(i: OpWriteFileInput) -> Self {
+        Self {
+            kind: 2u8,
+            path: i.path,
+            mode: i.mode,
+            only_if_missing: i.only_if_missing,
+            content: i.content,
+            validate: i.validate,
+            owner: i.owner,
+            group: i.group,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpGatherFactsInput {
 }
@@ -442,6 +483,14 @@ impl OpGatherFactsOutput {
 impl From<OpGatherFactsOutput> for OpGatherFactsInput {
     fn from(_o: OpGatherFactsOutput) -> Self {
         Self {
+        }
+    }
+}
+
+impl From<OpGatherFactsInput> for OpGatherFactsOutput {
+    fn from(_i: OpGatherFactsInput) -> Self {
+        Self {
+            kind: 3u8,
         }
     }
 }
@@ -515,6 +564,16 @@ impl From<OpStatOutput> for OpStatInput {
         Self {
             path: o.path,
             follow: o.follow,
+        }
+    }
+}
+
+impl From<OpStatInput> for OpStatOutput {
+    fn from(i: OpStatInput) -> Self {
+        Self {
+            kind: 4u8,
+            path: i.path,
+            follow: i.follow,
         }
     }
 }
@@ -628,6 +687,21 @@ impl From<OpWaitForOutput> for OpWaitForInput {
     }
 }
 
+impl From<OpWaitForInput> for OpWaitForOutput {
+    fn from(i: OpWaitForInput) -> Self {
+        Self {
+            kind: 6u8,
+            host: i.host,
+            port: i.port,
+            path: i.path,
+            state: i.state,
+            timeout_ms: i.timeout_ms,
+            delay_ms: i.delay_ms,
+            sleep_ms: i.sleep_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpFileInput {
     pub path: std::string::String,
@@ -637,6 +711,7 @@ pub struct OpFileInput {
     pub owner: std::string::String,
     pub group: std::string::String,
     pub recurse: u8,
+    pub src: std::string::String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -649,6 +724,7 @@ pub struct OpFileOutput {
     pub owner: std::string::String,
     pub group: std::string::String,
     pub recurse: u8,
+    pub src: std::string::String,
 }
 
 pub type OpFile = OpFileOutput;
@@ -681,6 +757,11 @@ impl OpFileInput {
             encoder.write_byte(b);
         }
         encoder.write_byte(self.recurse);
+        encoder.write_u16_le(self.src.len() as u16);
+        let string_bytes: &[u8] = self.src.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
         Ok(())
     }
 
@@ -710,6 +791,9 @@ impl OpFileOutput {
         let bytes = decoder.read_bytes_vec(length)?;
         let group = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         let recurse = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let src = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         Ok(Self {
             kind,
             path,
@@ -719,6 +803,7 @@ impl OpFileOutput {
             owner,
             group,
             recurse,
+            src,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -739,6 +824,23 @@ impl From<OpFileOutput> for OpFileInput {
             owner: o.owner,
             group: o.group,
             recurse: o.recurse,
+            src: o.src,
+        }
+    }
+}
+
+impl From<OpFileInput> for OpFileOutput {
+    fn from(i: OpFileInput) -> Self {
+        Self {
+            kind: 5u8,
+            path: i.path,
+            state: i.state,
+            has_mode: i.has_mode,
+            mode: i.mode,
+            owner: i.owner,
+            group: i.group,
+            recurse: i.recurse,
+            src: i.src,
         }
     }
 }
@@ -896,6 +998,25 @@ impl From<OpLineInFileOutput> for OpLineInFileInput {
             insertafter: o.insertafter,
             backrefs: o.backrefs,
             validate: o.validate,
+        }
+    }
+}
+
+impl From<OpLineInFileInput> for OpLineInFileOutput {
+    fn from(i: OpLineInFileInput) -> Self {
+        Self {
+            kind: 7u8,
+            path: i.path,
+            regexp: i.regexp,
+            line: i.line,
+            state: i.state,
+            has_mode: i.has_mode,
+            mode: i.mode,
+            create: i.create,
+            insertbefore: i.insertbefore,
+            insertafter: i.insertafter,
+            backrefs: i.backrefs,
+            validate: i.validate,
         }
     }
 }
@@ -1075,6 +1196,26 @@ impl From<OpBlockInFileOutput> for OpBlockInFileInput {
     }
 }
 
+impl From<OpBlockInFileInput> for OpBlockInFileOutput {
+    fn from(i: OpBlockInFileInput) -> Self {
+        Self {
+            kind: 8u8,
+            path: i.path,
+            block: i.block,
+            marker: i.marker,
+            marker_begin: i.marker_begin,
+            marker_end: i.marker_end,
+            state: i.state,
+            has_mode: i.has_mode,
+            mode: i.mode,
+            create: i.create,
+            insertbefore: i.insertbefore,
+            insertafter: i.insertafter,
+            validate: i.validate,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpPackageInput {
     pub manager: u8,
@@ -1227,6 +1368,25 @@ impl From<OpPackageOutput> for OpPackageInput {
     }
 }
 
+impl From<OpPackageInput> for OpPackageOutput {
+    fn from(i: OpPackageInput) -> Self {
+        Self {
+            kind: 10u8,
+            manager: i.manager,
+            names: i.names,
+            state: i.state,
+            update_cache: i.update_cache,
+            cache_valid_time: i.cache_valid_time,
+            purge: i.purge,
+            autoremove: i.autoremove,
+            default_release: i.default_release,
+            allow_unauthenticated: i.allow_unauthenticated,
+            virtualenv: i.virtualenv,
+            virtualenv_command: i.virtualenv_command,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpSystemdInput {
     pub name: std::string::String,
@@ -1332,6 +1492,22 @@ impl From<OpSystemdOutput> for OpSystemdInput {
             masked: o.masked,
             daemon_reload: o.daemon_reload,
             no_block: o.no_block,
+        }
+    }
+}
+
+impl From<OpSystemdInput> for OpSystemdOutput {
+    fn from(i: OpSystemdInput) -> Self {
+        Self {
+            kind: 9u8,
+            name: i.name,
+            state: i.state,
+            has_enabled: i.has_enabled,
+            enabled: i.enabled,
+            has_masked: i.has_masked,
+            masked: i.masked,
+            daemon_reload: i.daemon_reload,
+            no_block: i.no_block,
         }
     }
 }
@@ -1513,6 +1689,26 @@ impl From<OpUfwOutput> for OpUfwInput {
             comment: o.comment,
             delete: o.delete,
             insert: o.insert,
+        }
+    }
+}
+
+impl From<OpUfwInput> for OpUfwOutput {
+    fn from(i: OpUfwInput) -> Self {
+        Self {
+            kind: 11u8,
+            op: i.op,
+            rule: i.rule,
+            direction: i.direction,
+            proto: i.proto,
+            from_ip: i.from_ip,
+            from_port: i.from_port,
+            to_ip: i.to_ip,
+            to_port: i.to_port,
+            interface: i.interface,
+            comment: i.comment,
+            delete: i.delete,
+            insert: i.insert,
         }
     }
 }
@@ -1734,6 +1930,29 @@ impl From<OpIptablesOutput> for OpIptablesInput {
     }
 }
 
+impl From<OpIptablesInput> for OpIptablesOutput {
+    fn from(i: OpIptablesInput) -> Self {
+        Self {
+            kind: 20u8,
+            table: i.table,
+            chain: i.chain,
+            protocol: i.protocol,
+            source: i.source,
+            destination: i.destination,
+            source_port: i.source_port,
+            destination_port: i.destination_port,
+            in_interface: i.in_interface,
+            out_interface: i.out_interface,
+            jump: i.jump,
+            ctstate: i.ctstate,
+            comment: i.comment,
+            ip_version: i.ip_version,
+            action: i.action,
+            rule_state: i.rule_state,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpRepositoryInput {
     pub manager: u8,
@@ -1837,6 +2056,20 @@ impl From<OpRepositoryOutput> for OpRepositoryInput {
     }
 }
 
+impl From<OpRepositoryInput> for OpRepositoryOutput {
+    fn from(i: OpRepositoryInput) -> Self {
+        Self {
+            kind: 21u8,
+            manager: i.manager,
+            repo: i.repo,
+            state: i.state,
+            filename: i.filename,
+            mode: i.mode,
+            update_cache: i.update_cache,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpGroupInput {
     pub name: std::string::String,
@@ -1912,6 +2145,17 @@ impl From<OpGroupOutput> for OpGroupInput {
             name: o.name,
             state: o.state,
             system: o.system,
+        }
+    }
+}
+
+impl From<OpGroupInput> for OpGroupOutput {
+    fn from(i: OpGroupInput) -> Self {
+        Self {
+            kind: 23u8,
+            name: i.name,
+            state: i.state,
+            system: i.system,
         }
     }
 }
@@ -2074,6 +2318,25 @@ impl From<OpUserOutput> for OpUserInput {
     }
 }
 
+impl From<OpUserInput> for OpUserOutput {
+    fn from(i: OpUserInput) -> Self {
+        Self {
+            kind: 22u8,
+            name: i.name,
+            state: i.state,
+            system: i.system,
+            has_shell: i.has_shell,
+            shell: i.shell,
+            has_home: i.has_home,
+            home: i.home,
+            create_home: i.create_home,
+            primary_group: i.primary_group,
+            groups: i.groups,
+            append: i.append,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpAuthorizedKeyInput {
     pub user: std::string::String,
@@ -2161,6 +2424,18 @@ impl From<OpAuthorizedKeyOutput> for OpAuthorizedKeyInput {
             key: o.key,
             state: o.state,
             exclusive: o.exclusive,
+        }
+    }
+}
+
+impl From<OpAuthorizedKeyInput> for OpAuthorizedKeyOutput {
+    fn from(i: OpAuthorizedKeyInput) -> Self {
+        Self {
+            kind: 24u8,
+            user: i.user,
+            key: i.key,
+            state: i.state,
+            exclusive: i.exclusive,
         }
     }
 }
@@ -2262,6 +2537,18 @@ impl From<OpGetentOutput> for OpGetentInput {
     }
 }
 
+impl From<OpGetentInput> for OpGetentOutput {
+    fn from(i: OpGetentInput) -> Self {
+        Self {
+            kind: 25u8,
+            database: i.database,
+            key: i.key,
+            fail_key: i.fail_key,
+            split: i.split,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpHostnameInput {
     pub name: std::string::String,
@@ -2329,6 +2616,15 @@ impl From<OpHostnameOutput> for OpHostnameInput {
     }
 }
 
+impl From<OpHostnameInput> for OpHostnameOutput {
+    fn from(i: OpHostnameInput) -> Self {
+        Self {
+            kind: 26u8,
+            name: i.name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpTimezoneInput {
     pub name: std::string::String,
@@ -2392,6 +2688,15 @@ impl From<OpTimezoneOutput> for OpTimezoneInput {
     fn from(o: OpTimezoneOutput) -> Self {
         Self {
             name: o.name,
+        }
+    }
+}
+
+impl From<OpTimezoneInput> for OpTimezoneOutput {
+    fn from(i: OpTimezoneInput) -> Self {
+        Self {
+            kind: 27u8,
+            name: i.name,
         }
     }
 }
@@ -2607,6 +2912,28 @@ impl From<OpUriOutput> for OpUriInput {
     }
 }
 
+impl From<OpUriInput> for OpUriOutput {
+    fn from(i: OpUriInput) -> Self {
+        Self {
+            kind: 12u8,
+            method: i.method,
+            url: i.url,
+            header_keys: i.header_keys,
+            header_values: i.header_values,
+            body: i.body,
+            body_format: i.body_format,
+            status_codes: i.status_codes,
+            timeout_ms: i.timeout_ms,
+            return_content: i.return_content,
+            validate_certs: i.validate_certs,
+            follow_redirects: i.follow_redirects,
+            client_cert_pem: i.client_cert_pem,
+            client_key_pem: i.client_key_pem,
+            ca_bundle_pem: i.ca_bundle_pem,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpPostgresqlQueryInput {
     pub query: std::string::String,
@@ -2767,6 +3094,24 @@ impl From<OpPostgresqlQueryOutput> for OpPostgresqlQueryInput {
             autocommit: o.autocommit,
             positional_args: o.positional_args,
             read_only: o.read_only,
+        }
+    }
+}
+
+impl From<OpPostgresqlQueryInput> for OpPostgresqlQueryOutput {
+    fn from(i: OpPostgresqlQueryInput) -> Self {
+        Self {
+            kind: 13u8,
+            query: i.query,
+            db: i.db,
+            login_user: i.login_user,
+            login_password: i.login_password,
+            login_unix_socket: i.login_unix_socket,
+            login_host: i.login_host,
+            login_port: i.login_port,
+            autocommit: i.autocommit,
+            positional_args: i.positional_args,
+            read_only: i.read_only,
         }
     }
 }
@@ -2936,6 +3281,25 @@ impl From<OpPostgresqlExtOutput> for OpPostgresqlExtInput {
             login_unix_socket: o.login_unix_socket,
             login_host: o.login_host,
             login_port: o.login_port,
+        }
+    }
+}
+
+impl From<OpPostgresqlExtInput> for OpPostgresqlExtOutput {
+    fn from(i: OpPostgresqlExtInput) -> Self {
+        Self {
+            kind: 14u8,
+            name: i.name,
+            state: i.state,
+            version: i.version,
+            ext_schema: i.ext_schema,
+            cascade: i.cascade,
+            db: i.db,
+            login_user: i.login_user,
+            login_password: i.login_password,
+            login_unix_socket: i.login_unix_socket,
+            login_host: i.login_host,
+            login_port: i.login_port,
         }
     }
 }
@@ -3165,6 +3529,29 @@ impl From<OpGetUrlOutput> for OpGetUrlInput {
     }
 }
 
+impl From<OpGetUrlInput> for OpGetUrlOutput {
+    fn from(i: OpGetUrlInput) -> Self {
+        Self {
+            kind: 15u8,
+            url: i.url,
+            dest: i.dest,
+            checksum: i.checksum,
+            mode: i.mode,
+            owner: i.owner,
+            group: i.group,
+            header_keys: i.header_keys,
+            header_values: i.header_values,
+            timeout_ms: i.timeout_ms,
+            force: i.force,
+            validate_certs: i.validate_certs,
+            follow_redirects: i.follow_redirects,
+            client_cert_pem: i.client_cert_pem,
+            client_key_pem: i.client_key_pem,
+            ca_bundle_pem: i.ca_bundle_pem,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpAsyncStartInput {
     pub timeout_ms: u32,
@@ -3232,6 +3619,16 @@ impl From<OpAsyncStartOutput> for OpAsyncStartInput {
     }
 }
 
+impl From<OpAsyncStartInput> for OpAsyncStartOutput {
+    fn from(i: OpAsyncStartInput) -> Self {
+        Self {
+            kind: 16u8,
+            timeout_ms: i.timeout_ms,
+            inner: i.inner,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpAsyncStatusInput {
     pub job_id: u32,
@@ -3289,6 +3686,15 @@ impl From<OpAsyncStatusOutput> for OpAsyncStatusInput {
     fn from(o: OpAsyncStatusOutput) -> Self {
         Self {
             job_id: o.job_id,
+        }
+    }
+}
+
+impl From<OpAsyncStatusInput> for OpAsyncStatusOutput {
+    fn from(i: OpAsyncStatusInput) -> Self {
+        Self {
+            kind: 17u8,
+            job_id: i.job_id,
         }
     }
 }
@@ -3362,6 +3768,16 @@ impl From<OpReadFileOutput> for OpReadFileInput {
         Self {
             path: o.path,
             max_bytes: o.max_bytes,
+        }
+    }
+}
+
+impl From<OpReadFileInput> for OpReadFileOutput {
+    fn from(i: OpReadFileInput) -> Self {
+        Self {
+            kind: 18u8,
+            path: i.path,
+            max_bytes: i.max_bytes,
         }
     }
 }
@@ -3549,6 +3965,26 @@ impl From<OpUnarchiveOutput> for OpUnarchiveInput {
     }
 }
 
+impl From<OpUnarchiveInput> for OpUnarchiveOutput {
+    fn from(i: OpUnarchiveInput) -> Self {
+        Self {
+            kind: 19u8,
+            src: i.src,
+            dest: i.dest,
+            format: i.format,
+            creates: i.creates,
+            has_mode: i.has_mode,
+            mode: i.mode,
+            owner: i.owner,
+            group: i.group,
+            keep_newer: i.keep_newer,
+            list_files: i.list_files,
+            include: i.include,
+            exclude: i.exclude,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpCopyTargetInput {
     pub src: std::string::String,
@@ -3672,6 +4108,21 @@ impl From<OpCopyTargetOutput> for OpCopyTargetInput {
             owner: o.owner,
             group: o.group,
             validate: o.validate,
+        }
+    }
+}
+
+impl From<OpCopyTargetInput> for OpCopyTargetOutput {
+    fn from(i: OpCopyTargetInput) -> Self {
+        Self {
+            kind: 28u8,
+            src: i.src,
+            dest: i.dest,
+            has_mode: i.has_mode,
+            mode: i.mode,
+            owner: i.owner,
+            group: i.group,
+            validate: i.validate,
         }
     }
 }
@@ -3837,6 +4288,11 @@ impl Op {
                     encoder.write_uint8(b);
                 }
                 encoder.write_uint8(v.recurse);
+                encoder.write_uint16(v.src.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.src.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
             }
             Op::OpWaitFor(v) => {
                 encoder.write_uint8(v.kind);
@@ -4700,6 +5156,21 @@ impl From<HelloOutput> for HelloInput {
     }
 }
 
+impl From<HelloInput> for HelloOutput {
+    fn from(i: HelloInput) -> Self {
+        Self {
+            kind: 0u8,
+            arch: i.arch,
+            os: i.os,
+            kernel: i.kernel,
+            hostname: i.hostname,
+            uid: i.uid,
+            gid: i.gid,
+            agent_version: i.agent_version,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskDispatchInput {
     pub seq: u32,
@@ -4769,6 +5240,17 @@ impl From<TaskDispatchOutput> for TaskDispatchInput {
             seq: o.seq,
             check_mode: o.check_mode,
             op: o.op,
+        }
+    }
+}
+
+impl From<TaskDispatchInput> for TaskDispatchOutput {
+    fn from(i: TaskDispatchInput) -> Self {
+        Self {
+            kind: 1u8,
+            seq: i.seq,
+            check_mode: i.check_mode,
+            op: i.op,
         }
     }
 }
@@ -4850,6 +5332,17 @@ impl From<TaskProgressOutput> for TaskProgressInput {
             seq: o.seq,
             stream: o.stream,
             chunk: o.chunk,
+        }
+    }
+}
+
+impl From<TaskProgressInput> for TaskProgressOutput {
+    fn from(i: TaskProgressInput) -> Self {
+        Self {
+            kind: 2u8,
+            seq: i.seq,
+            stream: i.stream,
+            chunk: i.chunk,
         }
     }
 }
@@ -4945,6 +5438,20 @@ impl From<TaskDoneOutput> for TaskDoneInput {
     }
 }
 
+impl From<TaskDoneInput> for TaskDoneOutput {
+    fn from(i: TaskDoneInput) -> Self {
+        Self {
+            kind: 3u8,
+            seq: i.seq,
+            exit_code: i.exit_code,
+            changed: i.changed,
+            skipped: i.skipped,
+            started_unix_ns: i.started_unix_ns,
+            finished_unix_ns: i.finished_unix_ns,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskErrorInput {
     pub seq: u32,
@@ -5024,6 +5531,17 @@ impl From<TaskErrorOutput> for TaskErrorInput {
     }
 }
 
+impl From<TaskErrorInput> for TaskErrorOutput {
+    fn from(i: TaskErrorInput) -> Self {
+        Self {
+            kind: 4u8,
+            seq: i.seq,
+            code: i.code,
+            message: i.message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ByeInput {
 }
@@ -5079,6 +5597,14 @@ impl From<ByeOutput> for ByeInput {
     }
 }
 
+impl From<ByeInput> for ByeOutput {
+    fn from(_i: ByeInput) -> Self {
+        Self {
+            kind: 5u8,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PingInput {
 }
@@ -5130,6 +5656,14 @@ impl PingOutput {
 impl From<PingOutput> for PingInput {
     fn from(_o: PingOutput) -> Self {
         Self {
+        }
+    }
+}
+
+impl From<PingInput> for PingOutput {
+    fn from(_i: PingInput) -> Self {
+        Self {
+            kind: 6u8,
         }
     }
 }
@@ -5197,6 +5731,16 @@ impl From<PongOutput> for PongInput {
         Self {
             agent_recv_unix_ns: o.agent_recv_unix_ns,
             agent_sent_unix_ns: o.agent_sent_unix_ns,
+        }
+    }
+}
+
+impl From<PongInput> for PongOutput {
+    fn from(i: PongInput) -> Self {
+        Self {
+            kind: 7u8,
+            agent_recv_unix_ns: i.agent_recv_unix_ns,
+            agent_sent_unix_ns: i.agent_sent_unix_ns,
         }
     }
 }

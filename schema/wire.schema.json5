@@ -143,7 +143,7 @@
     },
 
     OpFile: {
-      description: "Ensure a filesystem path is in the requested state. Maps Ansible's `ansible.builtin.file` module. The agent applies the state and reports TaskDone with `changed=1` iff anything actually changed (creation, removal, mode bits flipped, owner/group changed, touch updated mtime). `state` is a uint8 enum: 0=directory (mkdir -p semantics; recurse chmod/chown if `recurse=1`), 1=absent (rm -rf if dir, unlink if file/symlink), 2=touch (create empty file if missing; always bumps mtime/atime — Ansible reports touch as always-changed), 3=file (ensure regular file exists; errors if path is missing or wrong type; still applies mode/owner/group). `has_mode` is 0/1: when 1, the low 12 bits of `mode` are applied via chmod; when 0, no chmod runs. Empty `owner`/`group` strings mean \"don't change\"; non-empty values are resolved via /etc/passwd and /etc/group (no NSS) and applied via chown. `recurse` (0/1) only applies to state=directory.",
+      description: "Ensure a filesystem path is in the requested state. Maps Ansible's `ansible.builtin.file` module. The agent applies the state and reports TaskDone with `changed=1` iff anything actually changed (creation, removal, mode bits flipped, owner/group changed, touch updated mtime, symlink target repointed). `state` is a uint8 enum: 0=directory (mkdir -p semantics; recurse chmod/chown if `recurse=1`), 1=absent (rm -rf if dir, unlink if file/symlink), 2=touch (create empty file if missing; always bumps mtime/atime — Ansible reports touch as always-changed), 3=file (ensure regular file exists; errors if path is missing or wrong type; still applies mode/owner/group), 4=link (ensure `path` is a symlink pointing at `src`; created if missing, atomically repointed if it targets something else, no-op if already correct; owner/group applied to the link itself via lchown; `mode`/`has_mode` are ignored since chmod is meaningless on a symlink; if `path` exists and is NOT a symlink the task fails with BAD_REQUEST — `force` is not supported). `has_mode` is 0/1: when 1, the low 12 bits of `mode` are applied via chmod; when 0, no chmod runs (ignored for state=link). Empty `owner`/`group` strings mean \"don't change\"; non-empty values are resolved via /etc/passwd and /etc/group (no NSS) and applied via chown. `recurse` (0/1) only applies to state=directory. `src` is the symlink target for state=link (empty for every other state, and an empty `src` with state=link is BAD_REQUEST); it is stored verbatim, so a relative target stays relative.",
       sequence: [
         { name: "kind", type: "uint8", const: 5 },
         { name: "path", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
@@ -153,6 +153,7 @@
         { name: "owner", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
         { name: "group", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
         { name: "recurse", type: "uint8" },
+        { name: "src", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
       ],
     },
 

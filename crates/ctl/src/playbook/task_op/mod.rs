@@ -122,8 +122,9 @@ pub struct Task {
     /// `loop_control:` — currently only `loop_var:` is supported (rename
     /// `item`). Any other key is rejected.
     pub loop_control: Option<LoopControl>,
-    /// `tags:` — currently parsed and stored but not yet honored by the
-    /// orchestrator (Phase 1a defers `--tags`/`--skip-tags` filtering).
+    /// `tags:` — task tags, honored by `--tags` / `--skip-tags` filtering
+    /// (see `tags.rs`). Unioned onto children at flatten time for `block:`,
+    /// play-level `roles:`, `include_role:`, and `import_tasks:`.
     pub tags: Vec<String>,
     /// `delegate_to: somehost` — Jinja-templated hostname. The task body
     /// runs against this host's connection, but register/set_fact effects
@@ -1906,17 +1907,38 @@ impl TaskOp {
                 w.delay_ms,
                 w.sleep_ms,
             )),
-            TaskOp::File(f) => Ok(op_file(
-                f.path.clone(),
-                f.state.wire_byte(),
-                f.mode
-                    .as_ref()
-                    .map(|m| m.expect_resolved("file.mode"))
-                    .transpose()?,
-                f.owner.clone().unwrap_or_default(),
-                f.group.clone().unwrap_or_default(),
-                f.recurse,
-            )),
+            TaskOp::File(f) => {
+                // `src` is meaningful only for state=link, where it's required.
+                let src = match f.state {
+                    FileState::Link => {
+                        let s = f.src.clone().unwrap_or_default();
+                        if s.is_empty() {
+                            return Err(anyhow!(
+                                "file: state=link requires a non-empty `src` (symlink target)"
+                            ));
+                        }
+                        s
+                    }
+                    _ => {
+                        if f.src.is_some() {
+                            return Err(anyhow!("file: `src` is only valid with state=link"));
+                        }
+                        String::new()
+                    }
+                };
+                Ok(op_file(
+                    f.path.clone(),
+                    f.state.wire_byte(),
+                    f.mode
+                        .as_ref()
+                        .map(|m| m.expect_resolved("file.mode"))
+                        .transpose()?,
+                    f.owner.clone().unwrap_or_default(),
+                    f.group.clone().unwrap_or_default(),
+                    f.recurse,
+                    src,
+                ))
+            }
             TaskOp::LineInFile(l) => Ok(op_lineinfile(
                 l.path.clone(),
                 l.regexp.clone(),

@@ -6,14 +6,14 @@
 //!   * `run`     — push the agent to each host, drive the playbook through
 //!     the orchestrator's per-task / per-play barrier loop, report results.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rsansible_ctl::{
     extra_vars, forward, inventory,
     orchestrator::{self, RunSpec},
     playbook, template, vault,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -48,9 +48,12 @@ enum Cmd {
         #[arg(short, long)]
         inventory: PathBuf,
         /// Path to the agent binary to push. Must be a musl-static Linux
-        /// build (`just build-agent-musl` produces one).
+        /// build (`just build-agent-musl` produces one). Optional: if
+        /// omitted, defaults to a `rsansible-agent` sitting next to this
+        /// executable (how the release tarball and `just dist` lay them
+        /// out), so a normal install needs no `-a`.
         #[arg(short = 'a', long)]
-        agent_binary: PathBuf,
+        agent_binary: Option<PathBuf>,
         /// Max concurrent SSH dials during the connect phase.
         #[arg(long, default_value_t = 50)]
         concurrency: usize,
@@ -129,6 +132,13 @@ enum Cmd {
         /// phase covers.
         #[arg(long = "timing")]
         timing: bool,
+        /// Path to a `.env`-style file backing `lookup('dotenv', KEY)`. When
+        /// omitted, a `.env.prod` is auto-discovered by walking up from the
+        /// inventory file's directory. Lets a `group_vars`/vault key
+        /// single-source its value from `.env.prod` instead of holding a copy
+        /// (`{{ lookup('dotenv', 'VALKEY_PASSWORD') }}`). Read controller-side.
+        #[arg(long = "dotenv", value_name = "PATH")]
+        dotenv: Option<PathBuf>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -263,8 +273,17 @@ async fn main() -> ExitCode {
             forward_host,
             no_cache,
             timing,
+            dotenv,
             playbook,
-        } => match cmd_run(
+        } => {
+            let agent_binary = match resolve_agent_binary(agent_binary) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match cmd_run(
             inventory,
             agent_binary,
             concurrency,
@@ -281,6 +300,7 @@ async fn main() -> ExitCode {
             forward_host,
             no_cache,
             timing,
+            dotenv,
             playbook,
         )
         .await
@@ -290,7 +310,8 @@ async fn main() -> ExitCode {
                 eprintln!("error: {e:#}");
                 ExitCode::FAILURE
             }
-        },
+        }
+        }
     }
 }
 
@@ -322,6 +343,66 @@ async fn cmd_validate(
     Ok(())
 }
 
+/// Resolve which agent binary to push to targets.
+///
+/// An explicit `-a/--agent_binary` always wins. Otherwise we fall back to
+/// a `rsansible-agent` sitting next to this executable — the layout the
+/// release tarball and `just dist` produce, and how a normal install ends
+/// up (controller + agent dropped side-by-side in the same bin dir). This
+/// is what lets `rsansible run -i inv playbook.yml` work with no `-a`.
+///
+/// Note the sibling is always the x86_64-musl agent regardless of the
+/// controller's own arch — correct, because the agent runs on the
+/// (x86_64 Linux) *targets*, not on the controller. If neither an explicit
+/// path nor a sibling exists, bail with a message that names both fixes.
+fn resolve_agent_binary(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    let exe = std::env::current_exe()
+        .context("locating the rsansible executable to find its sibling agent")?;
+    resolve_sibling_agent(&exe)
+}
+
+/// The no-`-a` fallback, split from [`resolve_agent_binary`] so it can be
+/// tested without depending on the process's real `current_exe()`.
+fn resolve_sibling_agent(exe_path: &Path) -> Result<PathBuf> {
+    let sibling = exe_path.with_file_name("rsansible-agent");
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    bail!(
+        "no agent binary to push: -a/--agent_binary was not given and no \
+         `rsansible-agent` was found next to the controller (looked at {}). \
+         Pass -a <path>, or install rsansible-agent alongside rsansible.",
+        sibling.display()
+    );
+}
+
+/// Resolve which `.env` file backs `lookup('dotenv', …)`.
+///
+/// An explicit `--dotenv` always wins (used as-is, resolved against cwd).
+/// Otherwise auto-discover: canonicalize the inventory path, then walk up its
+/// ancestor directories looking for a `.env.prod`, returning the first hit.
+/// This anchors the lookup to the inventory location (Bart's choice) so a
+/// normal `rsansible run -i inventory/production.yml …` from the `ansible/`
+/// dir finds the repo-root `.env.prod` with no flag. `None` if nothing is
+/// found — a run with no dotenv referrals doesn't need one.
+fn resolve_dotenv_file(explicit: Option<PathBuf>, inv_path: &Path) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p);
+    }
+    let start = inv_path.canonicalize().ok()?;
+    // `start` is the inventory *file*; begin the walk at its directory.
+    for dir in start.ancestors().skip(1) {
+        let candidate = dir.join(".env.prod");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     inv_path: PathBuf,
@@ -338,6 +419,7 @@ async fn cmd_run(
     forward_host: Option<String>,
     no_cache: bool,
     print_timing: bool,
+    dotenv: Option<PathBuf>,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -347,6 +429,15 @@ async fn cmd_run(
         .with_context(|| format!("loading inventory {}", inv_path.display()))?;
     playbook::validate(&pb, Some(&inv))?;
     template::precompile_all(&pb)?;
+
+    // Wire `lookup('dotenv', …)`: an explicit `--dotenv` wins; otherwise
+    // auto-discover a `.env.prod` by walking up from the inventory dir. If
+    // neither resolves, the lookup stays unconfigured and errors loudly only
+    // if a playbook actually uses it (a run with no dotenv referrals is fine).
+    if let Some(p) = resolve_dotenv_file(dotenv, &inv_path) {
+        eprintln!("dotenv: lookup('dotenv', …) → {}", p.display());
+        template::configure_dotenv_file(p);
+    }
 
     let extra = extra_vars::parse_all(&extra_vars_args)
         .context("parsing --extra-vars")?;
@@ -633,5 +724,41 @@ fn print_run_summary(report: &orchestrator::RunReport) {
             rtt = rtt_ns as f64 / 1e9,
             wall_s = t.wall_ns_total as f64 / 1e9,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn explicit_agent_path_always_wins() {
+        let got = resolve_agent_binary(Some(PathBuf::from("/explicit/agent"))).unwrap();
+        assert_eq!(got, PathBuf::from("/explicit/agent"));
+    }
+
+    #[test]
+    fn falls_back_to_sibling_agent_next_to_exe() {
+        let dir = TempDir::new().unwrap();
+        let exe = dir.path().join("rsansible");
+        std::fs::write(&exe, b"controller").unwrap();
+        let agent = dir.path().join("rsansible-agent");
+        std::fs::write(&agent, b"agent").unwrap();
+        assert_eq!(resolve_sibling_agent(&exe).unwrap(), agent);
+    }
+
+    #[test]
+    fn errors_with_both_fixes_when_no_sibling() {
+        let dir = TempDir::new().unwrap();
+        let exe = dir.path().join("rsansible");
+        std::fs::write(&exe, b"controller").unwrap();
+        // No rsansible-agent alongside it.
+        let err = resolve_sibling_agent(&exe).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no agent binary"), "got: {msg}");
+        // Names both escape hatches: -a and installing the agent.
+        assert!(msg.contains("-a"), "got: {msg}");
+        assert!(msg.contains("rsansible-agent"), "got: {msg}");
     }
 }

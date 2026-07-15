@@ -8,6 +8,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileOp {
+    /// Target path. Ansible's `file:` module accepts `path`, `dest`, and
+    /// `name` as aliases for the same field; we honor all three.
+    #[serde(alias = "dest", alias = "name")]
     pub path: String,
     pub state: FileState,
     /// `mode: "0755"` (string), `mode: 0o755` (int), or a Jinja
@@ -25,6 +28,11 @@ pub struct FileOp {
     /// apply mode/owner/group to all descendants (Ansible behavior).
     #[serde(default, deserialize_with = "deserialize_ansible_bool")]
     pub recurse: bool,
+    /// Symlink target — only meaningful for (and required by) `state: link`.
+    /// Stored verbatim, so a relative target stays relative. Rejected by
+    /// `to_wire_op` for any other state.
+    #[serde(default)]
+    pub src: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -36,6 +44,10 @@ pub enum FileState {
     /// Regular file — ensure it exists; doesn't create. Used to chmod /
     /// chown an existing file.
     File,
+    /// Symlink — ensure `path` is a symlink pointing at `src`. Requires
+    /// `src`; created if missing, atomically repointed if wrong, no-op if
+    /// already correct.
+    Link,
 }
 
 impl FileState {
@@ -46,6 +58,7 @@ impl FileState {
             FileState::Absent => 1,
             FileState::Touch => 2,
             FileState::File => 3,
+            FileState::Link => 4,
         }
     }
 }
@@ -211,6 +224,7 @@ file:
             owner: Some("root".into()),
             group: Some("root".into()),
             recurse: true,
+            src: None,
         });
         let WireOp::OpFile(o) = t.to_wire_op().unwrap() else {
             panic!()
@@ -223,6 +237,7 @@ file:
         assert_eq!(o.owner, "root");
         assert_eq!(o.group, "root");
         assert_eq!(o.recurse, 1);
+        assert_eq!(o.src, "");
 
         let t = TaskOp::File(FileOp {
             path: "/x".into(),
@@ -231,6 +246,7 @@ file:
             owner: None,
             group: None,
             recurse: false,
+            src: None,
         });
         let WireOp::OpFile(o) = t.to_wire_op().unwrap() else {
             panic!()
@@ -238,5 +254,80 @@ file:
         assert_eq!(o.state, 1);
         assert_eq!(o.has_mode, 0);
         assert_eq!(o.owner, "");
+    }
+
+    #[test]
+    fn parses_file_link_with_src() {
+        let t = parse_task(
+            r#"
+name: ln
+file:
+  src: /opt/patroni/venv/bin/patronictl
+  dest: /usr/local/bin/patronictl
+  state: link
+  owner: root
+  group: root
+"#,
+        );
+        match t.body {
+            TaskBody::Op(TaskOp::File(f)) => {
+                assert_eq!(f.state, FileState::Link);
+                // `dest:` is the file: module's alias for path (handled by the
+                // parser's field aliasing); the symlink target is `src`.
+                assert_eq!(f.path, "/usr/local/bin/patronictl");
+                assert_eq!(f.src.as_deref(), Some("/opt/patroni/venv/bin/patronictl"));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_link_to_wire_carries_src_and_state_byte() {
+        let t = TaskOp::File(FileOp {
+            path: "/usr/local/bin/patronictl".into(),
+            state: FileState::Link,
+            mode: None,
+            owner: Some("root".into()),
+            group: Some("root".into()),
+            recurse: false,
+            src: Some("/opt/patroni/venv/bin/patronictl".into()),
+        });
+        let WireOp::OpFile(o) = t.to_wire_op().unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.state, 4);
+        assert_eq!(o.src, "/opt/patroni/venv/bin/patronictl");
+        assert_eq!(o.path, "/usr/local/bin/patronictl");
+        assert_eq!(o.owner, "root");
+    }
+
+    #[test]
+    fn file_link_without_src_is_rejected() {
+        let t = TaskOp::File(FileOp {
+            path: "/usr/local/bin/patronictl".into(),
+            state: FileState::Link,
+            mode: None,
+            owner: None,
+            group: None,
+            recurse: false,
+            src: None,
+        });
+        let err = t.to_wire_op().unwrap_err().to_string();
+        assert!(err.contains("src"), "got: {err}");
+    }
+
+    #[test]
+    fn file_src_without_link_is_rejected() {
+        let t = TaskOp::File(FileOp {
+            path: "/tmp/x".into(),
+            state: FileState::Directory,
+            mode: None,
+            owner: None,
+            group: None,
+            recurse: false,
+            src: Some("/somewhere".into()),
+        });
+        let err = t.to_wire_op().unwrap_err().to_string();
+        assert!(err.contains("src") && err.contains("link"), "got: {err}");
     }
 }

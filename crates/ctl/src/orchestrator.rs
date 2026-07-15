@@ -6475,6 +6475,12 @@ fn render_op_inner(
                 Some(g) => Some(render_str_resolved(env, g, &view)?),
                 None => None,
             };
+            // `src` (symlink target for state=link) is Jinja-templated too,
+            // e.g. `src: "{{ patronictl_bin }}"`.
+            let src = match &f.src {
+                Some(s) => Some(render_str_resolved(env, s, &view)?),
+                None => None,
+            };
             TaskOp::File(FileOp {
                 path,
                 state: f.state,
@@ -6482,6 +6488,7 @@ fn render_op_inner(
                 owner,
                 group,
                 recurse: f.recurse,
+                src,
             })
         }
         TaskOp::LineInFile(l) => {

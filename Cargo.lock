@@ -388,6 +388,9 @@ dependencies = [
 [[package]]
 name = "binschema-runtime"
 version = "0.1.0"
+dependencies = [
+ "flate2",
+]
 
 [[package]]
 name = "bitflags"

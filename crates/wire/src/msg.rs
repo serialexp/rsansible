@@ -87,6 +87,7 @@ pub mod file_state {
     pub const ABSENT: u8 = 1;
     pub const TOUCH: u8 = 2;
     pub const FILE: u8 = 3;
+    pub const LINK: u8 = 4;
 }
 
 pub mod wait_state {
@@ -124,6 +125,7 @@ pub fn op_file(
     owner: String,
     group: String,
     recurse: bool,
+    src: String,
 ) -> Op {
     let (has_mode, mode_val) = match mode {
         Some(m) => (1u8, m),
@@ -138,6 +140,7 @@ pub fn op_file(
         owner,
         group,
         recurse: if recurse { 1 } else { 0 },
+        src,
     })
 }
 

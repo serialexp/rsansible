@@ -26,6 +26,7 @@ playbook author would notice first come first.
 | `lookup('file', path)` | Re-reads the file on every call | Reads once per `run()`, caches result |
 | `lookup('env', name)` | Re-reads the env var on every call | Reads once per `run()`, caches result |
 | `lookup('pipe', cmd)` | Re-runs the command every call | **Same — no cache** |
+| `lookup('dotenv', key)` | (no such plugin upstream) | Parses the `.env` file once per `run()`, caches the whole map |
 
 **Why diverge for `file` / `env`.** Templates render many times per
 playbook (once per host, once per `loop:` iteration, once per `when:`
@@ -93,7 +94,7 @@ and a plugin-namespace dispatcher means Ansible can render
 into a `template:` body without anyone noticing. rsansible's shim
 errors with:
 
-> `lookup("vauilt"): unknown plugin (supported plugins: file, pipe, env)`
+> `lookup("vauilt"): unknown plugin (supported plugins: file, pipe, env, dotenv)`
 
 at template-render time, so the typo surfaces immediately.
 
@@ -509,6 +510,50 @@ vars so a single inventory carries both facts about the same host.
   `INTERNAL_HOST_PORT_VAR` constants and
   `apply_internal_host_overrides()`, called once at the top of
   `run_forwarded`.
+
+---
+
+## 12. `lookup('dotenv', 'KEY')` — a `.env`-file lookup Ansible doesn't have
+
+| Aspect | Ansible | rsansible |
+|---|---|---|
+| `lookup('dotenv', 'KEY')` | No such plugin | Reads one key from a `.env`-style file, controller-side |
+| Missing key | (n/a) | **Hard error**, not empty string |
+| File location | (n/a) | `--dotenv <path>`, else auto-discovered by walking up from the inventory dir for `.env.prod` |
+
+**Why it exists.** Some secrets legitimately live in two files — a
+repo-root `.env.prod` (consumed by other tooling that `source`s it) and
+the ansible `group_vars`/vault. Keeping two copies in sync is a
+drift-bug waiting to happen (we shipped exactly that bug once: a
+`.env.prod` object-storage key that diverged from its vault twin).
+`dotenv` lets the vault key *reference* `.env.prod` instead of copying
+it:
+
+```yaml
+vault_valkey_password: "{{ lookup('dotenv', 'VALKEY_PASSWORD') }}"
+```
+
+**Expansion is faithful to bash `source`.** The parser understands
+`export ` prefixes, `#` comments, and — crucially — `${VAR}` / `$VAR`
+expansion against earlier keys, with single-quotes literal and
+double/unquoted expanded (`\$` escapes a literal `$`). This is
+deliberate: `.env.prod` is elsewhere consumed via `source`, so a value
+read through `dotenv` must equal the value `source` would produce (e.g.
+a `DATABASE_URL` built from `${GOTHAB_DB_PASSWORD}` and friends).
+
+**Missing key = error, unlike `env`.** `lookup('env', X)` is
+Ansible-lenient (missing → empty). `dotenv` is the opposite: a typo'd
+referral must fail the run loudly, never ship an empty password to a
+host. Use `| default('')` explicitly if an absent key is acceptable.
+
+**Path is process config, contents are per-run cache.** The resolved
+file *path* lives in a write-once process global (set from the CLI,
+same spirit as `env` reading `std::env`); the parsed *map* is memoized
+in the per-run `LookupCache` and dies with the run. Not wired for
+forward mode (the file lives on the operator's box, not the forwarder).
+
+**Code:** `crates/ctl/src/template.rs::{controller_dotenv_impl,
+parse_dotenv, DOTENV_FILE}`, `crates/ctl/src/main.rs::resolve_dotenv_file`.
 
 ---
 
