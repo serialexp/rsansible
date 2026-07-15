@@ -129,6 +129,18 @@ pub struct HostCtx {
     /// resolves, hostvars merges, …). See `crate::timing` for
     /// rationale.
     pub timing: Arc<crate::timing::TaskTimingAggregator>,
+    /// Run-shared structured-report sink. Same Arc-everywhere pattern as
+    /// `timing`: seeded from `RunSpec.reporter` at run startup, defaults to a
+    /// [`crate::report::NullReporter`] so `HostCtx::new` stands alone in tests.
+    /// The per-task emission funnel (`apply_per_host_result`) reads it off the
+    /// originating host's ctx.
+    pub reporter: Arc<dyn crate::report::Reporter>,
+    /// Summary of the most recent task body run on this host, reset to `None`
+    /// at each task's entry and set on completion. Read at the emission funnel
+    /// to enrich the [`crate::report::TaskReport`] with rc/duration/diff that
+    /// the `HostTaskOutcome::Ok` variant doesn't itself carry. `None` for
+    /// skipped / `when: false` / render-error tasks (no module ran).
+    pub last_summary: Option<crate::report::TaskRunSummary>,
 }
 
 impl HostCtx {
@@ -154,6 +166,8 @@ impl HostCtx {
             ansible_failed_result: None,
             run_metrics: Arc::new(RunMetrics::default()),
             timing: crate::timing::TaskTimingAggregator::new(),
+            reporter: Arc::new(crate::report::NullReporter),
+            last_summary: None,
         }
     }
 

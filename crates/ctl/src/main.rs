@@ -139,6 +139,13 @@ enum Cmd {
         /// (`{{ lookup('dotenv', 'VALKEY_PASSWORD') }}`). Read controller-side.
         #[arg(long = "dotenv", value_name = "PATH")]
         dotenv: Option<PathBuf>,
+        /// Write a structured newline-delimited-JSON run report to this path
+        /// (`-` for stdout). One `{"type":"task",…}` object per task-on-host
+        /// as it completes, then a final `{"type":"run",…}` summary. Fields use
+        /// Ansible vocabulary (`ok`/`changed`/`skipped`/`failed`, `rc`). Absent
+        /// ⇒ no structured report (human stderr summary only, as before).
+        #[arg(long = "report", value_name = "PATH")]
+        report: Option<PathBuf>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -274,6 +281,7 @@ async fn main() -> ExitCode {
             no_cache,
             timing,
             dotenv,
+            report,
             playbook,
         } => {
             let agent_binary = match resolve_agent_binary(agent_binary) {
@@ -301,6 +309,7 @@ async fn main() -> ExitCode {
             no_cache,
             timing,
             dotenv,
+            report,
             playbook,
         )
         .await
@@ -420,6 +429,7 @@ async fn cmd_run(
     no_cache: bool,
     print_timing: bool,
     dotenv: Option<PathBuf>,
+    report_path: Option<PathBuf>,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -494,6 +504,15 @@ async fn cmd_run(
         .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
     if check_mode {
         eprintln!("*** running in check mode — no changes will be made ***");
+    }
+    // Install a structured-report sink if `--report` was given. Constructing
+    // the writer up front means a bad path (unwritable dir) fails the run
+    // before we dial any host, not after a converge.
+    if let Some(path) = report_path.as_deref() {
+        let reporter = rsansible_ctl::report::JsonReporter::to_path(path)
+            .with_context(|| format!("--report {}", path.display()))?;
+        spec.reporter = std::sync::Arc::new(reporter);
+        eprintln!("report: writing structured run report to {}", path.display());
     }
     let report = orchestrator::run(spec)
         .await

@@ -150,6 +150,12 @@ pub struct RunSpec {
     ///     "the operator's laptop" even when the controller is on a
     ///     remote forwarder (design decision #4).
     pub forward_mode: Option<ForwardModeContext>,
+    /// Structured-report sink. Seeded onto every host's `HostCtx` at run
+    /// startup; the orchestrator emits one [`crate::report::TaskReport`] per
+    /// task-on-host and a final [`crate::report::RunOutcome`]. Defaults to a
+    /// [`crate::report::NullReporter`] (no behaviour change) unless the caller
+    /// installs one (e.g. `--report`).
+    pub reporter: Arc<dyn crate::report::Reporter>,
 }
 
 /// Forward-mode wiring passed into [`run`] by `remote-run` on the
@@ -184,6 +190,7 @@ impl RunSpec {
             playbook_dir: None,
             inventory_dir: None,
             forward_mode: None,
+            reporter: Arc::new(crate::report::NullReporter),
         }
     }
 }
@@ -246,6 +253,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         playbook_dir,
         inventory_dir,
         forward_mode,
+        reporter,
     } = spec;
     // Plumbed through to per-task dispatch so privkey (and any future
     // composite-dispatch op) can override the auto heuristic. Cheap to
@@ -473,6 +481,9 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         // atomic-only.
         ctx.run_metrics = run_metrics.clone();
         ctx.timing = timing_agg.clone();
+        // Run-shared structured-report sink. Same Arc-everywhere pattern; the
+        // per-task emission funnel reads it off the originating host's ctx.
+        ctx.reporter = reporter.clone();
         ctxs.insert(name.clone(), ctx);
     }
 
@@ -612,6 +623,35 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // concurrent write — the strategy futures are all awaited above.
     report.timing = run_metrics.snapshot();
     report.timing_breakdown = timing_agg.summary();
+
+    // End-of-run structured event. Mirror the aggregate RunReport into the
+    // report module's orchestrator-independent shape and hand it to the sink.
+    let outcome = crate::report::RunOutcome {
+        check_mode: report.check_mode,
+        stopped_early: report.stopped_early,
+        tasks_ok: report.tasks_ok,
+        tasks_changed: report.tasks_changed,
+        tasks_skipped: report.tasks_skipped,
+        hosts: report
+            .host_outcomes
+            .iter()
+            .map(|(name, o)| {
+                let state = match o {
+                    HostOutcome::Ok => crate::report::HostState::Ok,
+                    HostOutcome::Failed { task, reason } => crate::report::HostState::Failed {
+                        task: task.clone(),
+                        reason: reason.clone(),
+                    },
+                    HostOutcome::Unreachable { reason } => crate::report::HostState::Unreachable {
+                        reason: reason.clone(),
+                    },
+                    HostOutcome::NotTargeted => crate::report::HostState::NotTargeted,
+                };
+                (name.clone(), state)
+            })
+            .collect(),
+    };
+    reporter.finish(&outcome);
 
     Ok(report)
 }
@@ -1764,6 +1804,11 @@ async fn run_task_on_one_host(
 ) -> PerHostTaskResult {
     let name = ctx.host_name.clone();
     let timing = ctx.timing.clone();
+    // Structured-report scratch: cleared at task entry, set on completion of
+    // the module body below. A task that returns early (skipped / when:false /
+    // render error) leaves this `None`, which the emission funnel reads as
+    // "no module result" — correct, since nothing ran.
+    ctx.last_summary = None;
 
     // Task-scoped `vars:` come into effect *before* anything else
     // (including `when:`). Each entry is rendered in BTreeMap order
@@ -1947,6 +1992,13 @@ async fn run_task_on_one_host(
         timing.incr(&timing.body_dispatch_count);
         let outcome = match exec {
             BodyResult::Ok { register, changed, skipped } => {
+                // Capture rc/duration for the structured report before the
+                // register is (maybe) moved into the ctx's register dict.
+                ctx.last_summary = Some(crate::report::TaskRunSummary {
+                    rc: register.rc,
+                    duration_ms: register.took_ms,
+                    diff: None, // Phase 2 (`--diff`) fills this in.
+                });
                 if let Some(reg_name) = &task.register {
                     ctx.record_register(reg_name, register);
                 }
@@ -1966,6 +2018,14 @@ async fn run_task_on_one_host(
                 // task had a `register:` clause of its own).
                 if let (Some(reg_name), Some(rv)) = (&task.register, &register) {
                     ctx.record_register(reg_name, rv.clone());
+                }
+                // Surface rc/duration of the failing task to the report.
+                if let Some(rv) = &register {
+                    ctx.last_summary = Some(crate::report::TaskRunSummary {
+                        rc: rv.rc,
+                        duration_ms: rv.took_ms,
+                        diff: None,
+                    });
                 }
                 ctx.failed = true;
                 // Conn liveness only flips own_conn_alive when the dead
@@ -2075,6 +2135,14 @@ async fn run_task_on_one_host(
     let any_changed = iter_registers.iter().any(|r| r.changed);
     let all_skipped = !iter_registers.is_empty() && iter_registers.iter().all(|r| r.skipped);
     let any_iter_failed = iter_registers.iter().any(|r| r.failed);
+    // Structured-report summary for the looped task: sum per-iteration
+    // durations; take the last iteration's rc (matching how a looped task's
+    // aggregate register surfaces the terminal exit code). diff: Phase 2.
+    ctx.last_summary = Some(crate::report::TaskRunSummary {
+        rc: iter_registers.last().map(|r| r.rc).unwrap_or(0),
+        duration_ms: iter_registers.iter().map(|r| r.took_ms).sum(),
+        diff: None,
+    });
     let aggregate = RegisterValue {
         changed: any_changed,
         failed: any_iter_failed,
@@ -7968,6 +8036,42 @@ async fn apply_per_host_result(
             );
         }
         HostTaskOutcome::Skipped => {}
+    }
+    // Emit the structured per-(host, task) event. rc/duration/diff come off the
+    // summary the task body stashed on the ctx (None for skipped / when:false /
+    // render-error tasks — nothing ran). Status uses Ansible vocabulary, and
+    // `changed` wins over `skipped` so a check-mode would-change reads as
+    // `changed` (matching how Ansible colours check runs).
+    {
+        use crate::report::TaskStatus;
+        let (status, reason) = match &outcome {
+            HostTaskOutcome::Ok { changed, skipped } => {
+                let s = if *changed {
+                    TaskStatus::Changed
+                } else if *skipped {
+                    TaskStatus::Skipped
+                } else {
+                    TaskStatus::Ok
+                };
+                (s, None)
+            }
+            HostTaskOutcome::Skipped => (TaskStatus::Skipped, None),
+            HostTaskOutcome::Failed { reason, .. } => (TaskStatus::Failed, Some(reason.clone())),
+        };
+        let summary = ctx.last_summary.as_ref();
+        let tr = crate::report::TaskReport {
+            play: play.name.clone(),
+            host: name.clone(),
+            task: task.name.clone(),
+            status,
+            changed: status == TaskStatus::Changed,
+            check_mode: ctx.check_mode,
+            rc: summary.map(|s| s.rc),
+            duration_ms: summary.map(|s| s.duration_ms),
+            diff: summary.and_then(|s| s.diff.clone()),
+            reason,
+        };
+        ctx.reporter.on_task(&tr);
     }
     // Always reinsert ctx — set_facts/registers should persist even from failed hosts.
     ctxs.insert(name.clone(), ctx);
