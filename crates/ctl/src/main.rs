@@ -100,6 +100,15 @@ enum Cmd {
         /// `check_mode: false` overrides both directions.
         #[arg(long)]
         check: bool,
+        /// Show file diffs for changed files (like Ansible's `--diff`).
+        /// Diffing modules (`write_file`/`template`, `copy`) ship a
+        /// `{before, after}` payload for each changed file; the run prints a
+        /// unified diff to stderr and the structured `--report` carries the
+        /// payload verbatim. Combine with `--check` to preview would-be
+        /// changes without touching the hosts. Binary and oversized files are
+        /// summarised rather than dumped.
+        #[arg(long)]
+        diff: bool,
         /// Enable forward mode: push the controller binary to a host
         /// near the targets and drive the run from there. Collapses
         /// per-op SSH RTT on long-haul links. `connection: local` is
@@ -276,6 +285,7 @@ async fn main() -> ExitCode {
             limit,
             wire_strategy,
             check,
+            diff,
             forward,
             forward_host,
             no_cache,
@@ -302,6 +312,7 @@ async fn main() -> ExitCode {
             limit,
             wire_strategy,
             check,
+            diff,
             // `--forward-host X` implies `--forward` — both shapes
             // are the operator saying "I want forward mode."
             forward || forward_host.is_some(),
@@ -424,6 +435,7 @@ async fn cmd_run(
     limit: Vec<String>,
     wire_strategy: WireStrategyArg,
     check_mode: bool,
+    diff_mode: bool,
     forward_mode: bool,
     forward_host: Option<String>,
     no_cache: bool,
@@ -474,6 +486,7 @@ async fn cmd_run(
             skip_tags,
             limit,
             check_mode,
+            diff_mode,
             wire_strategy,
             concurrency,
             no_cache,
@@ -491,6 +504,7 @@ async fn cmd_run(
     spec.limit = limit;
     spec.wire_strategy = wire_strategy.into();
     spec.check_mode = check_mode;
+    spec.diff_mode = diff_mode;
     // Surface playbook_dir / inventory_dir to templates. Canonicalize so
     // `{{ playbook_dir }}/../foo` resolves cleanly regardless of how the
     // user spelled the original path.
@@ -617,6 +631,7 @@ async fn cmd_run_forwarded(
     skip_tags: Vec<String>,
     limit: Vec<String>,
     check_mode: bool,
+    diff_mode: bool,
     wire_strategy: WireStrategyArg,
     concurrency: usize,
     no_cache: bool,
@@ -661,6 +676,7 @@ async fn cmd_run_forwarded(
         skip_tags,
         limit,
         check_mode,
+        diff_mode,
         wire_strategy: wire_strategy.into(),
         max_concurrent_hosts: concurrency.max(1),
         no_cache,

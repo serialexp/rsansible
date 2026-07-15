@@ -10,6 +10,7 @@ mod async_job;
 mod authorized_key;
 mod blockinfile;
 mod copy_target;
+mod diff;
 mod exec;
 mod file;
 mod gather_facts;
@@ -73,12 +74,13 @@ pub fn dispatch<'a>(
     seq: u32,
     op: Op,
     check_mode: bool,
+    diff: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         match op {
             Op::OpExec(o) => exec::run_exec(ctx, seq, o, check_mode).await,
             Op::OpShell(o) => exec::run_shell(ctx, seq, o, check_mode).await,
-            Op::OpWriteFile(o) => write_file::run(ctx, seq, o, check_mode).await,
+            Op::OpWriteFile(o) => write_file::run(ctx, seq, o, check_mode, diff).await,
             Op::OpGatherFacts(_) => gather_facts::run(ctx, seq, check_mode).await,
             Op::OpStat(o) => stat::run(ctx, seq, o, check_mode).await,
             Op::OpFile(o) => file::run(ctx, seq, o, check_mode).await,
@@ -92,7 +94,7 @@ pub fn dispatch<'a>(
             Op::OpPostgresqlQuery(o) => postgresql::run_query(ctx, seq, o, check_mode).await,
             Op::OpPostgresqlExt(o) => postgresql::run_ext(ctx, seq, o, check_mode).await,
             Op::OpGetUrl(o) => get_url::run(ctx, seq, o, check_mode).await,
-            Op::OpAsyncStart(o) => async_job::run_start(ctx, seq, o, check_mode).await,
+            Op::OpAsyncStart(o) => async_job::run_start(ctx, seq, o, check_mode, diff).await,
             Op::OpAsyncStatus(o) => async_job::run_status(ctx, seq, o, check_mode).await,
             Op::OpReadFile(o) => read_file::run(ctx, seq, o, check_mode).await,
             Op::OpUnarchive(o) => unarchive::run(ctx, seq, o, check_mode).await,
@@ -104,7 +106,7 @@ pub fn dispatch<'a>(
             Op::OpGetent(o) => getent::run(ctx, seq, o, check_mode).await,
             Op::OpHostname(o) => hostname::run(ctx, seq, o, check_mode).await,
             Op::OpTimezone(o) => timezone::run(ctx, seq, o, check_mode).await,
-            Op::OpCopyTarget(o) => copy_target::run(ctx, seq, o, check_mode).await,
+            Op::OpCopyTarget(o) => copy_target::run(ctx, seq, o, check_mode, diff).await,
         }
     })
 }

@@ -5175,6 +5175,7 @@ impl From<HelloInput> for HelloOutput {
 pub struct TaskDispatchInput {
     pub seq: u32,
     pub check_mode: u8,
+    pub diff: u8,
     pub op: Op,
 }
 
@@ -5183,6 +5184,7 @@ pub struct TaskDispatchOutput {
     pub kind: u8,
     pub seq: u32,
     pub check_mode: u8,
+    pub diff: u8,
     pub op: Op,
 }
 
@@ -5199,6 +5201,7 @@ impl TaskDispatchInput {
         encoder.write_byte(1);
         encoder.write_u32_le(self.seq);
         encoder.write_byte(self.check_mode);
+        encoder.write_byte(self.diff);
         self.op.encode_into(encoder)?;
         Ok(())
     }
@@ -5218,11 +5221,13 @@ impl TaskDispatchOutput {
         }
         let seq = decoder.read_u32_le()?;
         let check_mode = decoder.read_byte()?;
+        let diff = decoder.read_byte()?;
         let op = Op::decode_with_decoder(decoder)?;
         Ok(Self {
             kind,
             seq,
             check_mode,
+            diff,
             op,
         })
     }
@@ -5239,6 +5244,7 @@ impl From<TaskDispatchOutput> for TaskDispatchInput {
         Self {
             seq: o.seq,
             check_mode: o.check_mode,
+            diff: o.diff,
             op: o.op,
         }
     }
@@ -5250,6 +5256,7 @@ impl From<TaskDispatchInput> for TaskDispatchOutput {
             kind: 1u8,
             seq: i.seq,
             check_mode: i.check_mode,
+            diff: i.diff,
             op: i.op,
         }
     }
@@ -5355,6 +5362,7 @@ pub struct TaskDoneInput {
     pub skipped: u8,
     pub started_unix_ns: u64,
     pub finished_unix_ns: u64,
+    pub diff: std::string::String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5366,6 +5374,7 @@ pub struct TaskDoneOutput {
     pub skipped: u8,
     pub started_unix_ns: u64,
     pub finished_unix_ns: u64,
+    pub diff: std::string::String,
 }
 
 pub type TaskDone = TaskDoneOutput;
@@ -5385,6 +5394,11 @@ impl TaskDoneInput {
         encoder.write_byte(self.skipped);
         encoder.write_u64_le(self.started_unix_ns);
         encoder.write_u64_le(self.finished_unix_ns);
+        encoder.write_u32_le(self.diff.len() as u32);
+        let string_bytes: &[u8] = self.diff.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
         Ok(())
     }
 
@@ -5407,6 +5421,9 @@ impl TaskDoneOutput {
         let skipped = decoder.read_byte()?;
         let started_unix_ns = decoder.read_u64_le()?;
         let finished_unix_ns = decoder.read_u64_le()?;
+        let length = decoder.read_u32_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let diff = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
         Ok(Self {
             kind,
             seq,
@@ -5415,6 +5432,7 @@ impl TaskDoneOutput {
             skipped,
             started_unix_ns,
             finished_unix_ns,
+            diff,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -5434,6 +5452,7 @@ impl From<TaskDoneOutput> for TaskDoneInput {
             skipped: o.skipped,
             started_unix_ns: o.started_unix_ns,
             finished_unix_ns: o.finished_unix_ns,
+            diff: o.diff,
         }
     }
 }
@@ -5448,6 +5467,7 @@ impl From<TaskDoneInput> for TaskDoneOutput {
             skipped: i.skipped,
             started_unix_ns: i.started_unix_ns,
             finished_unix_ns: i.finished_unix_ns,
+            diff: i.diff,
         }
     }
 }
@@ -5792,6 +5812,7 @@ impl Message {
                 encoder.write_uint8(v.kind);
                 encoder.write_uint32(v.seq, Endianness::LittleEndian);
                 encoder.write_uint8(v.check_mode);
+                encoder.write_uint8(v.diff);
                 v.op.encode_into(encoder)?;
             }
             Message::TaskProgress(v) => {
@@ -5811,6 +5832,11 @@ impl Message {
                 encoder.write_uint8(v.skipped);
                 encoder.write_uint64(v.started_unix_ns, Endianness::LittleEndian);
                 encoder.write_uint64(v.finished_unix_ns, Endianness::LittleEndian);
+                encoder.write_uint32(v.diff.len() as u32, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.diff.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
             }
             Message::TaskError(v) => {
                 encoder.write_uint8(v.kind);

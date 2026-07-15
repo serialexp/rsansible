@@ -621,6 +621,12 @@
         // what check mode means for it (skip mutation, probe-only, etc.); the
         // controller composite ops (e.g. openssl_privatekey) also branch on it.
         { name: "check_mode", type: "uint8" },
+        // 0 = no diff, 1 = the operator asked for `--diff`. Modules that
+        // support diffing (currently write_file / copy) read the pre-change
+        // content and ship a `{before, after, …}` payload back on TaskDone.diff;
+        // modules that don't support it ignore the flag. Independent of
+        // check_mode — diffs are produced in both real and dry-run runs.
+        { name: "diff", type: "uint8" },
         { name: "op", type: "Op" },
       ],
     },
@@ -651,6 +657,16 @@
         { name: "skipped", type: "uint8" },
         { name: "started_unix_ns", type: "uint64" },
         { name: "finished_unix_ns", type: "uint64" },
+        // Diff payload, populated only when the dispatch set `diff=1` AND the
+        // module supports diffing AND something actually changed. Empty string
+        // otherwise. Content is a JSON object in Ansible's diff shape —
+        // `{"before": "...", "after": "...", "before_header": "...",
+        // "after_header": "..."}` — with before/after capped and replaced by a
+        // marker when the content is binary or too large. uint32 length because
+        // a file diff can exceed 64 KiB. The controller stores it verbatim for
+        // the structured report and renders a unified diff from it for `--diff`
+        // stdout.
+        { name: "diff", type: "string", kind: "length_prefixed", length_type: "uint32", encoding: "utf8" },
       ],
     },
 

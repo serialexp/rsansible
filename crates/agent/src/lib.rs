@@ -87,8 +87,9 @@ where
                 // one at a time per the protocol.
                 let seq = td.seq;
                 let check_mode = td.check_mode != 0;
-                debug!(seq, check_mode, op = ?std::mem::discriminant(&td.op), "dispatching");
-                if let Err(e) = modules::dispatch(&ctx, seq, td.op, check_mode).await {
+                let diff = td.diff != 0;
+                debug!(seq, check_mode, diff, op = ?std::mem::discriminant(&td.op), "dispatching");
+                if let Err(e) = modules::dispatch(&ctx, seq, td.op, check_mode, diff).await {
                     // Module-internal errors should already have been reported
                     // as TaskError. If we end up here, log loudly.
                     error!(seq, error = %e, "module dispatch returned an error after handling");

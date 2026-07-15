@@ -29,7 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use minijinja::Environment;
 use rsansible_wire::{
     generated::{Message, TaskDoneOutput},
-    msg::{bye, now_unix_ns, task_dispatch},
+    msg::{bye, now_unix_ns, task_dispatch_with_diff},
     read_frame, write_frame, Op,
 };
 use serde_json::Value as JsonValue;
@@ -156,6 +156,11 @@ pub struct RunSpec {
     /// [`crate::report::NullReporter`] (no behaviour change) unless the caller
     /// installs one (e.g. `--report`).
     pub reporter: Arc<dyn crate::report::Reporter>,
+    /// CLI `--diff`. When true, module dispatches carry the diff request flag,
+    /// so diffing modules (write_file / copy) ship a `{before, after, …}`
+    /// payload back for changed files. Seeded onto every `HostCtx` like
+    /// `check_mode`. Run-level in v1 (no per-task override yet).
+    pub diff_mode: bool,
 }
 
 /// Forward-mode wiring passed into [`run`] by `remote-run` on the
@@ -191,6 +196,7 @@ impl RunSpec {
             inventory_dir: None,
             forward_mode: None,
             reporter: Arc::new(crate::report::NullReporter),
+            diff_mode: false,
         }
     }
 }
@@ -254,6 +260,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         inventory_dir,
         forward_mode,
         reporter,
+        diff_mode,
     } = spec;
     // Plumbed through to per-task dispatch so privkey (and any future
     // composite-dispatch op) can override the auto heuristic. Cheap to
@@ -476,6 +483,9 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         // Run-scoped dry-run flag — same value across every host.
         // Per-task `check_mode:` overrides this at dispatch time.
         ctx.check_mode = check_mode;
+        // Run-scoped `--diff` flag — same value across every host. Read at the
+        // dispatch site to set the `TaskDispatch.diff` wire byte.
+        ctx.diff_mode = diff_mode;
         // Run-shared timing aggregator. Cloning the Arc is the only
         // per-host setup needed; updates inside dispatch are
         // atomic-only.
@@ -1997,7 +2007,7 @@ async fn run_task_on_one_host(
                 ctx.last_summary = Some(crate::report::TaskRunSummary {
                     rc: register.rc,
                     duration_ms: register.took_ms,
-                    diff: None, // Phase 2 (`--diff`) fills this in.
+                    diff: register.diff.clone(),
                 });
                 if let Some(reg_name) = &task.register {
                     ctx.record_register(reg_name, register);
@@ -2024,7 +2034,7 @@ async fn run_task_on_one_host(
                     ctx.last_summary = Some(crate::report::TaskRunSummary {
                         rc: rv.rc,
                         duration_ms: rv.took_ms,
-                        diff: None,
+                        diff: rv.diff.clone(),
                     });
                 }
                 ctx.failed = true;
@@ -2137,11 +2147,20 @@ async fn run_task_on_one_host(
     let any_iter_failed = iter_registers.iter().any(|r| r.failed);
     // Structured-report summary for the looped task: sum per-iteration
     // durations; take the last iteration's rc (matching how a looped task's
-    // aggregate register surfaces the terminal exit code). diff: Phase 2.
+    // aggregate register surfaces the terminal exit code). `--diff`: collect
+    // each iteration's diff payload — a single changed file passes its object
+    // through unchanged; multiple become a JSON array of diff objects (the
+    // human renderer and gothab accept object-or-array).
+    let iter_diffs: Vec<String> = iter_registers.iter().filter_map(|r| r.diff.clone()).collect();
+    let combined_diff = match iter_diffs.len() {
+        0 => None,
+        1 => iter_diffs.into_iter().next(),
+        _ => Some(format!("[{}]", iter_diffs.join(","))),
+    };
     ctx.last_summary = Some(crate::report::TaskRunSummary {
         rc: iter_registers.last().map(|r| r.rc).unwrap_or(0),
         duration_ms: iter_registers.iter().map(|r| r.took_ms).sum(),
-        diff: None,
+        diff: combined_diff,
     });
     let aggregate = RegisterValue {
         changed: any_changed,
@@ -3311,6 +3330,8 @@ async fn run_op_body(
                     true,
                     clock_offset_ns,
                     check_mode,
+                    // read-only stat probe — never produces a diff
+                    false,
                     &ctx.run_metrics,
                 )
                 .await
@@ -3567,6 +3588,9 @@ async fn run_op_body(
         capture,
         clock_offset_ns,
         check_mode,
+        // Real module body dispatch: carry the run-level `--diff` request.
+        // Diffing modules (write_file / copy) honour it; others ignore it.
+        ctx.diff_mode,
         &ctx.run_metrics,
     )
     .await;
@@ -3623,6 +3647,7 @@ async fn run_op_body(
                     /*capture=*/ true,
                     clock_offset_ns,
                     /*check_mode=*/ false,
+                    /*diff=*/ false,
                     &ctx.run_metrics,
                 )
                 .await;
@@ -3665,6 +3690,13 @@ async fn run_op_body(
                 &exec.stdout,
                 &exec.stderr,
             );
+            // `--diff`: the agent ships a serialized `{before, after, …}`
+            // payload on `TaskDone.diff` (empty string when it didn't diff).
+            // Carry it verbatim onto the register so the report emission funnel
+            // can lift it into the task summary; not exposed to templates.
+            if !exec.done.diff.is_empty() {
+                rv.diff = Some(exec.done.diff.clone());
+            }
             // Module-specific result lifting. `stat:` ships its result as a
             // JSON object on stdout; we expose it as `register.stat.<field>`
             // to match Ansible's contract. Failure to parse here is silent —
@@ -3889,6 +3921,8 @@ async fn run_privkey_composite(
                 true,
                 clock_offset_ns,
                 check_mode,
+                // read-only stat probe — never produces a diff
+                false,
                 &ctx.run_metrics,
             )
             .await;
@@ -4026,6 +4060,8 @@ async fn run_privkey_composite(
             task.register.is_some(),
             clock_offset_ns,
             check_mode,
+            // openssl_privatekey PEM write — never diff secret key material
+            false,
             &ctx.run_metrics,
         )
         .await
@@ -4209,6 +4245,8 @@ async fn fetch_privkey_via_read_file(
             true,
             clock_offset_ns,
             check_mode,
+            // read-only OpReadFile probe — never produces a diff
+            false,
             &ctx.run_metrics,
         )
         .await
@@ -4855,6 +4893,8 @@ async fn dispatch_one_pg_query(
         capture,
         clock_offset_ns,
         check_mode,
+        // composite SQL dispatch — not a file diff
+        false,
         &ctx.run_metrics,
     )
     .await
@@ -7890,6 +7930,7 @@ async fn run_one_task_op(
     capture: bool,
     clock_offset_ns: i64,
     check_mode: bool,
+    diff: bool,
     metrics: &crate::run_metrics::RunMetrics,
 ) -> Result<OpExecOutcome> {
     // Capture the static op-name BEFORE moving `op` into the
@@ -7897,7 +7938,7 @@ async fn run_one_task_op(
     // so the run summary can answer "where did the agents spend
     // their time, by task type?".
     let op_name = op.name();
-    let dispatch = task_dispatch(seq, check_mode, op);
+    let dispatch = task_dispatch_with_diff(seq, check_mode, diff, op);
     write_frame(&mut conn.stream, &dispatch)
         .await
         .with_context(|| format!("writing TaskDispatch to {}", conn.label))?;
@@ -8071,6 +8112,21 @@ async fn apply_per_host_result(
             diff: summary.and_then(|s| s.diff.clone()),
             reason,
         };
+        // `--diff` human output: render a unified diff to stderr for changed
+        // files. Independent of the structured `--report` sink (which carries
+        // the raw payload) — this is the terminal-facing view. Only when the
+        // run requested diffs and the task actually shipped a payload.
+        if ctx.diff_mode {
+            if let Some(payload) = tr.diff.as_deref() {
+                if let Some(rendered) = crate::diff_render::render_diff_payload(payload) {
+                    let check_tag = if ctx.check_mode { " (check mode)" } else { "" };
+                    let task_label =
+                        if task.name.is_empty() { "<unnamed task>" } else { task.name.as_str() };
+                    eprintln!("--- diff: {name} :: {task_label}{check_tag} ---");
+                    eprint!("{rendered}");
+                }
+            }
+        }
         ctx.reporter.on_task(&tr);
     }
     // Always reinsert ctx — set_facts/registers should persist even from failed hosts.

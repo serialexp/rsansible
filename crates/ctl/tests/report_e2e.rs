@@ -100,7 +100,10 @@ async fn structured_report_captures_every_task_on_host() -> Result<()> {
     assert_eq!(shell.rc, Some(0), "shell rc should be captured");
     assert!(shell.duration_ms.is_some(), "duration should be captured");
     assert!(shell.reason.is_none());
-    assert!(shell.diff.is_none(), "diff is Phase 2, not populated yet");
+    assert!(
+        shell.diff.is_none(),
+        "shell isn't a diffing module, and --diff wasn't requested here anyway"
+    );
 
     let marker = task_named(&tasks, "drop a marker file");
     assert_eq!(

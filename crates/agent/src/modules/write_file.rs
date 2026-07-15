@@ -23,7 +23,13 @@ use super::file::{
 use super::validate_helper::{validate_tmp, ValidateError};
 use super::{emit_error, Context};
 
-pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpWriteFileOutput,
+    check_mode: bool,
+    diff: bool,
+) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
     let path = PathBuf::from(&op.path);
     let mode = op.mode;
@@ -140,18 +146,29 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: boo
     };
     let would_change = content_diff || mode_diff || uid_diff || gid_diff;
 
+    // `--diff`: build the Ansible-shaped `{before, after, …}` payload when the
+    // *content* changed. Mode/owner-only changes carry no content diff (empty
+    // string → controller treats as "no diff"). Computed once here so both the
+    // check-mode preview and the real post-write emission ship the same bytes.
+    let diff_payload = if diff && content_diff {
+        super::diff::build_file_diff(&op.path, prior.as_deref(), &op.content)
+    } else {
+        String::new()
+    };
+
     // Dry-run: report what we'd change without touching the file. The
     // diff is exact (we read prior content and mode above) so the
     // `changed` flag is the same value we'd report on a real run.
     if check_mode {
         let finished_unix_ns = now_unix_ns();
-        ctx.emit(msg::task_done(
+        ctx.emit(msg::task_done_with_diff(
             seq,
             0,
             would_change,
             false,
             started_unix_ns,
             finished_unix_ns,
+            diff_payload,
         ))
         .await;
         return Ok(());
@@ -310,7 +327,16 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWriteFileOutput, check_mode: boo
     let changed = would_change;
 
     let finished_unix_ns = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished_unix_ns)).await;
+    ctx.emit(msg::task_done_with_diff(
+        seq,
+        0,
+        changed,
+        false,
+        started_unix_ns,
+        finished_unix_ns,
+        diff_payload,
+    ))
+    .await;
     Ok(())
 }
 

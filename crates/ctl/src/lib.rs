@@ -6,6 +6,7 @@
 #[path = "become_.rs"]
 pub mod become_;
 pub mod back_channel;
+pub mod diff_render;
 pub mod exec_ctx;
 pub mod extra_vars;
 pub mod forward;

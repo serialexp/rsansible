@@ -69,6 +69,7 @@ pub async fn run_start(
     seq: u32,
     op: OpAsyncStartOutput,
     check_mode: bool,
+    diff: bool,
 ) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
     let inner: Op = *op.inner;
@@ -89,7 +90,7 @@ pub async fn run_start(
             // recursive edge (dispatch → run_start → spawn(dispatch))
             // has a concrete Send return type. `tokio::pin!` lets us
             // poll it via `&mut` inside the select.
-            let mut dispatch_fut = dispatch(&inner_ctx, seq, inner, false);
+            let mut dispatch_fut = dispatch(&inner_ctx, seq, inner, false, diff);
 
             // Per-iter sleep future so the select! has a third arm when
             // `timeout_ms == 0` (then we wait forever on `pending`).
@@ -349,7 +350,7 @@ mod tests {
         };
         // Run start; this emits the "started" envelope and spawns the
         // inner task.
-        run_start(&ctx, 7, start_op, false).await.unwrap();
+        run_start(&ctx, 7, start_op, false, false).await.unwrap();
 
         // Poll until finished.
         let mut got_finished = false;

@@ -25,6 +25,7 @@ pub async fn run(
     seq: u32,
     op: OpCopyTargetOutput,
     check_mode: bool,
+    diff: bool,
 ) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
     let src = PathBuf::from(&op.src);
@@ -122,15 +123,24 @@ pub async fn run(
     };
     let would_change = content_diff || mode_diff || owner_diff || group_diff;
 
+    // `--diff`: build the Ansible-shaped payload when the content changed.
+    // Computed once so the check-mode preview and the real emission match.
+    let diff_payload = if diff && content_diff {
+        super::diff::build_file_diff(&op.dest, prior_bytes.as_deref(), &src_bytes)
+    } else {
+        String::new()
+    };
+
     if check_mode {
         let finished_unix_ns = now_unix_ns();
-        ctx.emit(msg::task_done(
+        ctx.emit(msg::task_done_with_diff(
             seq,
             0,
             would_change,
             false,
             started_unix_ns,
             finished_unix_ns,
+            diff_payload,
         ))
         .await;
         return Ok(());
@@ -271,13 +281,14 @@ pub async fn run(
     }
 
     let finished_unix_ns = now_unix_ns();
-    ctx.emit(msg::task_done(
+    ctx.emit(msg::task_done_with_diff(
         seq,
         0,
         would_change,
         false,
         started_unix_ns,
         finished_unix_ns,
+        diff_payload,
     ))
     .await;
     Ok(())
@@ -337,7 +348,7 @@ mod tests {
         ) else {
             panic!()
         };
-        run(&ctx, 1, op, false).await.unwrap();
+        run(&ctx, 1, op, false, false).await.unwrap();
         drop(ctx);
 
         assert_eq!(fs::read(&dest).unwrap(), b"hello world");
@@ -372,7 +383,7 @@ mod tests {
         ) else {
             panic!()
         };
-        run(&ctx, 2, op, false).await.unwrap();
+        run(&ctx, 2, op, false, false).await.unwrap();
         drop(ctx);
 
         let msgs = drain(rx).await;
@@ -403,7 +414,7 @@ mod tests {
         ) else {
             panic!()
         };
-        run(&ctx, 3, op, false).await.unwrap();
+        run(&ctx, 3, op, false, false).await.unwrap();
         drop(ctx);
 
         // Dest must still be the original bytes.
@@ -433,7 +444,7 @@ mod tests {
         ) else {
             panic!()
         };
-        run(&ctx, 4, op, false).await.unwrap();
+        run(&ctx, 4, op, false, false).await.unwrap();
         drop(ctx);
 
         let msgs = drain(rx).await;
@@ -464,7 +475,7 @@ mod tests {
         ) else {
             panic!()
         };
-        run(&ctx, 5, op, true).await.unwrap();
+        run(&ctx, 5, op, true, false).await.unwrap();
         drop(ctx);
 
         assert!(!dest.exists(), "check mode must not write dest");

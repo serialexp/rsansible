@@ -48,6 +48,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
+# unified-diff rendering for `--diff` human output (controller-only; the
+# agent stays FFI-free). Text-only, no syntect/images features pulled in.
+similar = { version = "2", default-features = false, features = ["text"] }
 
 # logging
 tracing = "0.1"

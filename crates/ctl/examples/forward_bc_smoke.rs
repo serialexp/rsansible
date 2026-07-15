@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         skip_tags: vec![],
         limit: vec![],
         check_mode: false,
+        diff_mode: false,
         wire_strategy: WireStrategy::Auto,
         max_concurrent_hosts: 2,
         no_cache: false,

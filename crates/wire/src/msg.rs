@@ -845,10 +845,18 @@ pub fn hello(
 }
 
 pub fn task_dispatch(seq: u32, check_mode: bool, op: Op) -> Message {
+    task_dispatch_with_diff(seq, check_mode, false, op)
+}
+
+/// Like [`task_dispatch`] but sets the `diff` request flag. Modules that
+/// support diffing read the pre-change content and ship a `{before, after, …}`
+/// payload on `TaskDone.diff` when set.
+pub fn task_dispatch_with_diff(seq: u32, check_mode: bool, diff: bool, op: Op) -> Message {
     Message::TaskDispatch(TaskDispatchOutput {
         kind: 1,
         seq,
         check_mode: if check_mode { 1 } else { 0 },
+        diff: if diff { 1 } else { 0 },
         op,
     })
 }
@@ -877,6 +885,30 @@ pub fn task_done(
     started_unix_ns: u64,
     finished_unix_ns: u64,
 ) -> Message {
+    task_done_with_diff(
+        seq,
+        exit_code,
+        changed,
+        skipped,
+        started_unix_ns,
+        finished_unix_ns,
+        String::new(),
+    )
+}
+
+/// Like [`task_done`] but carries a diff payload (Ansible `{before, after, …}`
+/// JSON). Empty string means "no diff" — pass that (or use [`task_done`]) for
+/// modules that don't diff or when nothing changed.
+#[allow(clippy::too_many_arguments)]
+pub fn task_done_with_diff(
+    seq: u32,
+    exit_code: i32,
+    changed: bool,
+    skipped: bool,
+    started_unix_ns: u64,
+    finished_unix_ns: u64,
+    diff: String,
+) -> Message {
     Message::TaskDone(TaskDoneOutput {
         kind: 3,
         seq,
@@ -885,6 +917,7 @@ pub fn task_done(
         skipped: if skipped { 1 } else { 0 },
         started_unix_ns,
         finished_unix_ns,
+        diff,
     })
 }
 

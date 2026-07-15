@@ -98,6 +98,9 @@ pub struct WorkflowPayload {
     /// `--check` dry-run flag.
     #[serde(default)]
     pub check_mode: bool,
+    /// `--diff` flag — request `{before, after}` payloads for changed files.
+    #[serde(default)]
+    pub diff_mode: bool,
     /// `--wire-strategy` override. `Auto` defers to the per-host heuristic.
     #[serde(default)]
     pub wire_strategy: WireStrategy,
@@ -205,6 +208,7 @@ pub async fn cmd_remote_run(
     spec.limit = payload.limit;
     spec.wire_strategy = payload.wire_strategy;
     spec.check_mode = payload.check_mode;
+    spec.diff_mode = payload.diff_mode;
     spec.playbook_dir = pb_path
         .canonicalize()
         .ok()
@@ -496,6 +500,7 @@ pub struct ForwardArgs {
     pub skip_tags: Vec<String>,
     pub limit: Vec<String>,
     pub check_mode: bool,
+    pub diff_mode: bool,
     pub wire_strategy: WireStrategy,
     pub max_concurrent_hosts: usize,
     /// `--no-cache`: bypass `/tmp/rsansible-cache/` and re-push the
@@ -656,6 +661,7 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
         skip_tags: args.skip_tags,
         limit: args.limit,
         check_mode: args.check_mode,
+        diff_mode: args.diff_mode,
         wire_strategy: args.wire_strategy,
         max_concurrent_hosts: args.max_concurrent_hosts,
         forwarder_hostname: args.forwarder.name.clone(),
@@ -1324,6 +1330,7 @@ mod tests {
             skip_tags: vec![],
             limit: vec!["webservers".into()],
             check_mode: false,
+            diff_mode: false,
             wire_strategy: WireStrategy::Auto,
             max_concurrent_hosts: 10,
             forwarder_hostname: "h1".into(),

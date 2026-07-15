@@ -86,6 +86,13 @@ pub struct HostCtx {
     /// `HostCtx` so the controller-side composite paths (e.g.
     /// `openssl_privatekey`) can branch on the run-level default.
     pub check_mode: bool,
+    /// Run-scoped `--diff` flag, seeded once from `RunSpec.diff_mode`.
+    /// When set, diffing module dispatches (write_file / copy) request a
+    /// `{before, after, …}` payload for changed files. Read at the dispatch
+    /// site to set the `TaskDispatch.diff` wire byte. Run-level in v1 (no
+    /// per-task override yet — mirrors `check_mode`'s storage but without the
+    /// per-task escape hatch).
+    pub diff_mode: bool,
     /// In-memory cache of private-key PEM bytes generated this run,
     /// keyed by the remote dest path. Populated by the
     /// `OpenSslPrivkey` composite-dispatch path when it actually
@@ -161,6 +168,7 @@ impl HostCtx {
             wire_cost: WireCost::default(),
             wire_strategy: WireStrategy::default(),
             check_mode: false,
+            diff_mode: false,
             privkey_pem_cache: BTreeMap::new(),
             ansible_failed_task: None,
             ansible_failed_result: None,
@@ -217,6 +225,14 @@ pub struct RegisterValue {
     /// whatever JSON shape the module emits. Empty by default; populated
     /// from parsed stdout JSON for modules that opt in.
     pub extra: BTreeMap<String, JsonValue>,
+    /// Unified/structured file diff shipped by a diffing module (write_file /
+    /// copy) when the run requested `--diff` and the task changed a file.
+    /// Carries the agent's serialized `{before, after, before_header,
+    /// after_header}` payload (a JSON string) verbatim — the controller stores
+    /// it for the structured report and renders a human unified diff from it.
+    /// `None` when diff wasn't requested, the module doesn't diff, or nothing
+    /// changed. Not lifted into the template-visible register dict.
+    pub diff: Option<String>,
 }
 
 impl RegisterValue {
@@ -340,6 +356,7 @@ impl RegisterValue {
             results: None,
             attempts: 0,
             extra: BTreeMap::new(),
+            diff: None,
         }
     }
 

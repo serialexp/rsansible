@@ -52,9 +52,13 @@ pub struct TaskRunSummary {
     /// Wall time attributed to the task body. For looped tasks, the sum of
     /// per-iteration durations.
     pub duration_ms: u64,
-    /// Textual diff in Ansible's `{before, after, before_header, after_header}`
-    /// shape. Populated by the deferred `--diff` work (Phase 2); `None` until
-    /// then. Owned by rsansible — the consumer stores/renders it verbatim.
+    /// Serialized diff payload for a changed file, in Ansible's `{before,
+    /// after, before_header, after_header}` JSON shape (or a JSON array of
+    /// those for a looped task with several changed files). Populated when the
+    /// run requested `--diff` and a diffing module (write_file / copy) changed
+    /// a file; `None` otherwise. Owned by rsansible — the consumer stores it
+    /// verbatim (gothab) and can render a unified diff from it (see
+    /// [`crate::diff_render`]).
     pub diff: Option<String>,
 }
 
