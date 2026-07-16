@@ -155,6 +155,31 @@ enum Cmd {
         /// ⇒ no structured report (human stderr summary only, as before).
         #[arg(long = "report", value_name = "PATH")]
         report: Option<PathBuf>,
+        /// Stream the run to a generic HTTP ingestion endpoint as tasks
+        /// finish (live progress + a persisted partial if the run dies).
+        /// The base URL of a server implementing the push protocol
+        /// (`crates/ctl/PUSH_PROTOCOL.md`); the client appends `/runs`,
+        /// `/runs/{id}/items`, etc. Vendor-neutral — points at anything that
+        /// speaks the protocol. Requires `--report-project`/`--report-stack`
+        /// (and `--report-namespace`).
+        #[arg(long = "report-url", value_name = "URL")]
+        report_url: Option<String>,
+        /// Bearer token for the push endpoint's `open` handshake. Falls back
+        /// to the `RSANSIBLE_REPORT_TOKEN` env var. Only the initial `open`
+        /// uses it; streaming writes use the per-run lease the server mints.
+        #[arg(long = "report-token", value_name = "TOKEN")]
+        report_token: Option<String>,
+        /// Namespace/org the run is recorded under on the push endpoint.
+        #[arg(long = "report-namespace", value_name = "NAME")]
+        report_namespace: Option<String>,
+        /// Project (playbook/repo scope) the run belongs to on the push
+        /// endpoint. Defaults to the playbook file stem.
+        #[arg(long = "report-project", value_name = "NAME")]
+        report_project: Option<String>,
+        /// Stack (target environment/inventory, e.g. `prod`) the run belongs
+        /// to on the push endpoint.
+        #[arg(long = "report-stack", value_name = "NAME")]
+        report_stack: Option<String>,
         /// Playbook file (YAML).
         playbook: PathBuf,
     },
@@ -198,6 +223,18 @@ enum Cmd {
         #[arg(long)]
         inner: bool,
     },
+}
+
+/// The `--report-*` push-sink flags, bundled so `cmd_run`'s signature doesn't
+/// grow five more positional args. Assembled into a
+/// [`rsansible_ctl::report_http::PushConfig`] in `cmd_run` iff `url` is set.
+#[derive(Debug, Default)]
+struct ReportPushArgs {
+    url: Option<String>,
+    token: Option<String>,
+    namespace: Option<String>,
+    project: Option<String>,
+    stack: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -292,6 +329,11 @@ async fn main() -> ExitCode {
             timing,
             dotenv,
             report,
+            report_url,
+            report_token,
+            report_namespace,
+            report_project,
+            report_stack,
             playbook,
         } => {
             let agent_binary = match resolve_agent_binary(agent_binary) {
@@ -321,6 +363,13 @@ async fn main() -> ExitCode {
             timing,
             dotenv,
             report,
+            ReportPushArgs {
+                url: report_url,
+                token: report_token,
+                namespace: report_namespace,
+                project: report_project,
+                stack: report_stack,
+            },
             playbook,
         )
         .await
@@ -423,6 +472,50 @@ fn resolve_dotenv_file(explicit: Option<PathBuf>, inv_path: &Path) -> Option<Pat
     None
 }
 
+/// Assemble a [`rsansible_ctl::report_http::PushConfig`] from the `--report-*`
+/// flags. Returns `Ok(None)` when `--report-url` is absent (push sink off).
+/// When present, `--report-stack` and a token (flag or `RSANSIBLE_REPORT_TOKEN`)
+/// are required; `--report-namespace` defaults to empty (server may infer from
+/// the token) and `--report-project` defaults to the playbook file stem.
+fn build_push_config(
+    args: &ReportPushArgs,
+    pb_path: &std::path::Path,
+    check_mode: bool,
+) -> Result<Option<rsansible_ctl::report_http::PushConfig>> {
+    use rsansible_ctl::report_http::{PushConfig, RunMode};
+    let Some(url) = args.url.clone() else {
+        return Ok(None);
+    };
+    let token = args
+        .token
+        .clone()
+        .or_else(|| std::env::var("RSANSIBLE_REPORT_TOKEN").ok())
+        .context("--report-url requires --report-token (or RSANSIBLE_REPORT_TOKEN)")?;
+    let stack = args
+        .stack
+        .clone()
+        .context("--report-url requires --report-stack (the target environment)")?;
+    let project = args.project.clone().unwrap_or_else(|| {
+        pb_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "playbook".to_string())
+    });
+    let namespace = args.namespace.clone().unwrap_or_default();
+    Ok(Some(PushConfig {
+        base_url: url,
+        token,
+        namespace,
+        project,
+        stack,
+        mode: if check_mode { RunMode::Check } else { RunMode::Apply },
+        playbook: pb_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned()),
+        inventory: None,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     inv_path: PathBuf,
@@ -442,6 +535,7 @@ async fn cmd_run(
     print_timing: bool,
     dotenv: Option<PathBuf>,
     report_path: Option<PathBuf>,
+    push_args: ReportPushArgs,
     pb_path: PathBuf,
 ) -> Result<ExitCode> {
     let pb = playbook::load(&pb_path)
@@ -519,18 +613,48 @@ async fn cmd_run(
     if check_mode {
         eprintln!("*** running in check mode — no changes will be made ***");
     }
-    // Install a structured-report sink if `--report` was given. Constructing
-    // the writer up front means a bad path (unwritable dir) fails the run
-    // before we dial any host, not after a converge.
+    // Assemble the run's reporters. `--report <file>` and `--report-url` can
+    // both be active, so collect into a Vec and fan out via MultiReporter.
+    // Everything is constructed up front (a bad file path, or a bad push
+    // URL/token/scope) so the run fails before we dial any host, not after a
+    // converge.
+    use std::sync::Arc;
+    let mut reporters: Vec<Arc<dyn rsansible_ctl::report::Reporter>> = Vec::new();
     if let Some(path) = report_path.as_deref() {
         let reporter = rsansible_ctl::report::JsonReporter::to_path(path)
             .with_context(|| format!("--report {}", path.display()))?;
-        spec.reporter = std::sync::Arc::new(reporter);
+        reporters.push(Arc::new(reporter));
         eprintln!("report: writing structured run report to {}", path.display());
+    }
+    // The push sink, if `--report-url` was given. Keep the concrete handle so
+    // we can `join().await` it after the run to flush + finalize.
+    let push_reporter = if let Some(cfg) = build_push_config(&push_args, &pb_path, check_mode)? {
+        let base = cfg.base_url.clone();
+        let http = rsansible_ctl::report_http::HttpReporter::open(cfg)
+            .await
+            .with_context(|| format!("--report-url {base}"))?;
+        eprintln!("report: streaming run to {base} (run id {})", http.run_id());
+        reporters.push(http.clone());
+        Some(http)
+    } else {
+        None
+    };
+    if !reporters.is_empty() {
+        spec.reporter = if reporters.len() == 1 {
+            reporters.pop().unwrap()
+        } else {
+            Arc::new(rsansible_ctl::report_http::MultiReporter::new(reporters))
+        };
     }
     let report = orchestrator::run(spec)
         .await
         .context("orchestrator failed")?;
+
+    // Flush + finalize the push sink before we exit, so no results are lost.
+    // A reporting failure here is logged inside `join`, never fatal.
+    if let Some(http) = &push_reporter {
+        http.join().await;
+    }
 
     // Summary to stderr; machine-readable exit code reflects success/fail.
     let mut ok = 0usize;

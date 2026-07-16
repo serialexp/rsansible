@@ -1,0 +1,57 @@
+{
+  "_comment": "Push-protocol v1 wire samples. Committed identically in rsansible (crates/ctl/) and gothab (crates/gothab-server/tests/fixtures/). Both sides deserialize each sample into their own wire types and assert the round-trip, so a change on one side that isn't mirrored fails the other's test. See crates/ctl/PUSH_PROTOCOL.md.",
+  "open_request": {
+    "namespace": "acme",
+    "project": "site",
+    "stack": "prod",
+    "mode": "apply",
+    "playbook": "site.yml",
+    "inventory": "prod"
+  },
+  "open_response": {
+    "run_id": "0f9b1e2c-1111-2222-3333-444455556666",
+    "lease_token": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "lease_expires_at": "2026-07-16T12:05:00Z",
+    "renew_interval_secs": 240
+  },
+  "items_request": {
+    "items": [
+      {
+        "sequence": 0,
+        "dimensions": { "host": "db-1", "task": "install patroni", "play": "converge" },
+        "name": "install patroni",
+        "status": "changed",
+        "changed": true,
+        "rc": 0,
+        "started_at": "2026-07-16T12:00:01Z",
+        "finished_at": "2026-07-16T12:00:02Z",
+        "diff": "{\"before\":\"old\\n\",\"after\":\"new\\n\",\"before_header\":\"/etc/patroni.yml\",\"after_header\":\"/etc/patroni.yml\"}"
+      },
+      {
+        "sequence": 1,
+        "dimensions": { "host": "db-2", "task": "gather facts", "play": "converge", "role": "postgres" },
+        "name": "gather facts",
+        "status": "ok",
+        "changed": false,
+        "rc": 0
+      },
+      {
+        "sequence": 2,
+        "dimensions": { "host": "db-2", "task": "start service", "play": "converge" },
+        "name": "start service",
+        "status": "failed",
+        "changed": false,
+        "rc": 1,
+        "error": "unit patroni.service failed"
+      }
+    ]
+  },
+  "finalize_request": {
+    "status": "failed",
+    "summary": { "ok": 1, "changed": 1, "skipped": 0, "failed": 1, "unreachable": 0 },
+    "stopped_early": false
+  },
+  "renew_response": {
+    "lease_expires_at": "2026-07-16T12:09:00Z"
+  }
+}

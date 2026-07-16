@@ -75,8 +75,20 @@ rand = "0.9.4"
 tar = "0.4"
 flate2 = "1"
 walkdir = "2"
+# HTTP push sink: the `--report-url` reporter streams run results to a
+# generic HTTP ingestion endpoint (`crate::report_http`). rustls-tls (no
+# OpenSSL) + json, mirroring the client the `agent` crate already uses for
+# OpUri — no new kind of dependency on the controller.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 # Enable tokio's `test-util` so unit tests can `tokio::time::pause()` /
 # `advance()` to verify retry-loop delays without wall-clock sleeps.
 tokio = { workspace = true, features = ["test-util"] }
+# In-process mock HTTP server for the push-sink tests (`report_http`):
+# stands up the open/items/finalize/renew contract and records requests so
+# the client's sequencing, batching, retry, and lease-renewal are asserted
+# without a live gothab. axum + hyper are the same stack the `agent` crate
+# uses for its OpUri unit-test server.
+axum = "0.7"
+hyper = "1"

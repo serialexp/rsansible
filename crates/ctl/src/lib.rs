@@ -21,6 +21,7 @@ pub mod orchestrator;
 pub mod playbook;
 pub mod pool;
 pub mod report;
+pub mod report_http;
 pub mod run_metrics;
 pub mod ssh;
 pub mod tags;

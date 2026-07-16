@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Ansible-vocabulary status for one (host, task) result.
 ///
@@ -31,7 +31,7 @@ use serde::Serialize;
 /// no change vs one that mutated state / would mutate under `--check`).
 /// `Skipped` covers both `when: false` and a check-mode module that declined
 /// to act. `Failed`/`Unreachable` mirror Ansible's terminal host states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Ok,
