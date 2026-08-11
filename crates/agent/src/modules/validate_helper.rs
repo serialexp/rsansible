@@ -118,10 +118,8 @@ mod tests {
     use super::*;
 
     fn tmp_with_contents(name: &str, contents: &[u8]) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "rsansible-validate-{name}-{}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("rsansible-validate-{name}-{}", std::process::id()));
         std::fs::write(&p, contents).unwrap();
         p
     }
@@ -192,9 +190,9 @@ mod tests {
         // and either succeed or fail-on-exit, but NOT BadRequest.
         let res = validate_tmp("/bin/cat --not-a-flag=%s", &p);
         match res {
-            Err(ValidateError::BadRequest(msg)) => panic!(
-                "embedded %s must be substituted, not rejected as BadRequest: {msg}"
-            ),
+            Err(ValidateError::BadRequest(msg)) => {
+                panic!("embedded %s must be substituted, not rejected as BadRequest: {msg}")
+            }
             _ => {}
         }
         let _ = std::fs::remove_file(&p);

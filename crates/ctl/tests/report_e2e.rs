@@ -95,7 +95,11 @@ async fn structured_report_captures_every_task_on_host() -> Result<()> {
     assert!(tasks.iter().all(|t| !t.check_mode));
 
     let shell = task_named(&tasks, "say hi via shell");
-    assert_eq!(shell.status, TaskStatus::Changed, "shell has no idempotency");
+    assert_eq!(
+        shell.status,
+        TaskStatus::Changed,
+        "shell has no idempotency"
+    );
     assert!(shell.changed);
     assert_eq!(shell.rc, Some(0), "shell rc should be captured");
     assert!(shell.duration_ms.is_some(), "duration should be captured");

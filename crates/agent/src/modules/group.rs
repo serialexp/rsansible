@@ -215,7 +215,12 @@ grep -v "^$1$" "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
                 perms.set_mode(0o755);
                 std::fs::set_permissions(p, perms).unwrap();
             }
-            Stub { dir, getent, groupadd, groupdel }
+            Stub {
+                dir,
+                getent,
+                groupadd,
+                groupdel,
+            }
         }
         fn db(&self) -> String {
             std::fs::read_to_string(self.dir.join("groups")).unwrap_or_default()

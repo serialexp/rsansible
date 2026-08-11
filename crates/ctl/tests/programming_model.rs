@@ -37,8 +37,7 @@ async fn three_container_programming_model_run() -> Result<()> {
     let inv = build_inventory(&containers);
 
     let pb_path = examples_dir().join("programming_model.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

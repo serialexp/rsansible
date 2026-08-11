@@ -27,8 +27,8 @@ pub struct ExecOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playbook::task_op::TaskOp;
     use rsansible_wire::generated::Op as WireOp;
-    use crate::playbook::task_op::{TaskOp};
     use std::collections::BTreeMap;
 
     #[test]

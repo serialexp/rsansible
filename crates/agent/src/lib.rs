@@ -118,7 +118,10 @@ where
             | Message::TaskDone(_)
             | Message::TaskError(_)
             | Message::Pong(_)) => {
-                warn!(?unexpected, "ignoring ctrl→agent message of unexpected variant");
+                warn!(
+                    ?unexpected,
+                    "ignoring ctrl→agent message of unexpected variant"
+                );
             }
         }
     }

@@ -44,8 +44,12 @@ pub struct OpenSslPrivkeyOp {
     pub force_probe: bool,
 }
 
-fn default_privkey_size() -> u32 { 4096 }
-fn default_privkey_mode() -> ModeField { ModeField::Literal(0o600) }
+fn default_privkey_size() -> u32 {
+    4096
+}
+fn default_privkey_mode() -> ModeField {
+    ModeField::Literal(0o600)
+}
 
 impl<'de> Deserialize<'de> for OpenSslPrivkeyOp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -53,7 +57,9 @@ impl<'de> Deserialize<'de> for OpenSslPrivkeyOp {
         let path = match map.remove("path") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
             Some(serde_yaml::Value::String(_)) => {
-                return Err(D::Error::custom("openssl_privatekey.path: must be non-empty"));
+                return Err(D::Error::custom(
+                    "openssl_privatekey.path: must be non-empty",
+                ));
             }
             Some(other) => {
                 return Err(D::Error::custom(format!(
@@ -74,11 +80,14 @@ impl<'de> Deserialize<'de> for OpenSslPrivkeyOp {
         };
         let size = match map.remove("size") {
             None | Some(serde_yaml::Value::Null) => default_privkey_size(),
-            Some(serde_yaml::Value::Number(n)) => n.as_u64()
+            Some(serde_yaml::Value::Number(n)) => n
+                .as_u64()
                 .and_then(|v| u32::try_from(v).ok())
-                .ok_or_else(|| D::Error::custom(format!(
-                    "openssl_privatekey.size: expected a positive integer, got: {n}"
-                )))?,
+                .ok_or_else(|| {
+                    D::Error::custom(format!(
+                        "openssl_privatekey.size: expected a positive integer, got: {n}"
+                    ))
+                })?,
             Some(other) => {
                 return Err(D::Error::custom(format!(
                     "openssl_privatekey.size: expected an integer, got: {other:?}"
@@ -88,8 +97,8 @@ impl<'de> Deserialize<'de> for OpenSslPrivkeyOp {
         // Ansible writes mode as either an int (`0o600`) or a string
         // (`"0600"`); accept both via the shared helper so we don't
         // diverge from per-key Bucket-A behavior.
-        let mode = take_optional_mode::<D::Error>(&mut map, "mode")?
-            .unwrap_or_else(default_privkey_mode);
+        let mode =
+            take_optional_mode::<D::Error>(&mut map, "mode")?.unwrap_or_else(default_privkey_mode);
         // Ansible's openssl_privatekey accepts `owner` and `group` (it
         // chowns the generated key). We accept them at parse time so
         // playbooks that set them don't trip on unknown-field rejection;
@@ -114,18 +123,31 @@ impl<'de> Deserialize<'de> for OpenSslPrivkeyOp {
                 )));
             }
         };
-        let force_probe = take_optional_ansible_bool::<D::Error>(&mut map, "force_probe")?
-            .unwrap_or(false);
+        let force_probe =
+            take_optional_ansible_bool::<D::Error>(&mut map, "force_probe")?.unwrap_or(false);
         if !map.is_empty() {
-            let unknown: Vec<String> = map.keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "openssl_privatekey: unknown field(s): {unknown:?}; expected one of \
                  [path, type, size, mode, owner, group, force_probe]"
             )));
         }
-        Ok(OpenSslPrivkeyOp { path, kind, size, mode, owner, group, force_probe })
+        Ok(OpenSslPrivkeyOp {
+            path,
+            kind,
+            size,
+            mode,
+            owner,
+            group,
+            force_probe,
+        })
     }
 }
 
@@ -186,37 +208,48 @@ impl<'de> Deserialize<'de> for OpenSslCsrPipeOp {
         let mut map = serde_yaml::Mapping::deserialize(d)?;
         let privatekey_path = match map.remove("privatekey_path") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
-            None => return Err(D::Error::custom(
-                "openssl_csr_pipe: `privatekey_path` is required",
-            )),
-            other => return Err(D::Error::custom(format!(
-                "openssl_csr_pipe.privatekey_path: expected non-empty string, got: {other:?}"
-            ))),
+            None => {
+                return Err(D::Error::custom(
+                    "openssl_csr_pipe: `privatekey_path` is required",
+                ))
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "openssl_csr_pipe.privatekey_path: expected non-empty string, got: {other:?}"
+                )))
+            }
         };
         let common_name = match map.remove("common_name") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
-            None => return Err(D::Error::custom(
-                "openssl_csr_pipe: `common_name` is required",
-            )),
-            other => return Err(D::Error::custom(format!(
-                "openssl_csr_pipe.common_name: expected non-empty string, got: {other:?}"
-            ))),
+            None => {
+                return Err(D::Error::custom(
+                    "openssl_csr_pipe: `common_name` is required",
+                ))
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "openssl_csr_pipe.common_name: expected non-empty string, got: {other:?}"
+                )))
+            }
         };
-        let country_name = take_optional_field_string::<D::Error>(&mut map, "country_name")?
-            .unwrap_or_default();
-        let organization_name = take_optional_field_string::<D::Error>(&mut map, "organization_name")?
-            .unwrap_or_default();
+        let country_name =
+            take_optional_field_string::<D::Error>(&mut map, "country_name")?.unwrap_or_default();
+        let organization_name =
+            take_optional_field_string::<D::Error>(&mut map, "organization_name")?
+                .unwrap_or_default();
         let organizational_unit_name =
             take_optional_field_string::<D::Error>(&mut map, "organizational_unit_name")?
                 .unwrap_or_default();
         let subject_alt_name = take_optional_string_list::<D::Error>(&mut map, "subject_alt_name")?
             .unwrap_or_default();
-        let key_usage = take_optional_string_list::<D::Error>(&mut map, "key_usage")?
-            .unwrap_or_default();
-        let extended_key_usage = take_optional_string_list::<D::Error>(&mut map, "extended_key_usage")?
-            .unwrap_or_default();
-        let basic_constraints = take_optional_string_list::<D::Error>(&mut map, "basic_constraints")?
-            .unwrap_or_default();
+        let key_usage =
+            take_optional_string_list::<D::Error>(&mut map, "key_usage")?.unwrap_or_default();
+        let extended_key_usage =
+            take_optional_string_list::<D::Error>(&mut map, "extended_key_usage")?
+                .unwrap_or_default();
+        let basic_constraints =
+            take_optional_string_list::<D::Error>(&mut map, "basic_constraints")?
+                .unwrap_or_default();
         // `digest:` is the signing hash algorithm. rcgen picks one
         // implicitly from the key type, so we just store the requested
         // value and let the renderer trust rcgen's choice. See
@@ -253,8 +286,13 @@ impl<'de> Deserialize<'de> for OpenSslCsrPipeOp {
             ));
         }
         if !map.is_empty() {
-            let unknown: Vec<String> = map.keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "openssl_csr_pipe: unknown field(s): {unknown:?}; expected one of \
@@ -346,33 +384,42 @@ pub struct X509CertificatePipeOp {
     pub not_after_template: String,
 }
 
-fn default_cert_provider() -> String { "selfsigned".to_string() }
-fn default_cert_valid_days() -> u32 { 365 }
+fn default_cert_provider() -> String {
+    "selfsigned".to_string()
+}
+fn default_cert_valid_days() -> u32 {
+    365
+}
 
 impl<'de> Deserialize<'de> for X509CertificatePipeOp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut map = serde_yaml::Mapping::deserialize(d)?;
         let csr_content = match map.remove("csr_content") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
-            None => return Err(D::Error::custom(
-                "x509_certificate_pipe: `csr_content` is required",
-            )),
-            other => return Err(D::Error::custom(format!(
-                "x509_certificate_pipe.csr_content: expected non-empty string, got: {other:?}"
-            ))),
+            None => {
+                return Err(D::Error::custom(
+                    "x509_certificate_pipe: `csr_content` is required",
+                ))
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "x509_certificate_pipe.csr_content: expected non-empty string, got: {other:?}"
+                )))
+            }
         };
         let privatekey_content =
             take_optional_field_string::<D::Error>(&mut map, "privatekey_content")?
                 .unwrap_or_default();
-        let privatekey_path =
-            take_optional_field_string::<D::Error>(&mut map, "privatekey_path")?
-                .unwrap_or_default();
+        let privatekey_path = take_optional_field_string::<D::Error>(&mut map, "privatekey_path")?
+            .unwrap_or_default();
         let provider = match map.remove("provider") {
             None | Some(serde_yaml::Value::Null) => default_cert_provider(),
             Some(serde_yaml::Value::String(s)) => s,
-            Some(other) => return Err(D::Error::custom(format!(
-                "x509_certificate_pipe.provider: expected a string, got: {other:?}"
-            ))),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "x509_certificate_pipe.provider: expected a string, got: {other:?}"
+                )))
+            }
         };
         // Fail loudly for the unimplemented providers so users don't
         // get a silently-wrong cert (e.g. a self-signed cert when they
@@ -386,19 +433,16 @@ impl<'de> Deserialize<'de> for X509CertificatePipeOp {
 
         // ownca-specific inputs. Only validated when provider is ownca.
         let ownca_content =
-            take_optional_field_string::<D::Error>(&mut map, "ownca_content")?
-                .unwrap_or_default();
+            take_optional_field_string::<D::Error>(&mut map, "ownca_content")?.unwrap_or_default();
         let ownca_privatekey_content =
             take_optional_field_string::<D::Error>(&mut map, "ownca_privatekey_content")?
                 .unwrap_or_default();
         let ownca_privatekey_path =
             take_optional_field_string::<D::Error>(&mut map, "ownca_privatekey_path")?
                 .unwrap_or_default();
-        let ownca_not_after =
-            take_optional_field_string::<D::Error>(&mut map, "ownca_not_after")?;
+        let ownca_not_after = take_optional_field_string::<D::Error>(&mut map, "ownca_not_after")?;
         let ownca_digest =
-            take_optional_field_string::<D::Error>(&mut map, "ownca_digest")?
-                .unwrap_or_default();
+            take_optional_field_string::<D::Error>(&mut map, "ownca_digest")?.unwrap_or_default();
 
         // Provider-specific required-field validation.
         match provider.as_str() {
@@ -496,29 +540,38 @@ impl<'de> Deserialize<'de> for X509CertificatePipeOp {
         // the duration spelling at parse time — defer to dispatch.
         // Stash the template in `not_after_template`; valid_for_days
         // gets a placeholder that's overwritten at render time.
-        let (valid_for_days, not_after_template) = match (valid_for_days_explicit, &provider_not_after) {
-            (Some(_), Some(_)) => {
-                return Err(D::Error::custom(
-                    "x509_certificate_pipe: set either `valid_for_days` or the \
+        let (valid_for_days, not_after_template) =
+            match (valid_for_days_explicit, &provider_not_after) {
+                (Some(_), Some(_)) => {
+                    return Err(D::Error::custom(
+                        "x509_certificate_pipe: set either `valid_for_days` or the \
                      provider-specific `*_not_after`, not both",
-                ));
-            }
-            (Some(d), None) => (d, String::new()),
-            (None, Some(s)) => {
-                if super::shared::string_is_jinja(s) {
-                    (default_cert_valid_days(), s.clone())
-                } else {
-                    (parse_relative_duration_days(s).map_err(D::Error::custom)?, String::new())
+                    ));
                 }
-            }
-            (None, None) => (default_cert_valid_days(), String::new()),
-        };
+                (Some(d), None) => (d, String::new()),
+                (None, Some(s)) => {
+                    if super::shared::string_is_jinja(s) {
+                        (default_cert_valid_days(), s.clone())
+                    } else {
+                        (
+                            parse_relative_duration_days(s).map_err(D::Error::custom)?,
+                            String::new(),
+                        )
+                    }
+                }
+                (None, None) => (default_cert_valid_days(), String::new()),
+            };
         let selfsigned_digest =
             take_optional_field_string::<D::Error>(&mut map, "selfsigned_digest")?
                 .unwrap_or_default();
         if !map.is_empty() {
-            let unknown: Vec<String> = map.keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            let unknown: Vec<String> = map
+                .keys()
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "x509_certificate_pipe: unknown field(s): {unknown:?}; expected one of \
@@ -598,7 +651,9 @@ pub(crate) fn parse_relative_duration_days(s: &str) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::playbook::task_op::{parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task};
+    use crate::playbook::task_op::{
+        parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task,
+    };
     use crate::playbook::task_op::{TaskBody, TaskOp};
 
     #[test]
@@ -891,7 +946,10 @@ x509_certificate_pipe:
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("privatekey_content") || msg.contains("required"), "got: {msg}");
+        assert!(
+            msg.contains("privatekey_content") || msg.contains("required"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -922,6 +980,9 @@ openssl_privatekey:
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("curve") || msg.contains("unknown"), "got: {msg}");
+        assert!(
+            msg.contains("curve") || msg.contains("unknown"),
+            "got: {msg}"
+        );
     }
 }

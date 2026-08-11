@@ -178,10 +178,7 @@ fn set_timezone(bins: &Bins, name: &str) -> Result<(), TimezoneError> {
     // path already exists.
     if bins.etc_localtime.exists() || bins.etc_localtime.symlink_metadata().is_ok() {
         std::fs::remove_file(&bins.etc_localtime).map_err(|e| {
-            TimezoneError::Io(format!(
-                "remove {}: {e}",
-                bins.etc_localtime.display()
-            ))
+            TimezoneError::Io(format!("remove {}: {e}", bins.etc_localtime.display()))
         })?;
     }
     std::os::unix::fs::symlink(&zi_file, &bins.etc_localtime).map_err(|e| {
@@ -191,9 +188,8 @@ fn set_timezone(bins: &Bins, name: &str) -> Result<(), TimezoneError> {
             zi_file.display()
         ))
     })?;
-    std::fs::write(&bins.etc_timezone, format!("{name}\n")).map_err(|e| {
-        TimezoneError::Io(format!("write {}: {e}", bins.etc_timezone.display()))
-    })?;
+    std::fs::write(&bins.etc_timezone, format!("{name}\n"))
+        .map_err(|e| TimezoneError::Io(format!("write {}: {e}", bins.etc_timezone.display())))?;
     Ok(())
 }
 
@@ -300,7 +296,10 @@ esac
     }
 
     fn op(name: &str) -> OpTimezoneOutput {
-        OpTimezoneOutput { kind: 27, name: name.into() }
+        OpTimezoneOutput {
+            kind: 27,
+            name: name.into(),
+        }
     }
 
     #[test]
@@ -317,7 +316,8 @@ esac
         let changed = apply_with_bins(&stub.bins, &op("Europe/Amsterdam"), false).unwrap();
         assert!(changed);
         assert!(
-            stub.log().contains("timedatectl set-timezone Europe/Amsterdam"),
+            stub.log()
+                .contains("timedatectl set-timezone Europe/Amsterdam"),
             "log: {:?}",
             stub.log()
         );
@@ -331,11 +331,7 @@ esac
         assert!(changed);
         // /etc/localtime should be a symlink to zoneinfo/Europe/Amsterdam
         let link = std::fs::read_link(&stub.bins.etc_localtime).unwrap();
-        assert!(
-            link.ends_with("Europe/Amsterdam"),
-            "link: {:?}",
-            link
-        );
+        assert!(link.ends_with("Europe/Amsterdam"), "link: {:?}", link);
         assert_eq!(stub.etc().trim(), "Europe/Amsterdam");
     }
 

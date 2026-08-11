@@ -176,12 +176,12 @@ impl<'de> Deserialize<'de> for IptablesOp {
             "log_level",      // LOG target arg
             "limit",          // -m limit
             "limit_burst",
-            "flush",          // -F whole chain — different op shape
-            "policy",         // chain policy — different op shape
-            "rule_num",       // -I <chain> <num> — different positional insert
-            "gateway",        // route target arg
-            "numeric",        // -L formatting; we don't list rules
-            "wait",           // xtables-lock wait time
+            "flush",    // -F whole chain — different op shape
+            "policy",   // chain policy — different op shape
+            "rule_num", // -I <chain> <num> — different positional insert
+            "gateway",  // route target arg
+            "numeric",  // -L formatting; we don't list rules
+            "wait",     // xtables-lock wait time
         ] {
             if map.remove(unsupported).is_some() {
                 return Err(D::Error::custom(format!(
@@ -194,7 +194,11 @@ impl<'de> Deserialize<'de> for IptablesOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "iptables: unknown field(s): {unknown:?}; expected one of \

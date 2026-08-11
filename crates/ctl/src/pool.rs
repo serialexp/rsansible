@@ -206,7 +206,10 @@ impl AgentPool {
     /// return the wrapped pool handle alongside the seeded conn
     /// handle (so the caller can read RTT for wire-cost without
     /// re-locking).
-    pub async fn open_ssh(opts: &ConnectOptions, agent_binary: &[u8]) -> Result<(Self, ConnHandle)> {
+    pub async fn open_ssh(
+        opts: &ConnectOptions,
+        agent_binary: &[u8],
+    ) -> Result<(Self, ConnHandle)> {
         let session = ssh::open_session(opts, agent_binary).await?;
         let label = session.label.clone();
         let conn = ssh::spawn_agent_channel(&session, &BecomeKey::None).await?;
@@ -288,17 +291,17 @@ mod tests {
         let mut p = mock_pool();
         let a = p.get_or_spawn(&BecomeKey::None).await.unwrap();
         let b = p.get_or_spawn(&BecomeKey::None).await.unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "second call must return the same ConnHandle");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second call must return the same ConnHandle"
+        );
     }
 
     #[tokio::test]
     async fn distinct_become_keys_get_distinct_slots() {
         let mut p = mock_pool();
         let none = p.get_or_spawn(&BecomeKey::None).await.unwrap();
-        let root = p
-            .get_or_spawn(&BecomeKey::As("root".into()))
-            .await
-            .unwrap();
+        let root = p.get_or_spawn(&BecomeKey::As("root".into())).await.unwrap();
         let pg = p
             .get_or_spawn(&BecomeKey::As("postgres".into()))
             .await
@@ -307,10 +310,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&none, &pg));
         assert!(!Arc::ptr_eq(&root, &pg));
         // And every key sees the same handle on second call.
-        let root2 = p
-            .get_or_spawn(&BecomeKey::As("root".into()))
-            .await
-            .unwrap();
+        let root2 = p.get_or_spawn(&BecomeKey::As("root".into())).await.unwrap();
         assert!(Arc::ptr_eq(&root, &root2));
     }
 
@@ -318,9 +318,7 @@ mod tests {
     async fn keys_lists_every_spawned_slot() {
         let mut p = mock_pool();
         p.get_or_spawn(&BecomeKey::None).await.unwrap();
-        p.get_or_spawn(&BecomeKey::As("root".into()))
-            .await
-            .unwrap();
+        p.get_or_spawn(&BecomeKey::As("root".into())).await.unwrap();
         p.get_or_spawn(&BecomeKey::As("postgres".into()))
             .await
             .unwrap();
@@ -342,13 +340,14 @@ mod tests {
         // confirming each handle has inner=None).
         let mut p = mock_pool();
         p.get_or_spawn(&BecomeKey::None).await.unwrap();
-        p.get_or_spawn(&BecomeKey::As("root".into()))
-            .await
-            .unwrap();
+        p.get_or_spawn(&BecomeKey::As("root".into())).await.unwrap();
         p.kill_all().await;
         for key in p.keys() {
             let h = p.slot(key).unwrap();
-            assert!(h.lock().await.is_none(), "slot {key:?} not dead after kill_all");
+            assert!(
+                h.lock().await.is_none(),
+                "slot {key:?} not dead after kill_all"
+            );
         }
     }
 }

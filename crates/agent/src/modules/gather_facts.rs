@@ -34,7 +34,15 @@ pub async fn run(ctx: &Context, seq: u32, _check_mode: bool) -> anyhow::Result<(
     ctx.emit(msg::task_progress(seq, msg::stream::STDOUT, bytes))
         .await;
     let finished_unix_ns = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished_unix_ns)).await;
+    ctx.emit(msg::task_done(
+        seq,
+        0,
+        false,
+        false,
+        started_unix_ns,
+        finished_unix_ns,
+    ))
+    .await;
     Ok(())
 }
 
@@ -65,10 +73,7 @@ pub(crate) fn collect_facts() -> BTreeMap<String, Value> {
     out.insert("ansible_date_time".into(), date_time_json());
 
     if let Some(addr) = default_ipv4_address() {
-        out.insert(
-            "ansible_default_ipv4".into(),
-            json!({ "address": addr }),
-        );
+        out.insert("ansible_default_ipv4".into(), json!({ "address": addr }));
     }
 
     out
@@ -124,9 +129,7 @@ fn date_time_json() -> Value {
         .unwrap_or_default();
     let epoch = now.as_secs();
     let (year, month, day, hour, minute, second) = decompose_utc(epoch);
-    let iso = format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    );
+    let iso = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
     let date = format!("{year:04}-{month:02}-{day:02}");
     let time = format!("{hour:02}:{minute:02}:{second:02}");
     json!({

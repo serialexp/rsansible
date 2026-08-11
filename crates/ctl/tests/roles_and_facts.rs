@@ -24,10 +24,12 @@ fn roles_defaults_visible_after_load() -> Result<()> {
     let pb = playbook::load(&pb_path).context("load")?;
     let play = &pb.plays[0];
     // The role's defaults should have been merged into play.role_defaults.
-    let svc = play
-        .role_defaults
-        .get("service_name")
-        .ok_or_else(|| anyhow!("expected service_name default, got {:?}", play.role_defaults))?;
+    let svc = play.role_defaults.get("service_name").ok_or_else(|| {
+        anyhow!(
+            "expected service_name default, got {:?}",
+            play.role_defaults
+        )
+    })?;
     assert_eq!(svc, &serde_json::json!("rsansible-demo"));
     let port = play
         .role_defaults
@@ -63,12 +65,12 @@ fn role_tasks_prepended_to_play_tasks() -> Result<()> {
     // files/ dir.
     let copy_task = &play.tasks[1];
     let TaskBody::Op(TaskOp::Copy(c)) = &copy_task.body else {
-        return Err(anyhow!(
-            "expected Copy body, got {:?}",
-            copy_task.body
-        ));
+        return Err(anyhow!("expected Copy body, got {:?}", copy_task.body));
     };
-    let body = c.body.as_deref().ok_or_else(|| anyhow!("copy body not loaded"))?;
+    let body = c
+        .body
+        .as_deref()
+        .ok_or_else(|| anyhow!("copy body not loaded"))?;
     assert_eq!(
         std::str::from_utf8(body).unwrap(),
         "rsansible-demo: static asset shipped by copy:\n",
@@ -125,8 +127,7 @@ async fn three_container_roles_and_facts_run() -> Result<()> {
     let inv = build_inventory(&containers);
 
     let pb_path = examples_dir().join("roles_and_facts.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

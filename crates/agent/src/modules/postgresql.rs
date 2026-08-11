@@ -94,20 +94,18 @@ fn translate_psycopg_placeholders(query: &str) -> String {
                 in_double = !in_double;
                 out.push(c);
             }
-            '%' if !in_single && !in_double => {
-                match chars.peek() {
-                    Some('s') => {
-                        chars.next();
-                        idx += 1;
-                        out.push_str(&format!("${idx}"));
-                    }
-                    Some('%') => {
-                        chars.next();
-                        out.push('%');
-                    }
-                    _ => out.push('%'),
+            '%' if !in_single && !in_double => match chars.peek() {
+                Some('s') => {
+                    chars.next();
+                    idx += 1;
+                    out.push_str(&format!("${idx}"));
                 }
-            }
+                Some('%') => {
+                    chars.next();
+                    out.push('%');
+                }
+                _ => out.push('%'),
+            },
             _ => out.push(c),
         }
     }
@@ -226,11 +224,7 @@ pub async fn run_query(
 
 /// Execute a query with no parameters via `simple_query` — text mode,
 /// every column type works, real `statusmessage` from the server.
-async fn execute_simple(
-    client: &Client,
-    query: &str,
-    autocommit: bool,
-) -> Result<Value, String> {
+async fn execute_simple(client: &Client, query: &str, autocommit: bool) -> Result<Value, String> {
     let wrapped: String;
     let to_run = if autocommit {
         query
@@ -347,7 +341,10 @@ async fn execute_typed(
     for row in &rows {
         let mut obj = Map::with_capacity(row.columns().len());
         for (i, col) in row.columns().iter().enumerate() {
-            obj.insert(col.name().to_string(), pg_typed_to_json(row, i, col.type_()));
+            obj.insert(
+                col.name().to_string(),
+                pg_typed_to_json(row, i, col.type_()),
+            );
         }
         result_rows.push(Value::Object(obj));
     }
@@ -513,9 +510,7 @@ pub async fn run_ext(
         (false, true) => ExtAction::Create,
         (true, false) => ExtAction::Drop,
         (true, true) => match (&target_version, &prior_version) {
-            (Some(target), Some(prior)) if target != prior => {
-                ExtAction::Update(target.clone())
-            }
+            (Some(target), Some(prior)) if target != prior => ExtAction::Update(target.clone()),
             _ => ExtAction::Noop,
         },
     };
@@ -524,7 +519,12 @@ pub async fn run_ext(
     if !needs_change {
         // Already in the desired state. Build the envelope and return
         // changed=false (no DDL).
-        let bytes = serde_json::to_vec(&envelope_ext(&op.name, want_present, prior_version.clone(), prior_version))?;
+        let bytes = serde_json::to_vec(&envelope_ext(
+            &op.name,
+            want_present,
+            prior_version.clone(),
+            prior_version,
+        ))?;
         ctx.emit(msg::task_progress(seq, msg::stream::STDOUT, bytes))
             .await;
         let finished_unix_ns = now_unix_ns();
@@ -588,7 +588,12 @@ pub async fn run_ext(
         None
     };
 
-    let bytes = serde_json::to_vec(&envelope_ext(&op.name, want_present, prior_version, post_version))?;
+    let bytes = serde_json::to_vec(&envelope_ext(
+        &op.name,
+        want_present,
+        prior_version,
+        post_version,
+    ))?;
     ctx.emit(msg::task_progress(seq, msg::stream::STDOUT, bytes))
         .await;
 
@@ -614,7 +619,12 @@ fn extract_probe_version(messages: &[SimpleQueryMessage]) -> Option<String> {
     None
 }
 
-fn envelope_ext(name: &str, present: bool, prior: Option<String>, current: Option<String>) -> Value {
+fn envelope_ext(
+    name: &str,
+    present: bool,
+    prior: Option<String>,
+    current: Option<String>,
+) -> Value {
     let mut env = Map::new();
     env.insert("extension".into(), Value::String(name.to_string()));
     env.insert(

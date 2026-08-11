@@ -72,14 +72,22 @@ pub(super) fn parse_group_body<E: serde::de::Error>(
     if !map.is_empty() {
         let unknown: Vec<String> = map
             .keys()
-            .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            .map(|k| {
+                k.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"))
+            })
             .collect();
         return Err(E::custom(format!(
             "group: unknown field(s): {unknown:?}; expected one of [name, state, system]"
         )));
     }
 
-    Ok(GroupOp { name, state, system })
+    Ok(GroupOp {
+        name,
+        state,
+        system,
+    })
 }
 
 #[cfg(test)]

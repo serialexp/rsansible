@@ -76,22 +76,31 @@ impl<'de> Deserialize<'de> for TempfileOp {
                 )));
             }
         };
-        let suffix = take_optional_field_string::<D::Error>(&mut map, "suffix")?
-            .unwrap_or_default();
+        let suffix =
+            take_optional_field_string::<D::Error>(&mut map, "suffix")?.unwrap_or_default();
         let prefix = take_optional_field_string::<D::Error>(&mut map, "prefix")?
             .unwrap_or_else(default_prefix);
         let path = take_optional_field_string::<D::Error>(&mut map, "path")?;
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "tempfile: unknown field(s): {unknown:?}; expected one of \
                  [state, suffix, prefix, path]"
             )));
         }
-        Ok(TempfileOp { state, suffix, prefix, path })
+        Ok(TempfileOp {
+            state,
+            suffix,
+            prefix,
+            path,
+        })
     }
 }
 
@@ -190,7 +199,10 @@ tempfile:
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("template") || msg.contains("unknown"), "got: {msg}");
+        assert!(
+            msg.contains("template") || msg.contains("unknown"),
+            "got: {msg}"
+        );
     }
 
     #[test]

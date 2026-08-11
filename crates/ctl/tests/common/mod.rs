@@ -58,7 +58,10 @@ pub fn locate_agent_binary() -> Result<PathBuf> {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root.join("target"));
-    let bin = target_dir.join(TARGET).join("agent").join("rsansible-agent");
+    let bin = target_dir
+        .join(TARGET)
+        .join("agent")
+        .join("rsansible-agent");
     if !bin.exists() {
         bail!("expected agent at {bin:?} after build, but it isn't there");
     }

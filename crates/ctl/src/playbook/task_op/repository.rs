@@ -23,7 +23,9 @@
 //!     filename: pgdg
 //! ```
 
-use super::shared::{take_optional_ansible_bool, take_optional_field_string, take_optional_mode, ModeField};
+use super::shared::{
+    take_optional_ansible_bool, take_optional_field_string, take_optional_mode, ModeField,
+};
 
 /// `repository:` / `apt_repository:` parsed form.
 ///
@@ -127,9 +129,7 @@ pub(super) fn parse_repository_body<E: serde::de::Error>(
     pinned_manager: Option<RepositoryManager>,
     mut map: serde_yaml::Mapping,
 ) -> Result<RepositoryOp, E> {
-    let label = pinned_manager
-        .map(|m| m.label())
-        .unwrap_or("repository");
+    let label = pinned_manager.map(|m| m.label()).unwrap_or("repository");
 
     // `manager:` — explicit field on canonical `repository:`. On the
     // `apt_repository:` shim we still tolerate an explicit `manager: apt`
@@ -161,11 +161,7 @@ pub(super) fn parse_repository_body<E: serde::de::Error>(
 
     // `repo:` — required, single string. Empty/whitespace rejected.
     let repo = match map.remove("repo") {
-        None => {
-            return Err(E::custom(format!(
-                "{label}: missing required field `repo`"
-            )))
-        }
+        None => return Err(E::custom(format!("{label}: missing required field `repo`"))),
         Some(serde_yaml::Value::String(s)) => s,
         Some(other) => {
             return Err(E::custom(format!(
@@ -201,8 +197,7 @@ pub(super) fn parse_repository_body<E: serde::de::Error>(
     let filename = take_optional_field_string::<E>(&mut map, "filename")?.unwrap_or_default();
     let mode = take_optional_mode::<E>(&mut map, "mode")?;
     // Ansible's `apt_repository` defaults `update_cache: yes`. We match.
-    let update_cache =
-        take_optional_ansible_bool::<E>(&mut map, "update_cache")?.unwrap_or(true);
+    let update_cache = take_optional_ansible_bool::<E>(&mut map, "update_cache")?.unwrap_or(true);
 
     // `codename:` and `validate_certs:` are accepted-and-discarded for
     // ansible compatibility. `codename` is rarely useful (most playbooks
@@ -220,7 +215,11 @@ pub(super) fn parse_repository_body<E: serde::de::Error>(
     if !map.is_empty() {
         let unknown: Vec<String> = map
             .keys()
-            .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            .map(|k| {
+                k.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"))
+            })
             .collect();
         return Err(E::custom(format!(
             "{label}: unknown field(s): {unknown:?}; expected one of \
@@ -411,10 +410,7 @@ apt_repository:
   state: latest
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("[present, absent]"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("[present, absent]"), "got: {err}");
     }
 
     #[test]

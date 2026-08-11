@@ -298,7 +298,14 @@ impl RegisterValue {
         stdout_bytes: &[u8],
         stderr_bytes: &[u8],
     ) -> Self {
-        Self::from_exec_with_skipped(exit_code, changed, false, took_ms, stdout_bytes, stderr_bytes)
+        Self::from_exec_with_skipped(
+            exit_code,
+            changed,
+            false,
+            took_ms,
+            stdout_bytes,
+            stderr_bytes,
+        )
     }
 
     /// Like `from_exec` but accepts the `skipped` bit from `TaskDone`.
@@ -455,9 +462,7 @@ impl WorldVars {
                 .map(|(g, hs)| {
                     (
                         g.clone(),
-                        JsonValue::Array(
-                            hs.iter().cloned().map(JsonValue::String).collect(),
-                        ),
+                        JsonValue::Array(hs.iter().cloned().map(JsonValue::String).collect()),
                     )
                 })
                 .collect();
@@ -475,10 +480,8 @@ impl WorldVars {
                 .hostvars
                 .iter()
                 .map(|(h, vars)| {
-                    let obj: serde_json::Map<String, JsonValue> = vars
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    let obj: serde_json::Map<String, JsonValue> =
+                        vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     (h.clone(), JsonValue::Object(obj))
                 })
                 .collect();
@@ -514,10 +517,7 @@ impl Clone for WorldVars {
 /// layered on top. `groups` and `hostvars` are stitched in from `world`.
 /// `extra_vars` is highest precedence and matches Ansible's `-e` flag
 /// (cannot be overridden by anything inside the playbook).
-pub fn build_template_ctx(
-    ctx: &HostCtx,
-    world: &WorldVars,
-) -> BTreeMap<String, JsonValue> {
+pub fn build_template_ctx(ctx: &HostCtx, world: &WorldVars) -> BTreeMap<String, JsonValue> {
     let mut out: BTreeMap<String, JsonValue> = BTreeMap::new();
     for (k, v) in &ctx.role_defaults {
         out.insert(k.clone(), v.clone());
@@ -656,7 +656,8 @@ mod tests {
     #[test]
     fn build_ctx_extra_vars_beats_everything_else() {
         let mut ctx = HostCtx::new("web1".into());
-        ctx.role_defaults.insert("svc".into(), json!("from_default"));
+        ctx.role_defaults
+            .insert("svc".into(), json!("from_default"));
         ctx.inventory_vars.insert("svc".into(), json!("from_inv"));
         ctx.facts.insert("svc".into(), json!("from_fact"));
         ctx.play_vars.insert("svc".into(), json!("from_play"));
@@ -722,17 +723,17 @@ mod tests {
     /// final newline).
     #[test]
     fn register_exposes_stderr_lines_alongside_stdout_lines() {
-        let rv = RegisterValue::from_exec(
-            0,
-            false,
-            5,
-            b"line1\nline2\n",
-            b"err1\nerr2\n",
+        let rv = RegisterValue::from_exec(0, false, 5, b"line1\nline2\n", b"err1\nerr2\n");
+        assert_eq!(
+            rv.stderr_lines,
+            vec!["err1".to_string(), "err2".to_string()]
         );
-        assert_eq!(rv.stderr_lines, vec!["err1".to_string(), "err2".to_string()]);
         let j = rv.to_json();
-        assert_eq!(j["stderr_lines"], json!(["err1", "err2"]),
-            "regression: register.stderr_lines must be defined for command/shell registers");
+        assert_eq!(
+            j["stderr_lines"],
+            json!(["err1", "err2"]),
+            "regression: register.stderr_lines must be defined for command/shell registers"
+        );
         assert_eq!(j["stdout_lines"], json!(["line1", "line2"]));
     }
 
@@ -758,7 +759,8 @@ mod tests {
     fn register_extra_lifts_module_specific_keys() {
         // Mirrors what the orchestrator does after a `stat:` op: the
         // parsed JSON object lands under `register.stat`.
-        let mut rv = RegisterValue::from_exec(0, false, 1, b"{\"exists\":true,\"isreg\":true}", b"");
+        let mut rv =
+            RegisterValue::from_exec(0, false, 1, b"{\"exists\":true,\"isreg\":true}", b"");
         rv.extra.insert("stat".into(), rv.json.clone().unwrap());
         let j = rv.to_json();
         assert_eq!(j["stat"]["exists"], json!(true));

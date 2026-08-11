@@ -63,8 +63,7 @@ pub fn decrypt(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
         }
     }
     let outer = hex::decode(&hex_body).context("vault body: outer hex decode failed")?;
-    let outer_text =
-        std::str::from_utf8(&outer).context("vault body: inner blob is not UTF-8")?;
+    let outer_text = std::str::from_utf8(&outer).context("vault body: inner blob is not UTF-8")?;
     let parts: Vec<&str> = outer_text.split('\n').collect();
     if parts.len() != 3 {
         bail!(
@@ -98,7 +97,9 @@ pub fn decrypt(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
     cipher.apply_keystream(&mut buf);
 
     // Strip PKCS#7 padding.
-    let pad = *buf.last().ok_or_else(|| anyhow!("vault: empty plaintext"))?;
+    let pad = *buf
+        .last()
+        .ok_or_else(|| anyhow!("vault: empty plaintext"))?;
     if pad == 0 || pad as usize > buf.len() {
         bail!("vault: invalid PKCS#7 padding byte {pad}");
     }
@@ -117,8 +118,12 @@ fn parse_header(header: &str) -> Result<()> {
         .strip_prefix("$ANSIBLE_VAULT;")
         .ok_or_else(|| anyhow!("vault: missing $ANSIBLE_VAULT; prefix"))?;
     let mut parts = rest.split(';');
-    let version = parts.next().ok_or_else(|| anyhow!("vault: missing version"))?;
-    let cipher = parts.next().ok_or_else(|| anyhow!("vault: missing cipher"))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| anyhow!("vault: missing version"))?;
+    let cipher = parts
+        .next()
+        .ok_or_else(|| anyhow!("vault: missing cipher"))?;
     let _label = parts.next(); // 1.2 attaches a label; ignored
     match version {
         "1.1" | "1.2" => {}
@@ -177,7 +182,12 @@ pub fn encrypt_for_test(plaintext: &[u8], password: &str, salt: &[u8; 32]) -> Ve
     mac.update(&buf);
     let tag = mac.finalize().into_bytes();
 
-    let inner = format!("{}\n{}\n{}", hex::encode(salt), hex::encode(tag), hex::encode(&buf));
+    let inner = format!(
+        "{}\n{}\n{}",
+        hex::encode(salt),
+        hex::encode(tag),
+        hex::encode(&buf)
+    );
     let outer = hex::encode(inner.as_bytes());
 
     let mut out = String::from("$ANSIBLE_VAULT;1.1;AES256\n");
@@ -221,7 +231,10 @@ mod tests {
         // header was parsed successfully.
         let err = decrypt(b"$ANSIBLE_VAULT;1.2;AES256;production\nzz\n", "x").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("hex"), "expected hex-decode error after header accept; got: {msg}");
+        assert!(
+            msg.contains("hex"),
+            "expected hex-decode error after header accept; got: {msg}"
+        );
     }
 
     #[test]

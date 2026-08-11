@@ -359,6 +359,16 @@
       ],
     },
 
+    OpModprobe: {
+      description: "Load or unload a Linux kernel module. Maps `community.general.modprobe` (subset). `name` is the module name, required. `state` is a uint8: 0=present (loaded), 1=absent (unloaded). `params` is an optional space-separated parameter string applied at load time (e.g. `nf_conntrack_max=65536`); empty means none, and it is ignored for state=absent. Idempotency: read `/proc/modules` and compare against `name` with `-` and `_` treated as equivalent (the kernel normalises hyphens to underscores, so `kvm-amd` and `kvm_amd` are the same module). state=present and already listed -> no-op; otherwise `modprobe <name> [params]`. state=absent and not listed -> no-op; otherwise `modprobe -r <name>`. Note `params` cannot be reconciled against an already-loaded module — a module loaded with different parameters is left alone rather than reloaded, because unloading a live module (kvm, loop) can break running workloads. Persistence across reboots is NOT handled: Ansible's `persistent:` is rejected at parse time; write `/etc/modules-load.d/*.conf` with `copy:`/`template:` instead. Wire kind=29.",
+      sequence: [
+        { name: "kind", type: "uint8", const: 29 },
+        { name: "name", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+        { name: "state", type: "uint8" },
+        { name: "params", type: "string", kind: "length_prefixed", length_type: "uint16", encoding: "utf8" },
+      ],
+    },
+
     OpUri: {
       description: "HTTP client. Maps Ansible's `ansible.builtin.uri` (subset). `method` is a uint8: 0=GET, 1=POST, 2=PUT, 3=PATCH, 4=DELETE, 5=HEAD. `header_keys` / `header_values` are parallel arrays carrying the request headers (case preserved on the wire; reqwest canonicalises at send time). `body_format` is a uint8: 0=raw (body shipped verbatim, no Content-Type touched), 1=json (body shipped as-is — controller pre-serialises any YAML map at parse time; Content-Type set to application/json when not already in headers), 2=form (body shipped verbatim; Content-Type set to application/x-www-form-urlencoded when not already in headers — caller does the k=v&k=v encoding). `status_codes` is the list of accepted HTTP statuses; the agent emits TaskDone with exit_code=0 when the response status is in this list, exit_code=1 otherwise. The envelope is shipped on stdout in both cases for diagnostics. `follow_redirects` is a uint8: 0=none, 1=safe (follow up to 10 hops iff the original method was GET/HEAD), 2=all (follow up to 10 hops regardless of method). `validate_certs=0` disables TLS cert/hostname verification. `return_content=1` includes the response body as a UTF-8 string in the envelope's `content` field. Envelope shape: {status: uint16, url: string, headers: map<string,string> (response headers, keys lowercased), content?: string (only if return_content), content_length: uint, content_type: string, json?: <parsed body if Content-Type indicates JSON>, elapsed_ms: uint, redirected: bool}. `changed` is 1 for any successful non-GET/HEAD request (Ansible's contract: mutating verbs report changed even if the server didn't actually change), 0 for GET/HEAD or for any failed status. Pre-status errors (connect refused, DNS, TLS handshake, timeout) surface as TaskError BAD_HOST/BAD_REQUEST without an envelope. Wire kind=12.",
       sequence: [
@@ -586,6 +596,7 @@
         { type: "OpHostname", when: "value === 26" },
         { type: "OpTimezone", when: "value === 27" },
         { type: "OpCopyTarget", when: "value === 28" },
+        { type: "OpModprobe", when: "value === 29" },
       ],
     },
 

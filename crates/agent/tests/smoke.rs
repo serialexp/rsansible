@@ -16,7 +16,10 @@ fn agent_path() -> &'static str {
     env!("CARGO_BIN_EXE_rsansible-agent")
 }
 
-async fn read_until_done(reader: &mut BufReader<tokio::process::ChildStdout>, seq: u32) -> (Vec<Message>, Message) {
+async fn read_until_done(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    seq: u32,
+) -> (Vec<Message>, Message) {
     let mut progress = Vec::new();
     loop {
         let frame = read_frame(reader)
@@ -47,12 +50,19 @@ async fn hello_then_shell_then_bye() {
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     let hello = read_frame(&mut stdout).await.unwrap().expect("hello");
-    assert!(matches!(hello, Message::Hello(_)), "expected Hello, got {hello:?}");
+    assert!(
+        matches!(hello, Message::Hello(_)),
+        "expected Hello, got {hello:?}"
+    );
 
     // Run `echo hello`.
     write_frame(
         &mut stdin,
-        &msg::task_dispatch(1, false, msg::op_shell("echo hello".into(), vec![], vec![], 0)),
+        &msg::task_dispatch(
+            1,
+            false,
+            msg::op_shell("echo hello".into(), vec![], vec![], 0),
+        ),
     )
     .await
     .unwrap();
@@ -66,7 +76,9 @@ async fn hello_then_shell_then_bye() {
         .flatten()
         .collect();
     assert_eq!(stdout_bytes, b"hello\n");
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 0);
     assert_eq!(td.changed, 1);
 
@@ -78,7 +90,9 @@ async fn hello_then_shell_then_bye() {
     .await
     .unwrap();
     let (_progress, done) = read_until_done(&mut stdout, 2).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 7);
     assert_eq!(td.changed, 0);
 
@@ -109,7 +123,11 @@ async fn op_exec_with_env_and_cwd() {
             1,
             false,
             msg::op_exec(
-                vec!["/bin/sh".into(), "-c".into(), "printf '%s:%s' \"$FOO\" \"$PWD\"".into()],
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s:%s' \"$FOO\" \"$PWD\"".into(),
+                ],
                 vec!["FOO".into()],
                 vec!["bar".into()],
                 "/tmp".into(),
@@ -131,7 +149,9 @@ async fn op_exec_with_env_and_cwd() {
         .flatten()
         .collect();
     assert_eq!(out, b"bar:/tmp");
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 0);
 
     write_frame(&mut stdin, &msg::bye()).await.unwrap();
@@ -190,7 +210,9 @@ async fn op_exec_inherits_path_for_bare_argv0() {
     .unwrap();
 
     let (_progress, done) = read_until_done(&mut stdout, 1).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(
         td.exit_code, 0,
         "bare argv[0] must resolve via inherited PATH; \
@@ -232,15 +254,17 @@ async fn op_write_file_atomic() {
                 false,
                 b"hello\n".to_vec(),
                 String::new(),
-            
                 String::new(),
-                String::new(),),
+                String::new(),
+            ),
         ),
     )
     .await
     .unwrap();
     let (_p, done) = read_until_done(&mut stdout, 1).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 0);
     assert_eq!(td.changed, 1, "first write should report changed");
     assert_eq!(std::fs::read(&target).unwrap(), b"hello\n");
@@ -257,16 +281,21 @@ async fn op_write_file_atomic() {
                 false,
                 b"hello\n".to_vec(),
                 String::new(),
-            
                 String::new(),
-                String::new(),),
+                String::new(),
+            ),
         ),
     )
     .await
     .unwrap();
     let (_p, done) = read_until_done(&mut stdout, 2).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
-    assert_eq!(td.changed, 0, "rewriting same content should report unchanged");
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
+    assert_eq!(
+        td.changed, 0,
+        "rewriting same content should report unchanged"
+    );
 
     write_frame(&mut stdin, &msg::bye()).await.unwrap();
     drop(stdin);
@@ -308,15 +337,17 @@ async fn op_write_file_only_if_missing() {
                 true,
                 b"first-content\n".to_vec(),
                 String::new(),
-            
                 String::new(),
-                String::new(),),
+                String::new(),
+            ),
         ),
     )
     .await
     .unwrap();
     let (_p, done) = read_until_done(&mut stdout, 1).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 0);
     assert_eq!(td.changed, 1, "missing → should write and report changed");
     assert_eq!(std::fs::read(&target).unwrap(), b"first-content\n");
@@ -334,15 +365,17 @@ async fn op_write_file_only_if_missing() {
                 true,
                 b"DIFFERENT-content\n".to_vec(),
                 String::new(),
-            
                 String::new(),
-                String::new(),),
+                String::new(),
+            ),
         ),
     )
     .await
     .unwrap();
     let (_p, done) = read_until_done(&mut stdout, 2).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 0);
     assert_eq!(td.changed, 0, "existing dest → only_if_missing must skip");
     // Crucially, the original bytes must still be on disk — the differ
@@ -396,9 +429,9 @@ async fn op_write_file_validate_failure_leaves_dest_untouched() {
                 false,
                 b"BROKEN-would-lock-out-root\n".to_vec(),
                 "/bin/false %s".into(),
-            
                 String::new(),
-                String::new(),),
+                String::new(),
+            ),
         ),
     )
     .await
@@ -475,12 +508,17 @@ async fn op_write_file_unknown_owner_yields_bad_request() {
     .unwrap();
     let (_p, terminal) = read_until_done(&mut stdout, 1).await;
     let Message::TaskError(te) = terminal else {
-        panic!("expected TaskError for unknown owner, got {terminal:?} \
-                — regression: owner field is being ignored")
+        panic!(
+            "expected TaskError for unknown owner, got {terminal:?} \
+                — regression: owner field is being ignored"
+        )
     };
     assert_eq!(te.code, msg::err::BAD_REQUEST);
     // Dest must not have been created.
-    assert!(!target.exists(), "dest must not be created on owner resolve failure");
+    assert!(
+        !target.exists(),
+        "dest must not be created on owner resolve failure"
+    );
 
     write_frame(&mut stdin, &msg::bye()).await.unwrap();
     drop(stdin);
@@ -529,11 +567,16 @@ async fn op_write_file_unknown_group_yields_bad_request() {
     .unwrap();
     let (_p, terminal) = read_until_done(&mut stdout, 1).await;
     let Message::TaskError(te) = terminal else {
-        panic!("expected TaskError for unknown group, got {terminal:?} \
-                — regression: group field is being ignored")
+        panic!(
+            "expected TaskError for unknown group, got {terminal:?} \
+                — regression: group field is being ignored"
+        )
     };
     assert_eq!(te.code, msg::err::BAD_REQUEST);
-    assert!(!target.exists(), "dest must not be created on group resolve failure");
+    assert!(
+        !target.exists(),
+        "dest must not be created on group resolve failure"
+    );
 
     write_frame(&mut stdin, &msg::bye()).await.unwrap();
     drop(stdin);
@@ -595,7 +638,9 @@ async fn op_write_file_applies_owner_to_self() {
     .await
     .unwrap();
     let (_p, done) = read_until_done(&mut stdout, 1).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 0);
     assert!(target.exists(), "dest must exist after successful write");
 
@@ -640,15 +685,17 @@ async fn op_write_file_validate_success_writes_dest() {
                 // exists at the substituted path — exercises both the
                 // %s substitution and the success path.
                 "/usr/bin/test -f %s".into(),
-            
                 String::new(),
-                String::new(),),
+                String::new(),
+            ),
         ),
     )
     .await
     .unwrap();
     let (_p, done) = read_until_done(&mut stdout, 1).await;
-    let Message::TaskDone(td) = done else { panic!("expected TaskDone, got {done:?}") };
+    let Message::TaskDone(td) = done else {
+        panic!("expected TaskDone, got {done:?}")
+    };
     assert_eq!(td.exit_code, 0);
     assert_eq!(td.changed, 1);
     assert_eq!(std::fs::read(&target).unwrap(), b"valid-content\n");
@@ -691,7 +738,9 @@ async fn missing_binary_is_not_found() {
     .await
     .unwrap();
     let (_p, terminal) = read_until_done(&mut stdout, 1).await;
-    let Message::TaskError(te) = terminal else { panic!("expected TaskError, got {terminal:?}") };
+    let Message::TaskError(te) = terminal else {
+        panic!("expected TaskError, got {terminal:?}")
+    };
     assert_eq!(te.code, msg::err::NOT_FOUND);
 
     write_frame(&mut stdin, &msg::bye()).await.unwrap();

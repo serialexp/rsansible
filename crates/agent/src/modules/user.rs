@@ -577,7 +577,12 @@ mv "$GROUPS.tmp" "$GROUPS" 2>/dev/null || true
 
     #[test]
     fn creates_new_user_with_shell_and_home() {
-        let stub = build_stub("create", &["root:x:0:0::/root:/bin/bash"], &["root:x:0:"], &[]);
+        let stub = build_stub(
+            "create",
+            &["root:x:0:0::/root:/bin/bash"],
+            &["root:x:0:"],
+            &[],
+        );
         let mut o = op("alice", STATE_PRESENT);
         o.has_shell = 1;
         o.shell = "/bin/bash".into();
@@ -642,7 +647,12 @@ mv "$GROUPS.tmp" "$GROUPS" 2>/dev/null || true
 
     #[test]
     fn noop_delete_when_absent() {
-        let stub = build_stub("del-noop", &["root:x:0:0::/root:/bin/bash"], &["root:x:0:"], &[]);
+        let stub = build_stub(
+            "del-noop",
+            &["root:x:0:0::/root:/bin/bash"],
+            &["root:x:0:"],
+            &[],
+        );
         let o = op("alice", STATE_ABSENT);
         let changed = apply_with_bins(&stub.bins, &o, false).unwrap();
         assert!(!changed);

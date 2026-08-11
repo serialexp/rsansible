@@ -9,8 +9,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    IsCa, KeyPair, KeyUsagePurpose, RsaKeySize, SanType, PKCS_ECDSA_P256_SHA256, PKCS_ED25519,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose, RsaKeySize, SanType, PKCS_ECDSA_P256_SHA256, PKCS_ED25519,
     PKCS_RSA_SHA256,
 };
 use std::str::FromStr;
@@ -29,9 +29,7 @@ impl PrivkeyType {
         match s.to_ascii_uppercase().as_str() {
             "RSA" => Ok(Self::Rsa),
             "ED25519" | "ED-25519" => Ok(Self::Ed25519),
-            other => bail!(
-                "openssl_privatekey.type {other:?} not supported; pick RSA or Ed25519"
-            ),
+            other => bail!("openssl_privatekey.type {other:?} not supported; pick RSA or Ed25519"),
         }
     }
 }
@@ -57,15 +55,16 @@ pub fn generate_privkey(params: &PrivkeyParams) -> Result<Vec<u8>> {
                 2048 => RsaKeySize::_2048,
                 3072 => RsaKeySize::_3072,
                 4096 => RsaKeySize::_4096,
-                other => bail!(
-                    "openssl_privatekey RSA size must be 2048, 3072, or 4096; got {other}"
-                ),
+                other => {
+                    bail!("openssl_privatekey RSA size must be 2048, 3072, or 4096; got {other}")
+                }
             };
             KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, key_size)
                 .context("generating RSA private key")?
         }
-        PrivkeyType::Ed25519 => KeyPair::generate_for(&PKCS_ED25519)
-            .context("generating Ed25519 private key")?,
+        PrivkeyType::Ed25519 => {
+            KeyPair::generate_for(&PKCS_ED25519).context("generating Ed25519 private key")?
+        }
     };
     Ok(kp.serialize_pem().into_bytes())
 }
@@ -109,13 +108,12 @@ pub fn generate_csr(p: &CsrParams) -> Result<Vec<u8>> {
     // currently sitting in the privkey cache. `KeyPair::from_pem`
     // probes the algorithm tag (RSA vs Ed25519 vs ECDSA) automatically.
     let kp = KeyPair::from_pem(
-        std::str::from_utf8(&p.privkey_pem)
-            .context("CSR private key must be UTF-8 PEM")?,
+        std::str::from_utf8(&p.privkey_pem).context("CSR private key must be UTF-8 PEM")?,
     )
     .context("parsing private key PEM for CSR generation")?;
 
-    let mut params = CertificateParams::new(Vec::<String>::new())
-        .context("building CSR template")?;
+    let mut params =
+        CertificateParams::new(Vec::<String>::new()).context("building CSR template")?;
     // DN order matters for some parsers; we follow conventional
     // C → O → OU → CN. rcgen's DistinguishedName is append-only so
     // we push in that order.
@@ -138,7 +136,9 @@ pub fn generate_csr(p: &CsrParams) -> Result<Vec<u8>> {
         params.key_usages.push(parse_key_usage(ku)?);
     }
     for eku in &p.extended_key_usage {
-        params.extended_key_usages.push(parse_extended_key_usage(eku)?);
+        params
+            .extended_key_usages
+            .push(parse_extended_key_usage(eku)?);
     }
     // basic_constraints: an Ansible list like ["CA:TRUE"] or
     // ["CA:TRUE", "pathlen:0"]. Empty list = omit extension entirely
@@ -146,13 +146,8 @@ pub fn generate_csr(p: &CsrParams) -> Result<Vec<u8>> {
     // for the CA verdict and an optional pathlen.
     params.is_ca = parse_basic_constraints(&p.basic_constraints)?;
 
-    let csr = params
-        .serialize_request(&kp)
-        .context("serializing CSR")?;
-    Ok(csr
-        .pem()
-        .context("encoding CSR as PEM")?
-        .into_bytes())
+    let csr = params.serialize_request(&kp).context("serializing CSR")?;
+    Ok(csr.pem().context("encoding CSR as PEM")?.into_bytes())
 }
 
 /// Inputs for self-signed cert generation.
@@ -199,12 +194,11 @@ pub struct OwnCaSignedCertParams {
 /// certificate and validate properly against any client that trusts
 /// the original CA PEM.
 pub fn generate_ownca_signed_cert(p: &OwnCaSignedCertParams) -> Result<Vec<u8>> {
-    let ca_key_pem_str = std::str::from_utf8(&p.ca_privkey_pem)
-        .context("CA private key must be UTF-8 PEM")?;
-    let ca_key = KeyPair::from_pem(ca_key_pem_str)
-        .context("parsing CA private key PEM")?;
-    let ca_cert_pem_str = std::str::from_utf8(&p.ca_cert_pem)
-        .context("CA cert must be UTF-8 PEM")?;
+    let ca_key_pem_str =
+        std::str::from_utf8(&p.ca_privkey_pem).context("CA private key must be UTF-8 PEM")?;
+    let ca_key = KeyPair::from_pem(ca_key_pem_str).context("parsing CA private key PEM")?;
+    let ca_cert_pem_str =
+        std::str::from_utf8(&p.ca_cert_pem).context("CA cert must be UTF-8 PEM")?;
     let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem_str)
         .context("loading CA certificate params")?;
     let issuer_cert = ca_params
@@ -212,8 +206,8 @@ pub fn generate_ownca_signed_cert(p: &OwnCaSignedCertParams) -> Result<Vec<u8>> 
         .context("reconstructing CA certificate for issuer slot")?;
 
     let csr_pem_str = std::str::from_utf8(&p.csr_pem).context("CSR must be UTF-8 PEM")?;
-    let mut csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem_str)
-        .context("parsing CSR PEM")?;
+    let mut csr =
+        rcgen::CertificateSigningRequestParams::from_pem(csr_pem_str).context("parsing CSR PEM")?;
 
     // Apply the requested validity window. Same shape as selfsigned.
     let now = time::OffsetDateTime::now_utc();
@@ -230,17 +224,15 @@ pub fn generate_ownca_signed_cert(p: &OwnCaSignedCertParams) -> Result<Vec<u8>> 
 /// PEM encoding.
 pub fn generate_selfsigned_cert(p: &SelfSignedCertParams) -> Result<Vec<u8>> {
     let kp = KeyPair::from_pem(
-        std::str::from_utf8(&p.privkey_pem)
-            .context("self-signed cert key must be UTF-8 PEM")?,
+        std::str::from_utf8(&p.privkey_pem).context("self-signed cert key must be UTF-8 PEM")?,
     )
     .context("parsing private key PEM for self-signed cert")?;
 
     // rcgen 0.13 parses a PEM CSR into a CertificateSigningRequestParams
     // whose `params: CertificateParams` carries the subject/SANs/exts.
-    let csr_pem_str = std::str::from_utf8(&p.csr_pem)
-        .context("CSR must be UTF-8 PEM")?;
-    let csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem_str)
-        .context("parsing CSR PEM")?;
+    let csr_pem_str = std::str::from_utf8(&p.csr_pem).context("CSR must be UTF-8 PEM")?;
+    let csr =
+        rcgen::CertificateSigningRequestParams::from_pem(csr_pem_str).context("parsing CSR PEM")?;
     let mut params = csr.params;
 
     // Apply the requested validity window. rcgen defaults to a 1-year
@@ -325,20 +317,27 @@ fn parse_san(s: &str) -> Result<SanType> {
         .split_once(':')
         .ok_or_else(|| anyhow!("SAN {s:?} missing kind prefix (e.g. DNS:foo)"))?;
     match kind.to_ascii_uppercase().as_str() {
-        "DNS" => Ok(SanType::DnsName(value.try_into().map_err(|e| {
-            anyhow!("DNS SAN {value:?} rejected: {e}")
-        })?)),
+        "DNS" => Ok(SanType::DnsName(
+            value
+                .try_into()
+                .map_err(|e| anyhow!("DNS SAN {value:?} rejected: {e}"))?,
+        )),
         "IP" => {
-            let ip: std::net::IpAddr = value.parse()
+            let ip: std::net::IpAddr = value
+                .parse()
                 .with_context(|| format!("IP SAN {value:?} is not a valid IP"))?;
             Ok(SanType::IpAddress(ip))
         }
-        "EMAIL" => Ok(SanType::Rfc822Name(value.try_into().map_err(|e| {
-            anyhow!("email SAN {value:?} rejected: {e}")
-        })?)),
-        "URI" => Ok(SanType::URI(value.try_into().map_err(|e| {
-            anyhow!("URI SAN {value:?} rejected: {e}")
-        })?)),
+        "EMAIL" => {
+            Ok(SanType::Rfc822Name(value.try_into().map_err(|e| {
+                anyhow!("email SAN {value:?} rejected: {e}")
+            })?))
+        }
+        "URI" => Ok(SanType::URI(
+            value
+                .try_into()
+                .map_err(|e| anyhow!("URI SAN {value:?} rejected: {e}"))?,
+        )),
         other => bail!("unknown SAN kind {other:?}; expected DNS / IP / email / URI"),
     }
 }
@@ -559,8 +558,7 @@ mod tests {
         assert!(s.starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(s.contains("-----END CERTIFICATE-----"));
         // Reparse via rcgen to confirm well-formedness.
-        CertificateParams::from_ca_cert_pem(s)
-            .expect("reparse leaf cert via rcgen");
+        CertificateParams::from_ca_cert_pem(s).expect("reparse leaf cert via rcgen");
     }
 
     #[test]

@@ -51,8 +51,7 @@ async fn postgresql_query_and_ext_e2e() -> Result<()> {
     let inv = single_host_inventory(&container);
 
     let pb_path = examples_dir().join("postgresql.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

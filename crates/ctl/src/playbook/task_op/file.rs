@@ -66,9 +66,11 @@ impl FileState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task};
-    use rsansible_wire::generated::Op as WireOp;
+    use crate::playbook::task_op::{
+        parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task,
+    };
     use crate::playbook::task_op::{TaskBody, TaskOp};
+    use rsansible_wire::generated::Op as WireOp;
 
     #[test]
     fn parses_file_directory_with_mode_string() {
@@ -196,7 +198,10 @@ file:
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("bogus") || err.contains("unknown variant"), "got: {err}");
+        assert!(
+            err.contains("bogus") || err.contains("unknown variant"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -212,7 +217,10 @@ file:
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("force") || err.contains("unknown"), "got: {err}");
+        assert!(
+            err.contains("force") || err.contains("unknown"),
+            "got: {err}"
+        );
     }
 
     #[test]

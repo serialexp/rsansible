@@ -34,7 +34,12 @@ const MANAGER_APT: u8 = 1;
 // const MANAGER_ZYPPER: u8 = 6;  // reserved
 const MANAGER_PIP: u8 = 7;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpPackageOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpPackageOutput,
+    check_mode: bool,
+) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
     if op.names.is_empty() && op.update_cache == 0 && op.autoremove == 0 {
@@ -111,8 +116,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpPackageOutput, check_mode: bool)
     };
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
-        .await;
+    ctx.emit(msg::task_done(
+        seq,
+        0,
+        changed,
+        false,
+        started_unix_ns,
+        finished,
+    ))
+    .await;
     Ok(())
 }
 

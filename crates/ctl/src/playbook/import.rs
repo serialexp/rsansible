@@ -34,9 +34,13 @@ pub fn flatten_playbook(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
         // imported by `tasks:` is still importable by `handlers:` (and vice
         // versa); cycles within handlers themselves remain caught.
         let mut visited_h: BTreeSet<PathBuf> = BTreeSet::new();
-        play.handlers =
-            flatten_tasks(std::mem::take(&mut play.handlers), base_dir, &mut visited_h, 0)
-                .with_context(|| format!("flattening handlers in play {:?}", play.name))?;
+        play.handlers = flatten_tasks(
+            std::mem::take(&mut play.handlers),
+            base_dir,
+            &mut visited_h,
+            0,
+        )
+        .with_context(|| format!("flattening handlers in play {:?}", play.name))?;
     }
     Ok(())
 }
@@ -105,7 +109,11 @@ pub(crate) fn flatten_tasks(
 /// - `when:` AND-join as `(import) and (child)`. Parentheses preserve
 ///   operator precedence (minijinja binds `and` tighter than `or`, so
 ///   `a or b` AND `c` must render as `(a or b) and (c)`).
-fn propagate_import_metadata(tasks: &mut [Task], import_tags: &[String], import_when: &Option<String>) {
+fn propagate_import_metadata(
+    tasks: &mut [Task],
+    import_tags: &[String],
+    import_when: &Option<String>,
+) {
     for t in tasks {
         for tag in import_tags {
             if !t.tags.contains(tag) {
@@ -304,7 +312,10 @@ mod tests {
         assert_eq!(no_when.when.as_deref(), Some("outer_flag"));
         // A task with its own when: gets AND-joined, parenthesized.
         let has_when = tasks.iter().find(|t| t.name == "has-when").unwrap();
-        assert_eq!(has_when.when.as_deref(), Some("(outer_flag) and (inner_flag)"));
+        assert_eq!(
+            has_when.when.as_deref(),
+            Some("(outer_flag) and (inner_flag)")
+        );
     }
 
     #[test]
@@ -341,8 +352,16 @@ mod tests {
         let tasks = &pb.plays[0].tasks;
         // Deepest task collects BOTH ancestor imports' tags.
         let deepest = tasks.iter().find(|t| t.name == "deepest").unwrap();
-        assert!(deepest.tags.contains(&"inner".to_string()), "tags = {:?}", deepest.tags);
-        assert!(deepest.tags.contains(&"outer".to_string()), "tags = {:?}", deepest.tags);
+        assert!(
+            deepest.tags.contains(&"inner".to_string()),
+            "tags = {:?}",
+            deepest.tags
+        );
+        assert!(
+            deepest.tags.contains(&"outer".to_string()),
+            "tags = {:?}",
+            deepest.tags
+        );
         // A sibling only under the outer import gets only the outer tag.
         let middle = tasks.iter().find(|t| t.name == "middle").unwrap();
         assert!(middle.tags.contains(&"outer".to_string()));

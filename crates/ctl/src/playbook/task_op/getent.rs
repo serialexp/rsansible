@@ -26,8 +26,9 @@ pub(super) fn parse_getent_body<E: serde::de::Error>(
         return Err(E::custom("getent.database: empty"));
     }
 
-    let key = take_optional_field_string::<E>(&mut map, "key")?
-        .ok_or_else(|| E::custom("getent: missing required field `key` (omitted-key form not supported)"))?;
+    let key = take_optional_field_string::<E>(&mut map, "key")?.ok_or_else(|| {
+        E::custom("getent: missing required field `key` (omitted-key form not supported)")
+    })?;
     if key.trim().is_empty() {
         return Err(E::custom("getent.key: empty"));
     }
@@ -46,14 +47,23 @@ pub(super) fn parse_getent_body<E: serde::de::Error>(
     if !map.is_empty() {
         let unknown: Vec<String> = map
             .keys()
-            .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            .map(|k| {
+                k.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"))
+            })
             .collect();
         return Err(E::custom(format!(
             "getent: unknown field(s): {unknown:?}; expected one of [database, key, fail_key, split]"
         )));
     }
 
-    Ok(GetentOp { database, key, fail_key, split })
+    Ok(GetentOp {
+        database,
+        key,
+        fail_key,
+        split,
+    })
 }
 
 #[cfg(test)]
@@ -95,7 +105,9 @@ getent:
   key: docker
 "#,
         );
-        let TaskBody::Op(TaskOp::Getent(g)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::Getent(g)) = t.body else {
+            panic!()
+        };
         assert!(g.fail_key);
     }
 
@@ -103,21 +115,30 @@ getent:
     fn rejects_missing_database() {
         let yaml = "name: t\ngetent:\n  key: postgres\n";
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(format!("{err}").contains("missing required field `database`"), "got: {err}");
+        assert!(
+            format!("{err}").contains("missing required field `database`"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn rejects_missing_key() {
         let yaml = "name: t\ngetent:\n  database: passwd\n";
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(format!("{err}").contains("missing required field `key`"), "got: {err}");
+        assert!(
+            format!("{err}").contains("missing required field `key`"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn rejects_unimplemented_service() {
         let yaml = "name: t\ngetent:\n  database: passwd\n  key: bob\n  service: foo\n";
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(format!("{err}").contains("not yet implemented"), "got: {err}");
+        assert!(
+            format!("{err}").contains("not yet implemented"),
+            "got: {err}"
+        );
     }
 
     #[test]

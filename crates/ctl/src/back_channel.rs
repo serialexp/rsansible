@@ -142,7 +142,10 @@ pub async fn spawn_back_channel_conn(
                 key.label()
             )
         })?;
-    stream.flush().await.context("flushing back-channel preamble")?;
+    stream
+        .flush()
+        .await
+        .context("flushing back-channel preamble")?;
 
     let first = read_frame(&mut stream)
         .await

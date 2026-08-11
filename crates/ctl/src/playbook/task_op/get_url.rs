@@ -1,8 +1,8 @@
 //! `get_url:` task body.
 
-use super::shared::{parse_ansible_bool, take_optional_mode, take_optional_string, ModeField};
 #[allow(unused_imports)]
 use super::shared::parse_octal_mode;
+use super::shared::{parse_ansible_bool, take_optional_mode, take_optional_string, ModeField};
 use rsansible_wire::msg::uri_follow;
 use serde::{de::Error as _, Deserialize, Deserializer};
 use std::collections::BTreeMap;
@@ -169,8 +169,8 @@ impl<'de> Deserialize<'de> for GetUrlOp {
                 "all" | "yes" | "true" => uri_follow::ALL,
                 other => {
                     return Err(D::Error::custom(format!(
-                        "get_url.follow_redirects: expected one of [none, safe, all], got: {other:?}"
-                    )))
+                    "get_url.follow_redirects: expected one of [none, safe, all], got: {other:?}"
+                )))
                 }
             },
             Some(serde_yaml::Value::Bool(true)) => uri_follow::ALL,
@@ -182,12 +182,11 @@ impl<'de> Deserialize<'de> for GetUrlOp {
             }
         };
 
-        let client_cert = take_optional_string(&mut map, "client_cert", "get_url")?
-            .unwrap_or_default();
-        let client_key = take_optional_string(&mut map, "client_key", "get_url")?
-            .unwrap_or_default();
-        let ca_path = take_optional_string(&mut map, "ca_path", "get_url")?
-            .unwrap_or_default();
+        let client_cert =
+            take_optional_string(&mut map, "client_cert", "get_url")?.unwrap_or_default();
+        let client_key =
+            take_optional_string(&mut map, "client_key", "get_url")?.unwrap_or_default();
+        let ca_path = take_optional_string(&mut map, "ca_path", "get_url")?.unwrap_or_default();
 
         if !map.is_empty() {
             let unknown: Vec<String> = map
@@ -237,7 +236,9 @@ get_url:
   dest: /tmp/x.tar.gz
 "#,
         );
-        let TaskBody::Op(TaskOp::GetUrl(g)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::GetUrl(g)) = t.body else {
+            panic!()
+        };
         assert_eq!(g.url, "https://example.com/x.tar.gz");
         assert_eq!(g.dest, "/tmp/x.tar.gz");
         assert_eq!(g.checksum, "");
@@ -269,7 +270,9 @@ get_url:
   follow_redirects: safe
 "#,
         );
-        let TaskBody::Op(TaskOp::GetUrl(g)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::GetUrl(g)) = t.body else {
+            panic!()
+        };
         assert_eq!(g.checksum, "sha256:abc123");
         assert_eq!(g.mode, Some(super::super::ModeField::Literal(0o644)));
         assert_eq!(g.owner, "root");
@@ -294,7 +297,10 @@ get_url:
         let result: Result<Task, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "unknown field should be rejected");
         let err = format!("{:?}", result.err());
-        assert!(err.contains("bogus"), "error should mention the unknown field: {err}");
+        assert!(
+            err.contains("bogus"),
+            "error should mention the unknown field: {err}"
+        );
     }
 
     #[test]
@@ -312,7 +318,9 @@ get_url:
         );
         let TaskBody::Op(op) = t.body else { panic!() };
         let wire = op.to_wire_op().unwrap();
-        let WireOp::OpGetUrl(g) = wire else { panic!("got {wire:?}") };
+        let WireOp::OpGetUrl(g) = wire else {
+            panic!("got {wire:?}")
+        };
         assert_eq!(g.kind, 15);
         assert_eq!(g.url, "https://example.com/p");
         assert_eq!(g.dest, "/tmp/p");

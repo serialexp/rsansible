@@ -55,7 +55,11 @@ async fn end_to_end_shell_task() -> Result<()> {
     assert_eq!(conn.hello.os, rsansible_wire::msg::os::LINUX);
     assert!(!conn.hello.hostname.is_empty(), "Hello.hostname empty");
 
-    let dispatch = task_dispatch(1, false, op_shell("printf 'hi from agent\\n'".into(), vec![], vec![], 5_000));
+    let dispatch = task_dispatch(
+        1,
+        false,
+        op_shell("printf 'hi from agent\\n'".into(), vec![], vec![], 5_000),
+    );
     write_frame(&mut conn.stream, &dispatch)
         .await
         .context("writing TaskDispatch")?;
@@ -79,7 +83,11 @@ async fn end_to_end_shell_task() -> Result<()> {
                 break;
             }
             Message::TaskError(e) => {
-                bail!("agent reported TaskError: code={} msg={}", e.code, e.message)
+                bail!(
+                    "agent reported TaskError: code={} msg={}",
+                    e.code,
+                    e.message
+                )
             }
             other => bail!("unexpected frame from agent: {other:?}"),
         }

@@ -116,8 +116,7 @@ async fn block_success_runs_always_not_rescue() -> Result<()> {
     scrub_markers(&container)?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -136,8 +135,14 @@ async fn block_success_runs_always_not_rescue() -> Result<()> {
             "success: host {host} should be Ok, got {outcome:?}"
         );
     }
-    assert!(marker_exists(&container, "/tmp/rsansible-blk-t1")?, "t1 ran");
-    assert!(marker_exists(&container, "/tmp/rsansible-blk-t2")?, "t2 ran");
+    assert!(
+        marker_exists(&container, "/tmp/rsansible-blk-t1")?,
+        "t1 ran"
+    );
+    assert!(
+        marker_exists(&container, "/tmp/rsansible-blk-t2")?,
+        "t2 ran"
+    );
     assert!(
         !marker_exists(&container, "/tmp/rsansible-blk-rescue")?,
         "rescue must NOT have run on success path"
@@ -168,8 +173,7 @@ async fn block_rescue_recovers_and_sees_ansible_failed_vars() -> Result<()> {
     scrub_markers(&container)?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -188,7 +192,10 @@ async fn block_rescue_recovers_and_sees_ansible_failed_vars() -> Result<()> {
             "rescue-recovers: host {host} should be Ok (rescue recovered), got {outcome:?}"
         );
     }
-    assert!(marker_exists(&container, "/tmp/rsansible-blk-t1")?, "t1 ran before failure");
+    assert!(
+        marker_exists(&container, "/tmp/rsansible-blk-t1")?,
+        "t1 ran before failure"
+    );
     assert!(
         !marker_exists(&container, "/tmp/rsansible-blk-t3")?,
         "t3 must NOT have run — block aborts at the first failure"
@@ -228,8 +235,7 @@ async fn block_rescue_also_fails_runs_always_and_halts() -> Result<()> {
     scrub_markers(&container)?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

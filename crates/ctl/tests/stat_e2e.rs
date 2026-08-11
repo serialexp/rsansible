@@ -46,8 +46,7 @@ async fn stat_lifts_register_and_gates_when() -> Result<()> {
     let inv = single_host_inventory(&container);
 
     let pb_path = examples_dir().join("stat.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -67,9 +66,21 @@ async fn stat_lifts_register_and_gates_when() -> Result<()> {
     // 1. Regular file.
     let file_out = read_file(&container, "/tmp/rsansible-stat-file")?;
     let lines: Vec<&str> = file_out.lines().collect();
-    assert_eq!(lines.get(0).copied(), Some("true"), "exists=true: {file_out:?}");
-    assert_eq!(lines.get(1).copied(), Some("true"), "isreg=true: {file_out:?}");
-    assert_eq!(lines.get(2).copied(), Some("6"), "size=6 for \"hello\\n\": {file_out:?}");
+    assert_eq!(
+        lines.get(0).copied(),
+        Some("true"),
+        "exists=true: {file_out:?}"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("true"),
+        "isreg=true: {file_out:?}"
+    );
+    assert_eq!(
+        lines.get(2).copied(),
+        Some("6"),
+        "size=6 for \"hello\\n\": {file_out:?}"
+    );
     // sha256("hello\n") = 5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03
     assert_eq!(
         lines.get(3).copied(),
@@ -80,9 +91,21 @@ async fn stat_lifts_register_and_gates_when() -> Result<()> {
     // 2. Directory.
     let dir_out = read_file(&container, "/tmp/rsansible-stat-dir")?;
     let lines: Vec<&str> = dir_out.lines().collect();
-    assert_eq!(lines.get(0).copied(), Some("true"), "/tmp exists: {dir_out:?}");
-    assert_eq!(lines.get(1).copied(), Some("true"), "/tmp isdir: {dir_out:?}");
-    assert_eq!(lines.get(2).copied(), Some("false"), "/tmp isreg false: {dir_out:?}");
+    assert_eq!(
+        lines.get(0).copied(),
+        Some("true"),
+        "/tmp exists: {dir_out:?}"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("true"),
+        "/tmp isdir: {dir_out:?}"
+    );
+    assert_eq!(
+        lines.get(2).copied(),
+        Some("false"),
+        "/tmp isreg false: {dir_out:?}"
+    );
 
     // 3. Missing path.
     let missing_out = read_file(&container, "/tmp/rsansible-stat-missing")?;

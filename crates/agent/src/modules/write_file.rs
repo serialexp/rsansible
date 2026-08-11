@@ -11,15 +11,13 @@
 //! - `changed` is reported true iff the target's prior content or mode differed
 //!   from what we just wrote. Matches Ansible's `copy` module semantics.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::PathBuf;
 use rsansible_wire::generated::OpWriteFileOutput;
 use rsansible_wire::msg::{self, now_unix_ns};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
-use super::file::{
-    chown_group_only, chown_user_only, lchown_path, resolve_group, resolve_user,
-};
+use super::file::{chown_group_only, chown_user_only, lchown_path, resolve_group, resolve_user};
 use super::validate_helper::{validate_tmp, ValidateError};
 use super::{emit_error, Context};
 
@@ -44,8 +42,15 @@ pub async fn run(
         match tokio::fs::symlink_metadata(&path).await {
             Ok(_) => {
                 let finished_unix_ns = now_unix_ns();
-                ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished_unix_ns))
-                    .await;
+                ctx.emit(msg::task_done(
+                    seq,
+                    0,
+                    false,
+                    false,
+                    started_unix_ns,
+                    finished_unix_ns,
+                ))
+                .await;
                 return Ok(());
             }
             // Path doesn't exist → fall through to the normal write path.
@@ -54,13 +59,7 @@ pub async fn run(
             // parent dir) and should surface — same shape as a read failure
             // on the regular path.
             Err(e) => {
-                emit_error(
-                    ctx,
-                    seq,
-                    map_io_err(&e),
-                    format!("stat {}: {e}", op.path),
-                )
-                .await;
+                emit_error(ctx, seq, map_io_err(&e), format!("stat {}: {e}", op.path)).await;
                 return Ok(());
             }
         }
@@ -215,13 +214,7 @@ pub async fn run(
         // run with the same pid+seq would conflict (unlikely, but bounded by
         // PID space). Silently ignore the cleanup error.
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        emit_error(
-            ctx,
-            seq,
-            map_io_err(&e),
-            format!("write {}: {e}", op.path),
-        )
-        .await;
+        emit_error(ctx, seq, map_io_err(&e), format!("write {}: {e}", op.path)).await;
         return Ok(());
     }
 
@@ -269,11 +262,10 @@ pub async fn run(
     if !op.validate.is_empty() {
         let validate_str = op.validate.clone();
         let tmp_for_validate = tmp_path.clone();
-        let validate_result = tokio::task::spawn_blocking(move || {
-            validate_tmp(&validate_str, &tmp_for_validate)
-        })
-        .await
-        .expect("validate task panicked");
+        let validate_result =
+            tokio::task::spawn_blocking(move || validate_tmp(&validate_str, &tmp_for_validate))
+                .await
+                .expect("validate task panicked");
         match validate_result {
             Ok(()) => { /* fall through to rename */ }
             Err(ValidateError::BadRequest(msg_text)) => {

@@ -54,9 +54,8 @@ pub fn flatten_playbook(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
         for inv in &invocations {
             let name = inv.name();
             let spec_tags = inv.tags();
-            let role_dir = resolve_role_dir(base_dir, name).with_context(|| {
-                format!("resolving role {name:?} in play {:?}", play.name)
-            })?;
+            let role_dir = resolve_role_dir(base_dir, name)
+                .with_context(|| format!("resolving role {name:?} in play {:?}", play.name))?;
 
             let mut had_content = false;
 
@@ -225,8 +224,7 @@ fn expand_one(
     // and our validator already rejects duplicates; skip handlers
     // whose names already appear so re-including is idempotent).
     if let Some(loaded) = load_task_file(&role_dir, "handlers")? {
-        let existing: BTreeSet<String> =
-            play_handlers.iter().map(|h| h.name.clone()).collect();
+        let existing: BTreeSet<String> = play_handlers.iter().map(|h| h.name.clone()).collect();
         let tagged = tag_with_role_dir(loaded, &role_dir);
         for h in tagged {
             if !existing.contains(&h.name) {
@@ -354,10 +352,10 @@ fn load_tasks_from(role_dir: &Path, tasks_from: &str) -> Result<Vec<Task>> {
             anyhow!("tasks_from file not found; tried:\n{listed}")
         })?
         .clone();
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let tasks: Vec<Task> = serde_yaml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let tasks: Vec<Task> =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
     let flattened = flatten_tasks(tasks, &dir, &mut visited, 0)
         .with_context(|| format!("flattening {}", path.display()))?;
@@ -377,11 +375,7 @@ fn load_tasks_from(role_dir: &Path, tasks_from: &str) -> Result<Vec<Task>> {
 /// message.
 pub fn load_templates(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
     for play in &mut pb.plays {
-        for task in play
-            .tasks
-            .iter_mut()
-            .chain(play.handlers.iter_mut())
-        {
+        for task in play.tasks.iter_mut().chain(play.handlers.iter_mut()) {
             resolve_template_for_task(task, base_dir)?;
         }
     }
@@ -410,9 +404,8 @@ fn resolve_template_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
         if path.is_file() {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("reading template {}", path.display()))?;
-            let body = String::from_utf8(bytes).with_context(|| {
-                format!("template {} contains non-UTF-8 bytes", path.display())
-            })?;
+            let body = String::from_utf8(bytes)
+                .with_context(|| format!("template {} contains non-UTF-8 bytes", path.display()))?;
             t.body = Some(body);
             return Ok(());
         }
@@ -435,11 +428,7 @@ fn resolve_template_for_task(task: &mut Task, base_dir: &Path) -> Result<()> {
 /// verbatim — no UTF-8 requirement, no Jinja rendering.
 pub fn load_copy_files(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
     for play in &mut pb.plays {
-        for task in play
-            .tasks
-            .iter_mut()
-            .chain(play.handlers.iter_mut())
-        {
+        for task in play.tasks.iter_mut().chain(play.handlers.iter_mut()) {
             resolve_copy_for_task(task, base_dir)?;
         }
     }
@@ -624,21 +613,17 @@ fn load_defaults(role_dir: &Path) -> Result<Option<std::collections::BTreeMap<St
     load_defaults_at(&path)
 }
 
-fn load_defaults_at(
-    path: &Path,
-) -> Result<Option<std::collections::BTreeMap<String, JsonValue>>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+fn load_defaults_at(path: &Path) -> Result<Option<std::collections::BTreeMap<String, JsonValue>>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     if text.trim().is_empty() {
         return Ok(Some(std::collections::BTreeMap::new()));
     }
     let raw: std::collections::BTreeMap<String, serde_yaml::Value> =
-        serde_yaml::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let mut out = std::collections::BTreeMap::new();
     for (k, v) in raw {
-        let json = yaml_to_json(v)
-            .with_context(|| format!("{}: key {k}", path.display()))?;
+        let json = yaml_to_json(v).with_context(|| format!("{}: key {k}", path.display()))?;
         out.insert(k, json);
     }
     Ok(Some(out))
@@ -653,10 +638,10 @@ fn load_task_file(role_dir: &Path, subdir: &str) -> Result<Option<Vec<Task>>> {
         Some(p) => p,
         None => return Ok(None),
     };
-    let text = std::fs::read_to_string(&main)
-        .with_context(|| format!("reading {}", main.display()))?;
-    let tasks: Vec<Task> = serde_yaml::from_str(&text)
-        .with_context(|| format!("parsing {}", main.display()))?;
+    let text =
+        std::fs::read_to_string(&main).with_context(|| format!("reading {}", main.display()))?;
+    let tasks: Vec<Task> =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", main.display()))?;
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
     let flattened = flatten_tasks(tasks, &dir, &mut visited, 0)
         .with_context(|| format!("flattening {}", main.display()))?;
@@ -741,18 +726,27 @@ port: 80
             .collect();
         assert_eq!(hnames, vec!["bumped"]);
         assert_eq!(
-            pb.plays[0].role_defaults.get("service_name").and_then(JsonValue::as_str),
+            pb.plays[0]
+                .role_defaults
+                .get("service_name")
+                .and_then(JsonValue::as_str),
             Some("demo")
         );
         assert_eq!(
-            pb.plays[0].role_defaults.get("port").and_then(JsonValue::as_u64),
+            pb.plays[0]
+                .role_defaults
+                .get("port")
+                .and_then(JsonValue::as_u64),
             Some(80)
         );
         // Each role task should be tagged with the role dir.
         for t in &pb.plays[0].tasks[..2] {
             assert!(t.role_dir.is_some(), "{:?} missing role_dir", t.name);
         }
-        assert!(pb.plays[0].tasks[2].role_dir.is_none(), "play-direct task shouldn't carry role_dir");
+        assert!(
+            pb.plays[0].tasks[2].role_dir.is_none(),
+            "play-direct task shouldn't carry role_dir"
+        );
     }
 
     #[test]
@@ -841,10 +835,7 @@ port: 80
         let pb = playbook::load(&pb_path).unwrap();
         match &pb.plays[0].tasks[0].body {
             TaskBody::Op(TaskOp::Template(t)) => {
-                assert_eq!(
-                    t.body.as_deref(),
-                    Some("service={{ service_name }}\n"),
-                );
+                assert_eq!(t.body.as_deref(), Some("service={{ service_name }}\n"),);
             }
             other => panic!("expected template body, got {other:?}"),
         }
@@ -875,7 +866,10 @@ port: 80
         let err = playbook::load(&pb_path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("missing.j2"), "got: {msg}");
-        assert!(msg.contains("templates/missing.j2"), "search paths should be in error: {msg}");
+        assert!(
+            msg.contains("templates/missing.j2"),
+            "search paths should be in error: {msg}"
+        );
     }
 
     #[test]
@@ -893,7 +887,10 @@ port: 80
         write(&pb_path, pb_text);
         let pb = playbook::load(&pb_path).unwrap();
         assert_eq!(
-            pb.plays[0].role_defaults.get("v").and_then(JsonValue::as_str),
+            pb.plays[0]
+                .role_defaults
+                .get("v")
+                .and_then(JsonValue::as_str),
             Some("from_b")
         );
     }
@@ -914,7 +911,10 @@ port: 80
         write(&pb_path, pb_text);
         let pb = playbook::load(&pb_path).unwrap();
         assert_eq!(
-            pb.plays[0].role_defaults.get("x").and_then(JsonValue::as_u64),
+            pb.plays[0]
+                .role_defaults
+                .get("x")
+                .and_then(JsonValue::as_u64),
             Some(1)
         );
     }
@@ -957,7 +957,10 @@ port: 80
 
         // A task that already had tags merges with the role tags (deduped + sorted).
         assert_eq!(pb.plays[0].tasks[1].name, "r2");
-        assert_eq!(pb.plays[0].tasks[1].tags, vec!["common", "existing", "setup"]);
+        assert_eq!(
+            pb.plays[0].tasks[1].tags,
+            vec!["common", "existing", "setup"]
+        );
 
         // Play-direct task is untouched.
         assert_eq!(pb.plays[0].tasks[2].name, "play_own");
@@ -1272,7 +1275,10 @@ port: 80
         write(&pb_path, pb_text);
         let pb = playbook::load(&pb_path).unwrap();
         assert_eq!(
-            pb.plays[0].role_defaults.get("svc_port").and_then(JsonValue::as_u64),
+            pb.plays[0]
+                .role_defaults
+                .get("svc_port")
+                .and_then(JsonValue::as_u64),
             Some(8080)
         );
     }
@@ -1575,6 +1581,9 @@ port: 80
         let err = playbook::load(&pb_path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("missing.bin"), "got: {msg}");
-        assert!(msg.contains("files/missing.bin"), "search paths should be in error: {msg}");
+        assert!(
+            msg.contains("files/missing.bin"),
+            "search paths should be in error: {msg}"
+        );
     }
 }

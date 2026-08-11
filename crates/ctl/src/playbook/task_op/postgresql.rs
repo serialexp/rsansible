@@ -5,9 +5,7 @@
 //! used by these two ops; if anything else needs SQL classification
 //! later we can lift it.
 
-use super::shared::{
-    take_optional_ansible_bool, take_optional_field_string,
-};
+use super::shared::{take_optional_ansible_bool, take_optional_field_string};
 use rsansible_wire::msg::postgresql_ext_state;
 use serde::{de::Error as _, Deserialize, Deserializer};
 
@@ -219,7 +217,9 @@ pub fn classify_sql_readonly(sql: &str) -> bool {
         // Empty / whitespace-only query: no mutation possible.
         return true;
     }
-    statements.iter().all(|s| classify_one_statement_readonly(s))
+    statements
+        .iter()
+        .all(|s| classify_one_statement_readonly(s))
 }
 
 /// Decide whether a single, comment-stripped statement is read-only.
@@ -261,10 +261,34 @@ fn with_is_readonly(stmt: &str) -> bool {
 /// Mutating keywords we recognise as standalone identifiers. Lowercase
 /// inputs are normalised by `next_identifier_token`'s `to_ascii_uppercase`.
 const MUTATING_KEYWORDS: &[&str] = &[
-    "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "CREATE", "DROP", "ALTER", "GRANT",
-    "REVOKE", "CLUSTER", "REINDEX", "VACUUM", "REFRESH", "COPY", "CALL", "EXECUTE", "DO",
-    "LISTEN", "UNLISTEN", "NOTIFY", "LOCK", "PREPARE", "DEALLOCATE", "SET", "RESET",
-    "DISCARD", "SECURITY",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "TRUNCATE",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "GRANT",
+    "REVOKE",
+    "CLUSTER",
+    "REINDEX",
+    "VACUUM",
+    "REFRESH",
+    "COPY",
+    "CALL",
+    "EXECUTE",
+    "DO",
+    "LISTEN",
+    "UNLISTEN",
+    "NOTIFY",
+    "LOCK",
+    "PREPARE",
+    "DEALLOCATE",
+    "SET",
+    "RESET",
+    "DISCARD",
+    "SECURITY",
 ];
 
 /// True if any identifier token in `s` (skipping string/identifier/dollar
@@ -309,7 +333,9 @@ fn explain_options_include_analyze(stmt: &str) -> bool {
     let mut j = i;
     while j < bytes.len() {
         j = skip_whitespace(bytes, j);
-        let Some((tok, next)) = next_identifier_token(bytes, j) else { return false };
+        let Some((tok, next)) = next_identifier_token(bytes, j) else {
+            return false;
+        };
         match tok.as_str() {
             "ANALYZE" => return true,
             "VERBOSE" => {
@@ -674,8 +700,7 @@ fn take_pg_login_fields<E: serde::de::Error>(
     module: &str,
 ) -> Result<(String, String, String, String, u16), E> {
     let login_user = take_optional_field_string(map, "login_user")?.unwrap_or_default();
-    let login_password =
-        take_optional_field_string(map, "login_password")?.unwrap_or_default();
+    let login_password = take_optional_field_string(map, "login_password")?.unwrap_or_default();
     let login_unix_socket =
         take_optional_field_string(map, "login_unix_socket")?.unwrap_or_default();
     let login_host = take_optional_field_string(map, "login_host")?.unwrap_or_default();
@@ -684,11 +709,7 @@ fn take_pg_login_fields<E: serde::de::Error>(
         Some(serde_yaml::Value::Number(n)) => n
             .as_u64()
             .and_then(|v| u16::try_from(v).ok())
-            .ok_or_else(|| {
-                E::custom(format!(
-                    "{module}.login_port: expected uint16, got: {n}"
-                ))
-            })?,
+            .ok_or_else(|| E::custom(format!("{module}.login_port: expected uint16, got: {n}")))?,
         Some(serde_yaml::Value::String(s)) => {
             // Allow port as string (Jinja-rendered numerics arrive
             // here as strings after templating; defer parsing to
@@ -709,7 +730,13 @@ fn take_pg_login_fields<E: serde::de::Error>(
             )))
         }
     };
-    Ok((login_user, login_password, login_unix_socket, login_host, login_port))
+    Ok((
+        login_user,
+        login_password,
+        login_unix_socket,
+        login_host,
+        login_port,
+    ))
 }
 
 impl<'de> Deserialize<'de> for PostgresqlUserOp {
@@ -719,9 +746,11 @@ impl<'de> Deserialize<'de> for PostgresqlUserOp {
         let name = match map.remove("name") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
             None => return Err(D::Error::missing_field("name")),
-            Some(other) => return Err(D::Error::custom(format!(
-                "postgresql_user.name: expected non-empty string, got: {other:?}"
-            ))),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_user.name: expected non-empty string, got: {other:?}"
+                )))
+            }
         };
         let password = take_optional_field_string(&mut map, "password")?.unwrap_or_default();
         let role_attr_flags =
@@ -787,7 +816,11 @@ impl<'de> Deserialize<'de> for PostgresqlUserOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "postgresql_user: unknown field(s): {unknown:?}; expected one of \
@@ -850,14 +883,15 @@ impl<'de> Deserialize<'de> for PostgresqlDbOp {
         let name = match map.remove("name") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
             None => return Err(D::Error::missing_field("name")),
-            Some(other) => return Err(D::Error::custom(format!(
-                "postgresql_db.name: expected non-empty string, got: {other:?}"
-            ))),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_db.name: expected non-empty string, got: {other:?}"
+                )))
+            }
         };
         let owner = take_optional_field_string(&mut map, "owner")?.unwrap_or_default();
         let encoding = take_optional_field_string(&mut map, "encoding")?.unwrap_or_default();
-        let lc_collate =
-            take_optional_field_string(&mut map, "lc_collate")?.unwrap_or_default();
+        let lc_collate = take_optional_field_string(&mut map, "lc_collate")?.unwrap_or_default();
         let lc_ctype = take_optional_field_string(&mut map, "lc_ctype")?.unwrap_or_default();
         let template = take_optional_field_string(&mut map, "template")?.unwrap_or_default();
         let state = match map.remove("state") {
@@ -883,7 +917,11 @@ impl<'de> Deserialize<'de> for PostgresqlDbOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "postgresql_db: unknown field(s): {unknown:?}; expected one of \
@@ -968,12 +1006,8 @@ impl<'de> Deserialize<'de> for PostgresqlMembershipOp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut map = serde_yaml::Mapping::deserialize(d)?;
 
-        let groups = take_string_or_list::<D::Error>(
-            &mut map,
-            "group",
-            "groups",
-            "postgresql_membership",
-        )?;
+        let groups =
+            take_string_or_list::<D::Error>(&mut map, "group", "groups", "postgresql_membership")?;
         let target_roles = take_string_or_list::<D::Error>(
             &mut map,
             "target_role",
@@ -997,8 +1031,7 @@ impl<'de> Deserialize<'de> for PostgresqlMembershipOp {
                 )))
             }
         };
-        let fail_on_role =
-            take_optional_ansible_bool(&mut map, "fail_on_role")?.unwrap_or(true);
+        let fail_on_role = take_optional_ansible_bool(&mut map, "fail_on_role")?.unwrap_or(true);
         let db = resolve_db_alias::<D::Error>(&mut map, "postgresql_membership")?;
         let (login_user, login_password, login_unix_socket, login_host, login_port) =
             take_pg_login_fields::<D::Error>(&mut map, "postgresql_membership")?;
@@ -1006,7 +1039,11 @@ impl<'de> Deserialize<'de> for PostgresqlMembershipOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "postgresql_membership: unknown field(s): {unknown:?}; expected one of \
@@ -1038,9 +1075,11 @@ impl<'de> Deserialize<'de> for PostgresqlQueryOp {
         let query = match map.remove("query") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
             None => return Err(D::Error::missing_field("query")),
-            Some(other) => return Err(D::Error::custom(format!(
-                "postgresql_query.query: expected non-empty string, got: {other:?}"
-            ))),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_query.query: expected non-empty string, got: {other:?}"
+                )))
+            }
         };
         let db = resolve_db_alias::<D::Error>(&mut map, "postgresql_query")?;
         let login_user = take_optional_field_string(&mut map, "login_user")?.unwrap_or_default();
@@ -1065,8 +1104,7 @@ impl<'de> Deserialize<'de> for PostgresqlQueryOp {
                 )))
             }
         };
-        let autocommit =
-            take_optional_ansible_bool(&mut map, "autocommit")?.unwrap_or(false);
+        let autocommit = take_optional_ansible_bool(&mut map, "autocommit")?.unwrap_or(false);
         let positional_args: Vec<String> = match map.remove("positional_args") {
             None | Some(serde_yaml::Value::Null) => Vec::new(),
             Some(serde_yaml::Value::Sequence(seq)) => {
@@ -1097,7 +1135,11 @@ impl<'de> Deserialize<'de> for PostgresqlQueryOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "postgresql_query: unknown field(s): {unknown:?}; expected one of \
@@ -1129,9 +1171,11 @@ impl<'de> Deserialize<'de> for PostgresqlExtOp {
         let name = match map.remove("name") {
             Some(serde_yaml::Value::String(s)) if !s.is_empty() => s,
             None => return Err(D::Error::missing_field("name")),
-            Some(other) => return Err(D::Error::custom(format!(
-                "postgresql_ext.name: expected non-empty string, got: {other:?}"
-            ))),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "postgresql_ext.name: expected non-empty string, got: {other:?}"
+                )))
+            }
         };
         let state = match map.remove("state") {
             None | Some(serde_yaml::Value::Null) => postgresql_ext_state::PRESENT,
@@ -1180,7 +1224,11 @@ impl<'de> Deserialize<'de> for PostgresqlExtOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "postgresql_ext: unknown field(s): {unknown:?}; expected one of \
@@ -1208,9 +1256,11 @@ impl<'de> Deserialize<'de> for PostgresqlExtOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task};
-    use rsansible_wire::generated::Op as WireOp;
+    use crate::playbook::task_op::{
+        parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task,
+    };
     use crate::playbook::task_op::{TaskBody, TaskOp};
+    use rsansible_wire::generated::Op as WireOp;
 
     #[test]
     fn classify_sql_select_is_readonly() {
@@ -1220,7 +1270,9 @@ mod tests {
         assert!(classify_sql_readonly("SHOW server_version"));
         assert!(classify_sql_readonly("EXPLAIN SELECT 1"));
         assert!(classify_sql_readonly("VALUES (1), (2)"));
-        assert!(classify_sql_readonly("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(classify_sql_readonly(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
         assert!(classify_sql_readonly("TABLE pg_class"));
     }
 
@@ -1234,7 +1286,9 @@ mod tests {
         assert!(!classify_sql_readonly("ALTER SYSTEM SET work_mem = '64MB'"));
         assert!(!classify_sql_readonly("TRUNCATE t"));
         assert!(!classify_sql_readonly("VACUUM"));
-        assert!(!classify_sql_readonly("CREATE EXTENSION pg_stat_statements"));
+        assert!(!classify_sql_readonly(
+            "CREATE EXTENSION pg_stat_statements"
+        ));
     }
 
     #[test]
@@ -1243,7 +1297,9 @@ mod tests {
         assert!(classify_sql_readonly("/* leading block */ SELECT 1"));
         assert!(!classify_sql_readonly("-- still mutates\nDELETE FROM t"));
         // nested block comments — postgres supports nesting
-        assert!(classify_sql_readonly("/* outer /* inner */ outer */ SELECT 1"));
+        assert!(classify_sql_readonly(
+            "/* outer /* inner */ outer */ SELECT 1"
+        ));
     }
 
     #[test]
@@ -1273,16 +1329,24 @@ mod tests {
     fn classify_sql_explain_without_analyze_is_readonly() {
         assert!(classify_sql_readonly("EXPLAIN SELECT 1"));
         assert!(classify_sql_readonly("EXPLAIN INSERT INTO t VALUES (1)"));
-        assert!(classify_sql_readonly("EXPLAIN VERBOSE INSERT INTO t VALUES (1)"));
-        assert!(classify_sql_readonly("EXPLAIN (VERBOSE, BUFFERS) DELETE FROM t"));
-        assert!(classify_sql_readonly("EXPLAIN (ANALYZE FALSE) DELETE FROM t"));
+        assert!(classify_sql_readonly(
+            "EXPLAIN VERBOSE INSERT INTO t VALUES (1)"
+        ));
+        assert!(classify_sql_readonly(
+            "EXPLAIN (VERBOSE, BUFFERS) DELETE FROM t"
+        ));
+        assert!(classify_sql_readonly(
+            "EXPLAIN (ANALYZE FALSE) DELETE FROM t"
+        ));
         assert!(classify_sql_readonly("EXPLAIN (ANALYZE OFF) DELETE FROM t"));
     }
 
     #[test]
     fn classify_sql_explain_analyze_dml_is_mutating() {
         // Legacy bareword form.
-        assert!(!classify_sql_readonly("EXPLAIN ANALYZE INSERT INTO t VALUES (1)"));
+        assert!(!classify_sql_readonly(
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)"
+        ));
         assert!(!classify_sql_readonly("explain analyze delete from t"));
         assert!(!classify_sql_readonly(
             "EXPLAIN ANALYZE VERBOSE UPDATE t SET x = 1"
@@ -1294,9 +1358,7 @@ mod tests {
         assert!(!classify_sql_readonly(
             "EXPLAIN (ANALYZE TRUE, BUFFERS) UPDATE t SET x = 1"
         ));
-        assert!(!classify_sql_readonly(
-            "EXPLAIN (ANALYZE ON) DELETE FROM t"
-        ));
+        assert!(!classify_sql_readonly("EXPLAIN (ANALYZE ON) DELETE FROM t"));
         assert!(!classify_sql_readonly(
             "EXPLAIN (BUFFERS, ANALYZE 1) MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 1"
         ));
@@ -1414,7 +1476,10 @@ postgresql_query:
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("named_args") || msg.contains("unknown"), "got: {msg}");
+        assert!(
+            msg.contains("named_args") || msg.contains("unknown"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1471,10 +1536,15 @@ postgresql_user:
   login_unix_socket: /var/run/postgresql
 "#,
         );
-        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else {
+            panic!()
+        };
         assert_eq!(u.name, "acme");
         assert_eq!(u.password, "secret123");
-        assert_eq!(u.role_attr_flags, "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB");
+        assert_eq!(
+            u.role_attr_flags,
+            "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB"
+        );
         assert_eq!(u.state, 0); // present
         assert_eq!(u.login_unix_socket, "/var/run/postgresql");
         assert!(!u.no_password_changes);
@@ -1510,7 +1580,9 @@ postgresql_user:
   role_attr_flags: "{{ pg_attr_set }}"
 "#,
         );
-        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else {
+            panic!()
+        };
         assert_eq!(u.role_attr_flags, "{{ pg_attr_set }}");
     }
 
@@ -1524,7 +1596,9 @@ postgresql_user:
   state: absent
 "#,
         );
-        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::PostgresqlUser(u)) = t.body else {
+            panic!()
+        };
         assert_eq!(u.state, 1);
     }
 
@@ -1540,7 +1614,10 @@ postgresql_user:
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("conn_limit") || msg.contains("-1"), "got: {msg}");
+        assert!(
+            msg.contains("conn_limit") || msg.contains("-1"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1558,7 +1635,9 @@ postgresql_db:
   login_unix_socket: /var/run/postgresql
 "#,
         );
-        let TaskBody::Op(TaskOp::PostgresqlDb(d)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::PostgresqlDb(d)) = t.body else {
+            panic!()
+        };
         assert_eq!(d.name, "acme");
         assert_eq!(d.owner, "acme");
         assert_eq!(d.encoding, "UTF8");
@@ -1579,7 +1658,9 @@ postgresql_db:
   state: absent
 "#,
         );
-        let TaskBody::Op(TaskOp::PostgresqlDb(d)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::PostgresqlDb(d)) = t.body else {
+            panic!()
+        };
         assert_eq!(d.state, 1);
         assert!(d.owner.is_empty());
         assert!(d.encoding.is_empty());
@@ -1599,7 +1680,10 @@ postgresql_user:
         let TaskBody::Op(op) = t.body else { panic!() };
         let err = op.to_wire_op().unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("composite") || msg.contains("intercepted"), "got: {msg}");
+        assert!(
+            msg.contains("composite") || msg.contains("intercepted"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1616,7 +1700,9 @@ postgresql_membership:
     - bob
 "#,
         );
-        let TaskBody::Op(TaskOp::PostgresqlMembership(m)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::PostgresqlMembership(m)) = t.body else {
+            panic!()
+        };
         assert_eq!(m.groups, vec!["readers", "writers"]);
         assert_eq!(m.target_roles, vec!["alice", "bob"]);
         assert_eq!(m.state, 0);
@@ -1637,7 +1723,9 @@ postgresql_membership:
   fail_on_role: false
 "#,
         );
-        let TaskBody::Op(TaskOp::PostgresqlMembership(m)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::PostgresqlMembership(m)) = t.body else {
+            panic!()
+        };
         assert_eq!(m.groups, vec!["readers"]);
         assert_eq!(m.target_roles, vec!["alice"]);
         assert_eq!(m.state, 1);
@@ -1711,7 +1799,9 @@ postgresql_ext:
         );
         let TaskBody::Op(op) = t.body else { panic!() };
         let wire = op.to_wire_op().unwrap();
-        let WireOp::OpPostgresqlExt(e) = wire else { panic!("got {wire:?}") };
+        let WireOp::OpPostgresqlExt(e) = wire else {
+            panic!("got {wire:?}")
+        };
         assert_eq!(e.kind, 14);
         assert_eq!(e.name, "pg_trgm");
         assert_eq!(e.version, "1.6");

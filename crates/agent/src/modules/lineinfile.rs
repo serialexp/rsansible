@@ -44,10 +44,19 @@ use super::{emit_error, Context};
 const STATE_PRESENT: u8 = 0;
 const STATE_ABSENT: u8 = 1;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpLineInFileOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpLineInFileOutput,
+    check_mode: bool,
+) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
-    let mode = if op.has_mode != 0 { Some(op.mode & 0o7777) } else { None };
+    let mode = if op.has_mode != 0 {
+        Some(op.mode & 0o7777)
+    } else {
+        None
+    };
     let create = op.create != 0;
     let backrefs = op.backrefs != 0;
 
@@ -92,7 +101,13 @@ pub async fn run(ctx: &Context, seq: u32, op: OpLineInFileOutput, check_mode: bo
     let regexp = match compile_optional(&op.regexp) {
         Ok(r) => r,
         Err(e) => {
-            emit_error(ctx, seq, err::BAD_REQUEST, format!("lineinfile.regexp: {e}")).await;
+            emit_error(
+                ctx,
+                seq,
+                err::BAD_REQUEST,
+                format!("lineinfile.regexp: {e}"),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -149,7 +164,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpLineInFileOutput, check_mode: bo
         (None, State::Absent, _) => {
             // Absent + missing → done, unchanged.
             let finished = now_unix_ns();
-            ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished)).await;
+            ctx.emit(msg::task_done(
+                seq,
+                0,
+                false,
+                false,
+                started_unix_ns,
+                finished,
+            ))
+            .await;
             return Ok(());
         }
         (None, State::Present, true) => Vec::new(),
@@ -206,7 +229,11 @@ pub async fn run(ctx: &Context, seq: u32, op: OpLineInFileOutput, check_mode: bo
                 new_text.as_bytes(),
                 mode,
                 !file_existed,
-                if op.validate.is_empty() { None } else { Some(op.validate.as_str()) },
+                if op.validate.is_empty() {
+                    None
+                } else {
+                    Some(op.validate.as_str())
+                },
             ) {
                 Ok(()) => {}
                 Err(WriteError::Io(e)) => {
@@ -270,8 +297,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpLineInFileOutput, check_mode: bo
                         }
                     }
                     let finished = now_unix_ns();
-                    ctx.emit(msg::task_done(seq, 0, true, false, started_unix_ns, finished))
-                        .await;
+                    ctx.emit(msg::task_done(
+                        seq,
+                        0,
+                        true,
+                        false,
+                        started_unix_ns,
+                        finished,
+                    ))
+                    .await;
                     return Ok(());
                 }
             }
@@ -289,8 +323,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpLineInFileOutput, check_mode: bo
     }
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
-        .await;
+    ctx.emit(msg::task_done(
+        seq,
+        0,
+        changed,
+        false,
+        started_unix_ns,
+        finished,
+    ))
+    .await;
     Ok(())
 }
 
@@ -503,7 +544,16 @@ mod tests {
 
     #[test]
     fn compute_appends_when_no_match() {
-        let out = compute_new("a\nb\n", State::Present, None, "c", false, None, None, false);
+        let out = compute_new(
+            "a\nb\n",
+            State::Present,
+            None,
+            "c",
+            false,
+            None,
+            None,
+            false,
+        );
         assert_eq!(out, "a\nb\nc\n");
     }
 
@@ -636,16 +686,7 @@ mod tests {
     #[test]
     fn compute_preserves_lack_of_trailing_newline_for_absent_only() {
         // Absent: if every line goes away, we should produce "".
-        let out = compute_new(
-            "x\nx\n",
-            State::Absent,
-            None,
-            "x",
-            false,
-            None,
-            None,
-            false,
-        );
+        let out = compute_new("x\nx\n", State::Absent, None, "x", false, None, None, false);
         assert_eq!(out, "");
     }
 
@@ -655,7 +696,11 @@ mod tests {
 
     #[tokio::test]
     async fn write_atomic_creates_file() {
-        let dir = std::env::temp_dir().join(format!("rsansible-li-{}-{}", std::process::id(), now_unix_ns()));
+        let dir = std::env::temp_dir().join(format!(
+            "rsansible-li-{}-{}",
+            std::process::id(),
+            now_unix_ns()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("out");
         write_atomic(&p, b"hello\n", Some(0o600), true, None).unwrap();
@@ -671,7 +716,11 @@ mod tests {
     /// safety property depends on this.
     #[tokio::test]
     async fn write_atomic_validate_failure_leaves_dest_untouched() {
-        let dir = std::env::temp_dir().join(format!("rsansible-li-val-{}-{}", std::process::id(), now_unix_ns()));
+        let dir = std::env::temp_dir().join(format!(
+            "rsansible-li-val-{}-{}",
+            std::process::id(),
+            now_unix_ns()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("sshd_config");
         std::fs::write(&p, b"# original-known-good\n").unwrap();
@@ -692,7 +741,11 @@ mod tests {
     /// all writes when validate is set.
     #[tokio::test]
     async fn write_atomic_validate_success_writes_dest() {
-        let dir = std::env::temp_dir().join(format!("rsansible-li-valok-{}-{}", std::process::id(), now_unix_ns()));
+        let dir = std::env::temp_dir().join(format!(
+            "rsansible-li-valok-{}-{}",
+            std::process::id(),
+            now_unix_ns()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("config");
         // /bin/true with %s — substitution exercised, success path.

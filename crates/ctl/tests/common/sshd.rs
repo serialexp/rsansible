@@ -103,7 +103,11 @@ impl SshdContainer {
                 "-e",
                 &format!("PUBLIC_KEY={pubkey}"),
                 "-e",
-                if sudo_access { "SUDO_ACCESS=true" } else { "SUDO_ACCESS=false" },
+                if sudo_access {
+                    "SUDO_ACCESS=true"
+                } else {
+                    "SUDO_ACCESS=false"
+                },
                 "-e",
                 "PASSWORD_ACCESS=false",
                 IMAGE,
@@ -235,11 +239,8 @@ async fn wait_for_sshd(host: &str, port: u16) -> Result<()> {
     while Instant::now() < deadline {
         if let Ok(mut stream) = tokio::net::TcpStream::connect((host, port)).await {
             let mut buf = [0u8; 4];
-            let read = tokio::time::timeout(
-                Duration::from_secs(2),
-                stream.read_exact(&mut buf),
-            )
-            .await;
+            let read =
+                tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut buf)).await;
             if matches!(read, Ok(Ok(_))) && &buf == b"SSH-" {
                 drop(stream);
                 return Ok(());

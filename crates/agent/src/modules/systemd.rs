@@ -38,15 +38,18 @@ const STATE_STOPPED: u8 = 2;
 const STATE_RESTARTED: u8 = 3;
 const STATE_RELOADED: u8 = 4;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpSystemdOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpSystemdOutput,
+    check_mode: bool,
+) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
     // `name` is required for any operation that targets a unit
     // (state/enabled/masked). `daemon_reload: true` alone is
     // unit-agnostic — Ansible accepts that form, so we do too.
-    let needs_unit = op.state != STATE_NONE
-        || op.has_enabled != 0
-        || op.has_masked != 0;
+    let needs_unit = op.state != STATE_NONE || op.has_enabled != 0 || op.has_masked != 0;
     if needs_unit && op.name.trim().is_empty() {
         emit_error(
             ctx,
@@ -80,8 +83,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpSystemdOutput, check_mode: bool)
     };
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
-        .await;
+    ctx.emit(msg::task_done(
+        seq,
+        0,
+        changed,
+        false,
+        started_unix_ns,
+        finished,
+    ))
+    .await;
     Ok(())
 }
 
@@ -133,7 +143,10 @@ fn apply(bin: &str, op: &OpSystemdOutput, check_mode: bool) -> Result<bool, Syst
         // `static` is enabled-by-presence-only; treat it as "no action
         // needed" — `systemctl enable` on a static unit is a no-op
         // anyway.
-        let is_enabled = matches!(cur.as_str(), "enabled" | "enabled-runtime" | "alias" | "static");
+        let is_enabled = matches!(
+            cur.as_str(),
+            "enabled" | "enabled-runtime" | "alias" | "static"
+        );
         if want_enabled && !is_enabled {
             do_mutate(&["enable", name])?;
             changed = true;
@@ -351,7 +364,12 @@ esac
     #[test]
     fn started_when_already_active_is_noop() {
         let stub = Stub::new("started-noop", Some("active\n"), None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("nginx.service", STATE_STARTED), false).unwrap();
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &op("nginx.service", STATE_STARTED),
+            false,
+        )
+        .unwrap();
         assert!(!changed);
         let log = stub.log();
         assert!(log.contains("is-active nginx.service"), "log={log:?}");
@@ -361,7 +379,12 @@ esac
     #[test]
     fn started_when_inactive_triggers_start() {
         let stub = Stub::new("started-go", None, None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STARTED), false).unwrap();
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &op("foo.service", STATE_STARTED),
+            false,
+        )
+        .unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("start foo.service"), "log={log:?}");
@@ -370,7 +393,12 @@ esac
     #[test]
     fn stopped_when_active_triggers_stop() {
         let stub = Stub::new("stopped-go", Some("active\n"), None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STOPPED), false).unwrap();
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &op("foo.service", STATE_STOPPED),
+            false,
+        )
+        .unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("stop foo.service"), "log={log:?}");
@@ -379,7 +407,12 @@ esac
     #[test]
     fn stopped_when_already_inactive_is_noop() {
         let stub = Stub::new("stopped-noop", None, None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_STOPPED), false).unwrap();
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &op("foo.service", STATE_STOPPED),
+            false,
+        )
+        .unwrap();
         assert!(!changed);
         let log = stub.log();
         assert!(!log.contains("stop "), "log={log:?}");
@@ -388,7 +421,12 @@ esac
     #[test]
     fn restarted_always_runs_and_reports_changed() {
         let stub = Stub::new("restarted", Some("active\n"), None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("foo.service", STATE_RESTARTED), false).unwrap();
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &op("foo.service", STATE_RESTARTED),
+            false,
+        )
+        .unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(log.contains("restart foo.service"), "log={log:?}");
@@ -403,7 +441,12 @@ esac
     #[test]
     fn reloaded_on_inactive_unit_falls_back_to_start() {
         let stub = Stub::new("reload-inactive", None, None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("vmalert.service", STATE_RELOADED), false).unwrap();
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &op("vmalert.service", STATE_RELOADED),
+            false,
+        )
+        .unwrap();
         assert!(changed, "reload-on-inactive must report changed");
         let log = stub.log();
         // Must NOT have tried `reload` — systemctl would have failed.
@@ -425,7 +468,12 @@ esac
     #[test]
     fn reloaded_on_active_unit_calls_reload() {
         let stub = Stub::new("reload-active", Some("active\n"), None);
-        let changed = apply(stub.path().to_str().unwrap(), &op("vmalert.service", STATE_RELOADED), false).unwrap();
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &op("vmalert.service", STATE_RELOADED),
+            false,
+        )
+        .unwrap();
         assert!(changed);
         let log = stub.log();
         assert!(
@@ -483,10 +531,7 @@ esac
         o.no_block = 1;
         let _ = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         let log = stub.log();
-        assert!(
-            log.contains("--no-block start foo.service"),
-            "log={log:?}"
-        );
+        assert!(log.contains("--no-block start foo.service"), "log={log:?}");
     }
 
     #[test]

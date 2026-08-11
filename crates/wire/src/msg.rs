@@ -448,6 +448,21 @@ pub fn op_timezone(name: String) -> Op {
     Op::OpTimezone(OpTimezoneOutput { kind: 27, name })
 }
 
+/// `state:` byte values for `OpModprobe`.
+pub mod modprobe_state {
+    pub const PRESENT: u8 = 0;
+    pub const ABSENT: u8 = 1;
+}
+
+pub fn op_modprobe(name: String, state: u8, params: String) -> Op {
+    Op::OpModprobe(OpModprobeOutput {
+        kind: 29,
+        name,
+        state,
+        params,
+    })
+}
+
 /// `op:` byte values for `OpUfw`.
 pub mod ufw_op {
     pub const RULE: u8 = 0;
@@ -739,10 +754,7 @@ pub fn op_async_start(timeout_ms: u32, inner: Op) -> Op {
 }
 
 pub fn op_async_status(job_id: u32) -> Op {
-    Op::OpAsyncStatus(OpAsyncStatusOutput {
-        kind: 17,
-        job_id,
-    })
+    Op::OpAsyncStatus(OpAsyncStatusOutput { kind: 17, job_id })
 }
 
 pub fn op_read_file(path: String, max_bytes: u32) -> Op {

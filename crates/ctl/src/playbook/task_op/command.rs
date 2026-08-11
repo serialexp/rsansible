@@ -184,7 +184,9 @@ impl<'de> Deserialize<'de> for CommandOp {
             Some(serde_yaml::Value::Number(n)) => {
                 // Ansible accepts an integer number of seconds; convert.
                 let secs = n.as_u64().ok_or_else(|| {
-                    D::Error::custom(format!("command.timeout: must be a non-negative integer, got: {n}"))
+                    D::Error::custom(format!(
+                        "command.timeout: must be a non-negative integer, got: {n}"
+                    ))
                 })?;
                 u32::try_from(secs.saturating_mul(1_000)).map_err(|_| {
                     D::Error::custom("command.timeout: value too large (overflowed u32 ms)")
@@ -210,9 +212,7 @@ impl<'de> Deserialize<'de> for CommandOp {
         let _ = map.remove("warn");
         let _ = map.remove("strip_empty_ends");
         if let Some((k, _)) = map.into_iter().next() {
-            return Err(D::Error::custom(format!(
-                "command: unknown field {k:?}"
-            )));
+            return Err(D::Error::custom(format!("command: unknown field {k:?}")));
         }
 
         Ok(CommandOp {
@@ -231,15 +231,17 @@ impl<'de> Deserialize<'de> for CommandOp {
 /// error type.
 fn shlex_split_or_err<E: serde::de::Error>(s: &str) -> Result<Vec<String>, E> {
     shlex::split(s).ok_or_else(|| {
-        E::custom(format!("command: shlex parse failed on {s:?} (unterminated quote?)"))
+        E::custom(format!(
+            "command: shlex parse failed on {s:?} (unterminated quote?)"
+        ))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsansible_wire::generated::Op as WireOp;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
+    use rsansible_wire::generated::Op as WireOp;
 
     #[test]
     fn command_string_shorthand_parses_via_task() {

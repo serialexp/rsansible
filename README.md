@@ -106,7 +106,7 @@ short-circuit, post-Jinja shlex split), `shell:`, `exec:`,
 
 **System state:** `systemd:` / `service:`, `package:` (`apt:`,
 `pip:`), `repository:` / `apt_repository:`, `group:`, `user:`,
-`authorized_key:`, `getent:`, `hostname:`, `timezone:`.
+`authorized_key:`, `getent:`, `hostname:`, `timezone:`, `modprobe:`.
 
 **Networking:** `ufw:`, `iptables:` (subset; see ANSIBLE_COMPAT.md
 §9 for the rejected knobs), `uri:` (HTTP client).

@@ -55,9 +55,8 @@ fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()>
     // Catches malformed regex, unbalanced brackets, leading `!`/`&`, etc.
     if !entries.is_empty() {
         let joined = entries.join(",");
-        crate::host_pattern::HostPattern::parse(&joined).map_err(|e| {
-            anyhow!("{}: invalid hosts pattern {:?}: {}", where_(), joined, e)
-        })?;
+        crate::host_pattern::HostPattern::parse(&joined)
+            .map_err(|e| anyhow!("{}: invalid hosts pattern {:?}: {}", where_(), joined, e))?;
     }
     if let Some(inv) = inv {
         for n in &entries {
@@ -118,9 +117,7 @@ fn validate_play(play: &Play, idx: usize, inv: Option<&Inventory>) -> Result<()>
             }
         }
         if let TaskBody::Op(TaskOp::OpenSslCsrPipe(c)) = &task.body {
-            if !c.privatekey_path.contains("{{")
-                && !privkey_paths.contains(&c.privatekey_path)
-            {
+            if !c.privatekey_path.contains("{{") && !privkey_paths.contains(&c.privatekey_path) {
                 bail!(
                     "{}: task[{ti}] {:?}: openssl_csr_pipe.privatekey_path {:?} doesn't \
                      match any preceding openssl_privatekey task in this play. v1 requires \
@@ -416,9 +413,7 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             // resolution was deferred to dispatch. The deferred-load
             // path stashes the search dirs on the op; if those are
             // empty we know the resolver was never run.
-            if t.body.is_none()
-                && !crate::playbook::task_op::shared::string_is_jinja(&t.src)
-            {
+            if t.body.is_none() && !crate::playbook::task_op::shared::string_is_jinja(&t.src) {
                 bail!(
                     "{}: task[{ti}] {:?}: template src {:?} was not resolved at load time; \
                      call playbook::load() or ensure the file exists",
@@ -437,11 +432,7 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             // `body: None` at validate time.
             if let Some(src) = c.src.as_deref() {
                 if src.is_empty() {
-                    bail!(
-                        "{}: task[{ti}] {:?}: copy.src is empty",
-                        where_,
-                        task.name
-                    );
+                    bail!("{}: task[{ti}] {:?}: copy.src is empty", where_, task.name);
                 }
                 // `remote_src: true` makes src a target-side path; no
                 // controller-side load. Jinja-templated src is deferred
@@ -461,11 +452,7 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
                 }
             }
             if c.dest.is_empty() {
-                bail!(
-                    "{}: task[{ti}] {:?}: copy.dest is empty",
-                    where_,
-                    task.name
-                );
+                bail!("{}: task[{ti}] {:?}: copy.dest is empty", where_, task.name);
             }
             Ok(())
         }
@@ -481,11 +468,7 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
         }
         TaskOp::Stat(s) => {
             if s.path.is_empty() {
-                bail!(
-                    "{}: task[{ti}] {:?}: stat.path is empty",
-                    where_,
-                    task.name
-                );
+                bail!("{}: task[{ti}] {:?}: stat.path is empty", where_, task.name);
             }
             Ok(())
         }
@@ -669,11 +652,7 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
         }
         TaskOp::User(u) => {
             if u.name.trim().is_empty() {
-                bail!(
-                    "{}: task[{ti}] {:?}: user.name is empty",
-                    where_,
-                    task.name
-                );
+                bail!("{}: task[{ti}] {:?}: user.name is empty", where_, task.name);
             }
             Ok(())
         }
@@ -733,11 +712,7 @@ fn validate_op(op: &TaskOp, task: &Task, where_: &str, ti: usize) -> Result<()> 
             // enum membership). Header-injection guard: forbid CR/LF in
             // header keys.
             if u.url.trim().is_empty() {
-                bail!(
-                    "{}: task[{ti}] {:?}: uri.url is empty",
-                    where_,
-                    task.name
-                );
+                bail!("{}: task[{ti}] {:?}: uri.url is empty", where_, task.name);
             }
             for k in u.headers.keys() {
                 if k.is_empty() || k.contains('\r') || k.contains('\n') || k.contains(':') {
@@ -999,7 +974,10 @@ mod tests {
         .unwrap();
         let err = validate(&pb, None).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("duplicate") || msg.contains("dup"), "got: {msg}");
+        assert!(
+            msg.contains("duplicate") || msg.contains("dup"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1061,7 +1039,10 @@ mod tests {
         .unwrap();
         let err = validate(&pb, None).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("meta") && msg.contains("register"), "got: {msg}");
+        assert!(
+            msg.contains("meta") && msg.contains("register"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1150,7 +1131,10 @@ mod tests {
         .unwrap();
         let err = validate(&pb, None).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("stat.path") && msg.contains("empty"), "got: {msg}");
+        assert!(
+            msg.contains("stat.path") && msg.contains("empty"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1184,7 +1168,10 @@ mod tests {
         .unwrap();
         let err = validate(&pb, None).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("file.path") && msg.contains("empty"), "got: {msg}");
+        assert!(
+            msg.contains("file.path") && msg.contains("empty"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1203,7 +1190,10 @@ mod tests {
         .unwrap();
         let err = validate(&pb, None).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("recurse") && msg.contains("directory"), "got: {msg}");
+        assert!(
+            msg.contains("recurse") && msg.contains("directory"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1317,6 +1307,9 @@ mod tests {
         .unwrap();
         let err = validate(&pb, None).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("import_tasks") || msg.contains("flattened"), "got: {msg}");
+        assert!(
+            msg.contains("import_tasks") || msg.contains("flattened"),
+            "got: {msg}"
+        );
     }
 }

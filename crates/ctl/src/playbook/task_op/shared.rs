@@ -40,9 +40,7 @@ pub(super) fn take_optional_ansible_bool<E: serde::de::Error>(
                 "{key}: expected bool (true/false/yes/no/on/off), got: {other:?}"
             ))),
         },
-        Some(other) => Err(E::custom(format!(
-            "{key}: expected bool, got: {other:?}"
-        ))),
+        Some(other) => Err(E::custom(format!("{key}: expected bool, got: {other:?}"))),
     }
 }
 
@@ -122,7 +120,9 @@ pub(super) fn take_when_field<E: serde::de::Error>(
     match map.remove("when") {
         None => Ok(None),
         Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
-        Some(serde_yaml::Value::Bool(b)) => Ok(Some(if b { "true".into() } else { "false".into() })),
+        Some(serde_yaml::Value::Bool(b)) => {
+            Ok(Some(if b { "true".into() } else { "false".into() }))
+        }
         Some(serde_yaml::Value::Sequence(seq)) => {
             if seq.is_empty() {
                 return Ok(None);
@@ -247,9 +247,11 @@ pub(super) fn take_optional_string_list<E: serde::de::Error>(
             for (i, v) in seq.into_iter().enumerate() {
                 match v {
                     serde_yaml::Value::String(s) => out.push(s),
-                    other => return Err(E::custom(format!(
-                        "{key}[{i}]: expected a string, got: {other:?}"
-                    ))),
+                    other => {
+                        return Err(E::custom(format!(
+                            "{key}[{i}]: expected a string, got: {other:?}"
+                        )))
+                    }
                 }
             }
             Ok(Some(out))
@@ -270,9 +272,9 @@ pub(super) fn take_seconds_ms<E: serde::de::Error>(
     match map.remove(key) {
         None => Ok(default_ms),
         Some(serde_yaml::Value::Number(n)) => {
-            let s = n.as_f64().ok_or_else(|| {
-                E::custom(format!("wait_for.{key}: invalid number {n}"))
-            })?;
+            let s = n
+                .as_f64()
+                .ok_or_else(|| E::custom(format!("wait_for.{key}: invalid number {n}")))?;
             if !s.is_finite() || s < 0.0 {
                 return Err(E::custom(format!(
                     "wait_for.{key}: expected non-negative seconds, got {s}"
@@ -281,9 +283,9 @@ pub(super) fn take_seconds_ms<E: serde::de::Error>(
             Ok((s * 1000.0) as u32)
         }
         Some(serde_yaml::Value::String(s)) => {
-            let f = s.parse::<f64>().map_err(|e| {
-                E::custom(format!("wait_for.{key}: invalid number {s:?}: {e}"))
-            })?;
+            let f = s
+                .parse::<f64>()
+                .map_err(|e| E::custom(format!("wait_for.{key}: invalid number {s:?}: {e}")))?;
             if !f.is_finite() || f < 0.0 {
                 return Err(E::custom(format!(
                     "wait_for.{key}: expected non-negative seconds, got {f}"
@@ -449,11 +451,9 @@ where
     };
     let n = match v {
         serde_yaml::Value::Null => return Ok(None),
-        serde_yaml::Value::Number(n) => {
-            n.as_u64().ok_or_else(|| {
-                D::Error::custom(format!("mode: expected non-negative integer, got: {n}"))
-            })? as u32
-        }
+        serde_yaml::Value::Number(n) => n.as_u64().ok_or_else(|| {
+            D::Error::custom(format!("mode: expected non-negative integer, got: {n}"))
+        })? as u32,
         serde_yaml::Value::String(s) => parse_mode_str(&s).map_err(D::Error::custom)?,
         other => {
             return Err(D::Error::custom(format!(
@@ -513,8 +513,7 @@ pub(super) fn parse_mode_str(s: &str) -> Result<u32, String> {
     } else {
         (t, 8u32)
     };
-    u32::from_str_radix(body, radix)
-        .map_err(|e| format!("mode: invalid octal {s:?}: {e}"))
+    u32::from_str_radix(body, radix).map_err(|e| format!("mode: invalid octal {s:?}: {e}"))
 }
 
 /// Accept Ansible-flavored booleans: `true`, `false`, `yes`, `no`, `on`,
@@ -535,9 +534,7 @@ where
                 "expected bool (true/false/yes/no/on/off), got: {other:?}"
             ))),
         },
-        other => Err(D::Error::custom(format!(
-            "expected bool, got: {other:?}"
-        ))),
+        other => Err(D::Error::custom(format!("expected bool, got: {other:?}"))),
     }
 }
 
@@ -560,9 +557,7 @@ pub(super) fn parse_ansible_bool<E: serde::de::Error>(
                 "{field}: expected bool (yes/no/true/false), got: {other:?}"
             ))),
         },
-        Some(other) => Err(E::custom(format!(
-            "{field}: expected bool, got: {other:?}"
-        ))),
+        Some(other) => Err(E::custom(format!("{field}: expected bool, got: {other:?}"))),
     }
 }
 
@@ -576,7 +571,9 @@ pub(super) fn parse_octal_mode<E: serde::de::Error>(s: &str) -> Result<u32, E> {
         .or_else(|| trimmed.strip_prefix("0O"))
         .unwrap_or(trimmed);
     u32::from_str_radix(radix_stripped, 8).map_err(|e| {
-        E::custom(format!("expected octal mode string (e.g. \"0644\"), got {s:?}: {e}"))
+        E::custom(format!(
+            "expected octal mode string (e.g. \"0644\"), got {s:?}: {e}"
+        ))
     })
 }
 
@@ -608,7 +605,6 @@ where
         .collect()
 }
 
-
 /// Read a PEM file from the controller filesystem at wire-emit time.
 /// Empty path → empty bytes (= absent on the wire). The caller has
 /// already rendered any Jinja in the path. Used by `OpUri` for
@@ -620,6 +616,5 @@ pub(super) fn read_pem_if_set(path: &str, field: &str) -> anyhow::Result<Vec<u8>
     if path.is_empty() {
         return Ok(Vec::new());
     }
-    std::fs::read(path)
-        .with_context(|| format!("uri.{field}: reading PEM from {path:?}"))
+    std::fs::read(path).with_context(|| format!("uri.{field}: reading PEM from {path:?}"))
 }

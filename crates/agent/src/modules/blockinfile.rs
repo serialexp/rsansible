@@ -40,10 +40,19 @@ use super::{emit_error, Context};
 const STATE_PRESENT: u8 = 0;
 const STATE_ABSENT: u8 = 1;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpBlockInFileOutput,
+    check_mode: bool,
+) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
 
-    let mode = if op.has_mode != 0 { Some(op.mode & 0o7777) } else { None };
+    let mode = if op.has_mode != 0 {
+        Some(op.mode & 0o7777)
+    } else {
+        None
+    };
     let create = op.create != 0;
 
     let state = match op.state {
@@ -127,8 +136,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput, check_mode: b
         (None, State::Absent, _) => {
             // Absent + missing → done, unchanged.
             let finished = now_unix_ns();
-            ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished))
-                .await;
+            ctx.emit(msg::task_done(
+                seq,
+                0,
+                false,
+                false,
+                started_unix_ns,
+                finished,
+            ))
+            .await;
             return Ok(());
         }
         (None, State::Present, true) => Vec::new(),
@@ -185,7 +201,11 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput, check_mode: b
                 new_text.as_bytes(),
                 mode,
                 !file_existed,
-                if op.validate.is_empty() { None } else { Some(op.validate.as_str()) },
+                if op.validate.is_empty() {
+                    None
+                } else {
+                    Some(op.validate.as_str())
+                },
             ) {
                 Ok(()) => {}
                 Err(WriteError::Io(e)) => {
@@ -247,8 +267,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput, check_mode: b
                         }
                     }
                     let finished = now_unix_ns();
-                    ctx.emit(msg::task_done(seq, 0, true, false, started_unix_ns, finished))
-                        .await;
+                    ctx.emit(msg::task_done(
+                        seq,
+                        0,
+                        true,
+                        false,
+                        started_unix_ns,
+                        finished,
+                    ))
+                    .await;
                     return Ok(());
                 }
             }
@@ -266,8 +293,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpBlockInFileOutput, check_mode: b
     }
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
-        .await;
+    ctx.emit(msg::task_done(
+        seq,
+        0,
+        changed,
+        false,
+        started_unix_ns,
+        finished,
+    ))
+    .await;
     Ok(())
 }
 
@@ -350,8 +384,7 @@ fn compute_new(
             }
 
             // Build the new block lines: begin, body lines, end.
-            let mut block_lines: Vec<String> =
-                Vec::with_capacity(block.lines().count() + 2);
+            let mut block_lines: Vec<String> = Vec::with_capacity(block.lines().count() + 2);
             block_lines.push(begin_marker.to_string());
             for bl in block.split('\n') {
                 // split('\n') on "a\nb" yields ["a", "b"]; on "a\nb\n"
@@ -494,7 +527,8 @@ mod tests {
 
     #[test]
     fn replace_existing_block_in_place() {
-        let initial = "head\n# BEGIN ANSIBLE MANAGED BLOCK\nold1\nold2\n# END ANSIBLE MANAGED BLOCK\ntail\n";
+        let initial =
+            "head\n# BEGIN ANSIBLE MANAGED BLOCK\nold1\nold2\n# END ANSIBLE MANAGED BLOCK\ntail\n";
         let out = run_present(initial, "new1\nnew2");
         assert_eq!(
             out,
@@ -504,7 +538,8 @@ mod tests {
 
     #[test]
     fn idempotent_replace_with_same_content() {
-        let initial = "head\n# BEGIN ANSIBLE MANAGED BLOCK\na\nb\n# END ANSIBLE MANAGED BLOCK\ntail\n";
+        let initial =
+            "head\n# BEGIN ANSIBLE MANAGED BLOCK\na\nb\n# END ANSIBLE MANAGED BLOCK\ntail\n";
         let out = run_present(initial, "a\nb");
         assert_eq!(out, initial);
     }
@@ -543,7 +578,8 @@ mod tests {
 
     #[test]
     fn present_empty_block_removes_existing() {
-        let initial = "head\n# BEGIN ANSIBLE MANAGED BLOCK\nold\n# END ANSIBLE MANAGED BLOCK\ntail\n";
+        let initial =
+            "head\n# BEGIN ANSIBLE MANAGED BLOCK\nold\n# END ANSIBLE MANAGED BLOCK\ntail\n";
         let out = run_present(initial, "");
         assert_eq!(out, "head\ntail\n");
     }
@@ -593,8 +629,12 @@ mod tests {
         let out = compute_new(
             "",
             State::Present,
-            "// ---- {mark}-deploy ----".replace("{mark}", "TOP").as_str(),
-            "// ---- {mark}-deploy ----".replace("{mark}", "BOT").as_str(),
+            "// ---- {mark}-deploy ----"
+                .replace("{mark}", "TOP")
+                .as_str(),
+            "// ---- {mark}-deploy ----"
+                .replace("{mark}", "BOT")
+                .as_str(),
             "ln1\nln2",
             None,
             None,

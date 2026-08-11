@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# rsansible pre-commit hook — formatting gate.
+#
+# Why this exists: CI runs `cargo fmt --all --check` (.github/workflows/
+# ci.yml). Without a local gate, formatting drift is only discovered after
+# a push, and by then the fix is a separate commit touching files unrelated
+# to whatever you were actually working on. Worse, a rustfmt version bump
+# silently reformats the entire repo the next time anyone runs `cargo fmt
+# --all` — which is exactly how ~125 unrelated files once ended up in a
+# one-module changeset.
+#
+# Scope is deliberately just formatting: it has to be fast enough that
+# nobody is tempted to --no-verify past it. Clippy and tests are heavier
+# and live in `just lint` / `just test` and CI.
+#
+# Install with: just install-hooks
+
+set -euo pipefail
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not on PATH — skipping fmt check" >&2
+    exit 0
+fi
+
+if ! cargo fmt --all --check >/tmp/rsansible-fmt-check.$$ 2>&1; then
+    files=$(grep -c '^Diff in' /tmp/rsansible-fmt-check.$$ || true)
+    echo >&2
+    echo "pre-commit: formatting check failed (${files:-?} location(s))." >&2
+    echo >&2
+    sed -n '1,40p' /tmp/rsansible-fmt-check.$$ >&2
+    if [ "$(wc -l </tmp/rsansible-fmt-check.$$)" -gt 40 ]; then
+        echo "  ... truncated; run 'cargo fmt --all --check' for the rest" >&2
+    fi
+    echo >&2
+    echo "Fix with:  just fmt" >&2
+    echo >&2
+    echo "If this suddenly reports files you never touched, your rustfmt" >&2
+    echo "probably differs from the one the tree was formatted with —" >&2
+    echo "check 'rustfmt --version' before committing a repo-wide reformat," >&2
+    echo "and if you do land one, keep it as its own commit." >&2
+    rm -f /tmp/rsansible-fmt-check.$$
+    exit 1
+fi
+
+rm -f /tmp/rsansible-fmt-check.$$
+exit 0

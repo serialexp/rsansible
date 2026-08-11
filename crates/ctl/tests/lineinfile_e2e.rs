@@ -46,8 +46,7 @@ async fn lineinfile_create_replace_insert_remove() -> Result<()> {
     let inv = single_host_inventory(&container);
 
     let pb_path = examples_dir().join("lineinfile.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

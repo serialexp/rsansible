@@ -39,8 +39,7 @@ async fn file_module_directory_touch_file_absent_recurse() -> Result<()> {
     let inv = single_host_inventory(&container);
 
     let pb_path = examples_dir().join("file.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

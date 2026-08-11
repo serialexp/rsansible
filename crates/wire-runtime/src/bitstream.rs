@@ -64,7 +64,11 @@ impl BitStreamEncoder {
             return;
         }
 
-        let mask = if num_bits == 64 { u64::MAX } else { (1u64 << num_bits) - 1 };
+        let mask = if num_bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << num_bits) - 1
+        };
         let value = value & mask;
 
         // Fast path: MSB-first writes of <=8 bits that fit in current byte
@@ -242,43 +246,64 @@ impl BitStreamEncoder {
 
     #[inline]
     pub fn write_byte(&mut self, value: u8) {
-        debug_assert_eq!(self.bit_position, 0, "write_byte called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_position, 0,
+            "write_byte called when not byte-aligned"
+        );
         self.buffer.push(value);
     }
 
     #[inline]
     pub fn write_u16_le(&mut self, value: u16) {
-        debug_assert_eq!(self.bit_position, 0, "write_u16_le called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_position, 0,
+            "write_u16_le called when not byte-aligned"
+        );
         self.buffer.extend_from_slice(&value.to_le_bytes());
     }
 
     #[inline]
     pub fn write_u16_be(&mut self, value: u16) {
-        debug_assert_eq!(self.bit_position, 0, "write_u16_be called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_position, 0,
+            "write_u16_be called when not byte-aligned"
+        );
         self.buffer.extend_from_slice(&value.to_be_bytes());
     }
 
     #[inline]
     pub fn write_u32_le(&mut self, value: u32) {
-        debug_assert_eq!(self.bit_position, 0, "write_u32_le called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_position, 0,
+            "write_u32_le called when not byte-aligned"
+        );
         self.buffer.extend_from_slice(&value.to_le_bytes());
     }
 
     #[inline]
     pub fn write_u32_be(&mut self, value: u32) {
-        debug_assert_eq!(self.bit_position, 0, "write_u32_be called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_position, 0,
+            "write_u32_be called when not byte-aligned"
+        );
         self.buffer.extend_from_slice(&value.to_be_bytes());
     }
 
     #[inline]
     pub fn write_u64_le(&mut self, value: u64) {
-        debug_assert_eq!(self.bit_position, 0, "write_u64_le called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_position, 0,
+            "write_u64_le called when not byte-aligned"
+        );
         self.buffer.extend_from_slice(&value.to_le_bytes());
     }
 
     #[inline]
     pub fn write_u64_be(&mut self, value: u64) {
-        debug_assert_eq!(self.bit_position, 0, "write_u64_be called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_position, 0,
+            "write_u64_be called when not byte-aligned"
+        );
         self.buffer.extend_from_slice(&value.to_be_bytes());
     }
 
@@ -291,7 +316,10 @@ impl BitStreamEncoder {
             "leb128" => self.write_varlength_leb128(value),
             "ebml" => self.write_varlength_ebml(value),
             "vlq" => self.write_varlength_vlq(value),
-            _ => Err(BinSchemaError::InvalidValue(format!("Unknown varlength encoding: {}", encoding))),
+            _ => Err(BinSchemaError::InvalidValue(format!(
+                "Unknown varlength encoding: {}",
+                encoding
+            ))),
         }
     }
 
@@ -301,7 +329,10 @@ impl BitStreamEncoder {
         match encoding {
             "zigzag" => self.write_varlength_zigzag(value),
             "leb128_signed" => self.write_varlength_sleb128(value),
-            _ => Err(BinSchemaError::InvalidValue(format!("Unknown signed varlength encoding: {}", encoding))),
+            _ => Err(BinSchemaError::InvalidValue(format!(
+                "Unknown signed varlength encoding: {}",
+                encoding
+            ))),
         }
     }
 
@@ -390,7 +421,10 @@ impl BitStreamEncoder {
         }
 
         if value > max_val {
-            return Err(BinSchemaError::InvalidEncoding(format!("EBML value {} too large for 8-byte encoding", value)));
+            return Err(BinSchemaError::InvalidEncoding(format!(
+                "EBML value {} too large for 8-byte encoding",
+                value
+            )));
         }
 
         // Set marker bit at position (width * 7)
@@ -408,7 +442,10 @@ impl BitStreamEncoder {
     #[inline]
     fn write_varlength_vlq(&mut self, value: u64) -> Result<()> {
         if value > 0x0FFFFFFF {
-            return Err(BinSchemaError::InvalidEncoding(format!("VLQ value {} exceeds maximum (0x0FFFFFFF)", value)));
+            return Err(BinSchemaError::InvalidEncoding(format!(
+                "VLQ value {} exceeds maximum (0x0FFFFFFF)",
+                value
+            )));
         }
 
         // Collect bytes in reverse order (LSB first)
@@ -469,7 +506,9 @@ impl<'a> BitStreamDecoder<'a> {
     #[inline]
     pub fn read_bits(&mut self, num_bits: u8) -> Result<u64> {
         if num_bits == 0 || num_bits > 64 {
-            return Err(BinSchemaError::InvalidValue("Invalid number of bits".to_string()));
+            return Err(BinSchemaError::InvalidValue(
+                "Invalid number of bits".to_string(),
+            ));
         }
 
         // Fast path: MSB-first reads of <=8 bits
@@ -498,7 +537,8 @@ impl<'a> BitStreamDecoder<'a> {
             let bits_from_first = bits_available;
             let bits_from_second = num_bits - bits_from_first;
             let mask_first = (1u8 << bits_from_first) - 1;
-            let high_part = ((self.bytes[self.byte_offset] & mask_first) as u64) << bits_from_second;
+            let high_part =
+                ((self.bytes[self.byte_offset] & mask_first) as u64) << bits_from_second;
             let shift = 8 - bits_from_second;
             let mask_second = (1u8 << bits_from_second) - 1;
             let low_part = ((self.bytes[self.byte_offset + 1] >> shift) & mask_second) as u64;
@@ -553,7 +593,9 @@ impl<'a> BitStreamDecoder<'a> {
     #[inline]
     pub fn read_bytes_vec(&mut self, n: usize) -> Result<Vec<u8>> {
         if self.bit_offset != 0 {
-            return Err(BinSchemaError::AlignmentRequired("read_bytes_vec requires byte alignment".to_string()));
+            return Err(BinSchemaError::AlignmentRequired(
+                "read_bytes_vec requires byte alignment".to_string(),
+            ));
         }
         if self.byte_offset + n > self.bytes.len() {
             return Err(BinSchemaError::UnexpectedEof);
@@ -593,10 +635,14 @@ impl<'a> BitStreamDecoder<'a> {
                 return Err(BinSchemaError::UnexpectedEof);
             }
             let v = match endianness {
-                Endianness::BigEndian =>
-                    u16::from_be_bytes([self.bytes[self.byte_offset], self.bytes[self.byte_offset + 1]]),
-                Endianness::LittleEndian =>
-                    u16::from_le_bytes([self.bytes[self.byte_offset], self.bytes[self.byte_offset + 1]]),
+                Endianness::BigEndian => u16::from_be_bytes([
+                    self.bytes[self.byte_offset],
+                    self.bytes[self.byte_offset + 1],
+                ]),
+                Endianness::LittleEndian => u16::from_le_bytes([
+                    self.bytes[self.byte_offset],
+                    self.bytes[self.byte_offset + 1],
+                ]),
             };
             self.byte_offset += 2;
             return Ok(v);
@@ -732,29 +778,44 @@ impl<'a> BitStreamDecoder<'a> {
 
     #[inline]
     pub fn read_u16_le(&mut self) -> Result<u16> {
-        debug_assert_eq!(self.bit_offset, 0, "read_u16_le called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_offset, 0,
+            "read_u16_le called when not byte-aligned"
+        );
         if self.byte_offset + 2 > self.bytes.len() {
             return Err(BinSchemaError::UnexpectedEof);
         }
-        let v = u16::from_le_bytes([self.bytes[self.byte_offset], self.bytes[self.byte_offset + 1]]);
+        let v = u16::from_le_bytes([
+            self.bytes[self.byte_offset],
+            self.bytes[self.byte_offset + 1],
+        ]);
         self.byte_offset += 2;
         Ok(v)
     }
 
     #[inline]
     pub fn read_u16_be(&mut self) -> Result<u16> {
-        debug_assert_eq!(self.bit_offset, 0, "read_u16_be called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_offset, 0,
+            "read_u16_be called when not byte-aligned"
+        );
         if self.byte_offset + 2 > self.bytes.len() {
             return Err(BinSchemaError::UnexpectedEof);
         }
-        let v = u16::from_be_bytes([self.bytes[self.byte_offset], self.bytes[self.byte_offset + 1]]);
+        let v = u16::from_be_bytes([
+            self.bytes[self.byte_offset],
+            self.bytes[self.byte_offset + 1],
+        ]);
         self.byte_offset += 2;
         Ok(v)
     }
 
     #[inline]
     pub fn read_u32_le(&mut self) -> Result<u32> {
-        debug_assert_eq!(self.bit_offset, 0, "read_u32_le called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_offset, 0,
+            "read_u32_le called when not byte-aligned"
+        );
         if self.byte_offset + 4 > self.bytes.len() {
             return Err(BinSchemaError::UnexpectedEof);
         }
@@ -770,7 +831,10 @@ impl<'a> BitStreamDecoder<'a> {
 
     #[inline]
     pub fn read_u32_be(&mut self) -> Result<u32> {
-        debug_assert_eq!(self.bit_offset, 0, "read_u32_be called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_offset, 0,
+            "read_u32_be called when not byte-aligned"
+        );
         if self.byte_offset + 4 > self.bytes.len() {
             return Err(BinSchemaError::UnexpectedEof);
         }
@@ -786,7 +850,10 @@ impl<'a> BitStreamDecoder<'a> {
 
     #[inline]
     pub fn read_u64_le(&mut self) -> Result<u64> {
-        debug_assert_eq!(self.bit_offset, 0, "read_u64_le called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_offset, 0,
+            "read_u64_le called when not byte-aligned"
+        );
         if self.byte_offset + 8 > self.bytes.len() {
             return Err(BinSchemaError::UnexpectedEof);
         }
@@ -798,7 +865,10 @@ impl<'a> BitStreamDecoder<'a> {
 
     #[inline]
     pub fn read_u64_be(&mut self) -> Result<u64> {
-        debug_assert_eq!(self.bit_offset, 0, "read_u64_be called when not byte-aligned");
+        debug_assert_eq!(
+            self.bit_offset, 0,
+            "read_u64_be called when not byte-aligned"
+        );
         if self.byte_offset + 8 > self.bytes.len() {
             return Err(BinSchemaError::UnexpectedEof);
         }
@@ -817,7 +887,10 @@ impl<'a> BitStreamDecoder<'a> {
             "leb128" => self.read_varlength_leb128(),
             "ebml" => self.read_varlength_ebml(),
             "vlq" => self.read_varlength_vlq(),
-            _ => Err(BinSchemaError::InvalidValue(format!("Unknown varlength encoding: {}", encoding))),
+            _ => Err(BinSchemaError::InvalidValue(format!(
+                "Unknown varlength encoding: {}",
+                encoding
+            ))),
         }
     }
 
@@ -827,7 +900,10 @@ impl<'a> BitStreamDecoder<'a> {
         match encoding {
             "zigzag" => self.read_varlength_zigzag(),
             "leb128_signed" => self.read_varlength_sleb128(),
-            _ => Err(BinSchemaError::InvalidValue(format!("Unknown signed varlength encoding: {}", encoding))),
+            _ => Err(BinSchemaError::InvalidValue(format!(
+                "Unknown signed varlength encoding: {}",
+                encoding
+            ))),
         }
     }
 
@@ -853,7 +929,9 @@ impl<'a> BitStreamDecoder<'a> {
                 break;
             }
             if shift > 70 {
-                return Err(BinSchemaError::InvalidEncoding("SLEB128 value too large".to_string()));
+                return Err(BinSchemaError::InvalidEncoding(
+                    "SLEB128 value too large".to_string(),
+                ));
             }
         }
         // Sign-extend if the sign bit (0x40) of the final byte is set.
@@ -872,7 +950,9 @@ impl<'a> BitStreamDecoder<'a> {
         } else {
             let num_bytes = (first & 0x7F) as usize;
             if num_bytes > 8 {
-                return Err(BinSchemaError::InvalidEncoding("DER variable length too large".to_string()));
+                return Err(BinSchemaError::InvalidEncoding(
+                    "DER variable length too large".to_string(),
+                ));
             }
             let mut value = 0u64;
             for _ in 0..num_bytes {
@@ -894,7 +974,9 @@ impl<'a> BitStreamDecoder<'a> {
             shift += 7;
 
             if shift > 64 {
-                return Err(BinSchemaError::InvalidEncoding("LEB128 value too large".to_string()));
+                return Err(BinSchemaError::InvalidEncoding(
+                    "LEB128 value too large".to_string(),
+                ));
             }
 
             if (byte & 0x80) == 0 {
@@ -919,7 +1001,9 @@ impl<'a> BitStreamDecoder<'a> {
         }
 
         if width > 8 {
-            return Err(BinSchemaError::InvalidEncoding("EBML VINT: no marker bit found".to_string()));
+            return Err(BinSchemaError::InvalidEncoding(
+                "EBML VINT: no marker bit found".to_string(),
+            ));
         }
 
         // Start with first byte, removing marker bit
@@ -941,7 +1025,9 @@ impl<'a> BitStreamDecoder<'a> {
 
         loop {
             if bytes_read >= 4 {
-                return Err(BinSchemaError::InvalidEncoding("VLQ value too large (exceeds 4 bytes)".to_string()));
+                return Err(BinSchemaError::InvalidEncoding(
+                    "VLQ value too large (exceeds 4 bytes)".to_string(),
+                ));
             }
 
             let byte = self.read_uint8()?;
@@ -976,7 +1062,10 @@ impl<'a> BitStreamDecoder<'a> {
     #[inline]
     pub fn seek(&mut self, pos: usize) -> Result<()> {
         if pos > self.bytes.len() {
-            return Err(BinSchemaError::OutOfBounds(format!("Seek position {} is past end of data", pos)));
+            return Err(BinSchemaError::OutOfBounds(format!(
+                "Seek position {} is past end of data",
+                pos
+            )));
         }
         self.byte_offset = pos;
         self.bit_offset = 0;
@@ -991,7 +1080,9 @@ impl<'a> BitStreamDecoder<'a> {
         }
         // If we're in the middle of a byte, we can't peek properly
         if self.bit_offset != 0 {
-            return Err(BinSchemaError::AlignmentRequired("Cannot peek when not byte-aligned".to_string()));
+            return Err(BinSchemaError::AlignmentRequired(
+                "Cannot peek when not byte-aligned".to_string(),
+            ));
         }
         Ok(self.bytes[self.byte_offset])
     }
@@ -1003,7 +1094,9 @@ impl<'a> BitStreamDecoder<'a> {
             return Err(BinSchemaError::UnexpectedEof);
         }
         if self.bit_offset != 0 {
-            return Err(BinSchemaError::AlignmentRequired("Cannot peek when not byte-aligned".to_string()));
+            return Err(BinSchemaError::AlignmentRequired(
+                "Cannot peek when not byte-aligned".to_string(),
+            ));
         }
         match endianness {
             Endianness::BigEndian => {
@@ -1026,7 +1119,9 @@ impl<'a> BitStreamDecoder<'a> {
             return Err(BinSchemaError::UnexpectedEof);
         }
         if self.bit_offset != 0 {
-            return Err(BinSchemaError::AlignmentRequired("Cannot peek when not byte-aligned".to_string()));
+            return Err(BinSchemaError::AlignmentRequired(
+                "Cannot peek when not byte-aligned".to_string(),
+            ));
         }
         match endianness {
             Endianness::BigEndian => {
@@ -1087,8 +1182,14 @@ mod tests {
         let bytes = encoder.finish();
         let mut decoder = BitStreamDecoder::new(&bytes, BitOrder::MsbFirst);
 
-        assert_eq!(decoder.read_float32(Endianness::BigEndian).unwrap(), f32::INFINITY);
-        assert_eq!(decoder.read_float32(Endianness::BigEndian).unwrap(), f32::NEG_INFINITY);
+        assert_eq!(
+            decoder.read_float32(Endianness::BigEndian).unwrap(),
+            f32::INFINITY
+        );
+        assert_eq!(
+            decoder.read_float32(Endianness::BigEndian).unwrap(),
+            f32::NEG_INFINITY
+        );
     }
 
     #[test]

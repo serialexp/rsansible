@@ -32,8 +32,8 @@ impl ShellOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playbook::task_op::TaskOp;
     use rsansible_wire::generated::Op as WireOp;
-    use crate::playbook::task_op::{TaskOp};
 
     #[test]
     fn shell_simple_to_wire() {

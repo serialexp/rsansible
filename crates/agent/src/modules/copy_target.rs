@@ -182,13 +182,7 @@ pub async fn run(
 
     if let Err(e) = write_result {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        emit_error(
-            ctx,
-            seq,
-            map_io_err(&e),
-            format!("write {}: {e}", op.dest),
-        )
-        .await;
+        emit_error(ctx, seq, map_io_err(&e), format!("write {}: {e}", op.dest)).await;
         return Ok(());
     }
 
@@ -316,7 +310,9 @@ mod tests {
         (Context::new(crate::writer::Sender(tx)), rx)
     }
 
-    async fn drain(mut rx: mpsc::Receiver<rsansible_wire::Message>) -> Vec<rsansible_wire::Message> {
+    async fn drain(
+        mut rx: mpsc::Receiver<rsansible_wire::Message>,
+    ) -> Vec<rsansible_wire::Message> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
             out.push(m);

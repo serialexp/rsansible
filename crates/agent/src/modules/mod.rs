@@ -18,15 +18,16 @@ mod get_url;
 mod getent;
 mod group;
 mod hostname;
-mod timezone;
 mod iptables;
 mod lineinfile;
+mod modprobe;
 mod package;
 mod postgresql;
 mod read_file;
 mod repository;
 mod stat;
 mod systemd;
+mod timezone;
 mod ufw;
 mod unarchive;
 mod uri;
@@ -106,6 +107,7 @@ pub fn dispatch<'a>(
             Op::OpGetent(o) => getent::run(ctx, seq, o, check_mode).await,
             Op::OpHostname(o) => hostname::run(ctx, seq, o, check_mode).await,
             Op::OpTimezone(o) => timezone::run(ctx, seq, o, check_mode).await,
+            Op::OpModprobe(o) => modprobe::run(ctx, seq, o, check_mode).await,
             Op::OpCopyTarget(o) => copy_target::run(ctx, seq, o, check_mode, diff).await,
         }
     })

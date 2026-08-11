@@ -114,8 +114,7 @@ async fn retries_recovers_after_temporary_failure() -> Result<()> {
     std::fs::write(&pb_path, PLAYBOOK_RECOVERS)?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -154,8 +153,7 @@ async fn retries_exhausts_when_until_never_satisfied() -> Result<()> {
     std::fs::write(&pb_path, PLAYBOOK_EXHAUSTS)?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -196,8 +194,7 @@ async fn no_retries_means_attempts_key_absent_from_register() -> Result<()> {
     std::fs::write(&pb_path, PLAYBOOK_NO_RETRIES_NO_ATTEMPTS_KEY)?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

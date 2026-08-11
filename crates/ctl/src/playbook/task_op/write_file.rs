@@ -35,8 +35,8 @@ pub struct WriteFileOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playbook::task_op::TaskOp;
     use rsansible_wire::generated::Op as WireOp;
-    use crate::playbook::task_op::{TaskOp};
 
     #[test]
     fn write_file_to_wire() {

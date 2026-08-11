@@ -85,11 +85,9 @@ pub(super) fn parse_user_body<E: serde::de::Error>(
     // create_home defaults to true for present (Ansible default), ignored
     // for absent. We bake the default in here so the wire byte is
     // unambiguous.
-    let create_home =
-        take_optional_ansible_bool::<E>(&mut map, "create_home")?.unwrap_or(true);
+    let create_home = take_optional_ansible_bool::<E>(&mut map, "create_home")?.unwrap_or(true);
 
-    let primary_group =
-        take_optional_field_string::<E>(&mut map, "group")?.unwrap_or_default();
+    let primary_group = take_optional_field_string::<E>(&mut map, "group")?.unwrap_or_default();
 
     let groups = match map.remove("groups") {
         None | Some(serde_yaml::Value::Null) => Vec::new(),
@@ -154,7 +152,11 @@ pub(super) fn parse_user_body<E: serde::de::Error>(
     if !map.is_empty() {
         let unknown: Vec<String> = map
             .keys()
-            .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            .map(|k| {
+                k.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"))
+            })
             .collect();
         return Err(E::custom(format!(
             "user: unknown field(s): {unknown:?}; expected one of \

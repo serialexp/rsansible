@@ -91,12 +91,7 @@ fn apply_present(
     let existing = match std::fs::read_to_string(path) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(RepositoryError::Io(format!(
-                "read {}: {e}",
-                path.display()
-            )))
-        }
+        Err(e) => return Err(RepositoryError::Io(format!("read {}: {e}", path.display()))),
     };
     let existing_mode = match std::fs::metadata(path) {
         Ok(md) => Some(md.permissions().mode() & 0o7777),
@@ -113,9 +108,8 @@ fn apply_present(
     }
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            RepositoryError::Io(format!("create dir {}: {e}", parent.display()))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| RepositoryError::Io(format!("create dir {}: {e}", parent.display())))?;
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(format!(
@@ -148,16 +142,12 @@ fn apply_absent(path: &Path, check_mode: bool) -> Result<bool, RepositoryError> 
             if check_mode {
                 return Ok(true);
             }
-            std::fs::remove_file(path).map_err(|e| {
-                RepositoryError::Io(format!("remove {}: {e}", path.display()))
-            })?;
+            std::fs::remove_file(path)
+                .map_err(|e| RepositoryError::Io(format!("remove {}: {e}", path.display())))?;
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(RepositoryError::Io(format!(
-            "stat {}: {e}",
-            path.display()
-        ))),
+        Err(e) => Err(RepositoryError::Io(format!("stat {}: {e}", path.display()))),
     }
 }
 
@@ -249,10 +239,7 @@ mod tests {
         let apt = dir.join("apt-get");
         let log = dir.join("apt.log");
         std::fs::write(&log, "").unwrap();
-        let script = format!(
-            "#!/bin/sh\necho \"$@\" >> {log}\n",
-            log = log.display()
-        );
+        let script = format!("#!/bin/sh\necho \"$@\" >> {log}\n", log = log.display());
         {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
@@ -277,7 +264,11 @@ mod tests {
     #[test]
     fn present_writes_file_and_reports_changed() {
         let (sources, apt) = sandbox("present-new");
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         let written = std::fs::read_to_string(sources.join("pgdg.list")).unwrap();
@@ -292,7 +283,11 @@ mod tests {
         let path = sources.join("pgdg.list");
         std::fs::write(&path, "deb https://example.com/repo focal main\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
     }
@@ -303,7 +298,11 @@ mod tests {
         let path = sources.join("pgdg.list");
         std::fs::write(&path, "deb old line\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         let written = std::fs::read_to_string(&path).unwrap();
@@ -316,7 +315,11 @@ mod tests {
         let path = sources.join("pgdg.list");
         std::fs::write(&path, "deb https://example.com/repo focal main\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         let md = std::fs::metadata(&path).unwrap();
@@ -328,7 +331,11 @@ mod tests {
         let (sources, apt) = sandbox("absent-go");
         let path = sources.join("pgdg.list");
         std::fs::write(&path, "deb https://example.com/repo focal main\n").unwrap();
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_ABSENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_ABSENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
         assert!(!path.exists());
@@ -337,7 +344,11 @@ mod tests {
     #[test]
     fn absent_noop_when_missing() {
         let (sources, apt) = sandbox("absent-noop");
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_ABSENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_ABSENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         assert!(!changed);
     }
@@ -346,7 +357,11 @@ mod tests {
     fn update_cache_runs_only_on_change() {
         let (sources, apt) = sandbox("update-cache");
         // First call: file doesn't exist → changed → apt-get update runs.
-        let mut o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let mut o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         o.update_cache = 1;
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
@@ -376,7 +391,11 @@ mod tests {
     #[test]
     fn check_mode_present_reports_changed_without_writing() {
         let (sources, apt) = sandbox("check-present");
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, true).unwrap();
         assert!(changed);
         assert!(!sources.join("pgdg.list").exists());
@@ -389,7 +408,11 @@ mod tests {
         let (sources, apt) = sandbox("check-absent");
         let path = sources.join("pgdg.list");
         std::fs::write(&path, "deb https://example.com/repo focal main\n").unwrap();
-        let o = op("deb https://example.com/repo focal main", "pgdg", STATE_ABSENT);
+        let o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_ABSENT,
+        );
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, true).unwrap();
         assert!(changed);
         assert!(path.exists(), "absent check-mode must not delete");
@@ -398,17 +421,28 @@ mod tests {
     #[test]
     fn check_mode_skips_update_cache_even_on_change() {
         let (sources, apt) = sandbox("check-update");
-        let mut o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let mut o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         o.update_cache = 1;
         let changed = apply_with_paths(&sources, apt.to_str().unwrap(), &o, true).unwrap();
         assert!(changed);
-        assert!(apt_log(&sources).is_empty(), "check_mode must not run apt-get update");
+        assert!(
+            apt_log(&sources).is_empty(),
+            "check_mode must not run apt-get update"
+        );
     }
 
     #[test]
     fn custom_mode_is_honored() {
         let (sources, apt) = sandbox("custom-mode");
-        let mut o = op("deb https://example.com/repo focal main", "pgdg", STATE_PRESENT);
+        let mut o = op(
+            "deb https://example.com/repo focal main",
+            "pgdg",
+            STATE_PRESENT,
+        );
         o.mode = 0o640;
         let _ = apply_with_paths(&sources, apt.to_str().unwrap(), &o, false).unwrap();
         let md = std::fs::metadata(sources.join("pgdg.list")).unwrap();

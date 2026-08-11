@@ -52,9 +52,8 @@ pub async fn cmd_local_agent_listen(socket_path: PathBuf) -> Result<()> {
     // Best-effort cleanup of any stale socket file. Bind will fail
     // with EADDRINUSE otherwise.
     let _ = tokio::fs::remove_file(&socket_path).await;
-    let listener = UnixListener::bind(&socket_path).with_context(|| {
-        format!("binding local-agent unix socket {}", socket_path.display())
-    })?;
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("binding local-agent unix socket {}", socket_path.display()))?;
     info!(
         socket = %socket_path.display(),
         "local-agent listener up; awaiting back-channel connections",
@@ -112,7 +111,10 @@ async fn read_preamble_line(stream: &mut UnixStream) -> Result<String> {
     let mut buf = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
-        let n = stream.read(&mut byte).await.context("reading preamble byte")?;
+        let n = stream
+            .read(&mut byte)
+            .await
+            .context("reading preamble byte")?;
         if n == 0 {
             bail!("back-channel connection closed before sending BECOME preamble");
         }

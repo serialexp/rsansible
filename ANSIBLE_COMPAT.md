@@ -557,6 +557,76 @@ parse_dotenv, DOTENV_FILE}`, `crates/ctl/src/main.rs::resolve_dotenv_file`.
 
 ---
 
+## 13. `modprobe:` won't persist modules, and won't reload for changed `params`
+
+| Ansible knob | rsansible behavior |
+|---|---|
+| `name`, `state` (`present`/`absent`), `params` | **Honored.** |
+| `persistent` (`disabled`/`present`/`absent`) | **Parse error** — with a pointer to write `/etc/modules-load.d/*.conf` explicitly. |
+| `params` on an already-loaded module | **Ignored, and the task reports `changed: false`.** Ansible behaves the same way; we call it out because it surprises people. |
+
+### Why no `persistent:`
+
+Ansible's `persistent:` makes the module quietly own a file in
+`/etc/modules-load.d/` in addition to the live kernel state. The two
+halves then drift independently: someone edits the conf file, the task
+still reports green because the module is loaded; or the module is
+unloaded by hand and the conf file silently reloads it next boot. The
+task's stated subject is "is this module loaded right now", and that's
+all it should touch.
+
+Writing the file explicitly is one extra task and makes the persisted
+set greppable:
+
+```yaml
+- name: Load kernel modules now
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ kernel_modules }}"
+
+- name: Persist kernel modules across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/gothab.conf
+    content: "{{ kernel_modules | join('\n') }}\n"
+```
+
+Rejected at parse time rather than silently dropped: a playbook that
+thinks it persisted a module and didn't only finds out at the next
+reboot, which is the worst possible time.
+
+### Why a loaded module is never reloaded
+
+Module parameters apply at load time only; changing them means
+unloading and reloading. For the modules this exists to serve — `kvm`,
+`kvm_amd`, `loop` — an unload yanks the floor out from under running
+VMs and mounted loop devices. Silently rebooting someone's hypervisor
+because a `params:` string changed is not a tradeoff we're willing to
+make implicitly, so a loaded module is left alone regardless of
+`params`. Unload it deliberately (`state: absent`, then `present`) if
+you really mean it.
+
+### Idempotency model
+
+Read `/proc/modules` and compare the first whitespace-delimited field
+of each line against `name`, with `-` and `_` treated as equivalent.
+The kernel normalises hyphens to underscores, so `kvm-amd` in a
+playbook and `kvm_amd` in `/proc/modules` are the same module — a raw
+string compare would report `changed` on every run forever. Field
+splitting (rather than a substring search) is what keeps `loop` from
+matching a loaded `loopback_target`.
+
+### Code pointers
+
+- `schema/wire.schema.json5` — `OpModprobe` (kind=29). `name`,
+  `state` byte, `params` string.
+- `crates/ctl/src/playbook/task_op/modprobe.rs` — controller parser;
+  rejects `persistent:` and `params:` combined with `state: absent`.
+- `crates/agent/src/modules/modprobe.rs` — `/proc/modules` probe →
+  `modprobe <name> [params]` / `modprobe -r <name>`.
+
+---
+
 ## When you add a new divergence
 
 1. **Document it here first.** Add a `## N. <one-line summary>`

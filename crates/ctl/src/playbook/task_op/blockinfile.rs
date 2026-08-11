@@ -58,7 +58,11 @@ impl<'de> Deserialize<'de> for BlockInFileOp {
                     "blockinfile.path must be a string, got: {other:?}"
                 )))
             }
-            None => return Err(D::Error::custom("blockinfile: missing required field `path`")),
+            None => {
+                return Err(D::Error::custom(
+                    "blockinfile: missing required field `path`",
+                ))
+            }
         };
 
         let block = match map.remove("block") {
@@ -77,7 +81,8 @@ impl<'de> Deserialize<'de> for BlockInFileOp {
             .unwrap_or_else(|| "BEGIN".to_string());
         let marker_end = take_optional_field_string(&mut map, "marker_end")?
             .unwrap_or_else(|| "END".to_string());
-        let insertbefore = take_optional_field_string(&mut map, "insertbefore")?.unwrap_or_default();
+        let insertbefore =
+            take_optional_field_string(&mut map, "insertbefore")?.unwrap_or_default();
         let insertafter = take_optional_field_string(&mut map, "insertafter")?.unwrap_or_default();
 
         let state = match map.remove("state") {
@@ -105,7 +110,11 @@ impl<'de> Deserialize<'de> for BlockInFileOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "blockinfile: unknown field(s): {unknown:?}; expected one of \
@@ -143,7 +152,7 @@ impl<'de> Deserialize<'de> for BlockInFileOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
 
     #[test]
@@ -208,10 +217,7 @@ blockinfile:
   marker: "no token here"
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("{mark}"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("{mark}"), "got: {err}");
     }
 
     #[test]

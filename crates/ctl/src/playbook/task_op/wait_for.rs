@@ -59,7 +59,9 @@ impl<'de> Deserialize<'de> for WaitForOp {
             None => (None, String::new()),
             Some(serde_yaml::Value::Number(n)) => (
                 Some(n.as_u64().ok_or_else(|| {
-                    D::Error::custom(format!("wait_for.port must be a non-negative int, got: {n}"))
+                    D::Error::custom(format!(
+                        "wait_for.port must be a non-negative int, got: {n}"
+                    ))
                 })? as u32),
                 String::new(),
             ),
@@ -122,7 +124,11 @@ impl<'de> Deserialize<'de> for WaitForOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "wait_for: unknown field(s): {unknown:?}; \
@@ -163,7 +169,7 @@ impl<'de> Deserialize<'de> for WaitForOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
 
     #[test]
@@ -209,9 +215,7 @@ wait_for:
     #[test]
     fn parses_wait_for_state_aliases() {
         for s in ["started", "stopped", "present", "absent"] {
-            let yaml = format!(
-                "name: t\nwait_for:\n  path: /x\n  state: {s}\n",
-            );
+            let yaml = format!("name: t\nwait_for:\n  path: /x\n  state: {s}\n",);
             let _ = parse_task(&yaml);
         }
     }
@@ -309,14 +313,14 @@ wait_for:
     #[test]
     fn wait_for_to_wire_carries_fields() {
         let t = TaskOp::WaitFor(WaitForOp {
-                host: Some("h".into()),
-                port: Some(80),
-                path: None,
-                state: WaitForState::Present,
-                timeout_ms: 5000,
-                delay_ms: 100,
-                sleep_ms: 250,
-                port_template: String::new(),
+            host: Some("h".into()),
+            port: Some(80),
+            path: None,
+            state: WaitForState::Present,
+            timeout_ms: 5000,
+            delay_ms: 100,
+            sleep_ms: 250,
+            port_template: String::new(),
         });
         let wire = t.to_wire_op().unwrap();
         let rsansible_wire::generated::Op::OpWaitFor(w) = wire else {

@@ -217,69 +217,68 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
         }
     };
 
-    let update_cache =
-        take_optional_ansible_bool::<E>(&mut map, "update_cache")?.unwrap_or(false);
-    let autoremove =
-        take_optional_ansible_bool::<E>(&mut map, "autoremove")?.unwrap_or(false);
+    let update_cache = take_optional_ansible_bool::<E>(&mut map, "update_cache")?.unwrap_or(false);
+    let autoremove = take_optional_ansible_bool::<E>(&mut map, "autoremove")?.unwrap_or(false);
 
     // Apt-specific knobs: only consumed when manager pins an apt-aware
     // backend. Under `package:` (auto), we refuse them at parse time so
     // users don't silently lose configuration when the auto-detected
     // backend ignores them.
-    let (cache_valid_time, purge, default_release, allow_unauthenticated) =
-        if manager.accepts_apt_knobs() {
-            let cache_valid_time = match map.remove("cache_valid_time") {
-                None | Some(serde_yaml::Value::Null) => 0u32,
-                Some(serde_yaml::Value::Number(n)) => n.as_u64().ok_or_else(|| {
-                    E::custom(format!(
-                        "{label}.cache_valid_time must be a non-negative integer, got: {n}"
-                    ))
-                })? as u32,
-                Some(serde_yaml::Value::String(s)) => s.parse::<u32>().map_err(|e| {
-                    E::custom(format!(
-                        "{label}.cache_valid_time: invalid int {s:?}: {e}"
-                    ))
-                })?,
-                Some(other) => {
-                    return Err(E::custom(format!(
-                        "{label}.cache_valid_time must be a number, got: {other:?}"
-                    )))
-                }
-            };
-            let purge =
-                take_optional_ansible_bool::<E>(&mut map, "purge")?.unwrap_or(false);
-            let default_release =
-                take_optional_field_string::<E>(&mut map, "default_release")?
-                    .unwrap_or_default();
-            let allow_unauthenticated =
-                take_optional_ansible_bool::<E>(&mut map, "allow_unauthenticated")?
-                    .unwrap_or(false);
-            // Accept and discard `force_apt_get` — we always use apt-get.
-            let _ = map.remove("force_apt_get");
-            // Accept and discard `install_recommends` for now; acme
-            // doesn't set it. (Ansible's default ON matches apt-get's
-            // default ON.)
-            let _ = map.remove("install_recommends");
-            (cache_valid_time, purge, default_release, allow_unauthenticated)
-        } else {
-            // `package:` (auto) / `pip:` etc. refuse apt-only knobs.
-            for k in [
-                "cache_valid_time",
-                "purge",
-                "default_release",
-                "allow_unauthenticated",
-                "force_apt_get",
-                "install_recommends",
-            ] {
-                if map.contains_key(serde_yaml::Value::String(k.to_string())) {
-                    return Err(E::custom(format!(
-                        "{label}: field `{k}` is only valid under `apt:` (manager-specific). \
-                         Use `apt:` instead to set it."
-                    )));
-                }
+    let (cache_valid_time, purge, default_release, allow_unauthenticated) = if manager
+        .accepts_apt_knobs()
+    {
+        let cache_valid_time = match map.remove("cache_valid_time") {
+            None | Some(serde_yaml::Value::Null) => 0u32,
+            Some(serde_yaml::Value::Number(n)) => n.as_u64().ok_or_else(|| {
+                E::custom(format!(
+                    "{label}.cache_valid_time must be a non-negative integer, got: {n}"
+                ))
+            })? as u32,
+            Some(serde_yaml::Value::String(s)) => s.parse::<u32>().map_err(|e| {
+                E::custom(format!("{label}.cache_valid_time: invalid int {s:?}: {e}"))
+            })?,
+            Some(other) => {
+                return Err(E::custom(format!(
+                    "{label}.cache_valid_time must be a number, got: {other:?}"
+                )))
             }
-            (0, false, String::new(), false)
         };
+        let purge = take_optional_ansible_bool::<E>(&mut map, "purge")?.unwrap_or(false);
+        let default_release =
+            take_optional_field_string::<E>(&mut map, "default_release")?.unwrap_or_default();
+        let allow_unauthenticated =
+            take_optional_ansible_bool::<E>(&mut map, "allow_unauthenticated")?.unwrap_or(false);
+        // Accept and discard `force_apt_get` — we always use apt-get.
+        let _ = map.remove("force_apt_get");
+        // Accept and discard `install_recommends` for now; acme
+        // doesn't set it. (Ansible's default ON matches apt-get's
+        // default ON.)
+        let _ = map.remove("install_recommends");
+        (
+            cache_valid_time,
+            purge,
+            default_release,
+            allow_unauthenticated,
+        )
+    } else {
+        // `package:` (auto) / `pip:` etc. refuse apt-only knobs.
+        for k in [
+            "cache_valid_time",
+            "purge",
+            "default_release",
+            "allow_unauthenticated",
+            "force_apt_get",
+            "install_recommends",
+        ] {
+            if map.contains_key(serde_yaml::Value::String(k.to_string())) {
+                return Err(E::custom(format!(
+                    "{label}: field `{k}` is only valid under `apt:` (manager-specific). \
+                         Use `apt:` instead to set it."
+                )));
+            }
+        }
+        (0, false, String::new(), false)
+    };
 
     // Pip-specific knobs: only consumed under `pip:` (manager=Pip) or
     // `package: manager: pip`. Refused under apt / auto.
@@ -325,7 +324,11 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
     if !map.is_empty() {
         let unknown: Vec<String> = map
             .keys()
-            .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            .map(|k| {
+                k.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"))
+            })
             .collect();
         let allowed = if manager.accepts_apt_knobs() {
             "[name, pkg, state, update_cache, cache_valid_time, purge, autoremove, default_release, allow_unauthenticated, install_recommends, force_apt_get]"
@@ -377,7 +380,7 @@ pub(super) fn parse_package_body<E: serde::de::Error>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
 
     #[test]
@@ -633,7 +636,11 @@ package:
 
     #[test]
     fn package_rejects_purge_and_cache_valid_time() {
-        for field in ["purge: yes", "cache_valid_time: 3600", "allow_unauthenticated: yes"] {
+        for field in [
+            "purge: yes",
+            "cache_valid_time: 3600",
+            "allow_unauthenticated: yes",
+        ] {
             let yaml = format!(
                 r#"
 name: t

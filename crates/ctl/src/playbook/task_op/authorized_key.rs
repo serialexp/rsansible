@@ -72,8 +72,7 @@ pub(super) fn parse_authorized_key_body<E: serde::de::Error>(
         }
     };
 
-    let exclusive =
-        take_optional_ansible_bool::<E>(&mut map, "exclusive")?.unwrap_or(false);
+    let exclusive = take_optional_ansible_bool::<E>(&mut map, "exclusive")?.unwrap_or(false);
 
     for k in [
         "path",
@@ -93,7 +92,11 @@ pub(super) fn parse_authorized_key_body<E: serde::de::Error>(
     if !map.is_empty() {
         let unknown: Vec<String> = map
             .keys()
-            .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            .map(|k| {
+                k.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"))
+            })
             .collect();
         return Err(E::custom(format!(
             "authorized_key: unknown field(s): {unknown:?}; expected one of \

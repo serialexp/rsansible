@@ -165,7 +165,15 @@ mod tests {
         roundtrip(msg::task_dispatch(
             99,
             false,
-            msg::op_write_file("/etc/motd".into(), 0o644, false, b"hello world\n".to_vec(), String::new(), String::new(), String::new()),
+            msg::op_write_file(
+                "/etc/motd".into(),
+                0o644,
+                false,
+                b"hello world\n".to_vec(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
         ))
         .await;
     }
@@ -633,7 +641,15 @@ mod tests {
         roundtrip(msg::task_dispatch(
             42,
             false,
-            msg::op_write_file("/etc/ssl/key.pem".into(), 0o600, true, b"PEM".to_vec(), String::new(), String::new(), String::new()),
+            msg::op_write_file(
+                "/etc/ssl/key.pem".into(),
+                0o600,
+                true,
+                b"PEM".to_vec(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
         ))
         .await;
     }
@@ -830,14 +846,30 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_task_done() {
-        roundtrip(msg::task_done(42, 0, true, false, 1_700_000_000_000_000_000, 1_700_000_000_137_000_000)).await;
+        roundtrip(msg::task_done(
+            42,
+            0,
+            true,
+            false,
+            1_700_000_000_000_000_000,
+            1_700_000_000_137_000_000,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn roundtrip_task_done_skipped() {
         // skipped=true is set by modules that decline under check_mode
         // (exec/shell, and uri for mutating verbs).
-        roundtrip(msg::task_done(43, 0, false, true, 1_700_000_000_000_000_000, 1_700_000_000_001_000_000)).await;
+        roundtrip(msg::task_done(
+            43,
+            0,
+            false,
+            true,
+            1_700_000_000_000_000_000,
+            1_700_000_000_001_000_000,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -868,7 +900,11 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_pong() {
-        roundtrip(msg::pong(1_700_000_000_111_000_000, 1_700_000_000_222_000_000)).await;
+        roundtrip(msg::pong(
+            1_700_000_000_111_000_000,
+            1_700_000_000_222_000_000,
+        ))
+        .await;
     }
 
     #[tokio::test]

@@ -160,7 +160,12 @@ async fn open_items_finalize_happy_path() {
     let (base, st) = spawn_mock(0, 3600).await;
     let reporter = HttpReporter::open(cfg(base)).await.expect("open");
 
-    reporter.on_task(&task("db-1", "install", TaskStatus::Changed, Some("{\"before\":\"a\",\"after\":\"b\"}")));
+    reporter.on_task(&task(
+        "db-1",
+        "install",
+        TaskStatus::Changed,
+        Some("{\"before\":\"a\",\"after\":\"b\"}"),
+    ));
     reporter.on_task(&task("db-2", "gather", TaskStatus::Ok, None));
     reporter.finish(&ok_outcome());
     reporter.join().await;
@@ -175,7 +180,10 @@ async fn open_items_finalize_happy_path() {
     // All items arrived, under the lease token (never the operator token).
     let items: Vec<&Item> = rec.item_batches.iter().flat_map(|b| &b.items).collect();
     assert_eq!(items.len(), 2, "both tasks pushed");
-    assert!(rec.item_auth.iter().all(|a| a == "lease-abc"), "writes use the lease");
+    assert!(
+        rec.item_auth.iter().all(|a| a == "lease-abc"),
+        "writes use the lease"
+    );
     // Monotonic sequences + pivot dimensions + inline diff preserved.
     assert_eq!(items[0].sequence, 0);
     assert_eq!(items[0].dimensions.host, "db-1");
@@ -252,7 +260,11 @@ async fn lease_is_renewed_on_the_server_interval() {
     reporter.join().await;
 
     let rec = st.rec.lock().await;
-    assert!(rec.renews >= 2, "expected >=2 lease renewals, got {}", rec.renews);
+    assert!(
+        rec.renews >= 2,
+        "expected >=2 lease renewals, got {}",
+        rec.renews
+    );
 }
 
 /// The committed `protocol_fixture.json` deserializes cleanly into the wire

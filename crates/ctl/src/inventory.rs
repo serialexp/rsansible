@@ -147,8 +147,8 @@ impl Default for RawHostEntry {
 /// subdirectories are honored only by [`load_with_vars`].
 pub fn load(path: &Path) -> Result<Inventory> {
     let raw = load_raw_root(path)?;
-    let pre = flatten_pre_hosts(raw)
-        .with_context(|| format!("parsing inventory {}", path.display()))?;
+    let pre =
+        flatten_pre_hosts(raw).with_context(|| format!("parsing inventory {}", path.display()))?;
     assemble_inventory(pre, None)
         .with_context(|| format!("assembling inventory {}", path.display()))
 }
@@ -167,8 +167,8 @@ pub fn load_with_vars(
     vault_password: Option<&str>,
 ) -> Result<(Inventory, InventoryVars)> {
     let raw = load_raw_root(path)?;
-    let pre = flatten_pre_hosts(raw)
-        .with_context(|| format!("parsing inventory {}", path.display()))?;
+    let pre =
+        flatten_pre_hosts(raw).with_context(|| format!("parsing inventory {}", path.display()))?;
     let base = if path.is_dir() {
         path.to_path_buf()
     } else {
@@ -178,8 +178,14 @@ pub fn load_with_vars(
     };
     let group_names: Vec<String> = pre.groups.keys().cloned().collect();
     let host_names: Vec<String> = pre.hosts_raw.keys().cloned().collect();
-    let vars = discover_vars_named(&base, &group_names, &host_names, vault_password)
-        .with_context(|| format!("discovering host_vars/group_vars next to {}", path.display()))?;
+    let vars = discover_vars_named(&base, &group_names, &host_names, vault_password).with_context(
+        || {
+            format!(
+                "discovering host_vars/group_vars next to {}",
+                path.display()
+            )
+        },
+    )?;
     let inv = assemble_inventory(pre, Some(&vars))
         .with_context(|| format!("assembling inventory {}", path.display()))?;
     Ok((inv, vars))
@@ -269,7 +275,11 @@ fn merge_raw_root(dst: &mut RawRoot, src: RawRoot) {
         dst.all.hosts.insert(k, v);
     }
     for (gname, src_group) in src.all.children {
-        let dst_group = dst.all.children.entry(gname).or_insert_with(RawGroup::default);
+        let dst_group = dst
+            .all
+            .children
+            .entry(gname)
+            .or_insert_with(RawGroup::default);
         for (k, v) in src_group.vars {
             dst_group.vars.insert(k, v);
         }
@@ -329,7 +339,8 @@ fn flatten_pre_hosts(raw: RawRoot) -> Result<PreHosts> {
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut group_inline_vars: BTreeMap<String, BTreeMap<String, JsonValue>> = BTreeMap::new();
     // host_name -> (Vec<group>, inline_vars from per-host mapping)
-    let mut hosts_raw: BTreeMap<String, (Vec<String>, BTreeMap<String, JsonValue>)> = BTreeMap::new();
+    let mut hosts_raw: BTreeMap<String, (Vec<String>, BTreeMap<String, JsonValue>)> =
+        BTreeMap::new();
 
     for (group_name, group) in all.children {
         if group_name == "all" {
@@ -345,8 +356,9 @@ fn flatten_pre_hosts(raw: RawRoot) -> Result<PreHosts> {
             members.push(host_name.clone());
             let inline = match entry {
                 RawHostEntry::Null => BTreeMap::new(),
-                RawHostEntry::Map(m) => yaml_map_to_json(m)
-                    .with_context(|| format!("host {host_name} inline vars"))?,
+                RawHostEntry::Map(m) => {
+                    yaml_map_to_json(m).with_context(|| format!("host {host_name} inline vars"))?
+                }
             };
             let slot = hosts_raw
                 .entry(host_name.clone())
@@ -539,9 +551,7 @@ fn assemble_inventory(pre: PreHosts, disk: Option<&InventoryVars>) -> Result<Inv
     })
 }
 
-fn yaml_map_to_json(
-    m: BTreeMap<String, serde_yaml::Value>,
-) -> Result<BTreeMap<String, JsonValue>> {
+fn yaml_map_to_json(m: BTreeMap<String, serde_yaml::Value>) -> Result<BTreeMap<String, JsonValue>> {
     let mut out = BTreeMap::new();
     for (k, v) in m {
         out.insert(k, yaml_to_json(v)?);
@@ -622,12 +632,9 @@ fn load_var_target(
     Ok(None)
 }
 
-fn load_var_file(
-    path: &Path,
-    vault_password: Option<&str>,
-) -> Result<BTreeMap<String, JsonValue>> {
-    let raw = std::fs::read(path)
-        .with_context(|| format!("reading var file {}", path.display()))?;
+fn load_var_file(path: &Path, vault_password: Option<&str>) -> Result<BTreeMap<String, JsonValue>> {
+    let raw =
+        std::fs::read(path).with_context(|| format!("reading var file {}", path.display()))?;
     let bytes: Vec<u8> = if vault::is_vault(&raw) {
         match vault_password {
             Some(pw) => vault::decrypt(&raw, pw)
@@ -694,7 +701,10 @@ all:
         assert_eq!(h.host, "127.0.0.1");
         // Implicit localhost is NOT a member of `all` — matches Ansible.
         // Plays must target `hosts: localhost` explicitly to manage it.
-        assert!(h.member_of.is_empty(), "implicit localhost must not join any group");
+        assert!(
+            h.member_of.is_empty(),
+            "implicit localhost must not join any group"
+        );
         assert!(
             !inv.groups
                 .get("all")
@@ -731,7 +741,9 @@ all:
         ));
         let h = inv.hosts.get("localhost").expect("implicit localhost");
         assert_eq!(
-            h.inline_vars.get("ansible_connection").and_then(|v| v.as_str()),
+            h.inline_vars
+                .get("ansible_connection")
+                .and_then(|v| v.as_str()),
             Some("local"),
             "implicit localhost must carry ansible_connection=local in inline_vars",
         );
@@ -788,7 +800,12 @@ all:
         // so the `all` group is exactly the declared hosts.
         assert_eq!(inv.groups["all"], vec!["web1"]);
         assert_eq!(inv.groups["web"], vec!["web1"]);
-        assert_eq!(inv.all_vars.get("ansible_user").map(|v| v.as_str().unwrap()), Some("deploy"));
+        assert_eq!(
+            inv.all_vars
+                .get("ansible_user")
+                .map(|v| v.as_str().unwrap()),
+            Some("deploy")
+        );
     }
 
     #[test]
@@ -812,16 +829,23 @@ all:
         ));
         let h = &inv.hosts["db1"];
         assert_eq!(h.port, 2222);
-        assert_eq!(h.key_path.as_deref().unwrap().to_string_lossy(), "/home/me/.ssh/id_ed25519");
+        assert_eq!(
+            h.key_path.as_deref().unwrap().to_string_lossy(),
+            "/home/me/.ssh/id_ed25519"
+        );
         assert!(!h.inline_vars.contains_key("ansible_host"));
         assert!(!h.inline_vars.contains_key("ansible_port"));
         assert!(!h.inline_vars.contains_key("ansible_ssh_private_key_file"));
         assert_eq!(
-            h.inline_vars.get("instance_marker").and_then(|v| v.as_str()),
+            h.inline_vars
+                .get("instance_marker")
+                .and_then(|v| v.as_str()),
             Some("alpha")
         );
         assert_eq!(
-            inv.group_inline_vars["db"].get("pg_role").and_then(|v| v.as_str()),
+            inv.group_inline_vars["db"]
+                .get("pg_role")
+                .and_then(|v| v.as_str()),
             Some("primary")
         );
     }
@@ -894,7 +918,10 @@ extra_root: nope
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("extra_root") || msg.contains("unknown"), "got: {msg}");
+        assert!(
+            msg.contains("extra_root") || msg.contains("unknown"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -913,7 +940,10 @@ all:
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("mistyped") || msg.contains("unknown"), "got: {msg}");
+        assert!(
+            msg.contains("mistyped") || msg.contains("unknown"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -947,7 +977,9 @@ all:
 
         let (_inv, vars) = load_with_vars(&inv_path, None).unwrap();
         assert_eq!(
-            vars.group_vars["all"].get("region").and_then(|v| v.as_str()),
+            vars.group_vars["all"]
+                .get("region")
+                .and_then(|v| v.as_str()),
             Some("us-east-1")
         );
         // alphabetical order → b.yml overrides a.yml
@@ -956,7 +988,9 @@ all:
             Some("b")
         );
         assert_eq!(
-            vars.host_vars["h1"].get("instance_marker").and_then(|v| v.as_str()),
+            vars.host_vars["h1"]
+                .get("instance_marker")
+                .and_then(|v| v.as_str()),
             Some("alpha")
         );
         assert!(!vars.host_vars.contains_key("h2"));
@@ -986,12 +1020,18 @@ all:
 
         // Without password — skipped, no entry.
         let (_inv, vars_no) = load_with_vars(&inv_path, None).unwrap();
-        assert!(vars_no.group_vars.get("web").map(|m| m.is_empty()).unwrap_or(true));
+        assert!(vars_no
+            .group_vars
+            .get("web")
+            .map(|m| m.is_empty())
+            .unwrap_or(true));
 
         // With password — decrypted.
         let (_inv, vars_yes) = load_with_vars(&inv_path, Some("pw")).unwrap();
         assert_eq!(
-            vars_yes.group_vars["web"].get("secret").and_then(|v| v.as_str()),
+            vars_yes.group_vars["web"]
+                .get("secret")
+                .and_then(|v| v.as_str()),
             Some("hunter2")
         );
     }

@@ -203,10 +203,7 @@ impl ControlMaster {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         let t = std::time::Instant::now();
-        let status = cmd
-            .status()
-            .await
-            .context("spawning ssh ControlMaster")?;
+        let status = cmd.status().await.context("spawning ssh ControlMaster")?;
         if !status.success() {
             bail!(
                 "ssh ControlMaster open failed: {status} \
@@ -331,11 +328,7 @@ done
 ///
 /// `chmod 0700` ensures the file is executable + owner-only, so a
 /// subsequent `exec` from a bash script picks it up cleanly.
-pub async fn push_binary_to_cache(
-    dial: &ForwarderDial,
-    bytes: &[u8],
-    hash: &str,
-) -> Result<()> {
+pub async fn push_binary_to_cache(dial: &ForwarderDial, bytes: &[u8], hash: &str) -> Result<()> {
     let rand_suffix: u64 = rand::random();
     let tmp_name = format!("{hash}.tmp.{rand_suffix:016x}");
     // `cat > <tmp>` is the universal "stream stdin to a file"
@@ -449,14 +442,16 @@ pub async fn stage_binaries(
         push_futures.push(tokio::spawn(async move {
             let t = std::time::Instant::now();
             let n = bytes.len();
-            push_binary_to_cache(&dial, &bytes, &hash).await.with_context(|| {
-                format!(
-                    "pushing {} binary {} to forwarder cache as {}",
-                    kind.name(),
-                    path.display(),
-                    hash,
-                )
-            })?;
+            push_binary_to_cache(&dial, &bytes, &hash)
+                .await
+                .with_context(|| {
+                    format!(
+                        "pushing {} binary {} to forwarder cache as {}",
+                        kind.name(),
+                        path.display(),
+                        hash,
+                    )
+                })?;
             tracing::info!(
                 kind = kind.name(),
                 bytes = n,
@@ -496,7 +491,9 @@ mod tests {
         // Length: SHA-256 = 32 bytes = 64 hex chars.
         assert_eq!(h.len(), 64);
         // All lowercase hex.
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // Stable across calls.
         assert_eq!(h, hash_binary(bytes));
         // Different input → different hash.

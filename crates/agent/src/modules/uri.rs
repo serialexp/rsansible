@@ -111,23 +111,14 @@ pub async fn run(ctx: &Context, seq: u32, op: OpUriOutput, check_mode: bool) -> 
     let status_u16 = resp.status().as_u16();
     let final_url = resp.url().to_string();
     let headers_map = normalize_headers(resp.headers());
-    let content_type = headers_map
-        .get("content-type")
-        .cloned()
-        .unwrap_or_default();
+    let content_type = headers_map.get("content-type").cloned().unwrap_or_default();
 
     // Body bytes. reqwest's gzip decode is automatic when the gzip
     // feature is on and the server advertised it.
     let body_bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            emit_error(
-                ctx,
-                seq,
-                err::IO,
-                format!("reading response body: {e}"),
-            )
-            .await;
+            emit_error(ctx, seq, err::IO, format!("reading response body: {e}")).await;
             return Ok(());
         }
     };
@@ -163,10 +154,7 @@ pub async fn run(ctx: &Context, seq: u32, op: OpUriOutput, check_mode: bool) -> 
     envelope.insert("content_length".into(), Value::from(content_length));
     envelope.insert("content_type".into(), Value::String(content_type));
     envelope.insert("elapsed_ms".into(), Value::from(elapsed_ms));
-    envelope.insert(
-        "redirected".into(),
-        Value::Bool(final_url != original_url),
-    );
+    envelope.insert("redirected".into(), Value::Bool(final_url != original_url));
     if op.return_content != 0 {
         envelope.insert("content".into(), Value::String(body_str));
     }
@@ -221,12 +209,13 @@ fn content_type_indicates_json(ct: &str) -> bool {
     // suffix variant with parameters like `; charset=utf-8`. Lowercased
     // already by `normalize_headers`.
     let head = ct.split(';').next().unwrap_or("").trim();
-    head == "application/json"
-        || head == "text/json"
-        || head.ends_with("+json")
+    head == "application/json" || head == "text/json" || head.ends_with("+json")
 }
 
-fn build_client(op: &OpUriOutput, original_method: reqwest::Method) -> Result<reqwest::Client, String> {
+fn build_client(
+    op: &OpUriOutput,
+    original_method: reqwest::Method,
+) -> Result<reqwest::Client, String> {
     use reqwest::redirect::Policy;
 
     let policy = match op.follow_redirects {
@@ -322,8 +311,8 @@ fn build_request(
     for (k, v) in op.header_keys.iter().zip(op.header_values.iter()) {
         let name = HeaderName::from_bytes(k.as_bytes())
             .map_err(|e| format!("invalid header name {k:?}: {e}"))?;
-        let val = HeaderValue::from_str(v)
-            .map_err(|e| format!("invalid header value for {k:?}: {e}"))?;
+        let val =
+            HeaderValue::from_str(v).map_err(|e| format!("invalid header value for {k:?}: {e}"))?;
         if name == CONTENT_TYPE {
             caller_set_ct = true;
         }
@@ -408,7 +397,9 @@ mod tests {
     #[test]
     fn content_type_json_detection() {
         assert!(content_type_indicates_json("application/json"));
-        assert!(content_type_indicates_json("application/json; charset=utf-8"));
+        assert!(content_type_indicates_json(
+            "application/json; charset=utf-8"
+        ));
         assert!(content_type_indicates_json("application/vnd.api+json"));
         assert!(content_type_indicates_json("text/json"));
         assert!(!content_type_indicates_json("text/html"));
@@ -484,7 +475,12 @@ mod tests {
                 _ => {}
             }
         }
-        OpResult { envelope, exit_code, changed, error }
+        OpResult {
+            envelope,
+            exit_code,
+            changed,
+            error,
+        }
     }
 
     /// Boot an axum router on `127.0.0.1:0` and return the bound port.
@@ -530,7 +526,10 @@ mod tests {
         let app = Router::new().route(
             "/echo",
             get(|| async {
-                ([(header::CONTENT_TYPE, "application/json")], r#"{"foo":"bar"}"#)
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"foo":"bar"}"#,
+                )
             }),
         );
         let port = boot(app).await;
@@ -668,7 +667,11 @@ mod tests {
                     .to_string();
                 let (_, body) = req.into_parts();
                 let bytes = axum::body::to_bytes(body, 1024).await.unwrap();
-                (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain")], format!("{ct}|{}", String::from_utf8_lossy(&bytes)))
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    format!("{ct}|{}", String::from_utf8_lossy(&bytes)),
+                )
             }),
         );
         let port = boot(app).await;
@@ -714,13 +717,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/start",
-                any(|| async {
-                    (
-                        StatusCode::FOUND,
-                        [(header::LOCATION, "/end")],
-                        "",
-                    )
-                }),
+                any(|| async { (StatusCode::FOUND, [(header::LOCATION, "/end")], "") }),
             )
             .route("/end", any(|| async { (StatusCode::OK, "done") }));
         let port = boot(app).await;
@@ -808,7 +805,14 @@ mod tests {
     // unused but silenced — keep the path import alive in case future
     // tests want axum::extract::Path.
     #[allow(dead_code)]
-    fn _silence(_: AxumPath<()>, _: Query<HashMap<String, String>>, _: AxumHeaderMap, _: AxumMethod, _: Bytes, _: SocketAddr) -> Response<axum::body::Body> {
+    fn _silence(
+        _: AxumPath<()>,
+        _: Query<HashMap<String, String>>,
+        _: AxumHeaderMap,
+        _: AxumMethod,
+        _: Bytes,
+        _: SocketAddr,
+    ) -> Response<axum::body::Body> {
         ().into_response()
     }
 
@@ -833,13 +837,15 @@ mod tests {
     /// feature gates.
     fn gen_chain() -> TestChain {
         use rcgen::{
-            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-            KeyPair, KeyUsagePurpose, SanType, PKCS_ED25519,
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose, SanType, PKCS_ED25519,
         };
         // CA.
         let ca_kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params.distinguished_name.push(DnType::CommonName, "rsansible-test-CA");
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "rsansible-test-CA");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
         ca_params.key_usages.push(KeyUsagePurpose::CrlSign);
@@ -848,16 +854,24 @@ mod tests {
         // Server cert: SAN=127.0.0.1.
         let srv_kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
         let mut srv_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        srv_params.distinguished_name.push(DnType::CommonName, "rsansible-test-server");
+        srv_params
+            .distinguished_name
+            .push(DnType::CommonName, "rsansible-test-server");
         srv_params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
-        srv_params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
+        srv_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
         let srv_cert = srv_params.signed_by(&srv_kp, &ca_cert, &ca_kp).unwrap();
 
         // Client cert.
         let cli_kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
         let mut cli_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        cli_params.distinguished_name.push(DnType::CommonName, "rsansible-test-client");
-        cli_params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
+        cli_params
+            .distinguished_name
+            .push(DnType::CommonName, "rsansible-test-client");
+        cli_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
         let cli_cert = cli_params.signed_by(&cli_kp, &ca_cert, &ca_kp).unwrap();
 
         TestChain {
@@ -948,9 +962,7 @@ mod tests {
         let der = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .unwrap();
-        rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(der),
-        )
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(der))
     }
 
     /// Install a default rustls crypto provider for the test process if

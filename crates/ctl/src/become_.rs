@@ -57,7 +57,10 @@ pub struct EffectiveBecome {
 
 impl EffectiveBecome {
     pub const fn none() -> Self {
-        Self { apply: false, user: String::new() }
+        Self {
+            apply: false,
+            user: String::new(),
+        }
     }
 }
 
@@ -162,7 +165,7 @@ pub fn effective(
 mod tests {
     use super::*;
     use crate::exec_ctx::WorldVars;
-    use crate::playbook::{Task, TaskBody, TaskOp, ShellOp};
+    use crate::playbook::{ShellOp, Task, TaskBody, TaskOp};
     use crate::template::make_env;
 
     fn empty_ctx() -> HostCtx {
@@ -233,10 +236,8 @@ mod tests {
     fn effective_task_false_overrides_inventory_true() {
         let t = task_with_become(Some(false), None);
         let mut ctx = empty_ctx();
-        ctx.inventory_vars.insert(
-            "ansible_become".into(),
-            serde_json::Value::Bool(true),
-        );
+        ctx.inventory_vars
+            .insert("ansible_become".into(), serde_json::Value::Bool(true));
         let env = make_env();
         let eff = effective(&t, &ctx, &env, &WorldVars::default()).unwrap();
         assert!(!eff.apply, "explicit task false beats inventory true");
@@ -264,8 +265,10 @@ mod tests {
         // host's template ctx before the pool keys on it.
         let t = task_with_become(Some(true), Some("{{ db_user }}"));
         let mut ctx = empty_ctx();
-        ctx.inventory_vars
-            .insert("db_user".into(), serde_json::Value::String("postgres".into()));
+        ctx.inventory_vars.insert(
+            "db_user".into(),
+            serde_json::Value::String("postgres".into()),
+        );
         let env = make_env();
         let eff = effective(&t, &ctx, &env, &WorldVars::default()).unwrap();
         assert_eq!(eff.user, "postgres");

@@ -71,8 +71,7 @@ impl Default for WireCost {
 /// - 5 ms RTT, 1 MB/s, 50 KB template → threshold = 5 KB → true (probe).
 /// - 300 ms RTT, 100 KB/s, 1 MB file → threshold = 30 KB → true (probe).
 pub fn should_probe_first(cost: &WireCost, size_bytes: usize) -> bool {
-    let threshold_bytes =
-        (cost.rtt_ms as u64).saturating_mul(cost.bw_bytes_per_s as u64) / 1000;
+    let threshold_bytes = (cost.rtt_ms as u64).saturating_mul(cost.bw_bytes_per_s as u64) / 1000;
     (size_bytes as u64) > threshold_bytes
 }
 
@@ -107,34 +106,49 @@ mod tests {
     #[test]
     fn ship_blind_transcontinental_small_file() {
         // 300 ms RTT, 100 KB/s, 3 KB privkey: threshold = 30 KB. Ship.
-        let cost = WireCost { rtt_ms: 300, bw_bytes_per_s: 100_000 };
+        let cost = WireCost {
+            rtt_ms: 300,
+            bw_bytes_per_s: 100_000,
+        };
         assert!(!should_probe_first(&cost, 3_000));
     }
 
     #[test]
     fn ship_blind_lan_small_file() {
         // 5 ms RTT, 1 MB/s, 3 KB privkey: threshold = 5 KB. Ship.
-        let cost = WireCost { rtt_ms: 5, bw_bytes_per_s: 1_000_000 };
+        let cost = WireCost {
+            rtt_ms: 5,
+            bw_bytes_per_s: 1_000_000,
+        };
         assert!(!should_probe_first(&cost, 3_000));
     }
 
     #[test]
     fn probe_lan_medium_file() {
         // 5 ms RTT, 1 MB/s, 50 KB template: threshold = 5 KB. Probe.
-        let cost = WireCost { rtt_ms: 5, bw_bytes_per_s: 1_000_000 };
+        let cost = WireCost {
+            rtt_ms: 5,
+            bw_bytes_per_s: 1_000_000,
+        };
         assert!(should_probe_first(&cost, 50_000));
     }
 
     #[test]
     fn probe_transcontinental_big_file() {
         // 300 ms RTT, 100 KB/s, 1 MB blob: threshold = 30 KB. Probe.
-        let cost = WireCost { rtt_ms: 300, bw_bytes_per_s: 100_000 };
+        let cost = WireCost {
+            rtt_ms: 300,
+            bw_bytes_per_s: 100_000,
+        };
         assert!(should_probe_first(&cost, 1_000_000));
     }
 
     #[test]
     fn strategy_overrides_heuristic() {
-        let cost = WireCost { rtt_ms: 5, bw_bytes_per_s: 1_000_000 };
+        let cost = WireCost {
+            rtt_ms: 5,
+            bw_bytes_per_s: 1_000_000,
+        };
         // Auto path matches should_probe_first.
         assert_eq!(WireStrategy::Auto.decide(&cost, 50_000), true);
         assert_eq!(WireStrategy::Auto.decide(&cost, 3_000), false);
@@ -147,7 +161,10 @@ mod tests {
     fn zero_bandwidth_does_not_panic() {
         // Degenerate input shouldn't divide-by-zero; saturating_mul +
         // unsigned division makes threshold = 0 → everything probes.
-        let cost = WireCost { rtt_ms: 50, bw_bytes_per_s: 0 };
+        let cost = WireCost {
+            rtt_ms: 50,
+            bw_bytes_per_s: 0,
+        };
         assert!(should_probe_first(&cost, 1));
     }
 }

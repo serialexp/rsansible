@@ -263,10 +263,13 @@ END {{ if (!found) exit 2 }}
     fn parses_passwd_line() {
         let stub = Stub::new(
             "pw",
-            &[("passwd", "postgres:x:1000:1000::/var/lib/postgresql:/bin/bash")],
+            &[(
+                "passwd",
+                "postgres:x:1000:1000::/var/lib/postgresql:/bin/bash",
+            )],
         );
-        let out = apply_with_bin(stub.bin.to_str().unwrap(), &op("passwd", "postgres", true))
-            .unwrap();
+        let out =
+            apply_with_bin(stub.bin.to_str().unwrap(), &op("passwd", "postgres", true)).unwrap();
         let pg = out.get("postgres").unwrap().as_array().unwrap();
         // First field after lookup key is the password placeholder.
         assert_eq!(pg[0], "x");
@@ -277,8 +280,8 @@ END {{ if (!found) exit 2 }}
     #[test]
     fn miss_with_fail_key_errors() {
         let stub = Stub::new("miss", &[]);
-        let e = apply_with_bin(stub.bin.to_str().unwrap(), &op("passwd", "nobody", true))
-            .unwrap_err();
+        let e =
+            apply_with_bin(stub.bin.to_str().unwrap(), &op("passwd", "nobody", true)).unwrap_err();
         match e {
             GetentError::BadRequest(m) => assert!(m.contains("not found"), "got: {m}"),
             other => panic!("expected BadRequest, got: {other:?}"),
@@ -288,16 +291,16 @@ END {{ if (!found) exit 2 }}
     #[test]
     fn miss_without_fail_key_returns_null() {
         let stub = Stub::new("miss-noflag", &[]);
-        let out = apply_with_bin(stub.bin.to_str().unwrap(), &op("passwd", "nobody", false))
-            .unwrap();
+        let out =
+            apply_with_bin(stub.bin.to_str().unwrap(), &op("passwd", "nobody", false)).unwrap();
         assert!(out.get("nobody").unwrap().is_null());
     }
 
     #[test]
     fn whitespace_db_splits_on_whitespace() {
         let stub = Stub::new("hosts", &[("hosts", "10.0.0.1 pg1.local pg1")]);
-        let out = apply_with_bin(stub.bin.to_str().unwrap(), &op("hosts", "10.0.0.1", true))
-            .unwrap();
+        let out =
+            apply_with_bin(stub.bin.to_str().unwrap(), &op("hosts", "10.0.0.1", true)).unwrap();
         let fields = out.get("10.0.0.1").unwrap().as_array().unwrap();
         // First field after the IP (the lookup key) is the canonical name.
         assert_eq!(fields[0], "pg1.local");

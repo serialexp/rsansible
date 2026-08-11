@@ -210,7 +210,11 @@ pub async fn open_session(opts: &ConnectOptions, agent_binary: &[u8]) -> Result<
         .await
         .with_context(|| format!("pushing agent to {label}:{remote_path}"))?;
 
-    Ok(SshSession { handle, remote_path, label })
+    Ok(SshSession {
+        handle,
+        remote_path,
+        label,
+    })
 }
 
 /// Open a new channel on the given session and exec the agent under
@@ -220,20 +224,14 @@ pub async fn open_session(opts: &ConnectOptions, agent_binary: &[u8]) -> Result<
 ///
 /// The returned `AgentConn` carries `TransportKeepalive::Pooled` —
 /// the pool owns the session, slot drop doesn't tear it down.
-pub async fn spawn_agent_channel(
-    session: &SshSession,
-    key: &BecomeKey,
-) -> Result<AgentConn> {
+pub async fn spawn_agent_channel(session: &SshSession, key: &BecomeKey) -> Result<AgentConn> {
     // `RSANSIBLE_AGENT_KEEP_BINARY=1` tells the agent NOT to self-unlink its
     // on-disk binary at startup. The pool may spawn additional agents (one
     // per become-config) from the same on-disk path within the same SSH
     // session, so the file must persist for the lifetime of the session.
     // Controller-side cleanup happens via Bye / session close.
     let cmd = match key {
-        BecomeKey::None => format!(
-            "RSANSIBLE_AGENT_KEEP_BINARY=1 {}",
-            session.remote_path,
-        ),
+        BecomeKey::None => format!("RSANSIBLE_AGENT_KEEP_BINARY=1 {}", session.remote_path,),
         // `sudo -n` makes sudo fail fast rather than prompt for a password —
         // any deployment that needs `become: true` must have NOPASSWD
         // sudoers entries, matching Ansible's default for ssh + become.
@@ -291,23 +289,23 @@ pub async fn spawn_agent_channel(
     // fails for any reason we proceed with offset=0 rather than aborting
     // the whole connection — task timing traces become less accurate
     // but everything else still works.
-    let (clock_offset_ns, clock_rtt_ns) =
-        match probe_clock_skew(&mut stream, &session.label).await {
-            Ok((offset, rtt)) => {
-                info!(
-                    host = %session.label,
-                    become = %key.label(),
-                    offset_us = offset / 1_000,
-                    rtt_us = rtt / 1_000,
-                    "clock-skew probe done",
-                );
-                (offset, rtt)
-            }
-            Err(e) => {
-                warn!(host = %session.label, become = %key.label(), "clock-skew probe failed (continuing with offset=0): {e:#}");
-                (0, 0)
-            }
-        };
+    let (clock_offset_ns, clock_rtt_ns) = match probe_clock_skew(&mut stream, &session.label).await
+    {
+        Ok((offset, rtt)) => {
+            info!(
+                host = %session.label,
+                become = %key.label(),
+                offset_us = offset / 1_000,
+                rtt_us = rtt / 1_000,
+                "clock-skew probe done",
+            );
+            (offset, rtt)
+        }
+        Err(e) => {
+            warn!(host = %session.label, become = %key.label(), "clock-skew probe failed (continuing with offset=0): {e:#}");
+            (0, 0)
+        }
+    };
 
     Ok(AgentConn {
         label: session.label.clone(),
@@ -343,10 +341,7 @@ pub async fn connect_and_push(opts: &ConnectOptions, agent_binary: &[u8]) -> Res
 ///
 /// `offset = ((T2 - T1) + (T3 - T4)) / 2`  (positive iff agent ahead)
 /// `rtt    = (T4 - T1) - (T3 - T2)`        (always non-negative)
-pub(crate) async fn probe_clock_skew<S>(
-    stream: &mut S,
-    label: &str,
-) -> Result<(i64, u64)>
+pub(crate) async fn probe_clock_skew<S>(stream: &mut S, label: &str) -> Result<(i64, u64)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -366,13 +361,10 @@ where
     let t2 = pong.agent_recv_unix_ns;
     let t3 = pong.agent_sent_unix_ns;
     // Cast to i128 so we don't underflow on a wildly skewed clock.
-    let offset_ns =
-        (((t2 as i128) - (t1 as i128)) + ((t3 as i128) - (t4 as i128))) / 2;
-    let rtt_ns_signed =
-        ((t4 as i128) - (t1 as i128)) - ((t3 as i128) - (t2 as i128));
+    let offset_ns = (((t2 as i128) - (t1 as i128)) + ((t3 as i128) - (t4 as i128))) / 2;
+    let rtt_ns_signed = ((t4 as i128) - (t1 as i128)) - ((t3 as i128) - (t2 as i128));
     let rtt_ns = rtt_ns_signed.max(0) as u64;
-    let offset_ns =
-        offset_ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    let offset_ns = offset_ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     Ok((offset_ns, rtt_ns))
 }
 
@@ -412,10 +404,7 @@ async fn authenticate(
     let key = match load_secret_key(&key_path, None) {
         Ok(k) => k,
         Err(e) => {
-            let file_err = format!(
-                "loading SSH key {}: {e:#}",
-                key_path.display(),
-            );
+            let file_err = format!("loading SSH key {}: {e:#}", key_path.display(),);
             match agent_err {
                 Some(ae) => bail!(
                     "ssh auth {label} failed:\n  - {ae}\n  - {file_err}\n  \
@@ -468,7 +457,10 @@ async fn try_agent_auth(
     for ident in identities {
         let (pubkey, comment) = match &ident {
             AgentIdentity::PublicKey { key, comment } => (key.clone(), comment.clone()),
-            AgentIdentity::Certificate { certificate, comment } => (
+            AgentIdentity::Certificate {
+                certificate,
+                comment,
+            } => (
                 PublicKey::new(certificate.public_key().clone(), ""),
                 comment.clone(),
             ),
@@ -561,7 +553,10 @@ fn remote_agent_path() -> String {
 
 fn resolve_key_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
-        return Ok(expand_tilde_with_home(p, std::env::var_os("HOME").as_deref()));
+        return Ok(expand_tilde_with_home(
+            p,
+            std::env::var_os("HOME").as_deref(),
+        ));
     }
     if let Some(home) = std::env::var_os("HOME") {
         for name in &["id_ed25519", "id_ecdsa", "id_rsa"] {

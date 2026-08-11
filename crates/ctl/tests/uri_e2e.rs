@@ -49,8 +49,7 @@ async fn uri_lifts_envelope_into_register() -> Result<()> {
     let inv = single_host_inventory(&container);
 
     let pb_path = examples_dir().join("uri.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -82,11 +81,7 @@ async fn uri_lifts_envelope_into_register() -> Result<()> {
     // 3. status_code mismatch — failed=true + status still 200.
     let bad_out = read_file(&container, "/tmp/rsansible-uri-bad")?;
     let lines: Vec<&str> = bad_out.lines().collect();
-    assert_eq!(
-        lines.first().copied(),
-        Some("true"),
-        "failed: {bad_out:?}"
-    );
+    assert_eq!(lines.first().copied(), Some("true"), "failed: {bad_out:?}");
     assert_eq!(
         lines.get(1).copied(),
         Some("200"),
@@ -96,7 +91,11 @@ async fn uri_lifts_envelope_into_register() -> Result<()> {
     // 4. HEAD — status=200, changed=False (no mutation for GET/HEAD).
     let head_out = read_file(&container, "/tmp/rsansible-uri-head")?;
     let lines: Vec<&str> = head_out.lines().collect();
-    assert_eq!(lines.first().copied(), Some("200"), "HEAD status: {head_out:?}");
+    assert_eq!(
+        lines.first().copied(),
+        Some("200"),
+        "HEAD status: {head_out:?}"
+    );
     assert_eq!(
         lines.get(1).copied(),
         Some("false"),

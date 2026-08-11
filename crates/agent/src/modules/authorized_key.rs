@@ -60,9 +60,7 @@ pub async fn run(
         }
         Err(AuthorizedKeyError::Io(m)) => emit_error(ctx, seq, err::IO, m).await,
         Err(AuthorizedKeyError::Spawn(m)) => emit_error(ctx, seq, err::SPAWN_FAILED, m).await,
-        Err(AuthorizedKeyError::BadRequest(m)) => {
-            emit_error(ctx, seq, err::BAD_REQUEST, m).await
-        }
+        Err(AuthorizedKeyError::BadRequest(m)) => emit_error(ctx, seq, err::BAD_REQUEST, m).await,
     }
     Ok(())
 }
@@ -103,8 +101,9 @@ pub(crate) fn apply_with_paths(
     let ssh_dir = home.join(".ssh");
     let keys_path = ssh_dir.join("authorized_keys");
 
-    let new_key = parse_key(&op.key)
-        .ok_or_else(|| AuthorizedKeyError::BadRequest(format!("authorized_key: malformed key {:?}", op.key)))?;
+    let new_key = parse_key(&op.key).ok_or_else(|| {
+        AuthorizedKeyError::BadRequest(format!("authorized_key: malformed key {:?}", op.key))
+    })?;
 
     let existing_text = match fs::read_to_string(&keys_path) {
         Ok(s) => s,
@@ -127,13 +126,11 @@ pub(crate) fn apply_with_paths(
 
     // Ensure .ssh dir exists, 0700, owned by user.
     if !ssh_dir.exists() {
-        fs::create_dir_all(&ssh_dir).map_err(|e| {
-            AuthorizedKeyError::Io(format!("mkdir {}: {e}", ssh_dir.display()))
-        })?;
+        fs::create_dir_all(&ssh_dir)
+            .map_err(|e| AuthorizedKeyError::Io(format!("mkdir {}: {e}", ssh_dir.display())))?;
     }
-    fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
-        AuthorizedKeyError::Io(format!("chmod {}: {e}", ssh_dir.display()))
-    })?;
+    fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|e| AuthorizedKeyError::Io(format!("chmod {}: {e}", ssh_dir.display())))?;
     chown(&bins.chown, &ssh_dir, &op.user)?;
 
     // Atomic write of authorized_keys.
@@ -411,8 +408,7 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
         Stub { dir, bins, home }
     }
     fn read_keys(stub: &Stub) -> String {
-        std::fs::read_to_string(stub.home.join(".ssh").join("authorized_keys"))
-            .unwrap_or_default()
+        std::fs::read_to_string(stub.home.join(".ssh").join("authorized_keys")).unwrap_or_default()
     }
 
     const K1: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAA alice@laptop";
@@ -422,8 +418,8 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
     #[test]
     fn adds_first_key_into_empty_file() {
         let stub = build_stub("first", "alice");
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false)
-            .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false).unwrap();
         assert!(changed);
         assert_eq!(read_keys(&stub), format!("{K1}\n"));
         let md = std::fs::metadata(stub.home.join(".ssh")).unwrap();
@@ -436,9 +432,13 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
     fn idempotent_when_key_already_present() {
         let stub = build_stub("idem", "alice");
         std::fs::create_dir_all(stub.home.join(".ssh")).unwrap();
-        std::fs::write(stub.home.join(".ssh").join("authorized_keys"), format!("{K1}\n")).unwrap();
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false)
-            .unwrap();
+        std::fs::write(
+            stub.home.join(".ssh").join("authorized_keys"),
+            format!("{K1}\n"),
+        )
+        .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false).unwrap();
         assert!(!changed);
     }
 
@@ -448,7 +448,11 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
         // is already present rewrites the comment but doesn't duplicate.
         let stub = build_stub("comment", "alice");
         std::fs::create_dir_all(stub.home.join(".ssh")).unwrap();
-        std::fs::write(stub.home.join(".ssh").join("authorized_keys"), format!("{K1}\n")).unwrap();
+        std::fs::write(
+            stub.home.join(".ssh").join("authorized_keys"),
+            format!("{K1}\n"),
+        )
+        .unwrap();
         let changed = apply_with_paths(
             &stub.bins,
             &op("alice", K1_NEW_COMMENT, STATE_PRESENT, false),
@@ -465,9 +469,13 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
     fn preserves_other_keys_when_adding() {
         let stub = build_stub("multi", "alice");
         std::fs::create_dir_all(stub.home.join(".ssh")).unwrap();
-        std::fs::write(stub.home.join(".ssh").join("authorized_keys"), format!("{K2}\n")).unwrap();
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false)
-            .unwrap();
+        std::fs::write(
+            stub.home.join(".ssh").join("authorized_keys"),
+            format!("{K2}\n"),
+        )
+        .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false).unwrap();
         assert!(changed);
         let after = read_keys(&stub);
         assert!(after.contains(K1));
@@ -484,8 +492,8 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
             format!("{K1}\n{K2}\n"),
         )
         .unwrap();
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_ABSENT, false), false)
-            .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_ABSENT, false), false).unwrap();
         assert!(changed);
         let after = read_keys(&stub);
         assert!(!after.contains(K1));
@@ -496,9 +504,13 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
     fn absent_when_already_absent_is_noop() {
         let stub = build_stub("absent-noop", "alice");
         std::fs::create_dir_all(stub.home.join(".ssh")).unwrap();
-        std::fs::write(stub.home.join(".ssh").join("authorized_keys"), format!("{K2}\n")).unwrap();
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_ABSENT, false), false)
-            .unwrap();
+        std::fs::write(
+            stub.home.join(".ssh").join("authorized_keys"),
+            format!("{K2}\n"),
+        )
+        .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_ABSENT, false), false).unwrap();
         assert!(!changed);
     }
 
@@ -511,8 +523,8 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
             format!("{K1}\n{K2}\n"),
         )
         .unwrap();
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, true), false)
-            .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, true), false).unwrap();
         assert!(changed);
         assert_eq!(read_keys(&stub), format!("{K1}\n"));
     }
@@ -520,8 +532,8 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
     #[test]
     fn user_not_found_errors() {
         let stub = build_stub("nouser", "alice");
-        let err = apply_with_paths(&stub.bins, &op("bob", K1, STATE_PRESENT, false), false)
-            .unwrap_err();
+        let err =
+            apply_with_paths(&stub.bins, &op("bob", K1, STATE_PRESENT, false), false).unwrap_err();
         match err {
             AuthorizedKeyError::BadRequest(m) => assert!(m.contains("does not exist")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -543,28 +555,32 @@ echo "{user}:x:1000:1000::{home}:/bin/bash"
         let stub = build_stub("posstable", "alice");
         std::fs::create_dir_all(stub.home.join(".ssh")).unwrap();
         let initial = format!("{K1}\n{K2}\n");
-        std::fs::write(
-            stub.home.join(".ssh").join("authorized_keys"),
-            &initial,
-        )
-        .unwrap();
+        std::fs::write(stub.home.join(".ssh").join("authorized_keys"), &initial).unwrap();
         // Re-add K1 (already first in file). Should be a no-op.
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false)
-            .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), false).unwrap();
         assert!(!changed, "re-adding K1 to position 0 should be idempotent");
-        assert_eq!(read_keys(&stub), initial, "file content must be byte-identical");
+        assert_eq!(
+            read_keys(&stub),
+            initial,
+            "file content must be byte-identical"
+        );
         // Re-add K2 (already second in file). Should also be a no-op.
-        let changed = apply_with_paths(&stub.bins, &op("alice", K2, STATE_PRESENT, false), false)
-            .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K2, STATE_PRESENT, false), false).unwrap();
         assert!(!changed, "re-adding K2 to position 1 should be idempotent");
-        assert_eq!(read_keys(&stub), initial, "file content must remain byte-identical");
+        assert_eq!(
+            read_keys(&stub),
+            initial,
+            "file content must remain byte-identical"
+        );
     }
 
     #[test]
     fn check_mode_reports_change_without_writing() {
         let stub = build_stub("check", "alice");
-        let changed = apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), true)
-            .unwrap();
+        let changed =
+            apply_with_paths(&stub.bins, &op("alice", K1, STATE_PRESENT, false), true).unwrap();
         assert!(changed);
         assert!(!stub.home.join(".ssh").join("authorized_keys").exists());
     }

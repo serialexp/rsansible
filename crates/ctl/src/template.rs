@@ -44,9 +44,7 @@ pub fn configure_dotenv_file(path: PathBuf) {
     let _ = DOTENV_FILE.set(path);
 }
 
-use crate::playbook::{
-    AssertTask, ExecOp, LoopSpec, Playbook, ShellOp, Task, TaskBody, TaskOp,
-};
+use crate::playbook::{AssertTask, ExecOp, LoopSpec, Playbook, ShellOp, Task, TaskBody, TaskOp};
 
 /// Ansible-style `omit` sentinel.
 ///
@@ -67,8 +65,7 @@ use crate::playbook::{
 /// never collides with real user content. It is NOT a security
 /// boundary — anyone authoring a playbook with this exact literal in
 /// their YAML can confuse the engine. They shouldn't.
-pub const OMIT_SENTINEL: &str =
-    "__rsansible_omit_placeholder_8c0a9f2d4b1e3a6d5c7f8b9a0c1d2e3f__";
+pub const OMIT_SENTINEL: &str = "__rsansible_omit_placeholder_8c0a9f2d4b1e3a6d5c7f8b9a0c1d2e3f__";
 
 /// Rewrite a Jinja source string so attribute-style numeric subscripts
 /// like `item.0.name` become bracket subscripts `item[0].name`.
@@ -442,9 +439,7 @@ pub fn make_env<'a>() -> Environment<'a> {
         let cache = cache.clone();
         env.add_function(
             "controller_env",
-            move |name: String| -> Result<MjValue, MjError> {
-                controller_env_impl(&cache, name)
-            },
+            move |name: String| -> Result<MjValue, MjError> { controller_env_impl(&cache, name) },
         );
     }
     {
@@ -521,7 +516,11 @@ enum CacheKey {
 }
 
 fn cache_get(cache: &LookupCache, key: &CacheKey) -> Option<MjValue> {
-    cache.lock().expect("LookupCache poisoned").get(key).cloned()
+    cache
+        .lock()
+        .expect("LookupCache poisoned")
+        .get(key)
+        .cloned()
 }
 
 fn cache_put(cache: &LookupCache, key: CacheKey, value: MjValue) {
@@ -588,7 +587,9 @@ fn extract_filter(
     morekeys: Option<MjValue>,
 ) -> Result<MjValue, MjError> {
     let first = lookup_one(&container, &key)?;
-    let Some(more) = morekeys else { return Ok(first) };
+    let Some(more) = morekeys else {
+        return Ok(first);
+    };
     // `morekeys` accepts a single scalar or a list of scalars. Ansible's
     // docs say "string or list" but in practice integers also work for
     // list indexing.
@@ -671,7 +672,10 @@ fn random_filter(value: MjValue) -> Result<MjValue, MjError> {
     }
     Err(MjError::new(
         MjKind::InvalidOperation,
-        format!("random: expected an integer or a sequence, got {:?}", value.kind()),
+        format!(
+            "random: expected an integer or a sequence, got {:?}",
+            value.kind()
+        ),
     ))
 }
 
@@ -701,9 +705,7 @@ fn b64decode_filter(value: MjValue) -> Result<MjValue, MjError> {
     })?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
-        .map_err(|e| {
-            MjError::new(MjKind::InvalidOperation, format!("b64decode: {e}"))
-        })?;
+        .map_err(|e| MjError::new(MjKind::InvalidOperation, format!("b64decode: {e}")))?;
     let text = String::from_utf8(bytes).map_err(|e| {
         MjError::new(
             MjKind::InvalidOperation,
@@ -722,9 +724,8 @@ fn from_json_filter(value: MjValue) -> Result<MjValue, MjError> {
             format!("from_json: expected a string, got {:?}", value.kind()),
         )
     })?;
-    let json: serde_json::Value = serde_json::from_str(s).map_err(|e| {
-        MjError::new(MjKind::InvalidOperation, format!("from_json: {e}"))
-    })?;
+    let json: serde_json::Value = serde_json::from_str(s)
+        .map_err(|e| MjError::new(MjKind::InvalidOperation, format!("from_json: {e}")))?;
     Ok(MjValue::from_serialize(&json))
 }
 
@@ -733,9 +734,8 @@ fn from_json_filter(value: MjValue) -> Result<MjValue, MjError> {
 /// accept an `indent` arg (the built-in `tojson` does); acme doesn't
 /// use it. Add if needed.
 fn to_json_filter(value: MjValue) -> Result<MjValue, MjError> {
-    let s = serde_json::to_string(&value).map_err(|e| {
-        MjError::new(MjKind::InvalidOperation, format!("to_json: {e}"))
-    })?;
+    let s = serde_json::to_string(&value)
+        .map_err(|e| MjError::new(MjKind::InvalidOperation, format!("to_json: {e}")))?;
     Ok(MjValue::from(s))
 }
 
@@ -753,7 +753,9 @@ fn to_json_filter(value: MjValue) -> Result<MjValue, MjError> {
 /// is changed` on a non-register or undefined value returns false, not
 /// an error.
 fn register_bool_attr(value: &MjValue, attr: &str) -> bool {
-    let Ok(v) = value.get_attr(attr) else { return false };
+    let Ok(v) = value.get_attr(attr) else {
+        return false;
+    };
     if v.is_undefined() || v.is_none() {
         return false;
     }
@@ -802,7 +804,10 @@ fn to_seq(value: &MjValue, filter_name: &str) -> Result<Vec<MjValue>, MjError> {
         .map_err(|e| {
             MjError::new(
                 MjKind::InvalidOperation,
-                format!("{filter_name}: expected a sequence, got {:?}: {e}", value.kind()),
+                format!(
+                    "{filter_name}: expected a sequence, got {:?}: {e}",
+                    value.kind()
+                ),
             )
         })
 }
@@ -820,7 +825,10 @@ fn difference_filter(value: MjValue, other: MjValue) -> Result<MjValue, MjError>
     let a = to_seq(&value, "difference")?;
     let b = to_seq(&other, "difference")?;
     let exclude: std::collections::HashSet<String> = b.iter().map(value_key).collect();
-    let out: Vec<MjValue> = a.into_iter().filter(|v| !exclude.contains(&value_key(v))).collect();
+    let out: Vec<MjValue> = a
+        .into_iter()
+        .filter(|v| !exclude.contains(&value_key(v)))
+        .collect();
     Ok(MjValue::from(out))
 }
 
@@ -873,7 +881,10 @@ fn symmetric_difference_filter(value: MjValue, other: MjValue) -> Result<MjValue
 fn unique_filter(value: MjValue) -> Result<MjValue, MjError> {
     let a = to_seq(&value, "unique")?;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let out: Vec<MjValue> = a.into_iter().filter(|v| seen.insert(value_key(v))).collect();
+    let out: Vec<MjValue> = a
+        .into_iter()
+        .filter(|v| seen.insert(value_key(v)))
+        .collect();
     Ok(MjValue::from(out))
 }
 
@@ -896,7 +907,9 @@ fn flatten_filter(value: MjValue) -> Result<MjValue, MjError> {
 /// laxness, but a bad pattern is a hard error so playbooks find their
 /// typos.
 fn regex_match_test(value: MjValue, pattern: String) -> Result<bool, MjError> {
-    let Some(s) = value.as_str() else { return Ok(false) };
+    let Some(s) = value.as_str() else {
+        return Ok(false);
+    };
     let re = regex::Regex::new(&pattern).map_err(|e| {
         MjError::new(
             MjKind::InvalidOperation,
@@ -917,7 +930,9 @@ fn regex_match_test(value: MjValue, pattern: String) -> Result<bool, MjError> {
 /// Ansible's `search` test (and `regex` alias): `re.search(pattern,
 /// value)`-shaped — the pattern can match anywhere in the string.
 fn regex_search_test(value: MjValue, pattern: String) -> Result<bool, MjError> {
-    let Some(s) = value.as_str() else { return Ok(false) };
+    let Some(s) = value.as_str() else {
+        return Ok(false);
+    };
     let re = regex::Regex::new(&pattern).map_err(|e| {
         MjError::new(
             MjKind::InvalidOperation,
@@ -944,7 +959,9 @@ fn regex_replace_filter(
             format!("regex_replace: invalid pattern {pattern:?}: {e}"),
         )
     })?;
-    Ok(MjValue::from(re.replace_all(s, replacement.as_str()).into_owned()))
+    Ok(MjValue::from(
+        re.replace_all(s, replacement.as_str()).into_owned(),
+    ))
 }
 
 // =========================================================================
@@ -970,10 +987,7 @@ fn regex_replace_filter(
 /// need binary blobs in templates).
 ///
 /// Results are memoized per-run; see LookupCache.
-fn controller_read_file_impl(
-    cache: &LookupCache,
-    path: String,
-) -> Result<MjValue, MjError> {
+fn controller_read_file_impl(cache: &LookupCache, path: String) -> Result<MjValue, MjError> {
     let key = CacheKey::ReadFile(path.clone());
     if let Some(v) = cache_get(cache, &key) {
         return Ok(v);
@@ -1019,10 +1033,7 @@ fn controller_read_file_impl(
 /// either way) and so that if we later add an opt-in caching flag —
 /// e.g. `controller_shell_stdout(cmd, cache=true)` — the plumbing
 /// is already there.
-fn controller_shell_stdout_impl(
-    _cache: &LookupCache,
-    cmd: String,
-) -> Result<MjValue, MjError> {
+fn controller_shell_stdout_impl(_cache: &LookupCache, cmd: String) -> Result<MjValue, MjError> {
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -1132,7 +1143,10 @@ fn controller_dotenv_at(
         let text = String::from_utf8(bytes).map_err(|e| {
             MjError::new(
                 MjKind::InvalidOperation,
-                format!("lookup('dotenv'): {} is not valid UTF-8: {e}", path.display()),
+                format!(
+                    "lookup('dotenv'): {} is not valid UTF-8: {e}",
+                    path.display()
+                ),
             )
         })?;
         let parsed = parse_dotenv(&text);
@@ -1322,9 +1336,7 @@ fn lookup_shim_impl(
         let v = args.get(0).ok_or_else(|| {
             MjError::new(
                 MjKind::InvalidOperation,
-                format!(
-                    "lookup({plugin:?}): missing required argument ({field})"
-                ),
+                format!("lookup({plugin:?}): missing required argument ({field})"),
             )
         })?;
         v.as_str()
@@ -1355,20 +1367,12 @@ pub fn precompile_all(pb: &Playbook) -> Result<()> {
     for (pi, play) in pb.plays.iter().enumerate() {
         for (ti, task) in play.tasks.iter().enumerate() {
             check_task(&env, task).map_err(|e| {
-                anyhow!(
-                    "play[{pi}] {:?} task[{ti}] {:?}: {e}",
-                    play.name,
-                    task.name
-                )
+                anyhow!("play[{pi}] {:?} task[{ti}] {:?}: {e}", play.name, task.name)
             })?;
         }
         for (hi, h) in play.handlers.iter().enumerate() {
             check_task(&env, h).map_err(|e| {
-                anyhow!(
-                    "play[{pi}] {:?} handler[{hi}] {:?}: {e}",
-                    play.name,
-                    h.name
-                )
+                anyhow!("play[{pi}] {:?} handler[{hi}] {:?}: {e}", play.name, h.name)
             })?;
         }
     }
@@ -1383,7 +1387,8 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
     if let Some(LoopSpec::Expr(s)) = &task.loop_spec {
         // Treat the loop expression as a template — they're sometimes
         // bare `{{ var }}` and sometimes more complex `{{ a + b }}`.
-        env.template_from_str(&crate::template::prepare_jinja_source(&s)).map_err(|e| anyhow!("loop: {e}"))?;
+        env.template_from_str(&crate::template::prepare_jinja_source(&s))
+            .map_err(|e| anyhow!("loop: {e}"))?;
     }
     if let Some(d) = &task.delegate_to {
         env.template_from_str(&crate::template::prepare_jinja_source(&d))
@@ -1468,12 +1473,10 @@ fn check_task(env: &Environment, task: &Task) -> Result<()> {
                     .map_err(|e| anyhow!("block.tasks[{i}] {:?}: {e}", child.name))?;
             }
             for (i, child) in b.rescue.iter().enumerate() {
-                check_task(env, child)
-                    .map_err(|e| anyhow!("rescue[{i}] {:?}: {e}", child.name))?;
+                check_task(env, child).map_err(|e| anyhow!("rescue[{i}] {:?}: {e}", child.name))?;
             }
             for (i, child) in b.always.iter().enumerate() {
-                check_task(env, child)
-                    .map_err(|e| anyhow!("always[{i}] {:?}: {e}", child.name))?;
+                check_task(env, child).map_err(|e| anyhow!("always[{i}] {:?}: {e}", child.name))?;
             }
         }
     }
@@ -1491,7 +1494,11 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                 .map_err(|e| anyhow!("shell.command: {e}"))?;
         }
         TaskOp::Exec(ExecOp {
-            argv, env: e_env, cwd, stdin, ..
+            argv,
+            env: e_env,
+            cwd,
+            stdin,
+            ..
         }) => {
             for (i, a) in argv.iter().enumerate() {
                 env.template_from_str(&crate::template::prepare_jinja_source(&a))
@@ -1545,9 +1552,8 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             env.template_from_str(&crate::template::prepare_jinja_source(&t.dest))
                 .map_err(|e| anyhow!("template.dest: {e}"))?;
             if let Some(body) = t.body.as_deref() {
-                env.template_from_str(&crate::template::prepare_jinja_source(&body)).map_err(|e| {
-                    anyhow!("template src {:?}: {e}", t.src)
-                })?;
+                env.template_from_str(&crate::template::prepare_jinja_source(&body))
+                    .map_err(|e| anyhow!("template src {:?}: {e}", t.src))?;
             }
             if let Some(v) = t.validate.as_deref() {
                 env.template_from_str(&crate::template::prepare_jinja_source(&v))
@@ -1646,8 +1652,10 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
                     .map_err(|e| anyhow!("{label}.virtualenv: {e}"))?;
             }
             if !p.virtualenv_command.is_empty() {
-                env.template_from_str(&crate::template::prepare_jinja_source(&p.virtualenv_command))
-                    .map_err(|e| anyhow!("{label}.virtualenv_command: {e}"))?;
+                env.template_from_str(&crate::template::prepare_jinja_source(
+                    &p.virtualenv_command,
+                ))
+                .map_err(|e| anyhow!("{label}.virtualenv_command: {e}"))?;
             }
         }
         TaskOp::Repository(r) => {
@@ -1705,6 +1713,14 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
         TaskOp::Timezone(z) => {
             env.template_from_str(&crate::template::prepare_jinja_source(&z.name))
                 .map_err(|e| anyhow!("timezone.name: {e}"))?;
+        }
+        TaskOp::Modprobe(m) => {
+            env.template_from_str(&crate::template::prepare_jinja_source(&m.name))
+                .map_err(|e| anyhow!("modprobe.name: {e}"))?;
+            if !m.params.is_empty() {
+                env.template_from_str(&crate::template::prepare_jinja_source(&m.params))
+                    .map_err(|e| anyhow!("modprobe.params: {e}"))?;
+            }
         }
         TaskOp::Ufw(u) => {
             // All string fields may carry Jinja — the parse-time
@@ -1809,8 +1825,10 @@ fn check_op(env: &Environment, op: &TaskOp) -> Result<()> {
             // registers via Jinja in real playbooks.
             env.template_from_str(&crate::template::prepare_jinja_source(&c.csr_content))
                 .map_err(|e| anyhow!("x509_certificate_pipe.csr_content: {e}"))?;
-            env.template_from_str(&crate::template::prepare_jinja_source(&c.privatekey_content))
-                .map_err(|e| anyhow!("x509_certificate_pipe.privatekey_content: {e}"))?;
+            env.template_from_str(&crate::template::prepare_jinja_source(
+                &c.privatekey_content,
+            ))
+            .map_err(|e| anyhow!("x509_certificate_pipe.privatekey_content: {e}"))?;
         }
         TaskOp::PostgresqlQuery(p) => {
             // query, db, login_user, login_password, login_host all
@@ -2148,11 +2166,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let templates_dir = tmp.path().join("templates");
         std::fs::create_dir(&templates_dir).unwrap();
-        std::fs::write(
-            templates_dir.join("greeting.j2"),
-            "hello {{ name }}",
-        )
-        .unwrap();
+        std::fs::write(templates_dir.join("greeting.j2"), "hello {{ name }}").unwrap();
 
         let mut env: Environment<'static> = make_env();
         install_include_loader(&mut env, vec![templates_dir.clone()]);
@@ -2176,7 +2190,10 @@ mod tests {
         let mut env: Environment<'static> = make_env();
         install_include_loader(&mut env, vec![templates_dir.clone()]);
 
-        for bad in [r#"{% include "../etc/passwd" %}"#, r#"{% include "/etc/passwd" %}"#] {
+        for bad in [
+            r#"{% include "../etc/passwd" %}"#,
+            r#"{% include "/etc/passwd" %}"#,
+        ] {
             let tmpl = env.template_from_str(bad).unwrap();
             let err = tmpl.render(context! {}).unwrap_err();
             assert!(
@@ -2255,9 +2272,7 @@ mod tests {
     fn extract_filter_nested_via_morekeys_string() {
         let env = make_env();
         let tmpl = env
-            .template_from_str(
-                r#"{{ "alice" | extract(hostvars, "ansible_host") }}"#,
-            )
+            .template_from_str(r#"{{ "alice" | extract(hostvars, "ansible_host") }}"#)
             .unwrap();
         let hostvars = serde_json::json!({
             "alice": {"ansible_host": "10.0.0.1"},
@@ -2271,9 +2286,7 @@ mod tests {
     fn extract_filter_morekeys_list_path() {
         let env = make_env();
         let tmpl = env
-            .template_from_str(
-                r#"{{ "alice" | extract(hostvars, ["nested", "deep"]) }}"#,
-            )
+            .template_from_str(r#"{{ "alice" | extract(hostvars, ["nested", "deep"]) }}"#)
             .unwrap();
         let hostvars = serde_json::json!({
             "alice": {"nested": {"deep": "found"}}
@@ -2285,9 +2298,7 @@ mod tests {
     #[test]
     fn extract_filter_seq_index() {
         let env = make_env();
-        let tmpl = env
-            .template_from_str(r#"{{ 1 | extract(xs) }}"#)
-            .unwrap();
+        let tmpl = env.template_from_str(r#"{{ 1 | extract(xs) }}"#).unwrap();
         let xs = serde_json::json!(["a", "b", "c"]);
         let out = tmpl.render(context! { xs => xs }).unwrap();
         assert_eq!(out, "b");
@@ -2350,9 +2361,7 @@ mod tests {
     fn controller_read_file_errors_loudly_on_missing() {
         let env = make_env();
         let tmpl = env
-            .template_from_str(
-                r#"{{ controller_read_file("/definitely/does/not/exist/zzz") }}"#,
-            )
+            .template_from_str(r#"{{ controller_read_file("/definitely/does/not/exist/zzz") }}"#)
             .unwrap();
         let err = tmpl.render(context! {}).unwrap_err().to_string();
         assert!(
@@ -2376,9 +2385,7 @@ mod tests {
     fn controller_shell_stdout_surfaces_nonzero_exit() {
         let env = make_env();
         let tmpl = env
-            .template_from_str(
-                r#"{{ controller_shell_stdout("echo nope 1>&2; exit 7") }}"#,
-            )
+            .template_from_str(r#"{{ controller_shell_stdout("echo nope 1>&2; exit 7") }}"#)
             .unwrap();
         let err = tmpl.render(context! {}).unwrap_err().to_string();
         assert!(
@@ -2392,9 +2399,7 @@ mod tests {
         // Pick a name nothing else in this process should have set.
         let env = make_env();
         let tmpl = env
-            .template_from_str(
-                r#"[{{ controller_env("RSANSIBLE_TEST_DEFINITELY_UNSET_XYZ") }}]"#,
-            )
+            .template_from_str(r#"[{{ controller_env("RSANSIBLE_TEST_DEFINITELY_UNSET_XYZ") }}]"#)
             .unwrap();
         let out = tmpl.render(context! {}).unwrap();
         assert_eq!(out, "[]");
@@ -2408,9 +2413,7 @@ mod tests {
         std::env::set_var("RSANSIBLE_TEST_CONTROLLER_ENV_SET", "yes-it-is");
         let env = make_env();
         let tmpl = env
-            .template_from_str(
-                r#"{{ controller_env("RSANSIBLE_TEST_CONTROLLER_ENV_SET") }}"#,
-            )
+            .template_from_str(r#"{{ controller_env("RSANSIBLE_TEST_CONTROLLER_ENV_SET") }}"#)
             .unwrap();
         let out = tmpl.render(context! {}).unwrap();
         std::env::remove_var("RSANSIBLE_TEST_CONTROLLER_ENV_SET");
@@ -2467,7 +2470,10 @@ mod tests {
             "unexpected error: {err}"
         );
         // The supported-plugin list must now advertise `dotenv`.
-        assert!(err.contains("dotenv"), "supported list missing dotenv: {err}");
+        assert!(
+            err.contains("dotenv"),
+            "supported list missing dotenv: {err}"
+        );
     }
 
     fn empty_cache() -> LookupCache {
@@ -2566,15 +2572,17 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
             .write_all(b"K=second\n")
             .unwrap();
         let v2 = controller_dotenv_at(&cache, &path, "K".into()).unwrap();
-        assert_eq!(v2.as_str().unwrap(), "first", "cache should have parsed once");
+        assert_eq!(
+            v2.as_str().unwrap(),
+            "first",
+            "cache should have parsed once"
+        );
     }
 
     #[test]
     fn lookup_missing_arg_errors_with_field_name() {
         let env = make_env();
-        let tmpl = env
-            .template_from_str(r#"{{ lookup("file") }}"#)
-            .unwrap();
+        let tmpl = env.template_from_str(r#"{{ lookup("file") }}"#).unwrap();
         let err = tmpl.render(context! {}).unwrap_err().to_string();
         assert!(
             err.contains("path") && err.contains("missing"),
@@ -2710,9 +2718,7 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
         let tmpl = env
             .template_from_str("{{ s | b64encode | b64decode }}")
             .unwrap();
-        let out = tmpl
-            .render(context! { s => "hello world" })
-            .unwrap();
+        let out = tmpl.render(context! { s => "hello world" }).unwrap();
         assert_eq!(out, "hello world");
     }
 
@@ -2750,12 +2756,8 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
     #[test]
     fn from_json_propagates_parse_errors() {
         let env = make_env();
-        let tmpl = env
-            .template_from_str("{{ s | from_json }}")
-            .unwrap();
-        let err = tmpl
-            .render(context! { s => "not json" })
-            .unwrap_err();
+        let tmpl = env.template_from_str("{{ s | from_json }}").unwrap();
+        let err = tmpl.render(context! { s => "not json" }).unwrap_err();
         assert!(format!("{err}").contains("from_json"), "got: {err}");
     }
 
@@ -2918,9 +2920,7 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
         // Reach into the parsed structure and stash a malformed Jinja
         // template body. `precompile_all` should surface it with the
         // src in the error message.
-        if let TaskBody::Op(TaskOp::Template(t)) =
-            &mut pb.plays[0].tasks[0].body
-        {
+        if let TaskBody::Op(TaskOp::Template(t)) = &mut pb.plays[0].tasks[0].body {
             t.body = Some("hi {{ unclosed".into());
         } else {
             panic!("expected TaskOp::Template");
@@ -2943,9 +2943,7 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
 "#,
         )
         .unwrap();
-        if let TaskBody::Op(TaskOp::Template(t)) =
-            &mut pb.plays[0].tasks[0].body
-        {
+        if let TaskBody::Op(TaskOp::Template(t)) = &mut pb.plays[0].tasks[0].body {
             t.body = Some("hi {{ name | default('world') }}\n".into());
         } else {
             panic!("expected TaskOp::Template");
@@ -2973,10 +2971,22 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
     fn register_tests_read_register_attributes() {
         let env = make_env();
         let ctx = std::collections::BTreeMap::<String, serde_json::Value>::from_iter([
-            ("r_changed".into(), serde_json::json!({"changed": true, "failed": false, "skipped": false, "rc": 0})),
-            ("r_failed".into(), serde_json::json!({"changed": false, "failed": true, "rc": 1})),
-            ("r_skipped".into(), serde_json::json!({"changed": false, "failed": false, "skipped": true})),
-            ("r_clean".into(), serde_json::json!({"changed": false, "failed": false, "skipped": false, "rc": 0})),
+            (
+                "r_changed".into(),
+                serde_json::json!({"changed": true, "failed": false, "skipped": false, "rc": 0}),
+            ),
+            (
+                "r_failed".into(),
+                serde_json::json!({"changed": false, "failed": true, "rc": 1}),
+            ),
+            (
+                "r_skipped".into(),
+                serde_json::json!({"changed": false, "failed": false, "skipped": true}),
+            ),
+            (
+                "r_clean".into(),
+                serde_json::json!({"changed": false, "failed": false, "skipped": false, "rc": 0}),
+            ),
         ]);
         for (expr, expected, why) in [
             ("r_changed is changed", "y", "changed register"),
@@ -2994,9 +3004,9 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
             ("nope is succeeded", "n", "undefined → not succeeded"),
         ] {
             let src = format!("{{{{ 'y' if {expr} else 'n' }}}}");
-            let out = env.render_str(&src, &ctx).unwrap_or_else(|e| {
-                panic!("{why}: render failed: {e}; expr={expr}")
-            });
+            let out = env
+                .render_str(&src, &ctx)
+                .unwrap_or_else(|e| panic!("{why}: render failed: {e}; expr={expr}"));
             assert_eq!(out, expected, "{why}: expr={expr}");
         }
     }
@@ -3009,10 +3019,7 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
             ("me".into(), serde_json::json!("db-1")),
         ]);
         let out = env
-            .render_str(
-                "{{ hosts | difference([me]) | first }}",
-                &ctx,
-            )
+            .render_str("{{ hosts | difference([me]) | first }}", &ctx)
             .unwrap();
         assert_eq!(out, "db-2");
     }
@@ -3050,7 +3057,9 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
             "xs".into(),
             serde_json::json!([3, 1, 2, 1, 3, 4]),
         )]);
-        let out = env.render_str("{{ xs | unique | join(',') }}", &ctx).unwrap();
+        let out = env
+            .render_str("{{ xs | unique | join(',') }}", &ctx)
+            .unwrap();
         assert_eq!(out, "3,1,2,4");
     }
 
@@ -3076,10 +3085,7 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
             serde_json::json!("master_role:1"),
         )]);
         let out = env
-            .render_str(
-                "{{ 'yes' if s is match('role:') else 'no' }}",
-                &ctx2,
-            )
+            .render_str("{{ 'yes' if s is match('role:') else 'no' }}", &ctx2)
             .unwrap();
         assert_eq!(out, "no", "match must anchor at start of string");
     }
@@ -3093,17 +3099,11 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
         )]);
         // `search` matches anywhere, `regex` is the alias.
         let out = env
-            .render_str(
-                "{{ 'yes' if s is search('role:') else 'no' }}",
-                &ctx,
-            )
+            .render_str("{{ 'yes' if s is search('role:') else 'no' }}", &ctx)
             .unwrap();
         assert_eq!(out, "yes");
         let out = env
-            .render_str(
-                "{{ 'yes' if s is regex('role:') else 'no' }}",
-                &ctx,
-            )
+            .render_str("{{ 'yes' if s is regex('role:') else 'no' }}", &ctx)
             .unwrap();
         assert_eq!(out, "yes");
     }

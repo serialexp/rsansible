@@ -102,7 +102,11 @@ impl<'de> Deserialize<'de> for SystemdOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "systemd: unknown field(s): {unknown:?}; expected one of \
@@ -125,9 +129,8 @@ impl<'de> Deserialize<'de> for SystemdOp {
         // unit-agnostic, so we let that case through with an empty name
         // — the agent's apply() will skip unit-targeted blocks
         // automatically.
-        let needs_unit = !matches!(state, SystemdState::None)
-            || enabled.is_some()
-            || masked.is_some();
+        let needs_unit =
+            !matches!(state, SystemdState::None) || enabled.is_some() || masked.is_some();
         if needs_unit && name.is_empty() {
             return Err(D::Error::custom(
                 "systemd: `name` is required when state/enabled/masked is set",
@@ -148,7 +151,7 @@ impl<'de> Deserialize<'de> for SystemdOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
 
     #[test]
@@ -239,10 +242,7 @@ systemd:
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("`name` is required"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("`name` is required"), "got: {msg}");
     }
 
     #[test]
@@ -253,10 +253,7 @@ systemd:
   name: x
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("must specify"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("must specify"), "got: {err}");
     }
 
     #[test]
@@ -269,10 +266,7 @@ systemd:
   scope: user
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("only `system`"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("only `system`"), "got: {err}");
     }
 
     #[test]

@@ -67,7 +67,11 @@ enum Cmd {
         /// `{"json": "object"}` (JSON/YAML object literal). Highest-
         /// precedence variable source — wins over inventory, facts,
         /// play vars, set_facts, and registers.
-        #[arg(short = 'e', long = "extra-vars", value_name = "key=value|@file|{json}")]
+        #[arg(
+            short = 'e',
+            long = "extra-vars",
+            value_name = "key=value|@file|{json}"
+        )]
         extra_vars: Vec<String>,
         /// Run only tasks tagged with one of these (Ansible-style).
         /// Repeatable; values are also comma-split. Magic tag `always`
@@ -344,42 +348,42 @@ async fn main() -> ExitCode {
                 }
             };
             match cmd_run(
-            inventory,
-            agent_binary,
-            concurrency,
-            vault_password_file,
-            extra_vars,
-            tags,
-            skip_tags,
-            limit,
-            wire_strategy,
-            check,
-            diff,
-            // `--forward-host X` implies `--forward` — both shapes
-            // are the operator saying "I want forward mode."
-            forward || forward_host.is_some(),
-            forward_host,
-            no_cache,
-            timing,
-            dotenv,
-            report,
-            ReportPushArgs {
-                url: report_url,
-                token: report_token,
-                namespace: report_namespace,
-                project: report_project,
-                stack: report_stack,
-            },
-            playbook,
-        )
-        .await
-        {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("error: {e:#}");
-                ExitCode::FAILURE
+                inventory,
+                agent_binary,
+                concurrency,
+                vault_password_file,
+                extra_vars,
+                tags,
+                skip_tags,
+                limit,
+                wire_strategy,
+                check,
+                diff,
+                // `--forward-host X` implies `--forward` — both shapes
+                // are the operator saying "I want forward mode."
+                forward || forward_host.is_some(),
+                forward_host,
+                no_cache,
+                timing,
+                dotenv,
+                report,
+                ReportPushArgs {
+                    url: report_url,
+                    token: report_token,
+                    namespace: report_namespace,
+                    project: report_project,
+                    stack: report_stack,
+                },
+                playbook,
+            )
+            .await
+            {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
             }
-        }
         }
     }
 }
@@ -508,7 +512,11 @@ fn build_push_config(
         namespace,
         project,
         stack,
-        mode: if check_mode { RunMode::Check } else { RunMode::Apply },
+        mode: if check_mode {
+            RunMode::Check
+        } else {
+            RunMode::Apply
+        },
         playbook: pb_path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned()),
@@ -555,8 +563,7 @@ async fn cmd_run(
         template::configure_dotenv_file(p);
     }
 
-    let extra = extra_vars::parse_all(&extra_vars_args)
-        .context("parsing --extra-vars")?;
+    let extra = extra_vars::parse_all(&extra_vars_args).context("parsing --extra-vars")?;
 
     let agent_bytes = std::fs::read(&agent_binary_path)
         .with_context(|| format!("reading agent binary {}", agent_binary_path.display()))?;
@@ -624,7 +631,10 @@ async fn cmd_run(
         let reporter = rsansible_ctl::report::JsonReporter::to_path(path)
             .with_context(|| format!("--report {}", path.display()))?;
         reporters.push(Arc::new(reporter));
-        eprintln!("report: writing structured run report to {}", path.display());
+        eprintln!(
+            "report: writing structured run report to {}",
+            path.display()
+        );
     }
     // The push sink, if `--report-url` was given. Keep the concrete handle so
     // we can `join().await` it after the run to flush + finalize.
@@ -680,7 +690,11 @@ async fn cmd_run(
             }
         }
     }
-    let early = if report.stopped_early { " (stopped early)" } else { "" };
+    let early = if report.stopped_early {
+        " (stopped early)"
+    } else {
+        ""
+    };
     if report.check_mode {
         eprintln!(
             "summary: ok={ok} failed={failed} unreachable={unreachable} not_targeted={skipped} \
@@ -766,8 +780,7 @@ async fn cmd_run_forwarded(
     // orchestrator on the forwarder; the forwarder doesn't change
     // mid-run, so picking from the full inventory at CLI time is fine
     // (and avoids re-implementing per-play target resolution here).
-    let target_hosts: std::collections::BTreeSet<String> =
-        inv.hosts.keys().cloned().collect();
+    let target_hosts: std::collections::BTreeSet<String> = inv.hosts.keys().cloned().collect();
     let forwarder = forward::select_forwarder(
         &inv,
         &inv.all_vars,
@@ -784,8 +797,8 @@ async fn cmd_run_forwarded(
     // wire — no separate "remote build" step. (v1 caveat: that binary
     // must be musl-static Linux x86_64; cross-OS forwarders fail at
     // the agent Hello probe.)
-    let ctl_self_path = std::env::current_exe()
-        .context("locating own binary to ship to the forwarder")?;
+    let ctl_self_path =
+        std::env::current_exe().context("locating own binary to ship to the forwarder")?;
 
     let args = forward::ForwardArgs {
         playbook_path: pb_path,
@@ -852,7 +865,11 @@ fn print_run_summary(report: &orchestrator::RunReport) {
             }
         }
     }
-    let early = if report.stopped_early { " (stopped early)" } else { "" };
+    let early = if report.stopped_early {
+        " (stopped early)"
+    } else {
+        ""
+    };
     if report.check_mode {
         eprintln!(
             "summary: ok={ok} failed={failed} unreachable={unreachable} not_targeted={skipped} \

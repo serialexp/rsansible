@@ -263,21 +263,60 @@ impl TimingBreakdown {
             wf = self.when_false_count,
         ));
         out.push_str("  per-task barrier:\n");
-        out.push_str(&format!("    merge_hostvars        {:>9.2} ms\n", self.merge_hostvars_ms));
-        out.push_str(&format!("    fanout_setup          {:>9.2} ms\n", self.fanout_setup_ms));
-        out.push_str(&format!("    apply_per_host_result {:>9.2} ms\n", self.apply_per_host_result_ms));
+        out.push_str(&format!(
+            "    merge_hostvars        {:>9.2} ms\n",
+            self.merge_hostvars_ms
+        ));
+        out.push_str(&format!(
+            "    fanout_setup          {:>9.2} ms\n",
+            self.fanout_setup_ms
+        ));
+        out.push_str(&format!(
+            "    apply_per_host_result {:>9.2} ms\n",
+            self.apply_per_host_result_ms
+        ));
         out.push_str("  per host-task (inside fanout):\n");
-        out.push_str(&format!("    task_vars             {:>9.2} ms\n", self.task_vars_ms));
-        out.push_str(&format!("    eval_when             {:>9.2} ms\n", self.eval_when_ms));
-        out.push_str(&format!("    resolve_loop_items    {:>9.2} ms\n", self.resolve_loop_items_ms));
-        out.push_str(&format!("    resolve_target        {:>9.2} ms\n", self.resolve_target_ms));
+        out.push_str(&format!(
+            "    task_vars             {:>9.2} ms\n",
+            self.task_vars_ms
+        ));
+        out.push_str(&format!(
+            "    eval_when             {:>9.2} ms\n",
+            self.eval_when_ms
+        ));
+        out.push_str(&format!(
+            "    resolve_loop_items    {:>9.2} ms\n",
+            self.resolve_loop_items_ms
+        ));
+        out.push_str(&format!(
+            "    resolve_target        {:>9.2} ms\n",
+            self.resolve_target_ms
+        ));
         out.push_str(&format!("    body_dispatch         {:>9.2} ms  (= render_op + wire_dispatch + composite/post)\n", self.body_dispatch_ms));
-        out.push_str(&format!("      render_op           {:>9.2} ms  (controller Jinja)\n", self.render_op_ms));
-        out.push_str(&format!("        build_ctx         {:>9.2} ms  (flatten layers + clone cached JSON)\n", self.render_op_build_ctx_ms));
-        out.push_str(&format!("        resolve           {:>9.2} ms  (var-of-var fixpoint)\n", self.render_op_resolve_ms));
-        out.push_str(&format!("        fields            {:>9.2} ms  (per-field render_str)\n", self.render_op_fields_ms));
-        out.push_str(&format!("      wire_dispatch       {:>9.2} ms  (~ RunMetrics agent+rtt)\n", self.wire_dispatch_ms));
-        out.push_str(&format!("    notify_enqueue        {:>9.2} ms\n", self.notify_enqueue_ms));
+        out.push_str(&format!(
+            "      render_op           {:>9.2} ms  (controller Jinja)\n",
+            self.render_op_ms
+        ));
+        out.push_str(&format!(
+            "        build_ctx         {:>9.2} ms  (flatten layers + clone cached JSON)\n",
+            self.render_op_build_ctx_ms
+        ));
+        out.push_str(&format!(
+            "        resolve           {:>9.2} ms  (var-of-var fixpoint)\n",
+            self.render_op_resolve_ms
+        ));
+        out.push_str(&format!(
+            "        fields            {:>9.2} ms  (per-field render_str)\n",
+            self.render_op_fields_ms
+        ));
+        out.push_str(&format!(
+            "      wire_dispatch       {:>9.2} ms  (~ RunMetrics agent+rtt)\n",
+            self.wire_dispatch_ms
+        ));
+        out.push_str(&format!(
+            "    notify_enqueue        {:>9.2} ms\n",
+            self.notify_enqueue_ms
+        ));
         out.push_str(&format!(
             "  controller-side overhead total: {:.2} ms\n",
             self.controller_ms(),

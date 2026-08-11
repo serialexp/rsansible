@@ -126,9 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             name: "pg_basebackup".into(),
             // Idempotency: the bootstrap is complete iff PG_VERSION
             // exists in the data directory.
-            check: ChangeCheck::PathExists(
-                "/var/lib/postgresql/15/main/PG_VERSION".into(),
-            ),
+            check: ChangeCheck::PathExists("/var/lib/postgresql/15/main/PG_VERSION".into()),
             apply: cmd,
             // Re-run if the leader's user was recreated OR if our local
             // postgres service was reinstalled.

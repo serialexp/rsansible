@@ -2702,6 +2702,102 @@ impl From<OpTimezoneInput> for OpTimezoneOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpModprobeInput {
+    pub name: std::string::String,
+    pub state: u8,
+    pub params: std::string::String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpModprobeOutput {
+    pub kind: u8,
+    pub name: std::string::String,
+    pub state: u8,
+    pub params: std::string::String,
+}
+
+pub type OpModprobe = OpModprobeOutput;
+
+impl OpModprobeInput {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoder = BitStreamEncoder::new(BitOrder::MsbFirst);
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        encoder.write_byte(29);
+        encoder.write_u16_le(self.name.len() as u16);
+        let string_bytes: &[u8] = self.name.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        encoder.write_byte(self.state);
+        encoder.write_u16_le(self.params.len() as u16);
+        let string_bytes: &[u8] = self.params.as_bytes();
+        for &b in string_bytes.iter() {
+            encoder.write_byte(b);
+        }
+        Ok(())
+    }
+
+}
+
+impl OpModprobeOutput {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
+        Self::decode_with_decoder(&mut decoder)
+    }
+
+    pub fn decode_with_decoder(decoder: &mut BitStreamDecoder) -> Result<Self> {
+        let kind = decoder.read_byte()?;
+        if kind != 29u8 {
+            return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("expected 29, got {}", kind)));
+        }
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let name = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        let state = decoder.read_byte()?;
+        let length = decoder.read_u16_le()? as usize;
+        let bytes = decoder.read_bytes_vec(length)?;
+        let params = std::string::String::from_utf8(bytes).map_err(|_| binschema_runtime::BinSchemaError::InvalidUtf8)?;
+        Ok(Self {
+            kind,
+            name,
+            state,
+            params,
+        })
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        OpModprobeInput::from(self.clone()).encode()
+    }
+    pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
+        OpModprobeInput::from(self.clone()).encode_into(encoder)
+    }
+}
+
+impl From<OpModprobeOutput> for OpModprobeInput {
+    fn from(o: OpModprobeOutput) -> Self {
+        Self {
+            name: o.name,
+            state: o.state,
+            params: o.params,
+        }
+    }
+}
+
+impl From<OpModprobeInput> for OpModprobeOutput {
+    fn from(i: OpModprobeInput) -> Self {
+        Self {
+            kind: 29u8,
+            name: i.name,
+            state: i.state,
+            params: i.params,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpUriInput {
     pub method: u8,
     pub url: std::string::String,
@@ -4158,6 +4254,7 @@ pub enum Op {
     OpHostname(OpHostnameOutput),
     OpTimezone(OpTimezoneOutput),
     OpCopyTarget(OpCopyTargetOutput),
+    OpModprobe(OpModprobeOutput),
 }
 
 impl Op {
@@ -4965,6 +5062,20 @@ impl Op {
                     encoder.write_uint8(b);
                 }
             }
+            Op::OpModprobe(v) => {
+                encoder.write_uint8(v.kind);
+                encoder.write_uint16(v.name.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.name.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+                encoder.write_uint8(v.state);
+                encoder.write_uint16(v.params.len() as u16, Endianness::LittleEndian);
+                let string_bytes: &[u8] = v.params.as_bytes();
+                for &b in string_bytes.iter() {
+                    encoder.write_uint8(b);
+                }
+            }
         }
         Ok(())
     }
@@ -5035,6 +5146,8 @@ impl Op {
             Ok(Op::OpTimezone(OpTimezoneOutput::decode_with_decoder(decoder)?))
         } else if value == 28 {
             Ok(Op::OpCopyTarget(OpCopyTargetOutput::decode_with_decoder(decoder)?))
+        } else if value == 29 {
+            Ok(Op::OpModprobe(OpModprobeOutput::decode_with_decoder(decoder)?))
         } else {
             Err(binschema_runtime::BinSchemaError::InvalidVariant(format!("unknown discriminator value: {}", value)))
         }

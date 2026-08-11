@@ -59,9 +59,9 @@ impl<'de> Deserialize<'de> for SlurpOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
-    use rsansible_wire::generated::Op as WireOp;
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
+    use rsansible_wire::generated::Op as WireOp;
 
     #[test]
     fn parse_slurp_minimal() {
@@ -72,7 +72,9 @@ slurp:
   src: /etc/ssh/ssh_host_ed25519_key.pub
 "#,
         );
-        let TaskBody::Op(TaskOp::Slurp(s)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::Slurp(s)) = t.body else {
+            panic!()
+        };
         assert_eq!(s.src, "/etc/ssh/ssh_host_ed25519_key.pub");
         assert_eq!(s.max_bytes, 0);
     }
@@ -87,7 +89,9 @@ slurp:
   max_bytes: 65536
 "#,
         );
-        let TaskBody::Op(TaskOp::Slurp(s)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::Slurp(s)) = t.body else {
+            panic!()
+        };
         assert_eq!(s.max_bytes, 65_536);
     }
 

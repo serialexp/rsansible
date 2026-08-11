@@ -33,7 +33,11 @@ pub(super) fn parse_hostname_body<E: serde::de::Error>(
     if !map.is_empty() {
         let unknown: Vec<String> = map
             .keys()
-            .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+            .map(|k| {
+                k.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"))
+            })
             .collect();
         return Err(E::custom(format!(
             "hostname: unknown field(s): {unknown:?}; expected one of [name]"
@@ -68,14 +72,20 @@ hostname:
     fn rejects_missing_name() {
         let yaml = "name: t\nhostname: {}\n";
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(format!("{err}").contains("missing required field `name`"), "got: {err}");
+        assert!(
+            format!("{err}").contains("missing required field `name`"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn rejects_use_field() {
         let yaml = "name: t\nhostname:\n  name: pg1\n  use: systemd\n";
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(format!("{err}").contains("not yet implemented"), "got: {err}");
+        assert!(
+            format!("{err}").contains("not yet implemented"),
+            "got: {err}"
+        );
     }
 
     #[test]

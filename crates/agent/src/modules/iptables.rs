@@ -43,10 +43,9 @@ pub async fn run(
     let started_unix_ns = now_unix_ns();
 
     let bin = pick_binary(&op);
-    let result =
-        tokio::task::spawn_blocking(move || apply(&bin, &op, check_mode))
-            .await
-            .map_err(|e| anyhow::anyhow!("iptables join: {e}"))?;
+    let result = tokio::task::spawn_blocking(move || apply(&bin, &op, check_mode))
+        .await
+        .map_err(|e| anyhow::anyhow!("iptables join: {e}"))?;
 
     let changed = match result {
         Ok(c) => c,
@@ -397,7 +396,10 @@ exit 0
         op.action = ACTION_APPEND;
         let _ = apply(&bin, &op, false).unwrap();
         let log = stub.log();
-        assert!(log.lines().nth(1).unwrap().contains("-A OUTPUT"), "log: {log}");
+        assert!(
+            log.lines().nth(1).unwrap().contains("-A OUTPUT"),
+            "log: {log}"
+        );
     }
 
     #[test]

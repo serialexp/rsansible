@@ -93,8 +93,7 @@ async fn ignore_errors_lets_play_continue_and_register_reflects_failure() -> Res
     let _ = container.docker_exec(&["sh", "-c", "rm -f /tmp/rsansible-ie-*"])?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -144,8 +143,7 @@ async fn no_ignore_errors_halts_play_under_on_failure_stop() -> Result<()> {
     let _ = container.docker_exec(&["sh", "-c", "rm -f /tmp/rsansible-ie-*"])?;
 
     let inv = single_host_inventory(&container);
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 

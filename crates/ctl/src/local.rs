@@ -70,17 +70,11 @@ impl AsyncWrite for LocalStdioStream {
         let me = self.get_mut();
         Pin::new(&mut me.stdin).poll_write(cx, buf)
     }
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         let me = self.get_mut();
         Pin::new(&mut me.stdin).poll_flush(cx)
     }
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         let me = self.get_mut();
         Pin::new(&mut me.stdin).poll_shutdown(cx)
     }
@@ -127,8 +121,7 @@ pub fn write_agent_binary(agent_binary: &[u8]) -> Result<PathBuf> {
     // binary with anyone.
     use std::os::unix::fs::PermissionsExt as _;
     let perms = std::fs::Permissions::from_mode(0o700);
-    std::fs::set_permissions(tf.path(), perms)
-        .context("chmod 0700 on local agent temp file")?;
+    std::fs::set_permissions(tf.path(), perms).context("chmod 0700 on local agent temp file")?;
     let agent_path = tf.into_temp_path();
     let agent_path: PathBuf = agent_path.keep().context("keep agent temp file")?;
     Ok(agent_path)
@@ -148,10 +141,7 @@ pub fn write_agent_binary(agent_binary: &[u8]) -> Result<PathBuf> {
 ///
 /// The returned `AgentConn` carries `TransportKeepalive::Local(child)`
 /// — the conn owns its child process, so dropping the conn reaps it.
-pub async fn spawn_agent_process(
-    session: &LocalSession,
-    key: &BecomeKey,
-) -> Result<AgentConn> {
+pub async fn spawn_agent_process(session: &LocalSession, key: &BecomeKey) -> Result<AgentConn> {
     // `RSANSIBLE_AGENT_KEEP_BINARY=1` tells the agent NOT to self-unlink
     // its on-disk binary at startup. The pool may spawn additional agents
     // (one per become-config) from the same on-disk path during the same
@@ -168,7 +158,14 @@ pub async fn spawn_agent_process(
         // to set the keep-binary var for the agent itself.
         BecomeKey::As(user) => {
             let mut c = Command::new("sudo");
-            c.args(["-n", "-u", user.as_str(), "--", "env", "RSANSIBLE_AGENT_KEEP_BINARY=1"]);
+            c.args([
+                "-n",
+                "-u",
+                user.as_str(),
+                "--",
+                "env",
+                "RSANSIBLE_AGENT_KEEP_BINARY=1",
+            ]);
             c.arg(&session.agent_path);
             c
         }
@@ -238,14 +235,18 @@ pub async fn spawn_agent_process(
     // `openssl_privatekey`. Local subprocess RTT is microseconds —
     // the heuristic will naturally pick blind for everything, which
     // is the right default for "same machine".
-    let (clock_offset_ns, clock_rtt_ns) =
-        match crate::ssh::probe_clock_skew(&mut stream, &session.label).await {
-            Ok((offset, rtt)) => (offset, rtt),
-            Err(e) => {
-                warn!(host = %session.label, become = %key.label(), "local clock-skew probe failed (continuing): {e:#}");
-                (0, 0)
-            }
-        };
+    let (clock_offset_ns, clock_rtt_ns) = match crate::ssh::probe_clock_skew(
+        &mut stream,
+        &session.label,
+    )
+    .await
+    {
+        Ok((offset, rtt)) => (offset, rtt),
+        Err(e) => {
+            warn!(host = %session.label, become = %key.label(), "local clock-skew probe failed (continuing): {e:#}");
+            (0, 0)
+        }
+    };
 
     Ok(AgentConn {
         label: session.label.clone(),

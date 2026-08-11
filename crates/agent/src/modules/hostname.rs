@@ -270,7 +270,10 @@ echo "$2" > "$F"
     }
 
     fn op(name: &str) -> OpHostnameOutput {
-        OpHostnameOutput { kind: 26, name: name.into() }
+        OpHostnameOutput {
+            kind: 26,
+            name: name.into(),
+        }
     }
 
     #[test]

@@ -14,7 +14,10 @@ pub struct StatOp {
     /// Defaults to true (Ansible's default). Accepts `yes`/`no`/`true`/
     /// `false` in YAML — Ansible playbooks commonly spell booleans as
     /// `yes`/`no`, which serde_yaml otherwise refuses.
-    #[serde(default = "default_stat_follow", deserialize_with = "deserialize_ansible_bool")]
+    #[serde(
+        default = "default_stat_follow",
+        deserialize_with = "deserialize_ansible_bool"
+    )]
     pub follow: bool,
 }
 
@@ -25,9 +28,11 @@ fn default_stat_follow() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task};
-    use rsansible_wire::generated::Op as WireOp;
+    use crate::playbook::task_op::{
+        parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task,
+    };
     use crate::playbook::task_op::{TaskBody, TaskOp};
+    use rsansible_wire::generated::Op as WireOp;
 
     #[test]
     fn stat_to_wire_carries_path_and_follow() {

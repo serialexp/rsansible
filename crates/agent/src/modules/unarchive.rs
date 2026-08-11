@@ -394,9 +394,7 @@ fn sanitize_entry_path(raw: &Path) -> Result<PathBuf, String> {
             Component::Normal(p) => clean.push(p),
             Component::CurDir => {}
             Component::ParentDir => {
-                return Err(format!(
-                    "archive entry {raw:?} contains a `..` component"
-                ));
+                return Err(format!("archive entry {raw:?} contains a `..` component"));
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(format!("archive entry {raw:?} is absolute"));
@@ -429,7 +427,10 @@ where
     let mut files = Vec::new();
     let mut changed = false;
 
-    for entry in archive.entries().map_err(|e| format!("read entries: {e}"))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("read entries: {e}"))?
+    {
         let mut entry = entry.map_err(|e| format!("entry header: {e}"))?;
         let raw_path = entry
             .path()
@@ -445,15 +446,12 @@ where
         let abs = dest.join(&rel);
         // Defence in depth: ensure the joined path is under `dest`.
         if !abs.starts_with(dest) {
-            return Err(format!(
-                "archive entry {rel_str:?} escapes dest after join"
-            ));
+            return Err(format!("archive entry {rel_str:?} escapes dest after join"));
         }
 
         if keep_newer {
             if let Ok(meta) = std::fs::metadata(&abs) {
-                if let (Ok(dest_mtime), Ok(entry_mtime)) =
-                    (meta.modified(), entry.header().mtime())
+                if let (Ok(dest_mtime), Ok(entry_mtime)) = (meta.modified(), entry.header().mtime())
                 {
                     let entry_secs = entry_mtime as i64;
                     if let Ok(dur) = dest_mtime.duration_since(std::time::UNIX_EPOCH) {
@@ -474,8 +472,7 @@ where
 
         let header_kind = entry.header().entry_type();
         if header_kind.is_dir() {
-            std::fs::create_dir_all(&abs)
-                .map_err(|e| format!("mkdir {}: {e}", abs.display()))?;
+            std::fs::create_dir_all(&abs).map_err(|e| format!("mkdir {}: {e}", abs.display()))?;
             changed = true;
         } else if header_kind.is_symlink() {
             let target = entry
@@ -508,8 +505,9 @@ where
             let target_rel = sanitize_entry_path(&target)?;
             let target_abs = dest.join(target_rel);
             let _ = std::fs::remove_file(&abs);
-            std::fs::hard_link(&target_abs, &abs)
-                .map_err(|e| format!("hardlink {} → {}: {e}", abs.display(), target_abs.display()))?;
+            std::fs::hard_link(&target_abs, &abs).map_err(|e| {
+                format!("hardlink {} → {}: {e}", abs.display(), target_abs.display())
+            })?;
             changed = true;
         } else if header_kind.is_file() {
             // Unlink-before-create so we extract correctly into sticky
@@ -529,8 +527,8 @@ where
             // remove it (e.g. it's a directory we don't expect), the
             // subsequent `create` surfaces a clear error.
             let _ = std::fs::remove_file(&abs);
-            let mut out =
-                std::fs::File::create(&abs).map_err(|e| format!("create {}: {e}", abs.display()))?;
+            let mut out = std::fs::File::create(&abs)
+                .map_err(|e| format!("create {}: {e}", abs.display()))?;
             std::io::copy(&mut entry, &mut out)
                 .map_err(|e| format!("write {}: {e}", abs.display()))?;
             changed = true;
@@ -555,16 +553,14 @@ fn extract_zip(
     keep_newer: bool,
 ) -> Result<ExtractOutcome, String> {
     let f = std::fs::File::open(src).map_err(|e| format!("open {src}: {e}"))?;
-    let mut zip = zip::ZipArchive::new(BufReader::new(f))
-        .map_err(|e| format!("read zip directory: {e}"))?;
+    let mut zip =
+        zip::ZipArchive::new(BufReader::new(f)).map_err(|e| format!("read zip directory: {e}"))?;
 
     let mut files = Vec::new();
     let mut changed = false;
 
     for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| format!("zip entry {i}: {e}"))?;
+        let mut entry = zip.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
         let enclosed = entry
             .enclosed_name()
             .ok_or_else(|| format!("zip entry {i}: unsafe path {:?}", entry.name()))?;
@@ -577,9 +573,7 @@ fn extract_zip(
 
         let abs = dest.join(&rel);
         if !abs.starts_with(dest) {
-            return Err(format!(
-                "zip entry {rel_str:?} escapes dest after join"
-            ));
+            return Err(format!("zip entry {rel_str:?} escapes dest after join"));
         }
 
         if keep_newer {
@@ -614,17 +608,14 @@ fn extract_zip(
             // `fs.protected_regular` rationale. Same hardening applies
             // to zip extraction into sticky directories.
             let _ = std::fs::remove_file(&abs);
-            let mut out =
-                std::fs::File::create(&abs).map_err(|e| format!("create {}: {e}", abs.display()))?;
+            let mut out = std::fs::File::create(&abs)
+                .map_err(|e| format!("create {}: {e}", abs.display()))?;
             std::io::copy(&mut entry, &mut out)
                 .map_err(|e| format!("write {}: {e}", abs.display()))?;
             changed = true;
             // Preserve unix mode bits if present in the central directory.
             if let Some(m) = entry.unix_mode() {
-                let _ = std::fs::set_permissions(
-                    &abs,
-                    std::fs::Permissions::from_mode(m & 0o7777),
-                );
+                let _ = std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(m & 0o7777));
             }
         }
 
@@ -661,10 +652,7 @@ fn zip_datetime_to_unix(dt: &zip::DateTime) -> i64 {
         days += dm as i64;
     }
     days += (day.saturating_sub(1)) as i64;
-    days * 86_400
-        + (dt.hour() as i64) * 3600
-        + (dt.minute() as i64) * 60
-        + (dt.second() as i64)
+    days * 86_400 + (dt.hour() as i64) * 3600 + (dt.minute() as i64) * 60 + (dt.second() as i64)
 }
 
 // `chown_user_only` and `chown_group_only` were moved to
@@ -691,12 +679,8 @@ async fn emit_envelope(
         "extract_results": {},
     });
     if list_files {
-        env["files"] = serde_json::Value::Array(
-            files
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
+        env["files"] =
+            serde_json::Value::Array(files.into_iter().map(serde_json::Value::String).collect());
     }
     let bytes = serde_json::to_vec(&env)?;
     ctx.emit(msg::task_progress(seq, msg::stream::STDOUT, bytes))
@@ -729,11 +713,8 @@ mod tests {
 
     async fn drain(rx: &mut mpsc::Receiver<Message>) -> Vec<Message> {
         let mut out = Vec::new();
-        while let Ok(m) = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        )
-        .await
+        while let Ok(m) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match m {
                 Some(m) => out.push(m),
@@ -853,10 +834,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out");
         std::fs::create_dir(&dest).unwrap();
-        let archive_bytes = build_tar_gz(&[
-            ("hello.txt", b"hello\n"),
-            ("nested/world.txt", b"world\n"),
-        ]);
+        let archive_bytes =
+            build_tar_gz(&[("hello.txt", b"hello\n"), ("nested/world.txt", b"world\n")]);
         let archive_path = dir.path().join("a.tar.gz");
         std::fs::write(&archive_path, &archive_bytes).unwrap();
 
@@ -1007,10 +986,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out");
         std::fs::create_dir(&dest).unwrap();
-        let archive_bytes = build_zip(&[
-            ("keep.txt", b"keep"),
-            ("drop.txt", b"drop"),
-        ]);
+        let archive_bytes = build_zip(&[("keep.txt", b"keep"), ("drop.txt", b"drop")]);
         let archive_path = dir.path().join("a.zip");
         std::fs::write(&archive_path, &archive_bytes).unwrap();
 
@@ -1263,7 +1239,10 @@ mod tests {
             infer_format("/x/y.tar").unwrap(),
             ArchiveFormat::Tar
         ));
-        assert!(matches!(infer_format("/x/y.zip").unwrap(), ArchiveFormat::Zip));
+        assert!(matches!(
+            infer_format("/x/y.zip").unwrap(),
+            ArchiveFormat::Zip
+        ));
         assert!(infer_format("/x/y.unknown").is_err());
     }
 }

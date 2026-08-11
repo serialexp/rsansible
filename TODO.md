@@ -144,6 +144,7 @@ These don't fit neatly into a phase but should happen alongside the work.
 Done items live in `TODO_DONE.md` (Tags, `--limit`, `ignore_errors:`,
 Vault).
 
+
 - [x] **`--check` mode** — dry-run; every op reports what it *would* do
   without changing state. Shipped:
   - Wire envelope carries `TaskDispatch.check_mode` (1 byte) and `TaskDone.skipped` (1 byte).
@@ -383,8 +384,11 @@ Either way, **not v1**.
 ## Test-infrastructure flake (pre-existing)
 
 - [ ] **ETXTBSY race in stub-script tests.** A handful of agent tests
-  (`getent`, `hostname`, `pip`, possibly others) write a small shell
-  script into a tempdir and then exec it. When several such tests
+  write a small shell script into a tempdir and then exec it. Full
+  list as of the `modprobe` addition (12 modules): `getent`,
+  `timezone`, `ufw`, `hostname`, `user`, `group`, `systemd`,
+  `authorized_key`, `modprobe`, `repository/apt`, `package/apt`,
+  `package/pip`. When several such tests
   run in parallel, Linux returns ETXTBSY for one of the execs:
   thread A finishes its `std::fs::write` (closes its fd in A's
   parent), but thread B forked between A's open and close — B's
@@ -420,16 +424,38 @@ Either way, **not v1**.
 The `ci.yml` gate currently runs fmt + clippy as **informational,
 non-blocking** steps. Make them gating once the tree is clean:
 
-- [ ] **`cargo fmt` drift.** `cargo fmt --all --check` reports ~965
-  diff lines across ~100 files against current `@stable` (rustc 1.95).
-  There's no `rustfmt.toml` and no pinned toolchain, so this is
-  `@stable` drift from the 1.75 MSRV, not deliberate non-formatting.
-  Fix: run `cargo fmt --all` in a dedicated formatting-only commit
-  (keep it off feature diffs), then flip the CI fmt step to gating.
+- [x] **`cargo fmt` drift.** Was ~965 diff lines across ~100 files
+  against current `@stable`; the tree is now clean under rustfmt
+  1.9.0-stable (`cargo fmt --all --check` exits 0). Two caveats on how
+  it landed, both deliberate calls by Bart:
+  - It rode along with the `modprobe` change rather than the dedicated
+    formatting-only commit this entry originally prescribed. The
+    feature diff in that commit is correspondingly ~90% reformatting.
+  - `just gen-wire` now runs `cargo fmt --all` after installing the
+    generated + vendored files, because both arrive formatted to
+    binschema's taste and would otherwise re-dirty the tree on every
+    regeneration.
+  A `.githooks/pre-commit` hook (enable with `just install-hooks`) now
+  gates `cargo fmt --all --check` locally so the drift can't silently
+  return — notably so a future rustfmt bump surfaces as one deliberate
+  reformat rather than as noise inside someone's feature diff.
+- [ ] **Flip the CI fmt step to gating.** Now unblocked: `ci.yml`'s fmt
+  step is still `continue-on-error: true`, but its stated precondition
+  ("once the tree is fmt/clippy-clean") holds for fmt. Clippy is a
+  separate matter — see below — so flip only the fmt step.
 - [ ] **324 clippy warnings.** Mix of genuine lints and MSRV-drift
   noise (many are "stable since 1.80/1.83" against a 1.75 MSRV). Triage:
   fix the real ones, `#[allow]` or raise MSRV for the drift, then flip
   the CI clippy step to gating.
+  - Blocker worth knowing before attempting it: `just lint` (which is
+    `-D warnings`) currently fails inside `crates/wire-runtime` — 5
+    lints including `type_complexity` on
+    `compression_dict() -> Option<&Rc<RefCell<HashMap<Vec<u8>, usize>>>>`.
+    That crate is **vendored** (copied verbatim from binschema by
+    `just gen-wire`), so `#[allow]`-ing it locally is overwritten on the
+    next regeneration. Fix upstream in binschema, or exclude the
+    vendored crate from the lint recipe. This is why the new
+    pre-commit hook gates fmt only and leaves clippy to CI.
 - [ ] **Consider pinning the toolchain** (`rust-toolchain.toml`) so
   fmt/clippy are reproducible between local and CI instead of chasing a
   moving `@stable`. Decide the pinned version with Bart.

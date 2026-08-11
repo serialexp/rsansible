@@ -85,7 +85,10 @@ enum TermKind {
 #[derive(Debug, Clone, Copy)]
 enum IndexSpec {
     Single(i64),
-    Slice { start: Option<i64>, end: Option<i64> },
+    Slice {
+        start: Option<i64>,
+        end: Option<i64>,
+    },
 }
 
 /// Errors surfaced by [`HostPattern::parse`].
@@ -115,7 +118,8 @@ pub enum HostPatternError {
 /// pre-pattern-grammar typo-catching for the common case while still
 /// allowing the new glob/regex/index syntax.
 pub fn is_plain_name(s: &str) -> bool {
-    !s.chars().any(|c| matches!(c, '*' | '?' | '[' | ']' | '~' | '&' | '!' | ':' | ','))
+    !s.chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '~' | '&' | '!' | ':' | ','))
         && !s.is_empty()
         && s != "all"
 }
@@ -172,8 +176,11 @@ impl HostPattern {
                 }
                 Op::Intersect => {
                     let m: BTreeSet<&str> = matched.iter().map(String::as_str).collect();
-                    let keep: Vec<String> =
-                        working.iter().filter(|h| m.contains(h.as_str())).cloned().collect();
+                    let keep: Vec<String> = working
+                        .iter()
+                        .filter(|h| m.contains(h.as_str()))
+                        .cloned()
+                        .collect();
                     working_set = keep.iter().cloned().collect();
                     working = keep;
                 }
@@ -571,7 +578,10 @@ mod tests {
         );
         groups.insert(
             "webservers".into(),
-            vec!["web1", "web2", "web3"].into_iter().map(String::from).collect(),
+            vec!["web1", "web2", "web3"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
         );
         groups.insert("dbs".into(), vec!["db1".into()]);
         groups.insert("caches".into(), vec!["cache1".into()]);
@@ -734,10 +744,7 @@ mod tests {
 
     #[test]
     fn slice_clamps() {
-        assert_eq!(
-            resolve("webservers[0:99]"),
-            vec!["web1", "web2", "web3"]
-        );
+        assert_eq!(resolve("webservers[0:99]"), vec!["web1", "web2", "web3"]);
     }
 
     // ---- parse errors ----
@@ -745,19 +752,31 @@ mod tests {
     #[test]
     fn leading_exclude_errors() {
         let err = HostPattern::parse("!web1").unwrap_err();
-        assert!(matches!(err, HostPatternError::LeadingNonUnion { prefix: '!', .. }));
+        assert!(matches!(
+            err,
+            HostPatternError::LeadingNonUnion { prefix: '!', .. }
+        ));
     }
 
     #[test]
     fn leading_intersect_errors() {
         let err = HostPattern::parse("&web1").unwrap_err();
-        assert!(matches!(err, HostPatternError::LeadingNonUnion { prefix: '&', .. }));
+        assert!(matches!(
+            err,
+            HostPatternError::LeadingNonUnion { prefix: '&', .. }
+        ));
     }
 
     #[test]
     fn empty_pattern_errors() {
-        assert!(matches!(HostPattern::parse("").unwrap_err(), HostPatternError::Empty));
-        assert!(matches!(HostPattern::parse("   ").unwrap_err(), HostPatternError::Empty));
+        assert!(matches!(
+            HostPattern::parse("").unwrap_err(),
+            HostPatternError::Empty
+        ));
+        assert!(matches!(
+            HostPattern::parse("   ").unwrap_err(),
+            HostPatternError::Empty
+        ));
     }
 
     #[test]

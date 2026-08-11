@@ -69,8 +69,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpUfwOutput, check_mode: bool) -> 
     };
 
     let finished = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished))
-        .await;
+    ctx.emit(msg::task_done(
+        seq,
+        0,
+        changed,
+        false,
+        started_unix_ns,
+        finished,
+    ))
+    .await;
     Ok(())
 }
 
@@ -178,7 +185,12 @@ fn apply_rule(bin: &str, op: &OpUfwOutput, check_mode: bool) -> Result<bool, Ufw
     Ok(true)
 }
 
-fn apply_enable(bin: &str, _op: &OpUfwOutput, want_active: bool, check_mode: bool) -> Result<bool, UfwError> {
+fn apply_enable(
+    bin: &str,
+    _op: &OpUfwOutput,
+    want_active: bool,
+    check_mode: bool,
+) -> Result<bool, UfwError> {
     let status = run_ufw_capture(bin, &["status", "verbose"])?;
     let is_active = status
         .lines()
@@ -497,7 +509,11 @@ exit 0
         .unwrap();
         assert!(!changed);
         // status verbose should have been called, but no `allow` mutate.
-        assert!(stub.log().contains("status verbose"), "log={:?}", stub.log());
+        assert!(
+            stub.log().contains("status verbose"),
+            "log={:?}",
+            stub.log()
+        );
         let log = stub.log();
         // Filter out the status line and check no `allow 22/tcp` shape.
         let mutating = log
@@ -536,7 +552,11 @@ exit 0
         o.op = OP_ENABLE;
         let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
-        assert!(stub.log().contains("--force enable"), "log={:?}", stub.log());
+        assert!(
+            stub.log().contains("--force enable"),
+            "log={:?}",
+            stub.log()
+        );
     }
 
     #[test]
@@ -555,7 +575,11 @@ exit 0
         o.op = OP_DISABLE;
         let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
-        assert!(stub.log().contains("--force disable"), "log={:?}", stub.log());
+        assert!(
+            stub.log().contains("--force disable"),
+            "log={:?}",
+            stub.log()
+        );
     }
 
     #[test]
@@ -579,7 +603,11 @@ exit 0
         o.direction = "in".into();
         let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
         assert!(changed);
-        assert!(stub.log().contains("default reject incoming"), "log={:?}", stub.log());
+        assert!(
+            stub.log().contains("default reject incoming"),
+            "log={:?}",
+            stub.log()
+        );
     }
 
     #[test]

@@ -200,8 +200,7 @@ impl RunMetricsSnapshot {
     /// are signed (residual skew error); negative magnitudes are
     /// expected to be small.
     pub fn round_trip_ns_total(&self) -> i64 {
-        self.outbound_ns_total
-            .saturating_add(self.inbound_ns_total)
+        self.outbound_ns_total.saturating_add(self.inbound_ns_total)
     }
 
     /// Pretty-printed per-op-type table sorted by descending agent
@@ -323,8 +322,14 @@ mod tests {
         );
         let s = m.snapshot();
         assert_eq!(s.op_count, 1);
-        assert_eq!(s.agent_ns_total, 10_000_000, "agent-local duration is skew-immune");
-        assert_eq!(s.wall_ns_total, 14_000_000, "wall is purely controller-side");
+        assert_eq!(
+            s.agent_ns_total, 10_000_000,
+            "agent-local duration is skew-immune"
+        );
+        assert_eq!(
+            s.wall_ns_total, 14_000_000,
+            "wall is purely controller-side"
+        );
         assert_eq!(s.outbound_ns_total, 2_000_000, "outbound is skew-corrected");
         assert_eq!(s.inbound_ns_total, 2_000_000, "inbound is skew-corrected");
     }
@@ -358,17 +363,46 @@ mod tests {
     fn record_buckets_per_op_type() {
         let m = RunMetrics::default();
         // Two systemd ops: 10ms + 30ms agent, 14ms + 34ms wall.
-        m.record(102_000_000, 112_000_000, 100_000_000, 114_000_000, 0, "systemd");
-        m.record(202_000_000, 232_000_000, 200_000_000, 234_000_000, 0, "systemd");
+        m.record(
+            102_000_000,
+            112_000_000,
+            100_000_000,
+            114_000_000,
+            0,
+            "systemd",
+        );
+        m.record(
+            202_000_000,
+            232_000_000,
+            200_000_000,
+            234_000_000,
+            0,
+            "systemd",
+        );
         // One package op: 50ms agent, 54ms wall.
-        m.record(302_000_000, 352_000_000, 300_000_000, 354_000_000, 0, "package");
+        m.record(
+            302_000_000,
+            352_000_000,
+            300_000_000,
+            354_000_000,
+            0,
+            "package",
+        );
         let s = m.snapshot();
         assert_eq!(s.per_op.len(), 2, "two distinct op buckets");
-        let systemd = s.per_op.iter().find(|p| p.op == "systemd").expect("systemd bucket");
+        let systemd = s
+            .per_op
+            .iter()
+            .find(|p| p.op == "systemd")
+            .expect("systemd bucket");
         assert_eq!(systemd.count, 2);
         assert_eq!(systemd.agent_ns, 40_000_000);
         assert_eq!(systemd.wall_ns, 48_000_000);
-        let pkg = s.per_op.iter().find(|p| p.op == "package").expect("package bucket");
+        let pkg = s
+            .per_op
+            .iter()
+            .find(|p| p.op == "package")
+            .expect("package bucket");
         assert_eq!(pkg.count, 1);
         assert_eq!(pkg.agent_ns, 50_000_000);
         assert_eq!(pkg.wall_ns, 54_000_000);

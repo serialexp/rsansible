@@ -75,8 +75,7 @@ const DEFAULT_EXCLUDE_BASENAMES: &[&str] = &[
 /// Suffix-match excludes. Each entry must start with `*`; the rest is
 /// the literal suffix the basename has to end with for the file to be
 /// excluded.
-const DEFAULT_EXCLUDE_SUFFIXES: &[&str] =
-    &["*.vault", "*.pyc", "*.swp", "*~"];
+const DEFAULT_EXCLUDE_SUFFIXES: &[&str] = &["*.vault", "*.pyc", "*.swp", "*~"];
 
 /// Directory names whose contents are skipped wholesale.
 const DEFAULT_EXCLUDE_DIRS: &[&str] = &[".git", "__pycache__"];
@@ -194,10 +193,7 @@ fn add_tree_to_tar<W: Write>(
         // Exclude check for files (dir-prune already happened via
         // filter_entry).
         if entry.file_type().is_file() {
-            let basename = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if exclude.should_skip_file(basename) {
                 tracing::debug!(
                     file = %rel.display(),
@@ -468,10 +464,7 @@ mod tests {
         let dest = TempDir::new().unwrap();
         extract_workspace_tar_gz(&bytes, dest.path()).unwrap();
         assert!(dest.path().join("playbooks/site.yml").exists());
-        assert!(dest
-            .path()
-            .join("roles/common/tasks/main.yml")
-            .exists());
+        assert!(dest.path().join("roles/common/tasks/main.yml").exists());
         assert!(dest.path().join("inventory/production.yml").exists());
         assert!(
             !dest

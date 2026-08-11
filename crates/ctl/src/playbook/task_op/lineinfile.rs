@@ -61,7 +61,11 @@ impl<'de> Deserialize<'de> for LineInFileOp {
                     "lineinfile.path must be a string, got: {other:?}"
                 )))
             }
-            None => return Err(D::Error::custom("lineinfile: missing required field `path`")),
+            None => {
+                return Err(D::Error::custom(
+                    "lineinfile: missing required field `path`",
+                ))
+            }
         };
 
         let line = match map.remove("line") {
@@ -80,7 +84,8 @@ impl<'de> Deserialize<'de> for LineInFileOp {
 
         let regexp = take_optional_field_string(&mut map, "regexp")?;
         let regexp = regexp.unwrap_or_default();
-        let insertbefore = take_optional_field_string(&mut map, "insertbefore")?.unwrap_or_default();
+        let insertbefore =
+            take_optional_field_string(&mut map, "insertbefore")?.unwrap_or_default();
         let insertafter = take_optional_field_string(&mut map, "insertafter")?.unwrap_or_default();
 
         let state = match map.remove("state") {
@@ -109,7 +114,11 @@ impl<'de> Deserialize<'de> for LineInFileOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "lineinfile: unknown field(s): {unknown:?}; expected one of \
@@ -151,7 +160,7 @@ impl<'de> Deserialize<'de> for LineInFileOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
 
     #[test]
@@ -228,10 +237,7 @@ lineinfile:
   path: /etc/foo
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("non-empty `line`"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("non-empty `line`"), "got: {err}");
     }
 
     #[test]
@@ -261,10 +267,7 @@ lineinfile:
   backrefs: yes
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("backrefs requires"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("backrefs requires"), "got: {err}");
     }
 
     #[test]

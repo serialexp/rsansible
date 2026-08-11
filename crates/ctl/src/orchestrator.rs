@@ -41,14 +41,13 @@ use crate::become_::{self, BecomeKey};
 use crate::exec_ctx::{build_template_ctx, yaml_to_json, HostCtx, RegisterValue, WorldVars};
 use crate::inventory::{Host, Inventory, InventoryVars};
 use crate::playbook::{
-    AssertTask, AsyncStatusOp, BlockInFileOp, BlockSpec, CopyOp, DebugTask, ExecOp, FailTask,
-    FileOp, GetUrlOp, GetentOp, HostSelector, HostnameOp, IptablesOp,
+    AssertTask, AsyncStatusOp, AuthorizedKeyOp, BlockInFileOp, BlockSpec, CopyOp, DebugTask,
+    ExecOp, FailTask, FileOp, GetUrlOp, GetentOp, GroupOp, HostSelector, HostnameOp, IptablesOp,
     LineInFileOp, LoopSpec, MetaAction, OnFailure, OpenSslCsrPipeOp, OpenSslPrivkeyOp, PackageOp,
-    AuthorizedKeyOp, GroupOp, PauseTask, Play, Playbook, PostgresqlDbOp, PostgresqlExtOp,
-    PostgresqlMembershipOp, PostgresqlQueryOp, PostgresqlUserOp,
-    RepositoryOp, SetFactMap, ShellOp, SlurpOp, UserOp,
-    StatOp, Strategy, SystemdOp, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, UfwOp,
-    UnarchiveOp, UriOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
+    PauseTask, Play, Playbook, PostgresqlDbOp, PostgresqlExtOp, PostgresqlMembershipOp,
+    PostgresqlQueryOp, PostgresqlUserOp, RepositoryOp, SetFactMap, ShellOp, SlurpOp, StatOp,
+    Strategy, SystemdOp, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, UfwOp, UnarchiveOp,
+    UriOp, UserOp, WaitForOp, WriteFileOp, X509CertificatePipeOp,
 };
 use crate::pool::{AgentPool, PoolHandle};
 use crate::ssh::{AgentConn, ConnectOptions};
@@ -274,8 +273,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // building it once and Arc-cloning it into per-host futures keeps
     // the per-task hot path branch-free.
     let tag_filter = Arc::new(
-        crate::tags::TagFilter::from_cli(&tags, &skip_tags)
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        crate::tags::TagFilter::from_cli(&tags, &skip_tags).map_err(|e| anyhow::anyhow!("{e}"))?,
     );
 
     // `--limit` resolves to a host-pattern filter applied at two
@@ -283,8 +281,8 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // matches → typo, bail before any SSH dial) and a per-play
     // intersection right before dispatch. When the user didn't pass
     // `--limit`, the filter is the identity and both calls are no-ops.
-    let limit_filter = crate::limit::LimitFilter::from_cli(&limit)
-        .map_err(|e| anyhow::anyhow!("--limit: {e}"))?;
+    let limit_filter =
+        crate::limit::LimitFilter::from_cli(&limit).map_err(|e| anyhow::anyhow!("--limit: {e}"))?;
     if limit_filter.is_active() {
         let matched = limit_filter.preflight(&inventory);
         if matched.is_empty() {
@@ -305,8 +303,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // intersected with --limit. We don't dial hosts that `--limit` is
     // filtering out — the connect phase is the expensive bit.
     let target_hosts: BTreeSet<String> = if limit_filter.is_active() {
-        let allowed: BTreeSet<String> =
-            limit_filter.preflight(&inventory).into_iter().collect();
+        let allowed: BTreeSet<String> = limit_filter.preflight(&inventory).into_iter().collect();
         compute_all_targeted_hosts(&playbook, &inventory)
             .intersection(&allowed)
             .cloned()
@@ -334,8 +331,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
     // host gets one `AgentPool` whose `BecomeKey::None` slot is
     // seeded by the initial connect; further slots (one per distinct
     // `BecomeKey::As(user)`) spawn lazily at dispatch time.
-    let conn_modes =
-        resolve_host_connection_modes(&playbook, &inventory, &world, &target_hosts)?;
+    let conn_modes = resolve_host_connection_modes(&playbook, &inventory, &world, &target_hosts)?;
     let mut pools_raw: BTreeMap<String, (AgentPool, ConnHandle)> = BTreeMap::new();
     let semaphore = Arc::new(Semaphore::new(max_concurrent_hosts.max(1)));
     let mut set: JoinSet<(String, Result<(AgentPool, ConnHandle)>)> = JoinSet::new();
@@ -382,23 +378,17 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                             )
                             .await
                             .with_context(|| {
-                                format!(
-                                    "opening back-channel to laptop for {name_owned}"
-                                )
+                                format!("opening back-channel to laptop for {name_owned}")
                             })
                         } else {
                             AgentPool::open_local(name_owned.clone(), &bin)
                                 .await
-                                .with_context(|| {
-                                    format!("spawning local agent for {name_owned}")
-                                })
+                                .with_context(|| format!("spawning local agent for {name_owned}"))
                         }
                     } else {
                         AgentPool::open_local(name_owned.clone(), &bin)
                             .await
-                            .with_context(|| {
-                                format!("spawning local agent for {name_owned}")
-                            })
+                            .with_context(|| format!("spawning local agent for {name_owned}"))
                     }
                 }
             };
@@ -469,9 +459,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
                 ctx.wire_cost.rtt_ms = rtt_ms;
             }
         }
-        if let Some(JsonValue::Number(n)) =
-            ctx.inventory_vars.get("wire_bandwidth_bytes_per_s")
-        {
+        if let Some(JsonValue::Number(n)) = ctx.inventory_vars.get("wire_bandwidth_bytes_per_s") {
             if let Some(bw) = n.as_u64() {
                 ctx.wire_cost.bw_bytes_per_s = bw.min(u32::MAX as u64) as u32;
             }
@@ -744,15 +732,9 @@ fn build_world_vars(inv: &Inventory, vars: &InventoryVars) -> WorldVars {
         }
         // Always expose the four connection coords as resolved here, so
         // templates referencing `{{ ansible_host }}` see the merged value.
-        view.insert(
-            "ansible_host".into(),
-            JsonValue::String(host.host.clone()),
-        );
+        view.insert("ansible_host".into(), JsonValue::String(host.host.clone()));
         view.insert("ansible_port".into(), JsonValue::from(host.port));
-        view.insert(
-            "ansible_user".into(),
-            JsonValue::String(host.user.clone()),
-        );
+        view.insert("ansible_user".into(), JsonValue::String(host.user.clone()));
         if let Some(p) = &host.key_path {
             view.insert(
                 "ansible_ssh_private_key_file".into(),
@@ -773,7 +755,9 @@ fn apply_role_defaults_layer(
     ctxs: &mut BTreeMap<String, HostCtx>,
 ) {
     for name in targets {
-        let Some(ctx) = ctxs.get_mut(name) else { continue };
+        let Some(ctx) = ctxs.get_mut(name) else {
+            continue;
+        };
         ctx.role_defaults.clear();
         for (k, v) in &play.role_defaults {
             ctx.role_defaults.insert(k.clone(), v.clone());
@@ -835,15 +819,10 @@ fn build_world_vars_for_play(base: &WorldVars, play: &Play) -> WorldVars {
 /// on the owning walker) and call [`merge_dynamic_hostvars_locked`]
 /// instead — the in-fanout ctxs map is not at-rest in that strategy
 /// so a direct snapshot here would race.
-fn merge_dynamic_hostvars(
-    base: &WorldVars,
-    ctxs: &BTreeMap<String, HostCtx>,
-) -> WorldVars {
+fn merge_dynamic_hostvars(base: &WorldVars, ctxs: &BTreeMap<String, HostCtx>) -> WorldVars {
     let mut hostvars = base.hostvars.clone();
     for (name, ctx) in ctxs {
-        let view = hostvars
-            .entry(name.clone())
-            .or_insert_with(BTreeMap::new);
+        let view = hostvars.entry(name.clone()).or_insert_with(BTreeMap::new);
         // Overlay in precedence order (low → high). Each layer
         // overwrites the prior for shared keys.
         for (k, v) in &ctx.facts {
@@ -905,9 +884,7 @@ async fn merge_dynamic_hostvars_locked(
 ) -> WorldVars {
     let mut hostvars = base.hostvars.clone();
     for (name, view_lock) in peer_views {
-        let view = hostvars
-            .entry(name.clone())
-            .or_insert_with(BTreeMap::new);
+        let view = hostvars.entry(name.clone()).or_insert_with(BTreeMap::new);
         // Inline overlay so the borrow of `self_ctx` / `view_lock.read()`
         // lives only as long as needed without juggling Option<RwLockReadGuard>.
         let overlay = |ctx: &HostCtx, view: &mut BTreeMap<String, JsonValue>| {
@@ -957,7 +934,9 @@ fn apply_play_vars(
     world: &WorldVars,
 ) {
     for name in targets {
-        let Some(ctx) = ctxs.get_mut(name) else { continue };
+        let Some(ctx) = ctxs.get_mut(name) else {
+            continue;
+        };
         ctx.play_vars.clear();
         if play.vars.is_empty() {
             continue;
@@ -1019,8 +998,8 @@ fn apply_task_vars(
         let view = build_template_ctx(ctx, world);
         let val = match v {
             serde_yaml::Value::String(s) => {
-                let rendered = render_str(env, s, &view)
-                    .with_context(|| format!("render task var {k:?}"))?;
+                let rendered =
+                    render_str(env, s, &view).with_context(|| format!("render task var {k:?}"))?;
                 let trimmed = rendered.trim();
                 if looks_jsonish(trimmed) {
                     serde_json::from_str::<JsonValue>(trimmed)
@@ -1029,8 +1008,9 @@ fn apply_task_vars(
                     JsonValue::String(rendered)
                 }
             }
-            other => yaml_to_json(other.clone())
-                .with_context(|| format!("coerce task var {k:?}"))?,
+            other => {
+                yaml_to_json(other.clone()).with_context(|| format!("coerce task var {k:?}"))?
+            }
         };
         ctx.task_vars.insert(k.clone(), val);
     }
@@ -1081,7 +1061,7 @@ fn make_gather_facts_task() -> Task {
         failed_when: None,
         no_log: None,
         vars: std::collections::BTreeMap::new(),
-            environment: std::collections::BTreeMap::new(),
+        environment: std::collections::BTreeMap::new(),
     }
 }
 
@@ -1271,10 +1251,15 @@ async fn run_play_per_task(
             .host_task_count
             .fetch_add(live.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let any_failed = if task.run_once {
-            run_task_once_per_task(task, &live, pools, ctxs, report, next_seq, env, &world, play)
-                .await?
+            run_task_once_per_task(
+                task, &live, pools, ctxs, report, next_seq, env, &world, play,
+            )
+            .await?
         } else {
-            run_task_fanout(task, &live, pools, ctxs, report, next_seq, env, &world, play).await?
+            run_task_fanout(
+                task, &live, pools, ctxs, report, next_seq, env, &world, play,
+            )
+            .await?
         };
 
         if any_failed && play.on_failure == OnFailure::Stop {
@@ -1504,7 +1489,10 @@ async fn run_play_per_play(
     let peer_views: Arc<BTreeMap<String, Arc<TokioRwLock<HostCtx>>>> = Arc::new(
         live.iter()
             .map(|n| {
-                let initial = ctxs.get(n).cloned().unwrap_or_else(|| HostCtx::new(n.clone()));
+                let initial = ctxs
+                    .get(n)
+                    .cloned()
+                    .unwrap_or_else(|| HostCtx::new(n.clone()));
                 (n.clone(), Arc::new(TokioRwLock::new(initial)))
             })
             .collect(),
@@ -1537,19 +1525,14 @@ async fn run_play_per_play(
             let mut slot_counter: u32 = 0;
             for (i, task) in tasks.iter().enumerate() {
                 let _ = i; // index retained for diagnostics if needed
-                // Refresh the per-walker `WorldVars` from the published
-                // peer snapshots before every task. This is per_play's
-                // analogue of per_task's between-task barrier refresh,
-                // but eventual: peer slots reflect their owner's most
-                // recently completed task, not a global barrier.
+                           // Refresh the per-walker `WorldVars` from the published
+                           // peer snapshots before every task. This is per_play's
+                           // analogue of per_task's between-task barrier refresh,
+                           // but eventual: peer slots reflect their owner's most
+                           // recently completed task, not a global barrier.
                 let local_world = Arc::new(
-                    merge_dynamic_hostvars_locked(
-                        &base_world,
-                        &peer_views,
-                        &name_owned,
-                        &ctx,
-                    )
-                    .await,
+                    merge_dynamic_hostvars_locked(&base_world, &peer_views, &name_owned, &ctx)
+                        .await,
                 );
                 // Every task in the tree owns a coord slot; advance
                 // through skipped/meta/tag-filtered tasks so the
@@ -1652,17 +1635,10 @@ async fn run_play_per_play(
             }
             // End-of-play implicit flush for this host (only if not already
             // bailed under a fatal on_failure).
-            if first_failure.is_none()
-                || matches!(on_failure, OnFailure::Continue)
-            {
+            if first_failure.is_none() || matches!(on_failure, OnFailure::Continue) {
                 let flush_world = Arc::new(
-                    merge_dynamic_hostvars_locked(
-                        &base_world,
-                        &peer_views,
-                        &name_owned,
-                        &ctx,
-                    )
-                    .await,
+                    merge_dynamic_hostvars_locked(&base_world, &peer_views, &name_owned, &ctx)
+                        .await,
                 );
                 if let Some((hn, reason)) = run_handlers_one_host(
                     &handlers,
@@ -1879,7 +1855,10 @@ async fn run_task_on_one_host(
                 return PerHostTaskResult {
                     name,
                     ctx,
-                    outcome: HostTaskOutcome::Failed { reason, register: None },
+                    outcome: HostTaskOutcome::Failed {
+                        reason,
+                        register: None,
+                    },
                     conn_alive: true,
                 };
             }
@@ -1990,18 +1969,24 @@ async fn run_task_on_one_host(
                 return PerHostTaskResult {
                     name,
                     ctx,
-                    outcome: HostTaskOutcome::Failed { reason, register: None },
+                    outcome: HostTaskOutcome::Failed {
+                        reason,
+                        register: None,
+                    },
                     conn_alive: true,
                 };
             }
         };
         let t_body = Instant::now();
-        let exec =
-            run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
+        let exec = run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
         timing.add(&timing.body_dispatch_ns, t_body.elapsed());
         timing.incr(&timing.body_dispatch_count);
         let outcome = match exec {
-            BodyResult::Ok { register, changed, skipped } => {
+            BodyResult::Ok {
+                register,
+                changed,
+                skipped,
+            } => {
                 // Capture rc/duration for the structured report before the
                 // register is (maybe) moved into the ctx's register dict.
                 ctx.last_summary = Some(crate::report::TaskRunSummary {
@@ -2017,7 +2002,11 @@ async fn run_task_on_one_host(
                 timing.add(&timing.notify_enqueue_ns, t_notify.elapsed());
                 HostTaskOutcome::Ok { changed, skipped }
             }
-            BodyResult::Failed { reason, register, conn_alive } => {
+            BodyResult::Failed {
+                reason,
+                register,
+                conn_alive,
+            } => {
                 // Bind `register` to the failed task's register-shape
                 // result if any. We need to record it onto the host's
                 // register dict (when `task.register` is set) AND
@@ -2117,15 +2106,22 @@ async fn run_task_on_one_host(
             }
         };
         let t_body = Instant::now();
-        let exec =
-            run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
+        let exec = run_body_with_retries(task, &target, &mut ctx, &env, &world, &next_seq).await;
         timing.add(&timing.body_dispatch_ns, t_body.elapsed());
         timing.incr(&timing.body_dispatch_count);
         match exec {
-            BodyResult::Ok { register, changed: _, skipped: _ } => {
+            BodyResult::Ok {
+                register,
+                changed: _,
+                skipped: _,
+            } => {
                 iter_registers.push(register);
             }
-            BodyResult::Failed { reason, register, conn_alive } => {
+            BodyResult::Failed {
+                reason,
+                register,
+                conn_alive,
+            } => {
                 if any_failed.is_none() {
                     any_failed = Some(reason.clone());
                 }
@@ -2151,7 +2147,10 @@ async fn run_task_on_one_host(
     // each iteration's diff payload — a single changed file passes its object
     // through unchanged; multiple become a JSON array of diff objects (the
     // human renderer and gothab accept object-or-array).
-    let iter_diffs: Vec<String> = iter_registers.iter().filter_map(|r| r.diff.clone()).collect();
+    let iter_diffs: Vec<String> = iter_registers
+        .iter()
+        .filter_map(|r| r.diff.clone())
+        .collect();
     let combined_diff = match iter_diffs.len() {
         0 => None,
         1 => iter_diffs.into_iter().next(),
@@ -2177,7 +2176,10 @@ async fn run_task_on_one_host(
             let t_notify = Instant::now();
             enqueue_notifies(task, any_changed, false, &mut ctx, &env, &world);
             timing.add(&timing.notify_enqueue_ns, t_notify.elapsed());
-            HostTaskOutcome::Ok { changed: any_changed, skipped: all_skipped }
+            HostTaskOutcome::Ok {
+                changed: any_changed,
+                skipped: all_skipped,
+            }
         }
         Some(reason) => {
             ctx.failed = true;
@@ -2430,21 +2432,14 @@ async fn dispatch_one_task(
                     }
                     if waited.success
                         && !task.notify.is_empty()
-                        && waited
-                            .register
-                            .as_ref()
-                            .map(|r| r.changed)
-                            .unwrap_or(true)
+                        && waited.register.as_ref().map(|r| r.changed).unwrap_or(true)
                     {
                         for n in &task.notify {
-                            let rendered = match render_str(
-                                &env,
-                                n,
-                                &build_template_ctx(&ctx, &world),
-                            ) {
-                                Ok(s) => s,
-                                Err(_) => n.clone(),
-                            };
+                            let rendered =
+                                match render_str(&env, n, &build_template_ctx(&ctx, &world)) {
+                                    Ok(s) => s,
+                                    Err(_) => n.clone(),
+                                };
                             ctx.pending_handlers.insert(rendered);
                         }
                     }
@@ -2460,19 +2455,21 @@ async fn dispatch_one_task(
             // executing on every host. Should only happen for
             // synthetic dispatch (empty coord); normal play dispatch
             // pre-allocates one cell per task.
-            None => Box::pin(run_task_on_one_host(
-                task,
-                own_pool,
-                pools,
-                ctx,
-                next_seq,
-                env,
-                world,
-                coord.clone(),
-                slot_counter,
-                is_runner,
-            ))
-            .await,
+            None => {
+                Box::pin(run_task_on_one_host(
+                    task,
+                    own_pool,
+                    pools,
+                    ctx,
+                    next_seq,
+                    env,
+                    world,
+                    coord.clone(),
+                    slot_counter,
+                    is_runner,
+                ))
+                .await
+            }
         }
     } else {
         Box::pin(run_task_on_one_host(
@@ -2741,11 +2738,8 @@ async fn run_block_on_one_host(
                 }
                 Err(e) => {
                     if overall_failure.is_none() {
-                        overall_failure = Some((
-                            block_task.name.clone(),
-                            format!("when: {e:#}"),
-                            None,
-                        ));
+                        overall_failure =
+                            Some((block_task.name.clone(), format!("when: {e:#}"), None));
                     }
                     continue;
                 }
@@ -2897,11 +2891,7 @@ async fn run_block_on_one_host(
 /// `on_failure: stop` is not tripped. Matches Ansible's behavior:
 /// task-level opt-out from play-halting, register still reflects the
 /// truth so a downstream `when: prev.failed` can react to it.
-fn maybe_ignore_failure(
-    task: &Task,
-    outcome: HostTaskOutcome,
-    host: &str,
-) -> HostTaskOutcome {
+fn maybe_ignore_failure(task: &Task, outcome: HostTaskOutcome, host: &str) -> HostTaskOutcome {
     match (&task.ignore_errors, &outcome) {
         (Some(true), HostTaskOutcome::Failed { reason, .. }) => {
             info!(
@@ -2910,7 +2900,10 @@ fn maybe_ignore_failure(
                 reason = %reason,
                 "task failed but ignored (ignore_errors: true)"
             );
-            HostTaskOutcome::Ok { changed: false, skipped: false }
+            HostTaskOutcome::Ok {
+                changed: false,
+                skipped: false,
+            }
         }
         _ => outcome,
     }
@@ -3241,9 +3234,7 @@ async fn run_body_with_retries(
     if exhausted_without_exit {
         if let BodyResult::Ok { register, .. } = last_result {
             last_result = BodyResult::Failed {
-                reason: format!(
-                    "task did not satisfy `until:` after {attempts_made} attempts"
-                ),
+                reason: format!("task did not satisfy `until:` after {attempts_made} attempts"),
                 register: Some(register),
                 conn_alive: true,
             };
@@ -3483,8 +3474,7 @@ async fn run_op_body(
     // e.g. a `file:` task pass silently).
     if !task.environment.is_empty() {
         let view = build_template_ctx(ctx, world);
-        let mut rendered_env: Vec<(String, String)> =
-            Vec::with_capacity(task.environment.len());
+        let mut rendered_env: Vec<(String, String)> = Vec::with_capacity(task.environment.len());
         for (k, v) in &task.environment {
             let rendered_val = match render_str(env, v, &view) {
                 Ok(s) => s,
@@ -3552,10 +3542,9 @@ async fn run_op_body(
         },
     };
     let wire_op = match async_wrap {
-        Some(seconds) => rsansible_wire::msg::op_async_start(
-            seconds.saturating_mul(1000),
-            inner_wire_op,
-        ),
+        Some(seconds) => {
+            rsansible_wire::msg::op_async_start(seconds.saturating_mul(1000), inner_wire_op)
+        }
         None => inner_wire_op,
     };
 
@@ -3660,10 +3649,7 @@ async fn run_op_body(
                 };
                 let finished = serde_json::from_slice::<JsonValue>(&exec_now.stdout)
                     .ok()
-                    .and_then(|v| {
-                        v.get("finished")
-                            .and_then(|n| n.as_u64().map(|u| u != 0))
-                    })
+                    .and_then(|v| v.get("finished").and_then(|n| n.as_u64().map(|u| u != 0)))
                     .unwrap_or(false);
                 let past_deadline = Instant::now() > deadline;
                 result = Ok(exec_now);
@@ -3679,8 +3665,10 @@ async fn run_op_body(
 
     match result {
         Ok(exec) => {
-            let agent_elapsed_ns =
-                exec.done.finished_unix_ns.saturating_sub(exec.done.started_unix_ns);
+            let agent_elapsed_ns = exec
+                .done
+                .finished_unix_ns
+                .saturating_sub(exec.done.started_unix_ns);
             let took_ms = (agent_elapsed_ns / 1_000_000).min(u64::MAX);
             let mut rv = RegisterValue::from_exec_with_skipped(
                 exec.done.exit_code,
@@ -3891,8 +3879,9 @@ async fn run_privkey_composite(
     // unconditionally: the dry-run path *must* see whether the key
     // exists so we can report a meaningful `changed`/`skipped` pair
     // without writing bytes.
-    let probe =
-        effective_check_mode || p.force_probe || ctx.wire_strategy.decide(&ctx.wire_cost, pem.len());
+    let probe = effective_check_mode
+        || p.force_probe
+        || ctx.wire_strategy.decide(&ctx.wire_cost, pem.len());
 
     if probe {
         // Step 1: OpStat. Short, cheap, returns JSON on stdout.
@@ -4068,8 +4057,10 @@ async fn run_privkey_composite(
     };
     match write_result {
         Ok(exec) => {
-            let agent_elapsed_ns =
-                exec.done.finished_unix_ns.saturating_sub(exec.done.started_unix_ns);
+            let agent_elapsed_ns = exec
+                .done
+                .finished_unix_ns
+                .saturating_sub(exec.done.started_unix_ns);
             let took_ms = (agent_elapsed_ns / 1_000_000).min(u64::MAX);
             let mut rv = RegisterValue::from_exec_with_skipped(
                 exec.done.exit_code,
@@ -4140,22 +4131,19 @@ async fn synth_csr_pipe(
 ) -> BodyResult {
     let pem = match ctx.privkey_pem_cache.get(&c.privatekey_path) {
         Some(b) => b.clone(),
-        None => match fetch_privkey_via_read_file(
-            &c.privatekey_path,
-            target_conn,
-            next_seq,
-            task,
-            ctx,
-        )
-        .await
-        {
-            Ok(b) => {
-                // Cache for any follow-up _pipe step in this play.
-                ctx.privkey_pem_cache.insert(c.privatekey_path.clone(), b.clone());
-                b
+        None => {
+            match fetch_privkey_via_read_file(&c.privatekey_path, target_conn, next_seq, task, ctx)
+                .await
+            {
+                Ok(b) => {
+                    // Cache for any follow-up _pipe step in this play.
+                    ctx.privkey_pem_cache
+                        .insert(c.privatekey_path.clone(), b.clone());
+                    b
+                }
+                Err(e) => return e,
             }
-            Err(e) => return e,
-        },
+        }
     };
     synth_csr_pipe_from_pem(c, pem)
 }
@@ -4219,16 +4207,14 @@ async fn fetch_privkey_via_read_file(
     use base64::Engine as _;
 
     let read_seq = next_seq.fetch_add(1, Ordering::Relaxed);
-    let read_op =
-        rsansible_wire::msg::op_read_file(path.to_string(), CSR_PIPE_PRIVKEY_MAX_BYTES);
+    let read_op = rsansible_wire::msg::op_read_file(path.to_string(), CSR_PIPE_PRIVKEY_MAX_BYTES);
     let exec = {
         let mut guard = target_conn.lock().await;
         let conn = match guard.as_mut() {
             Some(c) => c,
             None => {
                 return Err(BodyResult::Failed {
-                    reason: "openssl_csr_pipe: agent conn is dead (host marked failed)"
-                        .into(),
+                    reason: "openssl_csr_pipe: agent conn is dead (host marked failed)".into(),
                     register: None,
                     conn_alive: false,
                 });
@@ -4296,9 +4282,7 @@ async fn fetch_privkey_via_read_file(
     match base64::engine::general_purpose::STANDARD.decode(b64) {
         Ok(bytes) => Ok(bytes),
         Err(e) => Err(BodyResult::Failed {
-            reason: format!(
-                "openssl_csr_pipe: base64-decoding slurp content from {path:?}: {e}"
-            ),
+            reason: format!("openssl_csr_pipe: base64-decoding slurp content from {path:?}: {e}"),
             register: None,
             conn_alive: true,
         }),
@@ -4440,9 +4424,7 @@ fn synth_tempfile(t: &TempfileOp) -> BodyResult {
                 Ok(f) => f,
                 Err(e) => {
                     return BodyResult::Failed {
-                        reason: format!(
-                            "tempfile: creating file under {parent:?} failed: {e}"
-                        ),
+                        reason: format!("tempfile: creating file under {parent:?} failed: {e}"),
                         register: None,
                         conn_alive: true,
                     };
@@ -5013,15 +4995,16 @@ impl ResolvedRoleAttrs {
                 continue;
             }
             let (canonical, want) =
-                crate::playbook::task_op::postgresql::normalize_role_attr_token(tok)
-                    .ok_or_else(|| {
+                crate::playbook::task_op::postgresql::normalize_role_attr_token(tok).ok_or_else(
+                    || {
                         anyhow!(
                             "postgresql_user.role_attr_flags: unknown attr {tok:?} \
                              (post-render); supported: LOGIN, SUPERUSER, CREATEDB, \
                              CREATEROLE, INHERIT, REPLICATION, BYPASSRLS (each with \
                              NO… counterpart)"
                         )
-                    })?;
+                    },
+                )?;
             match canonical {
                 "canlogin" => out.canlogin = Some(want),
                 "super" => out.super_ = Some(want),
@@ -5082,9 +5065,19 @@ impl ResolvedRoleAttrs {
         diff_one!(self.canlogin, probe.canlogin, "LOGIN", "NOLOGIN");
         diff_one!(self.super_, probe.super_, "SUPERUSER", "NOSUPERUSER");
         diff_one!(self.createdb, probe.createdb, "CREATEDB", "NOCREATEDB");
-        diff_one!(self.createrole, probe.createrole, "CREATEROLE", "NOCREATEROLE");
+        diff_one!(
+            self.createrole,
+            probe.createrole,
+            "CREATEROLE",
+            "NOCREATEROLE"
+        );
         diff_one!(self.inherit, probe.inherit, "INHERIT", "NOINHERIT");
-        diff_one!(self.replication, probe.replication, "REPLICATION", "NOREPLICATION");
+        diff_one!(
+            self.replication,
+            probe.replication,
+            "REPLICATION",
+            "NOREPLICATION"
+        );
         diff_one!(self.bypassrls, probe.bypassrls, "BYPASSRLS", "NOBYPASSRLS");
         parts.join(" ")
     }
@@ -5195,11 +5188,7 @@ fn parse_pg_authid_row(env: &JsonValue) -> Result<Option<PgAuthidRow>> {
 /// footprint (pbkdf2 + hmac + base64) and complexity isn't worth it
 /// for v1. Also md5-hashed roles still hit this path and over-report;
 /// adding md5 client-side comparison is a smaller follow-up.
-fn decide_password_alter(
-    password: &str,
-    _username: &str,
-    _cur_rolpassword: Option<&str>,
-) -> bool {
+fn decide_password_alter(password: &str, _username: &str, _cur_rolpassword: Option<&str>) -> bool {
     // v1: always re-set when password is provided. See doc comment
     // above for the SCRAM-vs-md5 hash-comparison follow-up.
     !password.is_empty()
@@ -5247,12 +5236,11 @@ async fn run_postgresql_user_composite(
         vec![op.name.clone()],
         true, // read_only
     );
-    let probe_exec = match dispatch_one_pg_query(task, ctx, target_conn, next_seq, probe_op, true)
-        .await
-    {
-        Ok(e) => e,
-        Err(br) => return br,
-    };
+    let probe_exec =
+        match dispatch_one_pg_query(task, ctx, target_conn, next_seq, probe_op, true).await {
+            Ok(e) => e,
+            Err(br) => return br,
+        };
     let probe_env = match parse_pg_query_envelope(&probe_exec, "postgresql_user.probe") {
         Ok(v) => v,
         Err(br) => return br,
@@ -5319,14 +5307,13 @@ async fn run_postgresql_user_composite(
                     vec![],
                     false,
                 );
-                let exec = match dispatch_one_pg_query(
-                    task, ctx, target_conn, next_seq, mut_op, true,
-                )
-                .await
-                {
-                    Ok(e) => e,
-                    Err(br) => return br,
-                };
+                let exec =
+                    match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                        .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
                 if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_user.create") {
                     return br;
                 }
@@ -5335,16 +5322,12 @@ async fn run_postgresql_user_composite(
         (true, Some(cur)) => {
             // ALTER ROLE if anything diverges.
             let attr_clause = requested_attrs.diff_against_probe(cur);
-            let conn_limit_diff =
-                op.conn_limit != crate::playbook::task_op::postgresql::CONN_LIMIT_UNSET
-                    && op.conn_limit != cur.connlimit;
+            let conn_limit_diff = op.conn_limit
+                != crate::playbook::task_op::postgresql::CONN_LIMIT_UNSET
+                && op.conn_limit != cur.connlimit;
             let want_password_alter = !op.password.is_empty()
                 && !op.no_password_changes
-                && decide_password_alter(
-                    &op.password,
-                    &op.name,
-                    cur.rolpassword.as_deref(),
-                );
+                && decide_password_alter(&op.password, &op.name, cur.rolpassword.as_deref());
             if !attr_clause.is_empty() || conn_limit_diff || want_password_alter {
                 let mut sql = format!("ALTER ROLE {name_quoted}");
                 let mut wrote_with = false;
@@ -5382,16 +5365,14 @@ async fn run_postgresql_user_composite(
                         vec![],
                         false,
                     );
-                    let exec = match dispatch_one_pg_query(
-                        task, ctx, target_conn, next_seq, mut_op, true,
-                    )
-                    .await
-                    {
-                        Ok(e) => e,
-                        Err(br) => return br,
-                    };
-                    if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_user.alter")
-                    {
+                    let exec =
+                        match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                            .await
+                        {
+                            Ok(e) => e,
+                            Err(br) => return br,
+                        };
+                    if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_user.alter") {
                         return br;
                     }
                 }
@@ -5415,14 +5396,13 @@ async fn run_postgresql_user_composite(
                     vec![],
                     false,
                 );
-                let exec = match dispatch_one_pg_query(
-                    task, ctx, target_conn, next_seq, mut_op, true,
-                )
-                .await
-                {
-                    Ok(e) => e,
-                    Err(br) => return br,
-                };
+                let exec =
+                    match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                        .await
+                    {
+                        Ok(e) => e,
+                        Err(br) => return br,
+                    };
                 if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_user.drop") {
                     return br;
                 }
@@ -5529,14 +5509,12 @@ async fn run_postgresql_membership_composite(
                 vec![group_name.clone(), target_name.clone()],
                 true,
             );
-            let probe_exec = match dispatch_one_pg_query(
-                task, ctx, target_conn, next_seq, probe_op, true,
-            )
-            .await
-            {
-                Ok(e) => e,
-                Err(br) => return br,
-            };
+            let probe_exec =
+                match dispatch_one_pg_query(task, ctx, target_conn, next_seq, probe_op, true).await
+                {
+                    Ok(e) => e,
+                    Err(br) => return br,
+                };
             let probe_env =
                 match parse_pg_query_envelope(&probe_exec, "postgresql_membership.probe") {
                     Ok(v) => v,
@@ -5645,17 +5623,14 @@ async fn run_postgresql_membership_composite(
                         vec![],
                         false,
                     );
-                    let exec = match dispatch_one_pg_query(
-                        task, ctx, target_conn, next_seq, mut_op, true,
-                    )
-                    .await
-                    {
-                        Ok(e) => e,
-                        Err(br) => return br,
-                    };
-                    if let Err(br) =
-                        parse_pg_query_envelope(&exec, "postgresql_membership.grant")
-                    {
+                    let exec =
+                        match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                            .await
+                        {
+                            Ok(e) => e,
+                            Err(br) => return br,
+                        };
+                    if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_membership.grant") {
                         return br;
                     }
                 }
@@ -5680,16 +5655,14 @@ async fn run_postgresql_membership_composite(
                         vec![],
                         false,
                     );
-                    let exec = match dispatch_one_pg_query(
-                        task, ctx, target_conn, next_seq, mut_op, true,
-                    )
-                    .await
-                    {
-                        Ok(e) => e,
-                        Err(br) => return br,
-                    };
-                    if let Err(br) =
-                        parse_pg_query_envelope(&exec, "postgresql_membership.revoke")
+                    let exec =
+                        match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                            .await
+                        {
+                            Ok(e) => e,
+                            Err(br) => return br,
+                        };
+                    if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_membership.revoke")
                     {
                         return br;
                     }
@@ -5769,12 +5742,11 @@ async fn run_postgresql_db_composite(
         vec![op.name.clone()],
         true,
     );
-    let probe_exec = match dispatch_one_pg_query(task, ctx, target_conn, next_seq, probe_op, true)
-        .await
-    {
-        Ok(e) => e,
-        Err(br) => return br,
-    };
+    let probe_exec =
+        match dispatch_one_pg_query(task, ctx, target_conn, next_seq, probe_op, true).await {
+            Ok(e) => e,
+            Err(br) => return br,
+        };
     let probe_env = match parse_pg_query_envelope(&probe_exec, "postgresql_db.probe") {
         Ok(v) => v,
         Err(br) => return br,
@@ -5827,7 +5799,10 @@ async fn run_postgresql_db_composite(
             let mut sql = format!("CREATE DATABASE {name_quoted}");
             let mut parts: Vec<String> = Vec::new();
             if !op.owner.is_empty() {
-                parts.push(format!("OWNER {}", quote_pg_ident(&op.owner).unwrap_or_else(|_| op.owner.clone())));
+                parts.push(format!(
+                    "OWNER {}",
+                    quote_pg_ident(&op.owner).unwrap_or_else(|_| op.owner.clone())
+                ));
             }
             if !op.template.is_empty() {
                 parts.push(format!(
@@ -5836,7 +5811,10 @@ async fn run_postgresql_db_composite(
                 ));
             }
             if !op.encoding.is_empty() {
-                parts.push(format!("ENCODING {}", quote_pg_string_literal(&op.encoding)));
+                parts.push(format!(
+                    "ENCODING {}",
+                    quote_pg_string_literal(&op.encoding)
+                ));
             }
             if !op.lc_collate.is_empty() {
                 parts.push(format!(
@@ -5888,8 +5866,7 @@ async fn run_postgresql_db_composite(
             // destroy data. Match Ansible: warn-silently — emit no
             // mutation for those, only adjust OWNER on divergence.
             if !op.owner.is_empty() && owner != &op.owner {
-                let owner_quoted =
-                    quote_pg_ident(&op.owner).unwrap_or_else(|_| op.owner.clone());
+                let owner_quoted = quote_pg_ident(&op.owner).unwrap_or_else(|_| op.owner.clone());
                 let sql = format!("ALTER DATABASE {name_quoted} OWNER TO {owner_quoted}");
                 queries.push(sql.clone());
                 changed = true;
@@ -5906,17 +5883,14 @@ async fn run_postgresql_db_composite(
                         vec![],
                         false,
                     );
-                    let exec = match dispatch_one_pg_query(
-                        task, ctx, target_conn, next_seq, mut_op, true,
-                    )
-                    .await
-                    {
-                        Ok(e) => e,
-                        Err(br) => return br,
-                    };
-                    if let Err(br) =
-                        parse_pg_query_envelope(&exec, "postgresql_db.alter_owner")
-                    {
+                    let exec =
+                        match dispatch_one_pg_query(task, ctx, target_conn, next_seq, mut_op, true)
+                            .await
+                        {
+                            Ok(e) => e,
+                            Err(br) => return br,
+                        };
+                    if let Err(br) = parse_pg_query_envelope(&exec, "postgresql_db.alter_owner") {
                         return br;
                     }
                 }
@@ -6036,7 +6010,14 @@ fn lift_get_url_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
+            "changed"
+                | "rc"
+                | "stdout"
+                | "stderr"
+                | "stdout_lines"
+                | "stderr_lines"
+                | "took_ms"
+                | "skipped"
                 | "failed"
         ) {
             continue;
@@ -6057,7 +6038,14 @@ fn lift_slurp_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
+            "changed"
+                | "rc"
+                | "stdout"
+                | "stderr"
+                | "stdout_lines"
+                | "stderr_lines"
+                | "took_ms"
+                | "skipped"
                 | "failed"
         ) {
             continue;
@@ -6099,10 +6087,8 @@ fn lift_getent_envelope(rv: &mut RegisterValue) {
         }
         map.insert(k, v);
     }
-    rv.extra.insert(
-        format!("getent_{database}"),
-        JsonValue::Object(map),
-    );
+    rv.extra
+        .insert(format!("getent_{database}"), JsonValue::Object(map));
 }
 
 fn lift_async_envelope(rv: &mut RegisterValue) {
@@ -6114,7 +6100,14 @@ fn lift_async_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
+            "changed"
+                | "rc"
+                | "stdout"
+                | "stderr"
+                | "stdout_lines"
+                | "stderr_lines"
+                | "took_ms"
+                | "skipped"
                 | "failed"
         ) {
             continue;
@@ -6135,7 +6128,14 @@ fn lift_unarchive_envelope(rv: &mut RegisterValue) {
     for (k, v) in envelope {
         if matches!(
             k.as_str(),
-            "changed" | "rc" | "stdout" | "stderr" | "stdout_lines" | "stderr_lines" | "took_ms" | "skipped"
+            "changed"
+                | "rc"
+                | "stdout"
+                | "stderr"
+                | "stdout_lines"
+                | "stderr_lines"
+                | "took_ms"
+                | "skipped"
                 | "failed"
         ) {
             continue;
@@ -6261,9 +6261,7 @@ fn render_op_inner(
                     )
                 })?;
                 if v.is_empty() {
-                    return Err(anyhow!(
-                        "command.cmd: empty after rendering+shlex-split"
-                    ));
+                    return Err(anyhow!("command.cmd: empty after rendering+shlex-split"));
                 }
                 v
             } else {
@@ -6373,12 +6371,8 @@ fn render_op_inner(
             let content = if t.search_dirs.is_empty() {
                 render_str_resolved(env, body_ref, &view)?
             } else {
-                let mut local_env: minijinja::Environment<'static> =
-                    crate::template::make_env();
-                crate::template::install_include_loader(
-                    &mut local_env,
-                    t.search_dirs.clone(),
-                );
+                let mut local_env: minijinja::Environment<'static> = crate::template::make_env();
+                crate::template::install_include_loader(&mut local_env, t.search_dirs.clone());
                 render_str_resolved(&local_env, body_ref, &view)?
             };
             let validate = match &t.validate {
@@ -6749,6 +6743,15 @@ fn render_op_inner(
         }),
         TaskOp::Timezone(z) => TaskOp::Timezone(crate::playbook::task_op::TimezoneOp {
             name: render_str_resolved(env, &z.name, &view)?,
+        }),
+        TaskOp::Modprobe(m) => TaskOp::Modprobe(crate::playbook::task_op::ModprobeOp {
+            name: render_str_resolved(env, &m.name, &view)?,
+            state: m.state,
+            params: if m.params.is_empty() {
+                String::new()
+            } else {
+                render_str_resolved(env, &m.params, &view)?
+            },
         }),
         TaskOp::Ufw(u) => {
             let render_if = |s: &str| -> Result<String> {
@@ -7167,9 +7170,8 @@ fn resolve_mode(
         ModeField::Template(t) => {
             let rendered = render_str(env, t, view)?;
             let trimmed = rendered.trim();
-            let n = crate::playbook::parse_rendered_mode(trimmed).map_err(|e| {
-                anyhow!("mode template {t:?} rendered to {rendered:?}: {e}")
-            })?;
+            let n = crate::playbook::parse_rendered_mode(trimmed)
+                .map_err(|e| anyhow!("mode template {t:?} rendered to {rendered:?}: {e}"))?;
             Ok(ModeField::Literal(n))
         }
     }
@@ -7266,9 +7268,8 @@ fn resolve_mode_resolved(
         ModeField::Template(t) => {
             let rendered = render_str_resolved(env, t, resolved_view)?;
             let trimmed = rendered.trim();
-            let n = crate::playbook::parse_rendered_mode(trimmed).map_err(|e| {
-                anyhow!("mode template {t:?} rendered to {rendered:?}: {e}")
-            })?;
+            let n = crate::playbook::parse_rendered_mode(trimmed)
+                .map_err(|e| anyhow!("mode template {t:?} rendered to {rendered:?}: {e}"))?;
             Ok(ModeField::Literal(n))
         }
     }
@@ -7493,9 +7494,7 @@ fn eval_when(
         .compile_expression(&prepared)
         .map_err(|e| anyhow!("compile: {e}"))?;
     let view = build_template_ctx(ctx, world);
-    let val = compiled
-        .eval(&view)
-        .map_err(|e| anyhow!("eval: {e}"))?;
+    let val = compiled.eval(&view).map_err(|e| anyhow!("eval: {e}"))?;
     Ok(val.is_true())
 }
 
@@ -7511,9 +7510,7 @@ fn eval_bool_with_view(
     let compiled = env
         .compile_expression(&prepared)
         .map_err(|e| anyhow!("compile: {e}"))?;
-    let val = compiled
-        .eval(view)
-        .map_err(|e| anyhow!("eval: {e}"))?;
+    let val = compiled.eval(view).map_err(|e| anyhow!("eval: {e}"))?;
     Ok(val.is_true())
 }
 
@@ -7598,32 +7595,59 @@ fn apply_changed_failed_when(
             Ok(true) => match result {
                 BodyResult::Ok { register, .. } => BodyResult::Failed {
                     reason: "failed_when: evaluated true".to_string(),
-                    register: Some(RegisterValue { failed: true, ..register }),
+                    register: Some(RegisterValue {
+                        failed: true,
+                        ..register
+                    }),
                     conn_alive: true,
                 },
-                BodyResult::Failed { reason, register, conn_alive } => BodyResult::Failed {
+                BodyResult::Failed {
+                    reason,
+                    register,
+                    conn_alive,
+                } => BodyResult::Failed {
                     reason,
                     register: register.map(|r| RegisterValue { failed: true, ..r }),
                     conn_alive,
                 },
             },
             Ok(false) => match result {
-                BodyResult::Ok { register, changed, skipped } => BodyResult::Ok {
-                    register: RegisterValue { failed: false, ..register },
+                BodyResult::Ok {
+                    register,
+                    changed,
+                    skipped,
+                } => BodyResult::Ok {
+                    register: RegisterValue {
+                        failed: false,
+                        ..register
+                    },
                     changed,
                     skipped,
                 },
-                BodyResult::Failed { register: Some(rv), .. } => BodyResult::Ok {
+                BodyResult::Failed {
+                    register: Some(rv), ..
+                } => BodyResult::Ok {
                     changed: rv.changed,
                     skipped: rv.skipped,
-                    register: RegisterValue { failed: false, ..rv },
+                    register: RegisterValue {
+                        failed: false,
+                        ..rv
+                    },
                 },
-                BodyResult::Failed { register: None, reason, conn_alive } => {
+                BodyResult::Failed {
+                    register: None,
+                    reason,
+                    conn_alive,
+                } => {
                     // No register to promote — keep failed. This
                     // covers controller-side pre-dispatch failures
                     // (vars: render error, etc.) where there's
                     // nothing for `failed_when: false` to override.
-                    BodyResult::Failed { register: None, reason, conn_alive }
+                    BodyResult::Failed {
+                        register: None,
+                        reason,
+                        conn_alive,
+                    }
                 }
             },
             Err(e) => {
@@ -7642,12 +7666,21 @@ fn apply_changed_failed_when(
     if let Some(expr) = task.changed_when.as_deref() {
         match eval_bool_with_view(env, expr, &view) {
             Ok(c) => match result {
-                BodyResult::Ok { register, skipped, .. } => BodyResult::Ok {
-                    register: RegisterValue { changed: c, ..register },
+                BodyResult::Ok {
+                    register, skipped, ..
+                } => BodyResult::Ok {
+                    register: RegisterValue {
+                        changed: c,
+                        ..register
+                    },
                     changed: c,
                     skipped,
                 },
-                BodyResult::Failed { reason, register, conn_alive } => BodyResult::Failed {
+                BodyResult::Failed {
+                    reason,
+                    register,
+                    conn_alive,
+                } => BodyResult::Failed {
                     reason,
                     register: register.map(|r| RegisterValue { changed: c, ..r }),
                     conn_alive,
@@ -7670,7 +7703,9 @@ fn resolve_loop_items(
     ctx: &HostCtx,
     world: &WorldVars,
 ) -> Result<Vec<JsonValue>> {
-    let Some(spec) = spec else { return Ok(Vec::new()) };
+    let Some(spec) = spec else {
+        return Ok(Vec::new());
+    };
     match spec {
         LoopSpec::Items(items) => {
             // Each item is a raw YAML value from the playbook source. Render
@@ -7806,9 +7841,8 @@ fn render_string_or_list_sources(
                         }
                         JsonValue::String(s) => out.push(s),
                         JsonValue::Null => {}
-                        other => out.push(
-                            serde_json::to_string(&other).unwrap_or_else(|_| String::new()),
-                        ),
+                        other => out
+                            .push(serde_json::to_string(&other).unwrap_or_else(|_| String::new())),
                     }
                     continue;
                 }
@@ -7865,10 +7899,8 @@ fn emit_timing_trace(host: &str, task_name: &str, seq: u32, exec: &OpExecOutcome
     // outbound/inbound deltas are dominated by skew on any pair of hosts
     // whose clocks haven't been NTP-tightened recently.
     let offset = exec.clock_offset_ns as i128;
-    let agent_started_corrected =
-        (exec.done.started_unix_ns as i128) - offset;
-    let agent_finished_corrected =
-        (exec.done.finished_unix_ns as i128) - offset;
+    let agent_started_corrected = (exec.done.started_unix_ns as i128) - offset;
+    let agent_finished_corrected = (exec.done.finished_unix_ns as i128) - offset;
     // Signed: small RTTs plus a sloppy single-sample offset can still leave
     // these mildly negative; the magnitude is the useful number.
     let outbound_ns = agent_started_corrected - (exec.dispatched_unix_ns as i128);
@@ -8120,8 +8152,11 @@ async fn apply_per_host_result(
             if let Some(payload) = tr.diff.as_deref() {
                 if let Some(rendered) = crate::diff_render::render_diff_payload(payload) {
                     let check_tag = if ctx.check_mode { " (check mode)" } else { "" };
-                    let task_label =
-                        if task.name.is_empty() { "<unnamed task>" } else { task.name.as_str() };
+                    let task_label = if task.name.is_empty() {
+                        "<unnamed task>"
+                    } else {
+                        task.name.as_str()
+                    };
                     eprintln!("--- diff: {name} :: {task_label}{check_tag} ---");
                     eprint!("{rendered}");
                 }
@@ -8139,11 +8174,7 @@ async fn apply_per_host_result(
     // the orchestrator's perspective, so leaving stale slots in
     // place would just confuse the next task.
     let drop_conns = !conn_alive
-        || (failed
-            && matches!(
-                play.on_failure,
-                OnFailure::MarkHostFailed | OnFailure::Stop
-            ));
+        || (failed && matches!(play.on_failure, OnFailure::MarkHostFailed | OnFailure::Stop));
     if drop_conns {
         if let Some(pool_handle) = pools.get(&name) {
             let pool = pool_handle.lock().await;
@@ -8197,7 +8228,15 @@ async fn flush_handlers(
         );
 
         let any_failed = run_task_fanout(
-            handler, &interested, pools, ctxs, report, next_seq, env, world, play,
+            handler,
+            &interested,
+            pools,
+            ctxs,
+            report,
+            next_seq,
+            env,
+            world,
+            play,
         )
         .await?;
 
@@ -8304,10 +8343,8 @@ fn resolve_host_connection_modes(
     targets: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, ConnMode>> {
     use crate::playbook::Connection;
-    let mut out: BTreeMap<String, ConnMode> = targets
-        .iter()
-        .map(|h| (h.clone(), ConnMode::Ssh))
-        .collect();
+    let mut out: BTreeMap<String, ConnMode> =
+        targets.iter().map(|h| (h.clone(), ConnMode::Ssh)).collect();
     // Host-var pin first. A host with inventory-level
     // `ansible_connection: local` (most prominently the implicit
     // `localhost` — Ansible auto-seeds it that way) is forced to
@@ -8414,7 +8451,6 @@ fn resolve_play_targets(sel: &HostSelector, inv: &Inventory) -> Vec<String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8477,9 +8513,7 @@ mod tests {
         .unwrap();
         let mut world = WorldVars::default();
         for (n, h) in &inv.hosts {
-            world
-                .hostvars
-                .insert(n.clone(), h.inline_vars.clone());
+            world.hostvars.insert(n.clone(), h.inline_vars.clone());
         }
         let targets: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let modes = resolve_host_connection_modes(&pb, &inv, &world, &targets).unwrap();
@@ -8565,8 +8599,7 @@ mod tests {
     /// matches what `build_world_vars` would produce for the same
     /// inventory shape (inventory_vars baked into each peer's view).
     fn static_world_for(peers: &[(&str, &[(&str, JsonValue)])]) -> WorldVars {
-        let mut hostvars: BTreeMap<String, BTreeMap<String, JsonValue>> =
-            BTreeMap::new();
+        let mut hostvars: BTreeMap<String, BTreeMap<String, JsonValue>> = BTreeMap::new();
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut all_members = Vec::new();
         for (name, inv_vars) in peers {
@@ -8588,10 +8621,9 @@ mod tests {
             ("b", &[("vswitch_ip", serde_json::json!("10.0.0.2"))]),
         ]);
         let mut ctx_a = HostCtx::new("a".into());
-        ctx_a.facts.insert(
-            "ansible_distribution".into(),
-            serde_json::json!("Ubuntu"),
-        );
+        ctx_a
+            .facts
+            .insert("ansible_distribution".into(), serde_json::json!("Ubuntu"));
         ctx_a
             .set_facts
             .insert("patroni_ready".into(), serde_json::json!(true));
@@ -8638,7 +8670,6 @@ mod tests {
             merged.hostvars["b"].get("inventory_hostname"),
             Some(&serde_json::json!("b"))
         );
-
     }
 
     #[test]
@@ -8647,10 +8678,7 @@ mod tests {
         let mut ctx = HostCtx::new("a".into());
         ctx.facts.insert("v".into(), serde_json::json!("fact"));
         ctx.set_facts.insert("v".into(), serde_json::json!("set"));
-        ctx.record_register(
-            "v",
-            RegisterValue::from_exec(0, false, 0, b"reg", b""),
-        );
+        ctx.record_register("v", RegisterValue::from_exec(0, false, 0, b"reg", b""));
         let mut ctxs = BTreeMap::new();
         ctxs.insert("a".to_string(), ctx);
 
@@ -9104,10 +9132,7 @@ mod tests {
             rv.extra.get("state").unwrap(),
             &serde_json::json!("present")
         );
-        assert_eq!(
-            rv.extra.get("version").unwrap(),
-            &serde_json::json!("1.10")
-        );
+        assert_eq!(rv.extra.get("version").unwrap(), &serde_json::json!("1.10"));
     }
 
     #[test]
@@ -9153,22 +9178,26 @@ mod tests {
             serde_yaml::Value::String("b".into()),
         ]);
         let items = resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).unwrap();
-        assert_eq!(items, vec![JsonValue::String("a".into()), JsonValue::String("b".into())]);
+        assert_eq!(
+            items,
+            vec![JsonValue::String("a".into()), JsonValue::String("b".into())]
+        );
     }
 
     #[test]
     fn resolve_loop_items_expression() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert(
-            "names".into(),
-            serde_json::json!(["alice", "bob"]),
-        );
+        ctx.set_facts
+            .insert("names".into(), serde_json::json!(["alice", "bob"]));
         let spec = LoopSpec::Expr("names".into());
         let items = resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).unwrap();
         assert_eq!(
             items,
-            vec![JsonValue::String("alice".into()), JsonValue::String("bob".into())]
+            vec![
+                JsonValue::String("alice".into()),
+                JsonValue::String("bob".into())
+            ]
         );
     }
 
@@ -9176,10 +9205,14 @@ mod tests {
     fn resolve_loop_items_expression_with_braces() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert("xs".into(), serde_json::json!([1, 2, 3]));
+        ctx.set_facts
+            .insert("xs".into(), serde_json::json!([1, 2, 3]));
         let spec = LoopSpec::Expr("{{ xs }}".into());
         let items = resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).unwrap();
-        assert_eq!(items, vec![JsonValue::from(1), JsonValue::from(2), JsonValue::from(3)]);
+        assert_eq!(
+            items,
+            vec![JsonValue::from(1), JsonValue::from(2), JsonValue::from(3)]
+        );
     }
 
     /// Regression: `apt: { name: "{{ pkg_list }}" }` where
@@ -9193,17 +9226,11 @@ mod tests {
     fn render_string_or_list_sources_splats_list_var() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert(
-            "pkg_list".into(),
-            serde_json::json!(["curl", "git", "vim"]),
-        );
+        ctx.set_facts
+            .insert("pkg_list".into(), serde_json::json!(["curl", "git", "vim"]));
         let view = build_template_ctx(&ctx, &WorldVars::default());
-        let out = render_string_or_list_sources(
-            &env,
-            &["{{ pkg_list }}".to_string()],
-            &view,
-        )
-        .unwrap();
+        let out =
+            render_string_or_list_sources(&env, &["{{ pkg_list }}".to_string()], &view).unwrap();
         assert_eq!(
             out,
             vec!["curl".to_string(), "git".to_string(), "vim".to_string()],
@@ -9219,12 +9246,9 @@ mod tests {
         let env = template::make_env();
         let ctx = HostCtx::new("h".into());
         let view = build_template_ctx(&ctx, &WorldVars::default());
-        let out = render_string_or_list_sources(
-            &env,
-            &["curl".to_string(), "git".to_string()],
-            &view,
-        )
-        .unwrap();
+        let out =
+            render_string_or_list_sources(&env, &["curl".to_string(), "git".to_string()], &view)
+                .unwrap();
         assert_eq!(out, vec!["curl".to_string(), "git".to_string()]);
     }
 
@@ -9237,12 +9261,7 @@ mod tests {
         ctx.set_facts
             .insert("pkg".into(), serde_json::json!("nginx"));
         let view = build_template_ctx(&ctx, &WorldVars::default());
-        let out = render_string_or_list_sources(
-            &env,
-            &["{{ pkg }}".to_string()],
-            &view,
-        )
-        .unwrap();
+        let out = render_string_or_list_sources(&env, &["{{ pkg }}".to_string()], &view).unwrap();
         assert_eq!(out, vec!["nginx".to_string()]);
     }
 
@@ -9398,12 +9417,7 @@ mod tests {
         ctx.role_defaults
             .insert("rules".into(), serde_json::json!(["allow {{ cidr }}"]));
         let view = build_template_ctx(&ctx, &WorldVars::default());
-        let out = render_str(
-            &env,
-            "{% for r in rules %}{{ r }}{% endfor %}",
-            &view,
-        )
-        .unwrap();
+        let out = render_str(&env, "{% for r in rules %}{{ r }}{% endfor %}", &view).unwrap();
         assert_eq!(out, "allow 10.10.0.0/16");
     }
 
@@ -9438,7 +9452,8 @@ mod tests {
     fn render_op_shell_expands_template() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert("who".into(), serde_json::json!("alice"));
+        ctx.set_facts
+            .insert("who".into(), serde_json::json!("alice"));
         let op = TaskOp::Shell(ShellOp::Simple("echo {{ who }}".into()));
         let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
         match rendered {
@@ -9455,7 +9470,8 @@ mod tests {
     fn render_op_copy_content_form_renders_jinja_into_body() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert("name".into(), serde_json::json!("world"));
+        ctx.set_facts
+            .insert("name".into(), serde_json::json!("world"));
         let op = TaskOp::Copy(CopyOp {
             src: None,
             content: Some("hello {{ name }}\n".into()),
@@ -9488,10 +9504,8 @@ mod tests {
     fn render_op_resolves_mode_template_to_literal() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert(
-            "item".into(),
-            serde_json::json!({"mode": "0750"}),
-        );
+        ctx.set_facts
+            .insert("item".into(), serde_json::json!({"mode": "0750"}));
         let op = TaskOp::Copy(CopyOp {
             src: None,
             content: Some("body\n".into()),
@@ -9525,7 +9539,8 @@ mod tests {
     fn render_op_copy_renders_owner_and_group_templates() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert("vmagent_user".into(), serde_json::json!("vmagent"));
+        ctx.set_facts
+            .insert("vmagent_user".into(), serde_json::json!("vmagent"));
         // Content form (remote_src=false).
         let op = TaskOp::Copy(CopyOp {
             src: None,
@@ -9542,10 +9557,16 @@ mod tests {
         let rendered = render_op(&op, &ctx, &env, &WorldVars::default()).unwrap();
         match rendered {
             TaskOp::Copy(c) => {
-                assert_eq!(c.owner.as_deref(), Some("vmagent"),
-                    "owner Jinja must be rendered before wire dispatch");
-                assert_eq!(c.group.as_deref(), Some("vmagent"),
-                    "group Jinja must be rendered before wire dispatch");
+                assert_eq!(
+                    c.owner.as_deref(),
+                    Some("vmagent"),
+                    "owner Jinja must be rendered before wire dispatch"
+                );
+                assert_eq!(
+                    c.group.as_deref(),
+                    Some("vmagent"),
+                    "group Jinja must be rendered before wire dispatch"
+                );
             }
             _ => panic!(),
         }
@@ -9578,8 +9599,10 @@ mod tests {
     fn render_op_exec_expands_argv_and_env() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert("target".into(), serde_json::json!("/etc/foo"));
-        ctx.set_facts.insert("level".into(), serde_json::json!("debug"));
+        ctx.set_facts
+            .insert("target".into(), serde_json::json!("/etc/foo"));
+        ctx.set_facts
+            .insert("level".into(), serde_json::json!("debug"));
         let op = TaskOp::Exec(ExecOp {
             argv: vec!["/bin/cat".into(), "{{ target }}".into()],
             env: [("LEVEL".to_string(), "{{ level }}".to_string())].into(),
@@ -9630,8 +9653,7 @@ mod tests {
     async fn pause_body_sleeps_rendered_seconds() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts
-            .insert("wait_s".into(), serde_json::json!(1));
+        ctx.set_facts.insert("wait_s".into(), serde_json::json!(1));
         let p = PauseTask {
             seconds: Some("{{ wait_s }}".into()),
             minutes: None,
@@ -9697,7 +9719,10 @@ mod tests {
         let r = run_pause_body(&p, &ctx, &env, &WorldVars::default()).await;
         match r {
             BodyResult::Failed { reason, .. } => {
-                assert!(reason.contains("pause.seconds"), "unexpected reason: {reason}");
+                assert!(
+                    reason.contains("pause.seconds"),
+                    "unexpected reason: {reason}"
+                );
             }
             _ => panic!("expected Failed"),
         }
@@ -9725,7 +9750,10 @@ mod tests {
         // the non-numeric chained reference stays a string but with the
         // chained value substituted in.
         assert_eq!(ctx.task_vars["all_attempts"], serde_json::json!(3));
-        assert_eq!(ctx.task_vars["writer_aggregate_data"], serde_json::json!("count=3"));
+        assert_eq!(
+            ctx.task_vars["writer_aggregate_data"],
+            serde_json::json!("count=3")
+        );
     }
 
     #[test]
@@ -9747,12 +9775,10 @@ mod tests {
         // CLI -e overrides per-task vars (matches Ansible precedence).
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.extra_vars.insert("v".into(), serde_json::json!("from_cli"));
+        ctx.extra_vars
+            .insert("v".into(), serde_json::json!("from_cli"));
         let mut vars: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
-        vars.insert(
-            "v".into(),
-            serde_yaml::Value::String("from_task".into()),
-        );
+        vars.insert("v".into(), serde_yaml::Value::String("from_task".into()));
         apply_task_vars(&vars, &mut ctx, &env, &WorldVars::default()).unwrap();
         // The slot is set...
         assert_eq!(ctx.task_vars["v"], serde_json::json!("from_task"));
@@ -9765,7 +9791,8 @@ mod tests {
     fn fail_body_renders_msg() {
         let env = template::make_env();
         let mut ctx = HostCtx::new("h".into());
-        ctx.set_facts.insert("why".into(), serde_json::json!("nope"));
+        ctx.set_facts
+            .insert("why".into(), serde_json::json!("nope"));
         let f = FailTask {
             msg: "stop: {{ why }}".into(),
         };
@@ -9952,7 +9979,14 @@ all:
     #[test]
     fn maybe_ignore_failure_leaves_ok_alone() {
         let task = shell_task_with_ignore(Some(true));
-        let got = maybe_ignore_failure(&task, HostTaskOutcome::Ok { changed: false, skipped: false }, "h1");
+        let got = maybe_ignore_failure(
+            &task,
+            HostTaskOutcome::Ok {
+                changed: false,
+                skipped: false,
+            },
+            "h1",
+        );
         assert!(matches!(got, HostTaskOutcome::Ok { .. }));
     }
 
@@ -10001,7 +10035,9 @@ all:
         };
         let result = synth_csr_pipe_from_pem(&op, key_pem);
         let rv = match result {
-            BodyResult::Ok { register, changed, .. } => {
+            BodyResult::Ok {
+                register, changed, ..
+            } => {
                 assert!(!changed, "_pipe always changed=false");
                 register
             }
@@ -10013,8 +10049,7 @@ all:
             .and_then(|v| v.as_str())
             .expect("register.content present");
         assert!(content.starts_with("-----BEGIN CERTIFICATE REQUEST-----"));
-        rcgen::CertificateSigningRequestParams::from_pem(content)
-            .expect("CSR PEM parses");
+        rcgen::CertificateSigningRequestParams::from_pem(content).expect("CSR PEM parses");
     }
 
     #[test]
@@ -10122,13 +10157,11 @@ all:
             basic_constraints: vec![],
         })
         .unwrap();
-        let ca_cert = crate::x509::generate_selfsigned_cert(
-            &crate::x509::SelfSignedCertParams {
-                privkey_pem: ca_key.clone(),
-                csr_pem: ca_csr,
-                valid_for_days: 365,
-            },
-        )
+        let ca_cert = crate::x509::generate_selfsigned_cert(&crate::x509::SelfSignedCertParams {
+            privkey_pem: ca_key.clone(),
+            csr_pem: ca_csr,
+            valid_for_days: 365,
+        })
         .expect("CA self-signed cert");
 
         let leaf_key = crate::x509::generate_privkey(&crate::x509::PrivkeyParams {
@@ -10251,10 +10284,8 @@ all:
 
     #[test]
     fn resolved_role_attrs_renders_create_clause() {
-        let attrs = ResolvedRoleAttrs::from_flags_str(
-            "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB",
-        )
-        .unwrap();
+        let attrs =
+            ResolvedRoleAttrs::from_flags_str("LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB").unwrap();
         let clause = attrs.render_create_clause();
         // Order is fixed by the rendering function; just check
         // membership rather than spelling.
@@ -10265,10 +10296,8 @@ all:
 
     #[test]
     fn resolved_role_attrs_diff_only_emits_divergent_attrs() {
-        let attrs = ResolvedRoleAttrs::from_flags_str(
-            "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB",
-        )
-        .unwrap();
+        let attrs =
+            ResolvedRoleAttrs::from_flags_str("LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB").unwrap();
         // Probe says the role is in the requested state already for
         // 3 of 4 attrs; only LOGIN differs.
         let probe = PgAuthidRow {
@@ -10291,10 +10320,8 @@ all:
 
     #[test]
     fn resolved_role_attrs_diff_empty_when_role_matches() {
-        let attrs = ResolvedRoleAttrs::from_flags_str(
-            "LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB",
-        )
-        .unwrap();
+        let attrs =
+            ResolvedRoleAttrs::from_flags_str("LOGIN,NOSUPERUSER,NOCREATEROLE,NOCREATEDB").unwrap();
         let probe = PgAuthidRow {
             super_: false,
             createrole: false,
@@ -10517,10 +10544,7 @@ all:
         let r = drive(&block).await;
         assert_ok(&r);
         // set_fact in t2 should have left a side effect on ctx.
-        assert_eq!(
-            r.ctx.set_facts.get("x"),
-            Some(&serde_json::json!(1))
-        );
+        assert_eq!(r.ctx.set_facts.get("x"), Some(&serde_json::json!(1)));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10851,10 +10875,7 @@ all:
         // a different value — proving the non-runner used the cell's
         // value rather than re-executing the body.
         let mut synthetic_set_facts = BTreeMap::new();
-        synthetic_set_facts.insert(
-            "from_runner".into(),
-            JsonValue::String("from-cell".into()),
-        );
+        synthetic_set_facts.insert("from_runner".into(), JsonValue::String("from-cell".into()));
         let cell = coord.cell(1).expect("inner slot");
         cell.publish(RunOnceResult {
             register: None,
@@ -10975,10 +10996,7 @@ all:
     // ---------- retries: / until: / delay: matrix ----------
 
     fn fail_task(name: &str, msg: &str) -> Task {
-        plain_task(
-            name,
-            TaskBody::Fail(FailTask { msg: msg.into() }),
-        )
+        plain_task(name, TaskBody::Fail(FailTask { msg: msg.into() }))
     }
 
     /// Drive a task with a pre-built `HostCtx` so tests can preload
@@ -11607,7 +11625,9 @@ all:
         // surfaces an aggregate register on the Failed outcome.
         match &r.outcome {
             HostTaskOutcome::Failed { register, .. } => {
-                let agg = register.as_ref().expect("loop failure carries aggregate register");
+                let agg = register
+                    .as_ref()
+                    .expect("loop failure carries aggregate register");
                 let results = agg.results.as_ref().expect("loop produces results array");
                 assert_eq!(results.len(), 3, "one register per loop item");
                 for (i, item_rv) in results.iter().enumerate() {

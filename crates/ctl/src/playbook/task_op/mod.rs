@@ -25,8 +25,8 @@ use rsansible_wire::{
     msg::{
         op_async_status, op_authorized_key, op_blockinfile, op_copy_target, op_exec, op_file,
         op_gather_facts, op_get_url, op_getent, op_group, op_hostname, op_iptables, op_lineinfile,
-        op_package, op_postgresql_ext, op_postgresql_query, op_repository, op_shell, op_stat,
-        op_systemd, op_timezone, op_ufw, op_uri, op_user, op_wait_for, op_write_file,
+        op_modprobe, op_package, op_postgresql_ext, op_postgresql_query, op_repository, op_shell,
+        op_stat, op_systemd, op_timezone, op_ufw, op_uri, op_user, op_wait_for, op_write_file,
     },
     Op,
 };
@@ -37,37 +37,39 @@ use std::path::PathBuf;
 pub(crate) mod shared;
 
 pub use shared::{parse_rendered_mode, ModeField};
-mod shell;
-mod exec;
-mod command;
-mod write_file;
-mod template;
-mod copy;
-mod stat;
-mod file;
-mod wait_for;
-mod lineinfile;
-mod blockinfile;
-mod systemd;
 mod authorized_key;
+mod block;
+mod blockinfile;
+mod command;
+mod copy;
+mod exec;
+mod file;
+mod get_url;
 mod getent;
 mod group;
 mod hostname;
-mod timezone;
-mod package;
-mod repository;
-mod user;
 mod iptables;
-mod ufw;
-mod uri;
+mod lineinfile;
+mod modprobe;
 pub(crate) mod openssl;
+mod package;
 pub(crate) mod postgresql;
-mod get_url;
+mod repository;
+mod shell;
 mod slurp;
-mod unarchive;
+mod stat;
+mod systemd;
 mod tempfile;
-mod block;
+mod template;
+mod timezone;
+mod ufw;
+mod unarchive;
+mod uri;
+mod user;
+mod wait_for;
+mod write_file;
 
+pub use authorized_key::{AuthorizedKeyOp, AuthorizedKeyState};
 pub use block::BlockSpec;
 pub use blockinfile::{BlockInFileOp, BlockInFileState};
 pub use command::CommandOp;
@@ -75,36 +77,38 @@ pub use copy::CopyOp;
 pub use exec::ExecOp;
 pub use file::{FileOp, FileState};
 pub use get_url::GetUrlOp;
-pub use lineinfile::{LineInFileOp, LineInFileState};
-pub use openssl::{OpenSslCsrPipeOp, OpenSslPrivkeyOp, X509CertificatePipeOp};
-pub use authorized_key::{AuthorizedKeyOp, AuthorizedKeyState};
 pub use getent::GetentOp;
 pub use group::{GroupOp, GroupState};
 pub use hostname::HostnameOp;
-pub use timezone::TimezoneOp;
+pub use iptables::{IptablesAction, IptablesIpVersion, IptablesOp, IptablesRuleState};
+pub use lineinfile::{LineInFileOp, LineInFileState};
+pub use modprobe::{ModprobeOp, ModprobeState};
+pub use openssl::{OpenSslCsrPipeOp, OpenSslPrivkeyOp, X509CertificatePipeOp};
 pub use package::{PackageManager, PackageOp, PackageState};
-pub use repository::{RepositoryManager, RepositoryOp, RepositoryState};
-pub use user::{UserOp, UserState};
 pub use postgresql::{
     classify_sql_readonly, PostgresqlDbOp, PostgresqlExtOp, PostgresqlMembershipOp,
     PostgresqlQueryOp, PostgresqlUserOp,
 };
+pub use repository::{RepositoryManager, RepositoryOp, RepositoryState};
 pub use shell::ShellOp;
 pub use slurp::SlurpOp;
 pub use stat::StatOp;
 pub use systemd::{SystemdOp, SystemdState};
-pub use template::TemplateOp;
 pub use tempfile::{TempfileKind, TempfileOp};
-pub use iptables::{IptablesAction, IptablesIpVersion, IptablesOp, IptablesRuleState};
+pub use template::TemplateOp;
+pub use timezone::TimezoneOp;
 pub use ufw::{UfwOp, UfwOpKind};
 pub use unarchive::UnarchiveOp;
 pub use uri::UriOp;
+pub use user::{UserOp, UserState};
 pub use wait_for::{WaitForOp, WaitForState};
 pub use write_file::WriteFileOp;
 
 use package::parse_package_body;
-use shared::{read_pem_if_set, take_int_or_template_string, take_optional_string, take_string_or_bool, take_when_field};
-
+use shared::{
+    read_pem_if_set, take_int_or_template_string, take_optional_string, take_string_or_bool,
+    take_when_field,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
@@ -435,6 +439,9 @@ pub enum TaskOp {
     /// `timezone:` — set the system timezone (zoneinfo name).
     /// Idempotent: reads the current timezone before mutating.
     Timezone(TimezoneOp),
+    /// `modprobe:` — load/unload a kernel module. Idempotent: reads
+    /// `/proc/modules` before acting. Does NOT persist across reboots.
+    Modprobe(ModprobeOp),
     /// `ufw:` — Uncomplicated Firewall control. One op covers one of
     /// rule / enable / disable / reset / default / reload / logging.
     Ufw(UfwOp),
@@ -570,6 +577,7 @@ const BODY_KEYS: &[&str] = &[
     "getent",
     "hostname",
     "timezone",
+    "modprobe",
     "async_status",
     "iptables",
     "ufw",
@@ -630,7 +638,6 @@ const METADATA_KEYS: &[&str] = &[
     "no_log",
     "environment",
 ];
-
 
 /// FQCN prefixes we accept on task keys. Ansible playbooks routinely
 /// spell modules as `ansible.builtin.<name>`, `community.crypto.<name>`,
@@ -723,15 +730,17 @@ impl<'de> Deserialize<'de> for Task {
         let register = take_optional_string(&mut map, "register", &name)?;
         let loop_spec = match map.remove("loop") {
             None => None,
-            Some(v) => Some(LoopSpec::from_yaml(v).map_err(|e| {
-                D::Error::custom(format!("task {name:?}: loop: {e}"))
-            })?),
+            Some(v) => Some(
+                LoopSpec::from_yaml(v)
+                    .map_err(|e| D::Error::custom(format!("task {name:?}: loop: {e}")))?,
+            ),
         };
         let loop_control = match map.remove("loop_control") {
             None => None,
-            Some(v) => Some(serde_yaml::from_value::<LoopControl>(v).map_err(|e| {
-                D::Error::custom(format!("task {name:?}: loop_control: {e}"))
-            })?),
+            Some(v) => Some(
+                serde_yaml::from_value::<LoopControl>(v)
+                    .map_err(|e| D::Error::custom(format!("task {name:?}: loop_control: {e}")))?,
+            ),
         };
         let tags = match map.remove("tags") {
             None => Vec::new(),
@@ -981,7 +990,11 @@ impl<'de> Deserialize<'de> for Task {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "task {name:?}: unknown field(s): {unknown:?}; \
@@ -1062,31 +1075,27 @@ impl<'de> Deserialize<'de> for Task {
                 // `RSANSIBLE_IDIOMS.md §3`.
                 let map: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
-                TaskBody::Op(TaskOp::Package(parse_package_body::<D::Error>(
-                    None,
-                    map,
-                )?))
+                TaskBody::Op(TaskOp::Package(parse_package_body::<D::Error>(None, map)?))
             }
             "repository" => {
                 // Canonical rsansible spelling. `manager:` is read from
                 // the body; defaults to `Auto`. See `RSANSIBLE_IDIOMS.md §2`.
                 let map: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
-                TaskBody::Op(TaskOp::Repository(
-                    repository::parse_repository_body::<D::Error>(None, map)?,
-                ))
+                TaskBody::Op(TaskOp::Repository(repository::parse_repository_body::<
+                    D::Error,
+                >(None, map)?))
             }
             "apt_repository" => {
                 // Ansible-compat shim. Pins `manager: Apt`; body may not
                 // contradict it.
                 let map: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
-                TaskBody::Op(TaskOp::Repository(
-                    repository::parse_repository_body::<D::Error>(
-                        Some(RepositoryManager::Apt),
-                        map,
-                    )?,
-                ))
+                TaskBody::Op(TaskOp::Repository(repository::parse_repository_body::<
+                    D::Error,
+                >(
+                    Some(RepositoryManager::Apt), map
+                )?))
             }
             "group" => {
                 let map: serde_yaml::Mapping =
@@ -1113,16 +1122,23 @@ impl<'de> Deserialize<'de> for Task {
             "hostname" => {
                 let map: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
-                TaskBody::Op(TaskOp::Hostname(
-                    hostname::parse_hostname_body::<D::Error>(map)?,
-                ))
+                TaskBody::Op(TaskOp::Hostname(hostname::parse_hostname_body::<D::Error>(
+                    map,
+                )?))
             }
             "timezone" => {
                 let map: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
-                TaskBody::Op(TaskOp::Timezone(
-                    timezone::parse_timezone_body::<D::Error>(map)?,
-                ))
+                TaskBody::Op(TaskOp::Timezone(timezone::parse_timezone_body::<D::Error>(
+                    map,
+                )?))
+            }
+            "modprobe" => {
+                let map: serde_yaml::Mapping =
+                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                TaskBody::Op(TaskOp::Modprobe(modprobe::parse_modprobe_body::<D::Error>(
+                    map,
+                )?))
             }
             "iptables" => TaskBody::Op(TaskOp::Iptables(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
@@ -1172,18 +1188,16 @@ impl<'de> Deserialize<'de> for Task {
             "tempfile" => TaskBody::Op(TaskOp::Tempfile(
                 serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
             )),
-            "assert" => TaskBody::Assert(
-                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
-            ),
-            "fail" => TaskBody::Fail(
-                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
-            ),
-            "debug" => TaskBody::Debug(
-                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
-            ),
-            "pause" => TaskBody::Pause(
-                serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?,
-            ),
+            "assert" => {
+                TaskBody::Assert(serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?)
+            }
+            "fail" => TaskBody::Fail(serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?),
+            "debug" => {
+                TaskBody::Debug(serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?)
+            }
+            "pause" => {
+                TaskBody::Pause(serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?)
+            }
             "set_fact" => {
                 let raw: serde_yaml::Mapping =
                     serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
@@ -1199,8 +1213,7 @@ impl<'de> Deserialize<'de> for Task {
                 TaskBody::SetFact(SetFactMap(out))
             }
             "import_tasks" => {
-                let path: String =
-                    serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
+                let path: String = serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
                 TaskBody::ImportTasks(PathBuf::from(path))
             }
             "include_role" => {
@@ -1238,7 +1251,11 @@ impl<'de> Deserialize<'de> for Task {
                 if !body_map.is_empty() {
                     let unknown: Vec<String> = body_map
                         .keys()
-                        .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                        .map(|k| {
+                            k.as_str()
+                                .map(String::from)
+                                .unwrap_or_else(|| format!("{k:?}"))
+                        })
                         .collect();
                     return Err(D::Error::custom(format!(
                         "task {name:?}: include_role: unknown field(s) {unknown:?}; \
@@ -1264,9 +1281,7 @@ impl<'de> Deserialize<'de> for Task {
                 // `block:` must be a non-empty list of tasks.
                 let tasks: Vec<Task> = match body_yaml {
                     v @ serde_yaml::Value::Sequence(_) => serde_yaml::from_value(v)
-                        .map_err(|e| {
-                            D::Error::custom(format!("task {name:?}: block: {e}"))
-                        })?,
+                        .map_err(|e| D::Error::custom(format!("task {name:?}: block: {e}")))?,
                     other => {
                         return Err(D::Error::custom(format!(
                             "task {name:?}: `block` must be a list of tasks, got: {other:?}"
@@ -1281,9 +1296,7 @@ impl<'de> Deserialize<'de> for Task {
                 let rescue: Vec<Task> = match rescue_yaml.take() {
                     None => Vec::new(),
                     Some(v @ serde_yaml::Value::Sequence(_)) => serde_yaml::from_value(v)
-                        .map_err(|e| {
-                            D::Error::custom(format!("task {name:?}: rescue: {e}"))
-                        })?,
+                        .map_err(|e| D::Error::custom(format!("task {name:?}: rescue: {e}")))?,
                     Some(other) => {
                         return Err(D::Error::custom(format!(
                             "task {name:?}: `rescue` must be a list of tasks, got: {other:?}"
@@ -1293,16 +1306,18 @@ impl<'de> Deserialize<'de> for Task {
                 let always: Vec<Task> = match always_yaml.take() {
                     None => Vec::new(),
                     Some(v @ serde_yaml::Value::Sequence(_)) => serde_yaml::from_value(v)
-                        .map_err(|e| {
-                            D::Error::custom(format!("task {name:?}: always: {e}"))
-                        })?,
+                        .map_err(|e| D::Error::custom(format!("task {name:?}: always: {e}")))?,
                     Some(other) => {
                         return Err(D::Error::custom(format!(
                             "task {name:?}: `always` must be a list of tasks, got: {other:?}"
                         )));
                     }
                 };
-                TaskBody::Block(BlockSpec { tasks, rescue, always })
+                TaskBody::Block(BlockSpec {
+                    tasks,
+                    rescue,
+                    always,
+                })
             }
             _ => unreachable!("body key not in BODY_KEYS dispatch"),
         };
@@ -1727,9 +1742,7 @@ where
             .into_iter()
             .map(|item| match item {
                 serde_yaml::Value::String(s) => Ok(s),
-                other => Err(D::Error::custom(format!(
-                    "expected string, got: {other:?}"
-                ))),
+                other => Err(D::Error::custom(format!("expected string, got: {other:?}"))),
             })
             .collect(),
         other => Err(D::Error::custom(format!(
@@ -1757,9 +1770,7 @@ impl LoopSpec {
         match v {
             serde_yaml::Value::String(s) => Ok(LoopSpec::Expr(s)),
             serde_yaml::Value::Sequence(seq) => Ok(LoopSpec::Items(seq)),
-            other => Err(format!(
-                "expected list or Jinja string, got: {other:?}"
-            )),
+            other => Err(format!("expected list or Jinja string, got: {other:?}")),
         }
     }
 }
@@ -2019,6 +2030,11 @@ impl TaskOp {
             )),
             TaskOp::Hostname(h) => Ok(op_hostname(h.name.clone())),
             TaskOp::Timezone(z) => Ok(op_timezone(z.name.clone())),
+            TaskOp::Modprobe(m) => Ok(op_modprobe(
+                m.name.clone(),
+                m.state.wire_byte(),
+                m.params.clone(),
+            )),
             TaskOp::AsyncStatus(a) => {
                 // `jid` has already been rendered to its final string
                 // form by the orchestrator's render_op pass; we just
@@ -2211,9 +2227,7 @@ pub(crate) fn try_parse_task_for_test(yaml: &str) -> Result<Task, serde_yaml::Er
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task, *,
-    };
+    use super::{parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task, *};
 
     #[test]
     fn retries_integer_form_parses() {
@@ -2573,10 +2587,7 @@ vars:
                     ir.vars.get("pg_archive_command").and_then(|v| v.as_str()),
                     Some("/usr/bin/wrapper %p")
                 );
-                assert_eq!(
-                    ir.vars.get("retries").and_then(|v| v.as_u64()),
-                    Some(3)
-                );
+                assert_eq!(ir.vars.get("retries").and_then(|v| v.as_u64()), Some(3));
             }
             other => panic!("got {other:?}"),
         }
@@ -2719,7 +2730,10 @@ shell: echo
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("pause") || msg.contains("unknown"), "got: {msg}");
+        assert!(
+            msg.contains("pause") || msg.contains("unknown"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -2736,7 +2750,10 @@ write_file:
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("more than one") || msg.contains("body"), "got: {msg}");
+        assert!(
+            msg.contains("more than one") || msg.contains("body"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -3029,7 +3046,10 @@ meta: hammer_time
         )
         .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("meta") || msg.contains("flush_handlers"), "got: {msg}");
+        assert!(
+            msg.contains("meta") || msg.contains("flush_handlers"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -3420,9 +3440,18 @@ environment:
   VERBOSE: true
 "#,
         );
-        assert_eq!(t.environment.get("PIPX_HOME").map(String::as_str), Some("/opt/patroni"));
-        assert_eq!(t.environment.get("MAX_RETRIES").map(String::as_str), Some("3"));
-        assert_eq!(t.environment.get("VERBOSE").map(String::as_str), Some("true"));
+        assert_eq!(
+            t.environment.get("PIPX_HOME").map(String::as_str),
+            Some("/opt/patroni")
+        );
+        assert_eq!(
+            t.environment.get("MAX_RETRIES").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            t.environment.get("VERBOSE").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -3499,9 +3528,6 @@ when:
   - 42
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err().to_string();
-        assert!(
-            err.contains("`when[1]` must be a string"),
-            "got: {err}"
-        );
+        assert!(err.contains("`when[1]` must be a string"), "got: {err}");
     }
 }

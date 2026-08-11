@@ -24,9 +24,9 @@ pub mod generated;
 pub mod framing;
 pub mod msg;
 
+pub use binschema_runtime as runtime;
 pub use framing::{read_frame, write_frame, FramingError, MAX_FRAME_LEN};
 pub use generated::{Message, Op};
-pub use binschema_runtime as runtime;
 
 impl Op {
     /// Short stable name for this op variant. Used by run-level
@@ -65,6 +65,7 @@ impl Op {
             Op::OpHostname(_) => "hostname",
             Op::OpTimezone(_) => "timezone",
             Op::OpCopyTarget(_) => "copy_target",
+            Op::OpModprobe(_) => "modprobe",
         }
     }
 }

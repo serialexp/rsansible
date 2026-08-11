@@ -132,9 +132,11 @@ impl<'de> Deserialize<'de> for CopyOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task};
-    use rsansible_wire::generated::Op as WireOp;
+    use crate::playbook::task_op::{
+        parse_task_for_test as parse_task, try_parse_task_for_test as try_parse_task,
+    };
     use crate::playbook::task_op::{TaskBody, TaskOp};
+    use rsansible_wire::generated::Op as WireOp;
 
     #[test]
     fn parses_copy_body() {
@@ -153,7 +155,10 @@ copy:
                 assert!(c.content.is_none());
                 assert_eq!(c.dest, "/etc/foo");
                 assert_eq!(c.mode, crate::playbook::ModeField::Literal(0o600));
-                assert!(c.body.is_none(), "body is populated by the loader, not parse");
+                assert!(
+                    c.body.is_none(),
+                    "body is populated by the loader, not parse"
+                );
             }
             other => panic!("expected copy, got {other:?}"),
         }
@@ -170,7 +175,9 @@ copy:
 "#,
         );
         match t.body {
-            TaskBody::Op(TaskOp::Copy(c)) => assert_eq!(c.mode, crate::playbook::ModeField::Literal(0o644)),
+            TaskBody::Op(TaskOp::Copy(c)) => {
+                assert_eq!(c.mode, crate::playbook::ModeField::Literal(0o644))
+            }
             _ => panic!(),
         }
     }

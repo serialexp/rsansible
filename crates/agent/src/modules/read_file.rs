@@ -90,13 +90,7 @@ pub async fn run(
         }
     };
     if let Err(e) = file.take(read_limit).read_to_end(&mut buf) {
-        emit_error(
-            ctx,
-            seq,
-            err::IO,
-            format!("read_file: read({path}): {e}"),
-        )
-        .await;
+        emit_error(ctx, seq, err::IO, format!("read_file: read({path}): {e}")).await;
         return Ok(());
     }
 
@@ -154,11 +148,8 @@ mod tests {
 
     async fn drain(rx: &mut mpsc::Receiver<Message>) -> Vec<Message> {
         let mut out = Vec::new();
-        while let Ok(m) = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        )
-        .await
+        while let Ok(m) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match m {
                 Some(m) => out.push(m),

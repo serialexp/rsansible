@@ -24,7 +24,10 @@ use std::path::PathBuf;
 pub struct TemplateOp {
     pub src: String,
     pub dest: String,
-    #[serde(default = "default_template_mode", deserialize_with = "deserialize_mode_field")]
+    #[serde(
+        default = "default_template_mode",
+        deserialize_with = "deserialize_mode_field"
+    )]
     pub mode: ModeField,
     /// File owner (POSIX user name). `None` keeps whatever owner the
     /// agent's effective uid would assign on create — usually root when

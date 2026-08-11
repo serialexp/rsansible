@@ -58,11 +58,7 @@ async fn main() -> anyhow::Result<()> {
         no_cache: false,
     };
     let report = run_forwarded(args).await?;
-    let failed = report
-        .host_outcomes
-        .values()
-        .filter(|o| o.failed())
-        .count();
+    let failed = report.host_outcomes.values().filter(|o| o.failed()).count();
     println!(
         "REPORT: tasks_ok={} failed_hosts={} stopped_early={} timing.op_count={}",
         report.tasks_ok, failed, report.stopped_early, report.timing.op_count

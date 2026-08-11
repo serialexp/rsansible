@@ -60,8 +60,7 @@ pub(crate) struct Bins {
 impl Bins {
     pub fn from_env() -> Self {
         Self {
-            default_python: std::env::var("RSANSIBLE_PYTHON")
-                .unwrap_or_else(|_| "python3".into()),
+            default_python: std::env::var("RSANSIBLE_PYTHON").unwrap_or_else(|_| "python3".into()),
             default_pip: std::env::var("RSANSIBLE_PIP").unwrap_or_else(|_| "pip3".into()),
         }
     }
@@ -213,7 +212,12 @@ impl PipInvocation {
 
 fn create_venv(bins: &Bins, venv: &str, command: &str) -> Result<(), PackageError> {
     let argv: Vec<String> = if command.is_empty() {
-        vec![bins.default_python.clone(), "-m".into(), "venv".into(), venv.into()]
+        vec![
+            bins.default_python.clone(),
+            "-m".into(),
+            "venv".into(),
+            venv.into(),
+        ]
     } else {
         let mut tokens: Vec<String> = command.split_whitespace().map(String::from).collect();
         if tokens.is_empty() {
@@ -466,7 +470,11 @@ esac
         let stub = Stub::new("pin-noop", &[("redis", "5.0.1")]);
         let changed = apply_with_bins(
             &bins(),
-            &op(&["redis==5.0.1"], STATE_PRESENT, stub.venv.to_str().unwrap()),
+            &op(
+                &["redis==5.0.1"],
+                STATE_PRESENT,
+                stub.venv.to_str().unwrap(),
+            ),
             false,
         )
         .unwrap();
@@ -478,7 +486,11 @@ esac
         let stub = Stub::new("pin-change", &[("redis", "5.0.0")]);
         let changed = apply_with_bins(
             &bins(),
-            &op(&["redis==5.0.1"], STATE_PRESENT, stub.venv.to_str().unwrap()),
+            &op(
+                &["redis==5.0.1"],
+                STATE_PRESENT,
+                stub.venv.to_str().unwrap(),
+            ),
             false,
         )
         .unwrap();

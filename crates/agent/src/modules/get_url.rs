@@ -296,13 +296,14 @@ pub async fn run(
 
     // Apply mode/owner/group regardless of download path — Ansible
     // reconciles permissions on stat-skip too. Track changed.
-    let perms_changed = match apply_attrs(&dest, mode_opt, owner_opt.as_deref(), group_opt.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => {
-            emit_error(ctx, seq, err::IO, e).await;
-            return Ok(());
-        }
-    };
+    let perms_changed =
+        match apply_attrs(&dest, mode_opt, owner_opt.as_deref(), group_opt.as_deref()).await {
+            Ok(c) => c,
+            Err(e) => {
+                emit_error(ctx, seq, err::IO, e).await;
+                return Ok(());
+            }
+        };
     if perms_changed {
         changed = true;
     }
@@ -492,8 +493,7 @@ fn build_client(op: &OpGetUrlOutput) -> Result<reqwest::Client, String> {
         if op.client_key_pem.is_empty() {
             return Err("client_cert_pem set but client_key_pem is empty".into());
         }
-        let mut bundle =
-            Vec::with_capacity(op.client_cert_pem.len() + op.client_key_pem.len() + 1);
+        let mut bundle = Vec::with_capacity(op.client_cert_pem.len() + op.client_key_pem.len() + 1);
         bundle.extend_from_slice(&op.client_cert_pem);
         if !bundle.ends_with(b"\n") {
             bundle.push(b'\n');
@@ -515,8 +515,7 @@ fn build_request(
     op: &OpGetUrlOutput,
 ) -> Result<reqwest::Request, String> {
     use reqwest::header::{HeaderName, HeaderValue};
-    let url =
-        reqwest::Url::parse(&op.url).map_err(|e| format!("parsing url {:?}: {e}", op.url))?;
+    let url = reqwest::Url::parse(&op.url).map_err(|e| format!("parsing url {:?}: {e}", op.url))?;
     let mut req = client.request(reqwest::Method::GET, url);
     if op.header_keys.len() != op.header_values.len() {
         return Err(format!(
@@ -528,8 +527,8 @@ fn build_request(
     for (k, v) in op.header_keys.iter().zip(op.header_values.iter()) {
         let name = HeaderName::from_bytes(k.as_bytes())
             .map_err(|e| format!("invalid header name {k:?}: {e}"))?;
-        let val = HeaderValue::from_str(v)
-            .map_err(|e| format!("invalid header value for {k:?}: {e}"))?;
+        let val =
+            HeaderValue::from_str(v).map_err(|e| format!("invalid header value for {k:?}: {e}"))?;
         req = req.header(name, val);
     }
     req.build().map_err(|e| format!("building request: {e}"))
@@ -563,11 +562,15 @@ async fn apply_attrs(
         // Resolve names → ids and shell out to chown (matches file.rs
         // approach; avoids unsafe libc).
         let uid_str = match owner {
-            Some(n) => resolve_user(n).ok_or_else(|| format!("unknown user: {n}"))?.to_string(),
+            Some(n) => resolve_user(n)
+                .ok_or_else(|| format!("unknown user: {n}"))?
+                .to_string(),
             None => String::new(),
         };
         let gid_str = match group {
-            Some(n) => resolve_group(n).ok_or_else(|| format!("unknown group: {n}"))?.to_string(),
+            Some(n) => resolve_group(n)
+                .ok_or_else(|| format!("unknown group: {n}"))?
+                .to_string(),
             None => String::new(),
         };
         let spec = format!("{uid_str}:{gid_str}");
@@ -606,11 +609,17 @@ async fn apply_attrs(
 }
 
 fn resolve_user(name: &str) -> Option<u32> {
-    parse_passwd_field(&std::fs::read_to_string("/etc/passwd").unwrap_or_default(), name)
+    parse_passwd_field(
+        &std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
+        name,
+    )
 }
 
 fn resolve_group(name: &str) -> Option<u32> {
-    parse_passwd_field(&std::fs::read_to_string("/etc/group").unwrap_or_default(), name)
+    parse_passwd_field(
+        &std::fs::read_to_string("/etc/group").unwrap_or_default(),
+        name,
+    )
 }
 
 fn parse_passwd_field(text: &str, name: &str) -> Option<u32> {
@@ -794,7 +803,10 @@ mod tests {
         let port = boot(app).await;
         let dir = tempdir();
         let dest = dir.join("payload.txt");
-        let op = op_for(&format!("http://127.0.0.1:{port}/payload"), dest.to_str().unwrap());
+        let op = op_for(
+            &format!("http://127.0.0.1:{port}/payload"),
+            dest.to_str().unwrap(),
+        );
         let r = run_op(op, false).await;
         assert!(r.error.is_none(), "no TaskError; got {:?}", r.error);
         assert_eq!(r.exit_code, 0);
@@ -819,7 +831,10 @@ mod tests {
         let dir = tempdir();
         let dest = dir.join("p.txt");
         std::fs::write(&dest, b"already here\n").unwrap();
-        let op = op_for(&format!("http://127.0.0.1:{port}/p"), dest.to_str().unwrap());
+        let op = op_for(
+            &format!("http://127.0.0.1:{port}/p"),
+            dest.to_str().unwrap(),
+        );
         let r = run_op(op, false).await;
         assert!(r.error.is_none());
         assert!(!r.changed, "stat-skip path");
@@ -839,7 +854,10 @@ mod tests {
             }),
         );
         let port = boot(app).await;
-        let mut op = op_for(&format!("http://127.0.0.1:{port}/c"), dest.to_str().unwrap());
+        let mut op = op_for(
+            &format!("http://127.0.0.1:{port}/c"),
+            dest.to_str().unwrap(),
+        );
         op.checksum =
             "sha256:a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447".into();
         let r = run_op(op, false).await;
@@ -853,7 +871,10 @@ mod tests {
         let port = boot(app).await;
         let dir = tempdir();
         let dest = dir.join("m.txt");
-        let mut op = op_for(&format!("http://127.0.0.1:{port}/m"), dest.to_str().unwrap());
+        let mut op = op_for(
+            &format!("http://127.0.0.1:{port}/m"),
+            dest.to_str().unwrap(),
+        );
         op.checksum = format!("sha256:{}", "0".repeat(64));
         let r = run_op(op, false).await;
         assert!(r.error.is_some(), "expected TaskError on mismatch");
@@ -867,14 +888,14 @@ mod tests {
 
     #[tokio::test]
     async fn http_404_surfaces_as_error_and_no_dest() {
-        let app = Router::new().route(
-            "/x",
-            get(|| async { (StatusCode::NOT_FOUND, "nope") }),
-        );
+        let app = Router::new().route("/x", get(|| async { (StatusCode::NOT_FOUND, "nope") }));
         let port = boot(app).await;
         let dir = tempdir();
         let dest = dir.join("x.txt");
-        let op = op_for(&format!("http://127.0.0.1:{port}/x"), dest.to_str().unwrap());
+        let op = op_for(
+            &format!("http://127.0.0.1:{port}/x"),
+            dest.to_str().unwrap(),
+        );
         let r = run_op(op, false).await;
         assert!(r.error.is_some());
         assert!(!dest.exists());
@@ -892,7 +913,10 @@ mod tests {
         let port = boot(app).await;
         let dir = tempdir();
         let dest = dir.join("k.txt");
-        let op = op_for(&format!("http://127.0.0.1:{port}/k"), dest.to_str().unwrap());
+        let op = op_for(
+            &format!("http://127.0.0.1:{port}/k"),
+            dest.to_str().unwrap(),
+        );
         let r = run_op(op, true).await;
         assert!(r.error.is_none());
         assert!(r.changed, "would-download case");
@@ -917,7 +941,10 @@ mod tests {
         let dir = tempdir();
         let dest = dir.join("f.txt");
         std::fs::write(&dest, b"stale\n").unwrap();
-        let mut op = op_for(&format!("http://127.0.0.1:{port}/f"), dest.to_str().unwrap());
+        let mut op = op_for(
+            &format!("http://127.0.0.1:{port}/f"),
+            dest.to_str().unwrap(),
+        );
         op.force = 1;
         let r = run_op(op, false).await;
         assert!(r.error.is_none());

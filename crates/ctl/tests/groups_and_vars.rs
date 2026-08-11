@@ -86,12 +86,10 @@ async fn three_container_groups_and_vars_run() -> Result<()> {
     // borrow only the on-disk vars. So load both: throw away the on-disk
     // inv, keep the vars.
     let dummy_inv_path = inv_dir.join("groups_and_vars.inventory.yml");
-    let (_disk_inv, inv_vars) =
-        inventory::load_with_vars(&dummy_inv_path, Some(&vault_pw))?;
+    let (_disk_inv, inv_vars) = inventory::load_with_vars(&dummy_inv_path, Some(&vault_pw))?;
 
     let pb_path = inv_dir.join("groups_and_vars.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -121,7 +119,10 @@ async fn three_container_groups_and_vars_run() -> Result<()> {
 
         // group_vars/web layer
         let body = read_file(c, "/tmp/rsansible-groupvar")?;
-        assert_eq!(body, "region=us-east-1 role=frontend\n", "{host_name}: groupvar wrong");
+        assert_eq!(
+            body, "region=us-east-1 role=frontend\n",
+            "{host_name}: groupvar wrong"
+        );
 
         // host_vars/host1 layer — host1 has instance_marker=alpha;
         // others fall back to default('none').

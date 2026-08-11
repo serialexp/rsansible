@@ -54,8 +54,8 @@ async fn x509_full_chain_and_idempotent_privkey() -> Result<()> {
 
     // ---------- run #1 — full generation chain ----------
     {
-        let pb = playbook::load(&pb_path)
-            .with_context(|| format!("loading {}", pb_path.display()))?;
+        let pb =
+            playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
         playbook::validate(&pb, Some(&inv)).context("validate run #1")?;
         rsansible_ctl::template::precompile_all(&pb).context("precompile run #1")?;
 

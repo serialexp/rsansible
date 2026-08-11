@@ -31,5 +31,13 @@ pub async fn gather(agent_version: &str) -> Message {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
 
-    msg::hello(arch, os, kernel, hostname, uid, gid, agent_version.to_string())
+    msg::hello(
+        arch,
+        os,
+        kernel,
+        hostname,
+        uid,
+        gid,
+        agent_version.to_string(),
+    )
 }

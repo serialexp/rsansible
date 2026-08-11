@@ -55,8 +55,9 @@ impl Codec for DeflateCodec {
         use std::io::Read;
         let mut d = DeflateDecoder::new(data);
         let mut out = Vec::with_capacity(expected_size);
-        d.read_to_end(&mut out)
-            .map_err(|err| BinSchemaError::InvalidEncoding(format!("deflate decompress: {}", err)))?;
+        d.read_to_end(&mut out).map_err(|err| {
+            BinSchemaError::InvalidEncoding(format!("deflate decompress: {}", err))
+        })?;
         Ok(out)
     }
 }

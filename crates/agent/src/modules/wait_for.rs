@@ -41,7 +41,12 @@ const STATE_ABSENT: u8 = 1;
 /// `sleep_ms` so a slow refusal/RST doesn't eat the full poll cycle.
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
 
-pub async fn run(ctx: &Context, seq: u32, op: OpWaitForOutput, _check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpWaitForOutput,
+    _check_mode: bool,
+) -> anyhow::Result<()> {
     // wait_for is a read-only probe — it never mutates host state, so
     // it runs unchanged under `--check`. Surfacing a missing dependency
     // is the whole point of dry-run, so we intentionally do NOT skip
@@ -87,8 +92,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpWaitForOutput, _check_mode: bool
     match outcome {
         Outcome::Met => {
             let finished_unix_ns = now_unix_ns();
-            ctx.emit(msg::task_done(seq, 0, false, false, started_unix_ns, finished_unix_ns))
-                .await;
+            ctx.emit(msg::task_done(
+                seq,
+                0,
+                false,
+                false,
+                started_unix_ns,
+                finished_unix_ns,
+            ))
+            .await;
         }
         Outcome::Timeout(detail) => {
             emit_error(ctx, seq, err::TIMEOUT, detail).await;
@@ -177,7 +189,12 @@ fn wait_loop(
     }
 }
 
-fn describe_timeout(op: &OpWaitForOutput, mode: &Mode, want_present: bool, total: Duration) -> String {
+fn describe_timeout(
+    op: &OpWaitForOutput,
+    mode: &Mode,
+    want_present: bool,
+    total: Duration,
+) -> String {
     let action = if want_present { "appear" } else { "disappear" };
     match mode {
         Mode::Tcp => format!(
@@ -236,7 +253,13 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    fn op_for_tcp(host: &str, port: u32, state: u8, timeout_ms: u32, sleep_ms: u32) -> OpWaitForOutput {
+    fn op_for_tcp(
+        host: &str,
+        port: u32,
+        state: u8,
+        timeout_ms: u32,
+        sleep_ms: u32,
+    ) -> OpWaitForOutput {
         OpWaitForOutput {
             kind: 6,
             host: host.into(),
@@ -361,7 +384,10 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(matches!(out, Outcome::Met), "expected Met");
-        assert!(start.elapsed() < Duration::from_millis(500), "should resolve fast");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "should resolve fast"
+        );
         drop(l);
     }
 
@@ -380,11 +406,14 @@ mod tests {
         );
         match out {
             Outcome::Timeout(m) => assert!(m.contains("appear"), "got: {m}"),
-            other => panic!("expected Timeout, got {:?}", match other {
-                Outcome::Met => "Met",
-                Outcome::Io(_) => "Io",
-                _ => "?",
-            }),
+            other => panic!(
+                "expected Timeout, got {:?}",
+                match other {
+                    Outcome::Met => "Met",
+                    Outcome::Io(_) => "Io",
+                    _ => "?",
+                }
+            ),
         }
     }
 

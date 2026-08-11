@@ -16,7 +16,12 @@ use super::{emit_error, Context};
 /// controller sees output incrementally rather than in giant bursts.
 const CHUNK_CAP: usize = 4 * 1024;
 
-pub async fn run_exec(ctx: &Context, seq: u32, op: OpExecOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run_exec(
+    ctx: &Context,
+    seq: u32,
+    op: OpExecOutput,
+    check_mode: bool,
+) -> anyhow::Result<()> {
     if op.argv.is_empty() {
         emit_error(ctx, seq, msg::err::BAD_REQUEST, "OpExec.argv is empty").await;
         return Ok(());
@@ -30,7 +35,15 @@ pub async fn run_exec(ctx: &Context, seq: u32, op: OpExecOutput, check_mode: boo
         // shells.
         let started_unix_ns = now_unix_ns();
         let finished_unix_ns = started_unix_ns;
-        ctx.emit(msg::task_done(seq, 0, false, true, started_unix_ns, finished_unix_ns)).await;
+        ctx.emit(msg::task_done(
+            seq,
+            0,
+            false,
+            true,
+            started_unix_ns,
+            finished_unix_ns,
+        ))
+        .await;
         return Ok(());
     }
     let mut cmd = Command::new(&op.argv[0]);
@@ -74,18 +87,35 @@ pub async fn run_exec(ctx: &Context, seq: u32, op: OpExecOutput, check_mode: boo
         ctx,
         seq,
         cmd,
-        if op.stdin.is_empty() { None } else { Some(op.stdin) },
+        if op.stdin.is_empty() {
+            None
+        } else {
+            Some(op.stdin)
+        },
         op.timeout_ms,
     )
     .await
 }
 
-pub async fn run_shell(ctx: &Context, seq: u32, op: OpShellOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run_shell(
+    ctx: &Context,
+    seq: u32,
+    op: OpShellOutput,
+    check_mode: bool,
+) -> anyhow::Result<()> {
     if check_mode {
         // Mirror run_exec — arbitrary shell has no safe probe.
         let started_unix_ns = now_unix_ns();
         let finished_unix_ns = started_unix_ns;
-        ctx.emit(msg::task_done(seq, 0, false, true, started_unix_ns, finished_unix_ns)).await;
+        ctx.emit(msg::task_done(
+            seq,
+            0,
+            false,
+            true,
+            started_unix_ns,
+            finished_unix_ns,
+        ))
+        .await;
         return Ok(());
     }
     if op.env_keys.len() != op.env_values.len() {
@@ -176,7 +206,15 @@ async fn run_command(
             // module flags any successful run as changed. Match that so
             // playbook UX feels familiar.
             let changed = code == 0;
-            ctx.emit(msg::task_done(seq, code, changed, false, started_unix_ns, finished_unix_ns)).await;
+            ctx.emit(msg::task_done(
+                seq,
+                code,
+                changed,
+                false,
+                started_unix_ns,
+                finished_unix_ns,
+            ))
+            .await;
         }
         Ok(None) => {
             // Timeout: child was killed by wait_with_timeout.

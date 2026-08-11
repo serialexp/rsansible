@@ -195,9 +195,8 @@ pub async fn cmd_remote_run(
     playbook::validate(&pb, Some(&inv))?;
     template::precompile_all(&pb)?;
 
-    let agent_bytes = std::fs::read(&agent_binary_path).with_context(|| {
-        format!("reading agent binary {}", agent_binary_path.display())
-    })?;
+    let agent_bytes = std::fs::read(&agent_binary_path)
+        .with_context(|| format!("reading agent binary {}", agent_binary_path.display()))?;
 
     let mut spec = RunSpec::new(inv, pb, agent_bytes);
     spec.inventory_vars = inv_vars;
@@ -340,9 +339,7 @@ pub fn apply_internal_host_overrides(
             .or_else(|| host_disk_vars.and_then(|v| v.get(INTERNAL_HOST_VAR)));
         if let Some(v) = internal_host {
             let s = v.as_str().ok_or_else(|| {
-                anyhow!(
-                    "host {name:?}: {INTERNAL_HOST_VAR} must be a string, got {v:?}"
-                )
+                anyhow!("host {name:?}: {INTERNAL_HOST_VAR} must be a string, got {v:?}")
             })?;
             host.host = s.to_string();
         }
@@ -353,14 +350,10 @@ pub fn apply_internal_host_overrides(
             .or_else(|| host_disk_vars.and_then(|v| v.get(INTERNAL_HOST_PORT_VAR)));
         if let Some(v) = internal_port {
             let p = v.as_u64().ok_or_else(|| {
-                anyhow!(
-                    "host {name:?}: {INTERNAL_HOST_PORT_VAR} must be an integer, got {v:?}"
-                )
+                anyhow!("host {name:?}: {INTERNAL_HOST_PORT_VAR} must be an integer, got {v:?}")
             })?;
             if p == 0 || p > u16::MAX as u64 {
-                bail!(
-                    "host {name:?}: {INTERNAL_HOST_PORT_VAR} {p} is out of range (1..=65535)"
-                );
+                bail!("host {name:?}: {INTERNAL_HOST_PORT_VAR} {p} is out of range (1..=65535)");
             }
             host.port = p as u16;
         }
@@ -397,9 +390,7 @@ pub fn select_forwarder(
     } else if let Some(v) = inventory_all_vars.get(FORWARD_HOST_VAR) {
         v.as_str()
             .ok_or_else(|| {
-                anyhow!(
-                    "inventory magic var {FORWARD_HOST_VAR} must be a string, got {v:?}"
-                )
+                anyhow!("inventory magic var {FORWARD_HOST_VAR} must be a string, got {v:?}")
             })?
             .to_string()
     } else {
@@ -548,16 +539,18 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
     // bundling each path's directory in isolation breaks the role
     // resolver. Common-ancestor bundling preserves the on-disk shape
     // the loader expects.
-    let pb_abs = args
-        .playbook_path
-        .canonicalize()
-        .with_context(|| format!("canonicalizing playbook path {}", args.playbook_path.display()))?;
-    let inv_abs = args
-        .inventory_path
-        .canonicalize()
-        .with_context(|| {
-            format!("canonicalizing inventory path {}", args.inventory_path.display())
-        })?;
+    let pb_abs = args.playbook_path.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing playbook path {}",
+            args.playbook_path.display()
+        )
+    })?;
+    let inv_abs = args.inventory_path.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing inventory path {}",
+            args.inventory_path.display()
+        )
+    })?;
     let pb_dir = pb_abs
         .parent()
         .ok_or_else(|| anyhow!("playbook path has no parent: {}", pb_abs.display()))?;
@@ -613,10 +606,8 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
     // local-on-forwarder unix socket, and the kernel + sshd splice
     // bytes back to the laptop's listener.
     let bc_suffix: u64 = rand::random();
-    let local_sock = std::env::temp_dir()
-        .join(format!("rsansible-bc-{bc_suffix:016x}-local.sock"));
-    let remote_sock_path =
-        format!("/tmp/rsansible-bc-{bc_suffix:016x}-remote.sock");
+    let local_sock = std::env::temp_dir().join(format!("rsansible-bc-{bc_suffix:016x}-local.sock"));
+    let remote_sock_path = format!("/tmp/rsansible-bc-{bc_suffix:016x}-remote.sock");
 
     // Best-effort: in case a previous crashed run left a stale socket
     // with the SAME random suffix (cosmically unlikely but cheap).
@@ -671,16 +662,17 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
         // below.
         back_channel_socket: remote_sock_path.clone(),
     };
-    let payload_json =
-        serde_json::to_vec(&payload).context("encoding WorkflowPayload JSON")?;
+    let payload_json = serde_json::to_vec(&payload).context("encoding WorkflowPayload JSON")?;
 
     let t_read_start = std::time::Instant::now();
     let ctl_bytes = std::fs::read(&args.ctl_binary_path).with_context(|| {
-        format!("reading controller binary {}", args.ctl_binary_path.display())
+        format!(
+            "reading controller binary {}",
+            args.ctl_binary_path.display()
+        )
     })?;
-    let agent_bytes = std::fs::read(&args.agent_binary_path).with_context(|| {
-        format!("reading agent binary {}", args.agent_binary_path.display())
-    })?;
+    let agent_bytes = std::fs::read(&args.agent_binary_path)
+        .with_context(|| format!("reading agent binary {}", args.agent_binary_path.display()))?;
     tracing::info!(
         ctl_bytes = ctl_bytes.len(),
         agent_bytes = agent_bytes.len(),
@@ -719,9 +711,7 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
     // `None`, meaning "fall back to the inline-stream-over-main-ssh"
     // approach the v1 implementation used.
     let staged = if args.no_cache {
-        tracing::info!(
-            "forward-mode phase: --no-cache, will stream binaries over main ssh stdin",
-        );
+        tracing::info!("forward-mode phase: --no-cache, will stream binaries over main ssh stdin",);
         None
     } else {
         let binaries = vec![
@@ -763,10 +753,7 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
     // access to"). `-A` enables agent forwarding so peer SSH from the
     // forwarder can use the operator's loaded keys.
     let script = match &staged {
-        Some(staged) => build_cached_bash_script(
-            &staged[0].remote_path,
-            &staged[1].remote_path,
-        ),
+        Some(staged) => build_cached_bash_script(&staged[0].remote_path, &staged[1].remote_path),
         None => build_remote_bash_script(ctl_bytes.len(), agent_bytes.len()),
     };
     let dest = format!("{}@{}", args.forwarder.user, args.forwarder.host);
@@ -791,11 +778,7 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
     // remote socket before binding — defensive against a previous
     // crashed run with the same suffix (cosmically unlikely but the
     // option costs nothing).
-    let r_arg = format!(
-        "{}:{}",
-        remote_sock_path,
-        local_sock.display()
-    );
+    let r_arg = format!("{}:{}", remote_sock_path, local_sock.display());
     let t_spawn = std::time::Instant::now();
     let mut ssh_cmd = tokio::process::Command::new("ssh");
     ssh_cmd
@@ -855,8 +838,8 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
             tracing::info!(
                 bytes = ctl_len,
                 elapsed_ms = t_ctl.elapsed().as_millis() as u64,
-                mb_per_s = (ctl_len as f64 / 1_048_576.0)
-                    / t_ctl.elapsed().as_secs_f64().max(0.001),
+                mb_per_s =
+                    (ctl_len as f64 / 1_048_576.0) / t_ctl.elapsed().as_secs_f64().max(0.001),
                 "forward-mode phase: ctl bytes written to ssh stdin",
             );
             let t_agent = std::time::Instant::now();
@@ -867,8 +850,8 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
             tracing::info!(
                 bytes = agent_len,
                 elapsed_ms = t_agent.elapsed().as_millis() as u64,
-                mb_per_s = (agent_len as f64 / 1_048_576.0)
-                    / t_agent.elapsed().as_secs_f64().max(0.001),
+                mb_per_s =
+                    (agent_len as f64 / 1_048_576.0) / t_agent.elapsed().as_secs_f64().max(0.001),
                 "forward-mode phase: agent bytes written to ssh stdin",
             );
         }
@@ -940,8 +923,9 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
                      see forwarder stderr above for diagnostic)"
                 );
             }
-            return Err(anyhow!(parse_err)
-                .context("decoding RunReport JSON from remote-run stdout"));
+            return Err(
+                anyhow!(parse_err).context("decoding RunReport JSON from remote-run stdout")
+            );
         }
     };
 
@@ -1090,7 +1074,10 @@ mod tests {
         );
         let targets: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let f = select_forwarder(&inv, &all_vars, &targets, None).unwrap();
-        assert_eq!(f.name, "b", "magic var should win over first-target fallback");
+        assert_eq!(
+            f.name, "b",
+            "magic var should win over first-target fallback"
+        );
     }
 
     #[test]
@@ -1108,8 +1095,7 @@ mod tests {
         let inv = inv_with(vec![host("a", "10.0.0.1")]);
         let all_vars = BTreeMap::new();
         let targets: BTreeSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        let e =
-            select_forwarder(&inv, &all_vars, &targets, Some("nonexistent")).unwrap_err();
+        let e = select_forwarder(&inv, &all_vars, &targets, Some("nonexistent")).unwrap_err();
         let msg = format!("{e:#}");
         assert!(msg.contains("nonexistent"), "msg = {msg}");
         assert!(
@@ -1177,7 +1163,10 @@ mod tests {
         assert_eq!(db2.host, "10.0.0.6");
         assert_eq!(db2.port, 2222);
         let app1 = inv.hosts.get("app-1").unwrap();
-        assert_eq!(app1.host, "135.181.x.x", "untouched host must keep public addr");
+        assert_eq!(
+            app1.host, "135.181.x.x",
+            "untouched host must keep public addr"
+        );
         assert_eq!(app1.port, 22);
     }
 
@@ -1207,7 +1196,10 @@ mod tests {
         let err = apply_internal_host_overrides(&mut inv, &InventoryVars::default()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("must be a string"), "{msg}");
-        assert!(msg.contains("db-2"), "diagnostic should name the host: {msg}");
+        assert!(
+            msg.contains("db-2"),
+            "diagnostic should name the host: {msg}"
+        );
     }
 
     #[test]

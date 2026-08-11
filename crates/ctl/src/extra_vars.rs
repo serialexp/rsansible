@@ -41,9 +41,8 @@ pub fn parse_one(arg: &str) -> Result<BTreeMap<String, JsonValue>> {
     // of JSON so we can route both through serde_yaml.
     let first = trimmed.chars().next().unwrap();
     if first == '{' || first == '[' {
-        return parse_yaml_object(trimmed).with_context(|| {
-            format!("parsing --extra-vars JSON/YAML literal")
-        });
+        return parse_yaml_object(trimmed)
+            .with_context(|| format!("parsing --extra-vars JSON/YAML literal"));
     }
     parse_key_value(trimmed)
 }
@@ -66,9 +65,9 @@ where
 }
 
 fn parse_key_value(arg: &str) -> Result<BTreeMap<String, JsonValue>> {
-    let (key, value) = arg
-        .split_once('=')
-        .ok_or_else(|| anyhow!("`{arg}` is not in `key=value` form (or use `@file` / `{{json}}`)"))?;
+    let (key, value) = arg.split_once('=').ok_or_else(|| {
+        anyhow!("`{arg}` is not in `key=value` form (or use `@file` / `{{json}}`)")
+    })?;
     let key = key.trim();
     if key.is_empty() {
         bail!("empty key in `{arg}`");
@@ -88,14 +87,14 @@ fn parse_key_value(arg: &str) -> Result<BTreeMap<String, JsonValue>> {
 }
 
 fn parse_yaml_object(text: &str) -> Result<BTreeMap<String, JsonValue>> {
-    let val: serde_yaml::Value = serde_yaml::from_str(text)
-        .with_context(|| "couldn't parse as YAML/JSON")?;
+    let val: serde_yaml::Value =
+        serde_yaml::from_str(text).with_context(|| "couldn't parse as YAML/JSON")?;
     yaml_value_to_top_level_map(val)
 }
 
 fn load_from_file(path: &Path) -> Result<BTreeMap<String, JsonValue>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let val: serde_yaml::Value = serde_yaml::from_str(&text)
         .with_context(|| format!("parsing {} as YAML", path.display()))?;
     yaml_value_to_top_level_map(val)
@@ -105,9 +104,9 @@ fn yaml_value_to_top_level_map(val: serde_yaml::Value) -> Result<BTreeMap<String
     let map = match val {
         serde_yaml::Value::Mapping(m) => m,
         serde_yaml::Value::Null => return Ok(BTreeMap::new()),
-        other => bail!(
-            "extra-vars source must be a top-level mapping (key: value), got: {other:?}"
-        ),
+        other => {
+            bail!("extra-vars source must be a top-level mapping (key: value), got: {other:?}")
+        }
     };
     let mut out = BTreeMap::new();
     for (k, v) in map {
@@ -148,9 +147,9 @@ fn yaml_to_json(v: serde_yaml::Value) -> Result<JsonValue> {
         serde_yaml::Value::Mapping(m) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in m {
-                let key = k.as_str().ok_or_else(|| {
-                    anyhow!("nested mapping key must be a string, got: {k:?}")
-                })?;
+                let key = k
+                    .as_str()
+                    .ok_or_else(|| anyhow!("nested mapping key must be a string, got: {k:?}"))?;
                 obj.insert(key.to_string(), yaml_to_json(v)?);
             }
             JsonValue::Object(obj)
@@ -187,10 +186,7 @@ mod tests {
     #[test]
     fn key_value_value_can_contain_equals() {
         let m = parse_one("url=https://example.com/?a=1&b=2").unwrap();
-        assert_eq!(
-            m.get("url"),
-            Some(&json!("https://example.com/?a=1&b=2"))
-        );
+        assert_eq!(m.get("url"), Some(&json!("https://example.com/?a=1&b=2")));
     }
 
     #[test]
@@ -239,11 +235,7 @@ mod tests {
     fn at_file_loads_yaml_map() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("vars.yml");
-        std::fs::write(
-            &path,
-            "service: demo\nport: 8080\nflags:\n  - a\n  - b\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "service: demo\nport: 8080\nflags:\n  - a\n  - b\n").unwrap();
         let m = parse_one(&format!("@{}", path.display())).unwrap();
         assert_eq!(m.get("service"), Some(&json!("demo")));
         assert_eq!(m.get("port"), Some(&json!(8080)));
@@ -266,11 +258,7 @@ mod tests {
 
     #[test]
     fn parse_all_mixes_key_value_and_json_literals() {
-        let m = parse_all(&[
-            "service=demo",
-            r#"{"port": 8080, "tls": true}"#,
-        ])
-        .unwrap();
+        let m = parse_all(&["service=demo", r#"{"port": 8080, "tls": true}"#]).unwrap();
         assert_eq!(m.get("service"), Some(&json!("demo")));
         assert_eq!(m.get("port"), Some(&json!(8080)));
         assert_eq!(m.get("tls"), Some(&json!(true)));

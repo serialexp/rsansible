@@ -22,22 +22,16 @@ use std::path::Path;
 
 #[allow(unused_imports)]
 pub use task_op::{
-    classify_sql_readonly, parse_rendered_mode, AssertTask, AsyncStatusOp, BlockInFileOp,
-    BlockInFileState, BlockSpec,
-    CommandOp,
-    CopyOp, DebugMsg, DebugTask, ExecOp,
-    FailTask, FileOp, FileState, GetUrlOp, GetentOp, HostnameOp, IncludeRoleSpec, IptablesAction,
-    IptablesIpVersion, IptablesOp, IptablesRuleState, LineInFileOp, LineInFileState,
-    LoopControl, LoopSpec, MetaAction, ModeField, OpenSslCsrPipeOp, OpenSslPrivkeyOp,
-    PackageManager,
-    AuthorizedKeyOp, AuthorizedKeyState, GroupOp, GroupState,
-    PackageOp, PackageState, PauseTask, PostgresqlDbOp, PostgresqlExtOp, PostgresqlMembershipOp,
-    PostgresqlQueryOp, PostgresqlUserOp,
-    RepositoryManager, RepositoryOp, RepositoryState, SetFactMap, ShellOp,
-    UserOp, UserState,
-    SlurpOp,
-    StatOp, SystemdOp, SystemdState, Task, TaskBody, TaskOp, TemplateOp, TempfileKind, TempfileOp,
-    UfwOp, UfwOpKind, UnarchiveOp, UriOp, WaitForOp, WaitForState, WriteFileOp,
+    classify_sql_readonly, parse_rendered_mode, AssertTask, AsyncStatusOp, AuthorizedKeyOp,
+    AuthorizedKeyState, BlockInFileOp, BlockInFileState, BlockSpec, CommandOp, CopyOp, DebugMsg,
+    DebugTask, ExecOp, FailTask, FileOp, FileState, GetUrlOp, GetentOp, GroupOp, GroupState,
+    HostnameOp, IncludeRoleSpec, IptablesAction, IptablesIpVersion, IptablesOp, IptablesRuleState,
+    LineInFileOp, LineInFileState, LoopControl, LoopSpec, MetaAction, ModeField, OpenSslCsrPipeOp,
+    OpenSslPrivkeyOp, PackageManager, PackageOp, PackageState, PauseTask, PostgresqlDbOp,
+    PostgresqlExtOp, PostgresqlMembershipOp, PostgresqlQueryOp, PostgresqlUserOp,
+    RepositoryManager, RepositoryOp, RepositoryState, SetFactMap, ShellOp, SlurpOp, StatOp,
+    SystemdOp, SystemdState, Task, TaskBody, TaskOp, TempfileKind, TempfileOp, TemplateOp, UfwOp,
+    UfwOpKind, UnarchiveOp, UriOp, UserOp, UserState, WaitForOp, WaitForState, WriteFileOp,
     X509CertificatePipeOp,
 };
 pub use validate::validate;
@@ -222,7 +216,10 @@ pub struct RoleSpec {
     /// `tags:` on a role invocation are propagated onto every task and
     /// handler pulled in from that role at flatten time. Accepts either
     /// a bare string (Ansible-style shorthand) or a YAML sequence.
-    #[serde(default, deserialize_with = "crate::playbook::task_op::deserialize_tags")]
+    #[serde(
+        default,
+        deserialize_with = "crate::playbook::task_op::deserialize_tags"
+    )]
     pub tags: Vec<String>,
 }
 
@@ -344,13 +341,12 @@ fn merge_vars_files(pb: &mut Playbook, base: &Path) -> Result<()> {
                     path.display(),
                 )
             })?;
-            let value: serde_yaml::Value = serde_yaml::from_str(&text)
-                .with_context(|| {
-                    format!(
-                        "play[{play_idx}] {:?}: parsing vars_files {rel:?}",
-                        play.name,
-                    )
-                })?;
+            let value: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| {
+                format!(
+                    "play[{play_idx}] {:?}: parsing vars_files {rel:?}",
+                    play.name,
+                )
+            })?;
             let map = match value {
                 serde_yaml::Value::Mapping(m) => m,
                 serde_yaml::Value::Null => continue, // empty file: skip
@@ -598,10 +594,7 @@ mod tests {
             v.get("greeting"),
             Some(&serde_yaml::Value::String("hello".into()))
         );
-        assert_eq!(
-            v.get("port"),
-            Some(&serde_yaml::Value::Number(8080.into()))
-        );
+        assert_eq!(v.get("port"), Some(&serde_yaml::Value::Number(8080.into())));
     }
 
     #[test]
@@ -1324,12 +1317,24 @@ all:
         );
         let b = block_children(&pb.plays[0].tasks[0]);
         // Bare child picks up both block-level vars verbatim.
-        assert_eq!(b.tasks[0].environment.get("PIPX_HOME").map(String::as_str), Some("/opt/patroni"));
-        assert_eq!(b.tasks[0].environment.get("SHARED_FLAG").map(String::as_str), Some("1"));
+        assert_eq!(
+            b.tasks[0].environment.get("PIPX_HOME").map(String::as_str),
+            Some("/opt/patroni")
+        );
+        assert_eq!(
+            b.tasks[0]
+                .environment
+                .get("SHARED_FLAG")
+                .map(String::as_str),
+            Some("1")
+        );
         // Child with its own env: keys: child wins on collision,
         // parent fills in the rest, child-only keys stay.
         let env = &b.tasks[1].environment;
-        assert_eq!(env.get("PIPX_HOME").map(String::as_str), Some("/opt/patroni"));
+        assert_eq!(
+            env.get("PIPX_HOME").map(String::as_str),
+            Some("/opt/patroni")
+        );
         assert_eq!(env.get("SHARED_FLAG").map(String::as_str), Some("2"));
         assert_eq!(env.get("EXTRA").map(String::as_str), Some("from-child"));
     }
@@ -1402,10 +1407,7 @@ all:
         // `inner_ok`, outer doesn't set when so middle's effective is
         // just `middle_ok` (the AND-join only triggers when both sides
         // exist). Then inner gets `(middle_ok) and (inner_ok)`.
-        assert_eq!(
-            inner.when.as_deref(),
-            Some("(middle_ok) and (inner_ok)")
-        );
+        assert_eq!(inner.when.as_deref(), Some("(middle_ok) and (inner_ok)"));
     }
 
     #[test]

@@ -42,14 +42,31 @@ const STATE_TOUCH: u8 = 2;
 const STATE_FILE: u8 = 3;
 const STATE_LINK: u8 = 4;
 
-pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput, check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpFileOutput,
+    check_mode: bool,
+) -> anyhow::Result<()> {
     let started_unix_ns = now_unix_ns();
     let path = op.path;
     let src = op.src;
-    let mode = if op.has_mode != 0 { Some(op.mode & 0o7777) } else { None };
+    let mode = if op.has_mode != 0 {
+        Some(op.mode & 0o7777)
+    } else {
+        None
+    };
     let recurse = op.recurse != 0;
-    let owner = if op.owner.is_empty() { None } else { Some(op.owner.as_str()) };
-    let group = if op.group.is_empty() { None } else { Some(op.group.as_str()) };
+    let owner = if op.owner.is_empty() {
+        None
+    } else {
+        Some(op.owner.as_str())
+    };
+    let group = if op.group.is_empty() {
+        None
+    } else {
+        Some(op.group.as_str())
+    };
 
     // Resolve owner/group up front — fail fast with BAD_REQUEST rather
     // than partial work.
@@ -57,8 +74,13 @@ pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput, check_mode: bool) ->
         None => None,
         Some(Ok(u)) => Some(u),
         Some(Err(name)) => {
-            emit_error(ctx, seq, err::BAD_REQUEST, format!("unknown user: {name:?}"))
-                .await;
+            emit_error(
+                ctx,
+                seq,
+                err::BAD_REQUEST,
+                format!("unknown user: {name:?}"),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -66,8 +88,13 @@ pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput, check_mode: bool) ->
         None => None,
         Some(Ok(g)) => Some(g),
         Some(Err(name)) => {
-            emit_error(ctx, seq, err::BAD_REQUEST, format!("unknown group: {name:?}"))
-                .await;
+            emit_error(
+                ctx,
+                seq,
+                err::BAD_REQUEST,
+                format!("unknown group: {name:?}"),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -111,8 +138,15 @@ pub async fn run(ctx: &Context, seq: u32, op: OpFileOutput, check_mode: bool) ->
     };
 
     let finished_unix_ns = now_unix_ns();
-    ctx.emit(msg::task_done(seq, 0, changed, false, started_unix_ns, finished_unix_ns))
-        .await;
+    ctx.emit(msg::task_done(
+        seq,
+        0,
+        changed,
+        false,
+        started_unix_ns,
+        finished_unix_ns,
+    ))
+    .await;
     Ok(())
 }
 
@@ -476,13 +510,21 @@ fn lchown(path: &Path, uid: u32, gid: u32) -> Result<(), FileError> {
 /// fine for the systems rsansible targets. Returns Err(name) on miss so
 /// the caller can surface a useful TaskError.
 pub(crate) fn resolve_user(name: &str) -> Result<u32, String> {
-    parse_passwd_field(&std::fs::read_to_string("/etc/passwd").unwrap_or_default(), name, 2)
-        .ok_or_else(|| name.to_string())
+    parse_passwd_field(
+        &std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
+        name,
+        2,
+    )
+    .ok_or_else(|| name.to_string())
 }
 
 pub(crate) fn resolve_group(name: &str) -> Result<u32, String> {
-    parse_passwd_field(&std::fs::read_to_string("/etc/group").unwrap_or_default(), name, 2)
-        .ok_or_else(|| name.to_string())
+    parse_passwd_field(
+        &std::fs::read_to_string("/etc/group").unwrap_or_default(),
+        name,
+        2,
+    )
+    .ok_or_else(|| name.to_string())
 }
 
 /// `chown -h <uid>:<gid> <path>` — `-h` flavour that doesn't follow
@@ -680,11 +722,15 @@ mod tests {
         let a = root.join("r/a");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::write(a.join("inside"), b"x").unwrap();
-        std::fs::set_permissions(a.join("inside"), std::fs::Permissions::from_mode(0o600))
-            .unwrap();
-        let changed = apply_directory(&root.join("r"), Some(0o755), None, None, true, false).unwrap();
+        std::fs::set_permissions(a.join("inside"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let changed =
+            apply_directory(&root.join("r"), Some(0o755), None, None, true, false).unwrap();
         assert!(changed);
-        let m = std::fs::metadata(a.join("inside")).unwrap().permissions().mode() & 0o7777;
+        let m = std::fs::metadata(a.join("inside"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
         // Inner file gets the same mode.
         assert_eq!(m, 0o755);
     }
@@ -747,7 +793,10 @@ mod tests {
 
         let changed = apply_link(&link, &target_s, None, None, false).unwrap();
         assert!(changed, "first apply creates the symlink");
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
 
         let changed = apply_link(&link, &target_s, None, None, false).unwrap();
@@ -763,7 +812,10 @@ mod tests {
         assert!(changed, "different target should repoint");
         assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("/new/target"));
         // Repoint preserves the symlink (didn't turn it into a regular file).
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

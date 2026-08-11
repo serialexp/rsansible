@@ -3,9 +3,9 @@
 //! The CLI binary in `src/main.rs` is a thin wrapper over the modules here
 //! so integration tests can drive them directly.
 
+pub mod back_channel;
 #[path = "become_.rs"]
 pub mod become_;
-pub mod back_channel;
 pub mod diff_render;
 pub mod exec_ctx;
 pub mod extra_vars;

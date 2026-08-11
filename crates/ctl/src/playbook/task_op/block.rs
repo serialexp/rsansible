@@ -304,7 +304,10 @@ block:
         )
         .expect_err("register on block should error");
         let msg = err.to_string();
-        assert!(msg.contains("register") && msg.contains("block"), "msg: {msg}");
+        assert!(
+            msg.contains("register") && msg.contains("block"),
+            "msg: {msg}"
+        );
     }
 
     #[test]
@@ -320,7 +323,10 @@ block:
         )
         .expect_err("notify on block should error");
         let msg = err.to_string();
-        assert!(msg.contains("notify") && msg.contains("block"), "msg: {msg}");
+        assert!(
+            msg.contains("notify") && msg.contains("block"),
+            "msg: {msg}"
+        );
     }
 
     #[test]
@@ -336,7 +342,10 @@ block:
         )
         .expect_err("run_once on block should error");
         let msg = err.to_string();
-        assert!(msg.contains("run_once") && msg.contains("block"), "msg: {msg}");
+        assert!(
+            msg.contains("run_once") && msg.contains("block"),
+            "msg: {msg}"
+        );
     }
 
     #[test]

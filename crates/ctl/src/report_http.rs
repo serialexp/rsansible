@@ -248,10 +248,7 @@ impl HttpReporter {
             let body = resp.text().await.unwrap_or_default();
             bail!("open run failed: HTTP {status}: {body}");
         }
-        let open: OpenResponse = resp
-            .json()
-            .await
-            .context("decode open-run response")?;
+        let open: OpenResponse = resp.json().await.context("decode open-run response")?;
 
         let (tx, rx) = unbounded_channel::<Msg>();
         let worker = Worker {
@@ -489,13 +486,19 @@ impl Worker {
                 .await;
             match res {
                 Ok(r) if r.status().is_success() => return true,
-                Ok(r) if r.status().is_client_error()
-                    && r.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                Ok(r)
+                    if r.status().is_client_error()
+                        && r.status() != reqwest::StatusCode::TOO_MANY_REQUESTS =>
                 {
-                    tracing::warn!("report push: {url} rejected with HTTP {} (permanent)", r.status());
+                    tracing::warn!(
+                        "report push: {url} rejected with HTTP {} (permanent)",
+                        r.status()
+                    );
                     return false;
                 }
-                Ok(r) => tracing::debug!("report push: {url} HTTP {} (attempt {attempt})", r.status()),
+                Ok(r) => {
+                    tracing::debug!("report push: {url} HTTP {} (attempt {attempt})", r.status())
+                }
                 Err(e) => tracing::debug!("report push: {url} error (attempt {attempt}): {e}"),
             }
             if attempt < MAX_RETRIES {

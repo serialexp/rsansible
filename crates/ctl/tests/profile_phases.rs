@@ -100,7 +100,10 @@ async fn profile_three_host_run() -> Result<()> {
         }
         (conns, t_phase.elapsed())
     };
-    log.push(("ssh-connect+push+hello (wall, all hosts in parallel)", connect_wall));
+    log.push((
+        "ssh-connect+push+hello (wall, all hosts in parallel)",
+        connect_wall,
+    ));
 
     // 5. Three barrier tasks: shell echo, write_file, exec cat. Each
     //    timed as a whole barrier (slowest host wins).
@@ -110,7 +113,12 @@ async fn profile_three_host_run() -> Result<()> {
         rsansible_wire::msg::task_dispatch(
             1,
             false,
-            op_shell("printf 'hi from %s\\n' \"$(hostname)\"".into(), vec![], vec![], 5_000),
+            op_shell(
+                "printf 'hi from %s\\n' \"$(hostname)\"".into(),
+                vec![],
+                vec![],
+                5_000,
+            ),
         ),
     )
     .await?;
@@ -128,9 +136,9 @@ async fn profile_three_host_run() -> Result<()> {
                 false,
                 b"hello from rsansible\n".to_vec(),
                 String::new(),
-            
                 String::new(),
-                String::new(),),
+                String::new(),
+            ),
         ),
     )
     .await?;
@@ -194,7 +202,8 @@ async fn profile_three_host_run() -> Result<()> {
         per_host_connect.sort();
         let min = per_host_connect.first().copied().unwrap();
         let max = per_host_connect.last().copied().unwrap();
-        let mean = per_host_connect.iter().sum::<std::time::Duration>() / per_host_connect.len() as u32;
+        let mean =
+            per_host_connect.iter().sum::<std::time::Duration>() / per_host_connect.len() as u32;
         eprintln!(
             "  per-host connect+push+Hello: min {:.2?}  mean {:.2?}  max {:.2?}  (count={})",
             min,

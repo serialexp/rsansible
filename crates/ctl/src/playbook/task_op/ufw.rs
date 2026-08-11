@@ -109,9 +109,9 @@ impl<'de> Deserialize<'de> for UfwOp {
                     "ufw.insert must be a non-negative integer, got: {n}"
                 ))
             })? as u32,
-            Some(serde_yaml::Value::String(s)) => s.parse::<u32>().map_err(|e| {
-                D::Error::custom(format!("ufw.insert: invalid int {s:?}: {e}"))
-            })?,
+            Some(serde_yaml::Value::String(s)) => s
+                .parse::<u32>()
+                .map_err(|e| D::Error::custom(format!("ufw.insert: invalid int {s:?}: {e}")))?,
             Some(other) => {
                 return Err(D::Error::custom(format!(
                     "ufw.insert must be a number, got: {other:?}"
@@ -122,7 +122,11 @@ impl<'de> Deserialize<'de> for UfwOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "ufw: unknown field(s): {unknown:?}; expected one of \
@@ -212,7 +216,10 @@ impl<'de> Deserialize<'de> for UfwOp {
         }
         if !proto.is_empty() && !string_is_jinja(&proto) {
             let p = proto.to_ascii_lowercase();
-            if !matches!(p.as_str(), "any" | "tcp" | "udp" | "esp" | "ah" | "ipv6" | "igmp") {
+            if !matches!(
+                p.as_str(),
+                "any" | "tcp" | "udp" | "esp" | "ah" | "ipv6" | "igmp"
+            ) {
                 return Err(D::Error::custom(format!(
                     "ufw.proto: expected one of [any, tcp, udp, esp, ah, ipv6, igmp], got: {proto:?}"
                 )));
@@ -239,7 +246,7 @@ impl<'de> Deserialize<'de> for UfwOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
 
     #[test]
@@ -386,10 +393,7 @@ ufw:
   direction: in
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("aliases"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("aliases"), "got: {err}");
     }
 
     #[test]
@@ -442,10 +446,7 @@ ufw:
   proto: tcp
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("must specify"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("must specify"), "got: {err}");
     }
 
     #[test]

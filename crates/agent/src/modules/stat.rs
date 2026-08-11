@@ -34,14 +34,19 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
-use rsansible_wire::msg::{self, now_unix_ns};
 use rsansible_wire::generated::OpStatOutput;
+use rsansible_wire::msg::{self, now_unix_ns};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::{emit_error, Context};
 
-pub async fn run(ctx: &Context, seq: u32, op: OpStatOutput, _check_mode: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: &Context,
+    seq: u32,
+    op: OpStatOutput,
+    _check_mode: bool,
+) -> anyhow::Result<()> {
     // stat is read-only; `_check_mode` is accepted for plumbing
     // uniformity and ignored.
     let started_unix_ns = now_unix_ns();
@@ -134,9 +139,18 @@ fn stat_path(path: &str, follow: bool) -> Result<Value, StatError> {
     out.insert("size".into(), Value::from(meta.size()));
     out.insert("uid".into(), Value::from(meta.uid()));
     out.insert("gid".into(), Value::from(meta.gid()));
-    out.insert("mtime".into(), Value::from(seconds_f64(meta.mtime(), meta.mtime_nsec())));
-    out.insert("atime".into(), Value::from(seconds_f64(meta.atime(), meta.atime_nsec())));
-    out.insert("ctime".into(), Value::from(seconds_f64(meta.ctime(), meta.ctime_nsec())));
+    out.insert(
+        "mtime".into(),
+        Value::from(seconds_f64(meta.mtime(), meta.mtime_nsec())),
+    );
+    out.insert(
+        "atime".into(),
+        Value::from(seconds_f64(meta.atime(), meta.atime_nsec())),
+    );
+    out.insert(
+        "ctime".into(),
+        Value::from(seconds_f64(meta.ctime(), meta.ctime_nsec())),
+    );
 
     // Checksum: only for regular files (matches Ansible's default
     // `get_checksum: true`). If we can't open the file, we leave the
@@ -206,7 +220,10 @@ mod tests {
     fn stat_missing_returns_exists_false() {
         let v = stat_path("/definitely/does/not/exist/rsansible-stat", true).unwrap();
         assert_eq!(v["exists"], Value::Bool(false));
-        assert_eq!(v["path"], Value::String("/definitely/does/not/exist/rsansible-stat".into()));
+        assert_eq!(
+            v["path"],
+            Value::String("/definitely/does/not/exist/rsansible-stat".into())
+        );
     }
 
     #[test]

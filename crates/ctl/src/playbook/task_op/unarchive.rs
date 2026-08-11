@@ -67,8 +67,11 @@ impl<'de> Deserialize<'de> for UnarchiveOp {
         // v1 requires `remote_src: yes`. The controller-pushed-archive
         // path (`copy:` ... + extract) isn't wired yet; surface a clear
         // error instead of silently uploading nothing.
-        let remote_src =
-            parse_ansible_bool::<D::Error>(map.remove("remote_src"), "unarchive.remote_src", false)?;
+        let remote_src = parse_ansible_bool::<D::Error>(
+            map.remove("remote_src"),
+            "unarchive.remote_src",
+            false,
+        )?;
         if !remote_src {
             return Err(D::Error::custom(
                 "unarchive: only `remote_src: yes` is supported in v1; \
@@ -104,7 +107,9 @@ impl<'de> Deserialize<'de> for UnarchiveOp {
             Some("tar.bz2") | Some("tbz2") | Some("tbz") | Some("bz2") | Some("bzip2") => {
                 rsansible_wire::msg::unarchive_format::TAR_BZ2
             }
-            Some("tar.xz") | Some("txz") | Some("xz") => rsansible_wire::msg::unarchive_format::TAR_XZ,
+            Some("tar.xz") | Some("txz") | Some("xz") => {
+                rsansible_wire::msg::unarchive_format::TAR_XZ
+            }
             Some("tar") => rsansible_wire::msg::unarchive_format::TAR,
             Some("zip") => rsansible_wire::msg::unarchive_format::ZIP,
             Some(other) => {
@@ -195,9 +200,7 @@ impl<'de> Deserialize<'de> for UnarchiveOp {
         };
 
         if let Some((k, _)) = map.into_iter().next() {
-            return Err(D::Error::custom(format!(
-                "unarchive: unknown field {k:?}"
-            )));
+            return Err(D::Error::custom(format!("unarchive: unknown field {k:?}")));
         }
 
         Ok(UnarchiveOp {
@@ -219,9 +222,9 @@ impl<'de> Deserialize<'de> for UnarchiveOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
-    use rsansible_wire::generated::Op as WireOp;
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
+    use rsansible_wire::generated::Op as WireOp;
 
     #[test]
     fn parse_unarchive_minimal() {
@@ -234,7 +237,9 @@ unarchive:
   remote_src: yes
 "#,
         );
-        let TaskBody::Op(TaskOp::Unarchive(u)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::Unarchive(u)) = t.body else {
+            panic!()
+        };
         assert_eq!(u.src, "/srv/cache/etcd.tar.gz");
         assert_eq!(u.dest, "/usr/local/bin");
         assert_eq!(u.format, rsansible_wire::msg::unarchive_format::AUTO);
@@ -269,7 +274,9 @@ unarchive:
     - README.md
 "#,
         );
-        let TaskBody::Op(TaskOp::Unarchive(u)) = t.body else { panic!() };
+        let TaskBody::Op(TaskOp::Unarchive(u)) = t.body else {
+            panic!()
+        };
         assert_eq!(u.format, rsansible_wire::msg::unarchive_format::ZIP);
         assert_eq!(u.creates, "/opt/etcd/etcd");
         assert!(u.keep_newer);
@@ -293,7 +300,9 @@ unarchive:
                 "name: t\nunarchive:\n  src: /a/b\n  dest: /c\n  remote_src: yes\n  format: {label}\n"
             );
             let t: Task = serde_yaml::from_str(&yaml).unwrap();
-            let TaskBody::Op(TaskOp::Unarchive(u)) = t.body else { panic!() };
+            let TaskBody::Op(TaskOp::Unarchive(u)) = t.body else {
+                panic!()
+            };
             assert_eq!(u.format, byte, "format alias {label}");
         }
     }
@@ -405,7 +414,9 @@ unarchive:
             exclude: Vec::new(),
         });
         let wire = op.to_wire_op().unwrap();
-        let WireOp::OpUnarchive(o) = wire else { panic!() };
+        let WireOp::OpUnarchive(o) = wire else {
+            panic!()
+        };
         assert_eq!(o.has_mode, 0);
         assert_eq!(o.mode, 0);
     }

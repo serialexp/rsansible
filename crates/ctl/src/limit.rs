@@ -41,13 +41,11 @@ impl LimitFilter {
                 return Err(HostPatternError::EmptyTerm(parts.join(",")));
             }
         }
-        let joined = parts
-            .iter()
-            .map(|s| s.trim())
-            .collect::<Vec<_>>()
-            .join(",");
+        let joined = parts.iter().map(|s| s.trim()).collect::<Vec<_>>().join(",");
         let pattern = HostPattern::parse(&joined)?;
-        Ok(Self { pattern: Some(pattern) })
+        Ok(Self {
+            pattern: Some(pattern),
+        })
     }
 
     /// Returns true iff the user supplied a `--limit` value.
@@ -111,7 +109,10 @@ mod tests {
         );
         groups.insert(
             "webservers".into(),
-            vec!["web1", "web2", "web3"].into_iter().map(String::from).collect(),
+            vec!["web1", "web2", "web3"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
         );
         Inventory {
             hosts,
@@ -145,8 +146,7 @@ mod tests {
 
     #[test]
     fn repeated_flags_join_via_union() {
-        let f =
-            LimitFilter::from_cli(&["web1".to_string(), "db1".to_string()]).unwrap();
+        let f = LimitFilter::from_cli(&["web1".to_string(), "db1".to_string()]).unwrap();
         let inv = fixture();
         assert_eq!(f.preflight(&inv), vec!["web1", "db1"]);
     }

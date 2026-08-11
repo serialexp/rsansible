@@ -235,10 +235,7 @@ pub async fn run_status(
     let mut envelope = Map::new();
     envelope.insert("ansible_job_id".into(), Value::from(op.job_id));
     envelope.insert("started".into(), Value::from(1));
-    envelope.insert(
-        "finished".into(),
-        Value::from(if finished { 1 } else { 0 }),
-    );
+    envelope.insert("finished".into(), Value::from(if finished { 1 } else { 0 }));
 
     if finished {
         envelope.insert("rc".into(), Value::from(g.rc.unwrap_or(-1)));

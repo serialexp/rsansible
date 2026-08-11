@@ -28,8 +28,7 @@ async fn three_container_handlers_and_delegation_run() -> Result<()> {
     let inv = build_inventory(&containers);
 
     let pb_path = examples_dir().join("handlers_and_delegation.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -87,7 +86,10 @@ async fn three_container_handlers_and_delegation_run() -> Result<()> {
         let out = c.docker_exec(&["cat", "/tmp/rsansible-restart-marker"])?;
         assert!(out.status.success(), "missing restart_marker file");
         let body = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert_eq!(body, "restarted\n", "restart handler ran more than once: {body:?}");
+        assert_eq!(
+            body, "restarted\n",
+            "restart handler ran more than once: {body:?}"
+        );
 
         // End-of-play implicit flush fired the eop_log handler.
         let out = c.docker_exec(&["cat", "/tmp/rsansible-eop-marker"])?;

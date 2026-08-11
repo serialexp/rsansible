@@ -514,7 +514,11 @@ done
         let stub = Stub::new("absent-go", &[("nginx", "1.18.0-6")]);
         let changed = run(&stub, &op(&["nginx"], STATE_ABSENT)).unwrap();
         assert!(changed);
-        assert!(stub.log().contains("remove -y nginx"), "log={:?}", stub.log());
+        assert!(
+            stub.log().contains("remove -y nginx"),
+            "log={:?}",
+            stub.log()
+        );
         assert!(!stub.db().contains("nginx"));
     }
 
@@ -533,7 +537,11 @@ done
         o.purge = 1;
         let changed = run(&stub, &o).unwrap();
         assert!(changed);
-        assert!(stub.log().contains("purge -y nginx"), "log={:?}", stub.log());
+        assert!(
+            stub.log().contains("purge -y nginx"),
+            "log={:?}",
+            stub.log()
+        );
     }
 
     #[test]
@@ -579,7 +587,11 @@ done
         let mut o = op(&["nginx"], STATE_PRESENT);
         o.default_release = "bookworm-backports".into();
         let _ = run(&stub, &o).unwrap();
-        assert!(stub.log().contains("-t bookworm-backports"), "log={:?}", stub.log());
+        assert!(
+            stub.log().contains("-t bookworm-backports"),
+            "log={:?}",
+            stub.log()
+        );
     }
 
     #[test]

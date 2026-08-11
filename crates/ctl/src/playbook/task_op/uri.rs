@@ -184,7 +184,9 @@ impl<'de> Deserialize<'de> for UriOp {
             None | Some(serde_yaml::Value::Null) => vec![200u16],
             Some(serde_yaml::Value::Number(n)) => {
                 let v = n.as_u64().ok_or_else(|| {
-                    D::Error::custom(format!("uri.status_code: expected a non-negative int, got: {n}"))
+                    D::Error::custom(format!(
+                        "uri.status_code: expected a non-negative int, got: {n}"
+                    ))
                 })?;
                 if !(100..=599).contains(&v) {
                     return Err(D::Error::custom(format!(
@@ -208,7 +210,9 @@ impl<'de> Deserialize<'de> for UriOp {
                         }
                     };
                     let v = n.as_u64().ok_or_else(|| {
-                        D::Error::custom(format!("uri.status_code: expected a non-negative int, got: {n}"))
+                        D::Error::custom(format!(
+                            "uri.status_code: expected a non-negative int, got: {n}"
+                        ))
                     })?;
                     if !(100..=599).contains(&v) {
                         return Err(D::Error::custom(format!(
@@ -230,9 +234,9 @@ impl<'de> Deserialize<'de> for UriOp {
         let timeout_ms = match map.remove("timeout") {
             None | Some(serde_yaml::Value::Null) => 30_000u32,
             Some(serde_yaml::Value::Number(n)) => {
-                let s = n.as_f64().ok_or_else(|| {
-                    D::Error::custom(format!("uri.timeout: invalid number {n}"))
-                })?;
+                let s = n
+                    .as_f64()
+                    .ok_or_else(|| D::Error::custom(format!("uri.timeout: invalid number {n}")))?;
                 if !s.is_finite() || s < 0.0 {
                     return Err(D::Error::custom(format!(
                         "uri.timeout: expected non-negative seconds, got {s}"
@@ -259,10 +263,10 @@ impl<'de> Deserialize<'de> for UriOp {
         };
 
         // return_content / validate_certs — Ansible-flavored bools.
-        let return_content = take_optional_ansible_bool::<D::Error>(&mut map, "return_content")?
-            .unwrap_or(false);
-        let validate_certs = take_optional_ansible_bool::<D::Error>(&mut map, "validate_certs")?
-            .unwrap_or(true);
+        let return_content =
+            take_optional_ansible_bool::<D::Error>(&mut map, "return_content")?.unwrap_or(false);
+        let validate_certs =
+            take_optional_ansible_bool::<D::Error>(&mut map, "validate_certs")?.unwrap_or(true);
 
         // follow_redirects — none/safe/all. Default safe.
         let follow_redirects = match map.remove("follow_redirects") {
@@ -295,12 +299,12 @@ impl<'de> Deserialize<'de> for UriOp {
         // mTLS / custom-CA paths. Strings (paths on the controller),
         // Jinja-templatable, optional. Empty string = absent. Bytes are
         // read at render time so per-host paths work.
-        let client_cert = take_optional_string::<D::Error>(&mut map, "client_cert", "uri")?
-            .unwrap_or_default();
-        let client_key = take_optional_string::<D::Error>(&mut map, "client_key", "uri")?
-            .unwrap_or_default();
-        let ca_path = take_optional_string::<D::Error>(&mut map, "ca_path", "uri")?
-            .unwrap_or_default();
+        let client_cert =
+            take_optional_string::<D::Error>(&mut map, "client_cert", "uri")?.unwrap_or_default();
+        let client_key =
+            take_optional_string::<D::Error>(&mut map, "client_key", "uri")?.unwrap_or_default();
+        let ca_path =
+            take_optional_string::<D::Error>(&mut map, "ca_path", "uri")?.unwrap_or_default();
         if !client_cert.is_empty() && client_key.is_empty() {
             return Err(D::Error::custom(
                 "uri.client_cert is set but uri.client_key is missing — \
@@ -317,7 +321,11 @@ impl<'de> Deserialize<'de> for UriOp {
         if !map.is_empty() {
             let unknown: Vec<String> = map
                 .keys()
-                .map(|k| k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}")))
+                .map(|k| {
+                    k.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{k:?}"))
+                })
                 .collect();
             return Err(D::Error::custom(format!(
                 "uri: unknown field(s): {unknown:?}; expected one of \
@@ -348,9 +356,9 @@ impl<'de> Deserialize<'de> for UriOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::task_op::{parse_task_for_test as parse_task};
-    use rsansible_wire::msg::{uri_body_format, uri_follow, uri_method};
+    use crate::playbook::task_op::parse_task_for_test as parse_task;
     use crate::playbook::task_op::{Task, TaskBody, TaskOp};
+    use rsansible_wire::msg::{uri_body_format, uri_follow, uri_method};
     use std::collections::BTreeMap;
 
     fn parse_uri(yaml: &str) -> UriOp {
@@ -469,10 +477,7 @@ uri:
     foo: bar
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("body_format: json"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("body_format: json"), "got: {err}");
     }
 
     #[test]
@@ -496,10 +501,7 @@ uri:
   follow_redirects: maybe
 "#;
         let err = serde_yaml::from_str::<Task>(yaml).unwrap_err();
-        assert!(
-            format!("{err}").contains("follow_redirects"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("follow_redirects"), "got: {err}");
     }
 
     #[test]
@@ -555,10 +557,7 @@ uri:
         assert_eq!(o.url, "https://api/x");
         // BTreeMap sorted: Accept before Authorization.
         assert_eq!(o.header_keys, vec!["Accept", "Authorization"]);
-        assert_eq!(
-            o.header_values,
-            vec!["application/json", "Bearer xyz"]
-        );
+        assert_eq!(o.header_values, vec!["application/json", "Bearer xyz"]);
         assert_eq!(o.body, br#"{"a":1}"#.to_vec());
         assert_eq!(o.body_format, uri_body_format::JSON);
         assert_eq!(o.status_codes, vec![200u16, 201u16]);
@@ -578,10 +577,7 @@ uri:
         // slurps them into the wire bytes fields. We don't need real
         // PEM here — agent-side parsing isn't exercised; only the
         // controller's read-file-and-embed pass is.
-        let dir = std::env::temp_dir().join(format!(
-            "rsansible-mtls-paths-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rsansible-mtls-paths-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("client.crt");
         let key_path = dir.join("client.key");

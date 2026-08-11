@@ -37,8 +37,7 @@ async fn apt_drives_install_remove_latest() -> Result<()> {
     let inv = single_host_inventory(&container);
 
     let pb_path = examples_dir().join("apt.yaml");
-    let pb = playbook::load(&pb_path)
-        .with_context(|| format!("loading {}", pb_path.display()))?;
+    let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
     playbook::validate(&pb, Some(&inv)).context("validate")?;
     rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -68,12 +67,12 @@ async fn apt_drives_install_remove_latest() -> Result<()> {
 
     // Final scenario (#8): update precedes install in the final log.
     let final_log = read_file(&container, "/tmp/rsansible-apt-stub/log.final")?;
-    let update_pos = final_log.find("update").ok_or_else(|| {
-        anyhow!("update line missing from final log: {final_log:?}")
-    })?;
-    let install_pos = final_log.find("install -y").ok_or_else(|| {
-        anyhow!("install line missing from final log: {final_log:?}")
-    })?;
+    let update_pos = final_log
+        .find("update")
+        .ok_or_else(|| anyhow!("update line missing from final log: {final_log:?}"))?;
+    let install_pos = final_log
+        .find("install -y")
+        .ok_or_else(|| anyhow!("install line missing from final log: {final_log:?}"))?;
     assert!(
         update_pos < install_pos,
         "update must precede install in: {final_log:?}"

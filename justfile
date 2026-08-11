@@ -29,6 +29,13 @@ gen-wire:
     # checkout — keeps `cargo check` working in CI / fresh clones.
     rm -rf crates/wire-runtime
     cp -r {{gen_out}}/binschema_runtime crates/wire-runtime
+    # Both the generated file and the vendored runtime arrive formatted to
+    # binschema's taste, not ours — and both are workspace members, so
+    # `cargo fmt --all --check` (CI + the pre-commit hook) would fail on
+    # code nobody here hand-wrote. Normalising now makes regeneration
+    # idempotent: re-running gen-wire produces a byte-identical tree
+    # instead of a fresh formatting diff every time.
+    cargo fmt --all
     @echo "regenerated crates/wire/src/generated.rs + crates/wire-runtime/ — review the diff"
 
 # Build the agent for x86_64 Linux musl, stripped.
@@ -86,6 +93,15 @@ lint:
 
 fmt:
     cargo fmt --all
+
+# Point git at the tracked hooks in .githooks/ (one-time, per clone).
+#
+# Hooks can't live in .git/hooks and still be version-controlled, so they
+# live in .githooks/ and this flips core.hooksPath to match. Run once
+# after cloning.
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "core.hooksPath -> .githooks (pre-commit: cargo fmt --all --check)"
 
 # Build the documentation site (mdBook) into docs/book/.
 #

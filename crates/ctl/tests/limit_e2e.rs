@@ -110,8 +110,8 @@ async fn limit_filter_selects_only_matching_hosts() -> Result<()> {
         }
 
         let inv = three_host_inventory(&containers);
-        let pb = playbook::load(&pb_path)
-            .with_context(|| format!("loading {}", pb_path.display()))?;
+        let pb =
+            playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;
         playbook::validate(&pb, Some(&inv)).context("validate")?;
         rsansible_ctl::template::precompile_all(&pb).context("precompile")?;
 
@@ -154,8 +154,7 @@ async fn limit_filter_selects_only_matching_hosts() -> Result<()> {
             }
         }
 
-        let expected: std::collections::BTreeSet<&str> =
-            sc.expect_marked.iter().copied().collect();
+        let expected: std::collections::BTreeSet<&str> = sc.expect_marked.iter().copied().collect();
         for name in ["web1", "web2", "web3"] {
             let c = container_by_name(&containers, name);
             let present = marker_exists(c)?;
