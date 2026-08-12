@@ -23,6 +23,7 @@ pub mod pool;
 pub mod report;
 pub mod report_http;
 pub mod run_metrics;
+pub mod secrets;
 pub mod ssh;
 pub mod tags;
 pub mod template;

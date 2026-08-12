@@ -155,6 +155,11 @@ pub struct RunSpec {
     /// [`crate::report::NullReporter`] (no behaviour change) unless the caller
     /// installs one (e.g. `--report`).
     pub reporter: Arc<dyn crate::report::Reporter>,
+    /// Literal secret values decrypted out of vault files during inventory
+    /// load, redacted from diffs and failure text at the emission funnel.
+    /// Comes straight from [`crate::inventory::load_with_vars`]; defaults to
+    /// an empty registry, which is a passthrough.
+    pub secrets: Arc<crate::secrets::SecretRegistry>,
     /// CLI `--diff`. When true, module dispatches carry the diff request flag,
     /// so diffing modules (write_file / copy) ship a `{before, after, …}`
     /// payload back for changed files. Seeded onto every `HostCtx` like
@@ -195,6 +200,7 @@ impl RunSpec {
             inventory_dir: None,
             forward_mode: None,
             reporter: Arc::new(crate::report::NullReporter),
+            secrets: Arc::new(crate::secrets::SecretRegistry::new()),
             diff_mode: false,
         }
     }
@@ -259,6 +265,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         inventory_dir,
         forward_mode,
         reporter,
+        secrets,
         diff_mode,
     } = spec;
     // Plumbed through to per-task dispatch so privkey (and any future
@@ -482,6 +489,7 @@ pub async fn run(spec: RunSpec) -> Result<RunReport> {
         // Run-shared structured-report sink. Same Arc-everywhere pattern; the
         // per-task emission funnel reads it off the originating host's ctx.
         ctx.reporter = reporter.clone();
+        ctx.secrets = secrets.clone();
         ctxs.insert(name.clone(), ctx);
     }
 
@@ -8089,6 +8097,35 @@ async fn apply_per_host_result(
         conn_alive,
     } = r;
     let failed = matches!(outcome, HostTaskOutcome::Failed { .. });
+    // `no_log: true` means the task handled secrets. Everything derived from
+    // its module output — the failure reason, the file diff — is censored here,
+    // at the single funnel every sink is downstream of (stderr render, JSONL
+    // `--report`, the HTTP push to gothab, and the end-of-run recap). Censoring
+    // per-sink instead would mean each new reporter is one forgotten line away
+    // from leaking.
+    //
+    // `rc`, `duration_ms` and the ok/changed/failed status are *not* censored:
+    // they carry no module output, and blanking them would leave the operator
+    // unable to see that a secret-handling task failed at all — which is how
+    // people end up removing `no_log` to debug, exactly when they shouldn't.
+    //
+    // Underneath `no_log` sits vault redaction, for the far more common case
+    // where nobody marked the task at all. The controller rendered the file
+    // itself and still holds the values it decrypted, so any appearing
+    // literally in the output are replaced by exact match — no guessing, no
+    // false positives. Defence in depth, not a substitute: `crate::secrets`
+    // documents precisely which secrets it cannot see.
+    //
+    // Both behaviours diverge from Ansible — see ANSIBLE_COMPAT.md §14.
+    let no_log = task.no_log.unwrap_or(false);
+    let secrets = ctx.secrets.clone();
+    let censor = |text: String| {
+        if no_log {
+            crate::report::CENSORED.to_string()
+        } else {
+            secrets.redact_text(&text)
+        }
+    };
     match &outcome {
         HostTaskOutcome::Ok { changed, skipped } => {
             report.tasks_ok += 1;
@@ -8104,7 +8141,7 @@ async fn apply_per_host_result(
                 name.clone(),
                 HostOutcome::Failed {
                     task: task.name.clone(),
-                    reason: reason.clone(),
+                    reason: censor(reason.clone()),
                 },
             );
         }
@@ -8129,7 +8166,9 @@ async fn apply_per_host_result(
                 (s, None)
             }
             HostTaskOutcome::Skipped => (TaskStatus::Skipped, None),
-            HostTaskOutcome::Failed { reason, .. } => (TaskStatus::Failed, Some(reason.clone())),
+            HostTaskOutcome::Failed { reason, .. } => {
+                (TaskStatus::Failed, Some(censor(reason.clone())))
+            }
         };
         let summary = ctx.last_summary.as_ref();
         let tr = crate::report::TaskReport {
@@ -8141,7 +8180,15 @@ async fn apply_per_host_result(
             check_mode: ctx.check_mode,
             rc: summary.map(|s| s.rc),
             duration_ms: summary.map(|s| s.duration_ms),
-            diff: summary.and_then(|s| s.diff.clone()),
+            // A diff is literal file content, so `no_log` drops it outright —
+            // there is no partial form of it that is safe.
+            diff: if no_log {
+                None
+            } else {
+                summary
+                    .and_then(|s| s.diff.clone())
+                    .map(|d| ctx.secrets.redact_json_payload(&d))
+            },
             reason,
         };
         // `--diff` human output: render a unified diff to stderr for changed
@@ -11640,5 +11687,266 @@ all:
             }
             _ => panic!("expected Failed"),
         }
+    }
+
+    // ---------- secrecy at the emission funnel ----------
+    //
+    // `apply_per_host_result` is the single point every sink is downstream
+    // of — stderr, the `--report` JSONL, the HTTP push to gothab, the
+    // end-of-run recap. These tests drive it directly with a capturing
+    // reporter so they assert on the record that actually reaches a sink,
+    // rather than on the helpers underneath it. A future reporter that
+    // forgets to censor is impossible by construction; a change that moves
+    // censoring *out* of the funnel breaks these.
+
+    #[derive(Default)]
+    struct CaptureReporter {
+        tasks: std::sync::Mutex<Vec<crate::report::TaskReport>>,
+    }
+    impl crate::report::Reporter for CaptureReporter {
+        fn on_task(&self, report: &crate::report::TaskReport) {
+            self.tasks.lock().unwrap().push(report.clone());
+        }
+    }
+
+    fn empty_report() -> RunReport {
+        RunReport {
+            host_outcomes: BTreeMap::new(),
+            stopped_early: false,
+            check_mode: false,
+            tasks_changed: 0,
+            tasks_skipped: 0,
+            tasks_ok: 0,
+            timing: crate::run_metrics::RunMetricsSnapshot::default(),
+            timing_breakdown: crate::timing::TimingBreakdown::default(),
+        }
+    }
+
+    fn funnel_play() -> Play {
+        let mut pb = playbook::parse(
+            "- name: p\n  hosts: all\n  gather_facts: false\n  tasks:\n    - name: t\n      debug:\n        msg: hi\n",
+        )
+        .expect("play fixture parses");
+        pb.plays.pop().unwrap()
+    }
+
+    /// Push one already-decided per-host outcome through the funnel and
+    /// return `(emitted TaskReport, run report)`.
+    async fn funnel(
+        task: &Task,
+        outcome: HostTaskOutcome,
+        summary: Option<crate::report::TaskRunSummary>,
+        secrets: crate::secrets::SecretRegistry,
+    ) -> (crate::report::TaskReport, RunReport) {
+        let play = funnel_play();
+        let capture = Arc::new(CaptureReporter::default());
+        let mut ctx = HostCtx::new("h1".into());
+        ctx.reporter = capture.clone();
+        ctx.secrets = Arc::new(secrets);
+        ctx.last_summary = summary;
+        let r = PerHostTaskResult {
+            name: "h1".into(),
+            ctx,
+            outcome,
+            conn_alive: true,
+        };
+        let pools: Arc<BTreeMap<String, PoolHandle>> = Arc::new(BTreeMap::new());
+        let mut ctxs: BTreeMap<String, HostCtx> = BTreeMap::new();
+        let mut report = empty_report();
+        apply_per_host_result(&play, task, r, &pools, &mut ctxs, &mut report).await;
+        let emitted = capture.tasks.lock().unwrap().first().cloned();
+        (
+            emitted.expect("funnel emits exactly one TaskReport"),
+            report,
+        )
+    }
+
+    /// A realistic agent-side diff payload with `secret` inlined into the
+    /// rendered file content, as a templated vault value would appear.
+    fn diff_payload_containing(secret: &str) -> String {
+        serde_json::json!({
+            "before": "password = old\n",
+            "after": format!("password = {secret}\n"),
+            "before_header": "/etc/app.conf",
+            "after_header": "/etc/app.conf",
+        })
+        .to_string()
+    }
+
+    fn summary_with_diff(diff: Option<String>) -> Option<crate::report::TaskRunSummary> {
+        Some(crate::report::TaskRunSummary {
+            rc: 0,
+            duration_ms: 42,
+            diff,
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_log_drops_the_diff_and_censors_the_failure_reason() {
+        let mut t = plain_task(
+            "write secret",
+            TaskBody::Debug(DebugTask {
+                msg: None,
+                var: None,
+            }),
+        );
+        t.no_log = Some(true);
+        let (tr, run) = funnel(
+            &t,
+            HostTaskOutcome::Failed {
+                reason: "could not write /etc/app.conf: password = hunter2-and-more".into(),
+                register: None,
+            },
+            summary_with_diff(Some(diff_payload_containing("hunter2-and-more"))),
+            crate::secrets::SecretRegistry::new(),
+        )
+        .await;
+        assert_eq!(tr.reason.as_deref(), Some(crate::report::CENSORED));
+        assert!(
+            tr.diff.is_none(),
+            "no_log has no safe partial form of a diff"
+        );
+        // The recap line the operator sees at end-of-run goes through the
+        // same censor, not just the structured event.
+        match run.host_outcomes.get("h1") {
+            Some(HostOutcome::Failed { reason, .. }) => {
+                assert_eq!(reason, crate::report::CENSORED);
+            }
+            other => panic!("expected a failed host outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_log_still_shows_that_the_task_failed_and_how_long_it_took() {
+        // Blanking rc/duration/status too would leave the operator unable to
+        // see that a secret-handling task failed at all — which is exactly
+        // when people strip `no_log` to debug.
+        let mut t = plain_task(
+            "write secret",
+            TaskBody::Debug(DebugTask {
+                msg: None,
+                var: None,
+            }),
+        );
+        t.no_log = Some(true);
+        let (tr, _) = funnel(
+            &t,
+            HostTaskOutcome::Failed {
+                reason: "boom".into(),
+                register: None,
+            },
+            Some(crate::report::TaskRunSummary {
+                rc: 7,
+                duration_ms: 42,
+                diff: None,
+            }),
+            crate::secrets::SecretRegistry::new(),
+        )
+        .await;
+        assert_eq!(tr.status, crate::report::TaskStatus::Failed);
+        assert_eq!(tr.rc, Some(7));
+        assert_eq!(tr.duration_ms, Some(42));
+        assert_eq!(tr.task, "write secret");
+        assert_eq!(tr.host, "h1");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn vault_values_are_redacted_out_of_an_uncensored_diff() {
+        // The common case: nobody marked the task `no_log`, but the value
+        // came out of a vault file, so the controller knows it verbatim.
+        let secret = "hunter2-and-more";
+        let t = plain_task(
+            "render config",
+            TaskBody::Debug(DebugTask {
+                msg: None,
+                var: None,
+            }),
+        );
+        let (tr, _) = funnel(
+            &t,
+            HostTaskOutcome::Ok {
+                changed: true,
+                skipped: false,
+            },
+            summary_with_diff(Some(diff_payload_containing(secret))),
+            crate::secrets::SecretRegistry::from_values([secret.to_string()]),
+        )
+        .await;
+        let diff = tr.diff.expect("a non-no_log changed task keeps its diff");
+        assert!(
+            !diff.contains(secret),
+            "vault value survived into the emitted diff: {diff}"
+        );
+        assert!(
+            diff.contains(crate::secrets::REDACTED),
+            "redaction marker missing: {diff}"
+        );
+        // Redaction must not destroy the payload — downstream renders it.
+        let v: JsonValue = serde_json::from_str(&diff).expect("diff stays valid JSON");
+        assert_eq!(v["before_header"], "/etc/app.conf");
+        assert_eq!(v["before"], "password = old\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn vault_values_are_redacted_out_of_a_failure_reason() {
+        let secret = "hunter2-and-more";
+        let t = plain_task(
+            "render config",
+            TaskBody::Debug(DebugTask {
+                msg: None,
+                var: None,
+            }),
+        );
+        let (tr, run) = funnel(
+            &t,
+            HostTaskOutcome::Failed {
+                reason: format!("psql: FATAL: password authentication failed for {secret}"),
+                register: None,
+            },
+            None,
+            crate::secrets::SecretRegistry::from_values([secret.to_string()]),
+        )
+        .await;
+        let reason = tr.reason.expect("failures carry a reason");
+        assert!(!reason.contains(secret), "vault value survived: {reason}");
+        assert!(reason.starts_with("psql: FATAL:"), "context kept: {reason}");
+        match run.host_outcomes.get("h1") {
+            Some(HostOutcome::Failed { reason, .. }) => {
+                assert!(!reason.contains(secret), "vault value survived the recap")
+            }
+            other => panic!("expected a failed host outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_with_no_vault_passes_output_through_untouched() {
+        // The registry is empty for every run that used no vault file, and
+        // must then be a pure passthrough — no heuristics, no guessing.
+        let t = plain_task(
+            "render config",
+            TaskBody::Debug(DebugTask {
+                msg: None,
+                var: None,
+            }),
+        );
+        let payload = diff_payload_containing("not-actually-a-secret");
+        let (tr, _) = funnel(
+            &t,
+            HostTaskOutcome::Ok {
+                changed: true,
+                skipped: false,
+            },
+            summary_with_diff(Some(payload.clone())),
+            crate::secrets::SecretRegistry::new(),
+        )
+        .await;
+        let diff = tr.diff.expect("changed task keeps its diff");
+        assert!(diff.contains("not-actually-a-secret"));
+        let got: JsonValue = serde_json::from_str(&diff).unwrap();
+        let want: JsonValue = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            got, want,
+            "payload must be byte-equivalent modulo key order"
+        );
     }
 }

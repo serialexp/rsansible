@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::exec_ctx::yaml_to_json;
+use crate::secrets::SecretRegistry;
 use crate::vault;
 
 /// Fully-parsed inventory.
@@ -162,10 +163,18 @@ pub fn load(path: &Path) -> Result<Inventory> {
 /// `*.yml` / `*.yaml` file in it is treated as an inventory source and
 /// merged. The directory itself becomes the base for `host_vars/` /
 /// `group_vars/` discovery (matches Ansible's behavior).
+///
+/// The third return value is a [`SecretRegistry`] holding every string this
+/// call decrypted out of a vault file, for redacting diffs and failure text
+/// downstream. It is *returned* rather than taken as an optional parameter on
+/// purpose: this is the only place in the process that knows which values came
+/// from a vault, so a caller who quietly declined to pass one would silently
+/// lose redaction for the whole run. Handing it back unconditionally makes
+/// dropping it a visible `_`.
 pub fn load_with_vars(
     path: &Path,
     vault_password: Option<&str>,
-) -> Result<(Inventory, InventoryVars)> {
+) -> Result<(Inventory, InventoryVars, SecretRegistry)> {
     let raw = load_raw_root(path)?;
     let pre =
         flatten_pre_hosts(raw).with_context(|| format!("parsing inventory {}", path.display()))?;
@@ -178,17 +187,17 @@ pub fn load_with_vars(
     };
     let group_names: Vec<String> = pre.groups.keys().cloned().collect();
     let host_names: Vec<String> = pre.hosts_raw.keys().cloned().collect();
-    let vars = discover_vars_named(&base, &group_names, &host_names, vault_password).with_context(
-        || {
+    let secrets = SecretRegistry::new();
+    let vars = discover_vars_named(&base, &group_names, &host_names, vault_password, &secrets)
+        .with_context(|| {
             format!(
                 "discovering host_vars/group_vars next to {}",
                 path.display()
             )
-        },
-    )?;
+        })?;
     let inv = assemble_inventory(pre, Some(&vars))
         .with_context(|| format!("assembling inventory {}", path.display()))?;
-    Ok((inv, vars))
+    Ok((inv, vars, secrets))
 }
 
 /// Read one inventory source (file or directory) into a single RawRoot.
@@ -566,6 +575,7 @@ fn discover_vars_named(
     group_names: &[String],
     host_names: &[String],
     vault_password: Option<&str>,
+    secrets: &SecretRegistry,
 ) -> Result<InventoryVars> {
     let mut out = InventoryVars::default();
     let gv_root = base.join("group_vars");
@@ -575,18 +585,18 @@ fn discover_vars_named(
         if group == "all" {
             seen_all = true;
         }
-        if let Some(map) = load_var_target(&gv_root, group, vault_password)? {
+        if let Some(map) = load_var_target(&gv_root, group, vault_password, secrets)? {
             out.group_vars.insert(group.clone(), map);
         }
     }
     if !seen_all {
-        if let Some(map) = load_var_target(&gv_root, "all", vault_password)? {
+        if let Some(map) = load_var_target(&gv_root, "all", vault_password, secrets)? {
             out.group_vars.insert("all".to_string(), map);
         }
     }
     let hv_root = base.join("host_vars");
     for host in host_names {
-        if let Some(map) = load_var_target(&hv_root, host, vault_password)? {
+        if let Some(map) = load_var_target(&hv_root, host, vault_password, secrets)? {
             out.host_vars.insert(host.clone(), map);
         }
     }
@@ -599,6 +609,7 @@ fn load_var_target(
     root: &Path,
     name: &str,
     vault_password: Option<&str>,
+    secrets: &SecretRegistry,
 ) -> Result<Option<BTreeMap<String, JsonValue>>> {
     let dir = root.join(name);
     if dir.is_dir() {
@@ -616,7 +627,7 @@ fn load_var_target(
         files.sort();
         let mut merged: BTreeMap<String, JsonValue> = BTreeMap::new();
         for f in files {
-            let m = load_var_file(&f, vault_password)?;
+            let m = load_var_file(&f, vault_password, secrets)?;
             for (k, v) in m {
                 merged.insert(k, v);
             }
@@ -626,16 +637,24 @@ fn load_var_target(
     for ext in ["yml", "yaml"] {
         let file = root.join(format!("{name}.{ext}"));
         if file.is_file() {
-            return Ok(Some(load_var_file(&file, vault_password)?));
+            return Ok(Some(load_var_file(&file, vault_password, secrets)?));
         }
     }
     Ok(None)
 }
 
-fn load_var_file(path: &Path, vault_password: Option<&str>) -> Result<BTreeMap<String, JsonValue>> {
+fn load_var_file(
+    path: &Path,
+    vault_password: Option<&str>,
+    secrets: &SecretRegistry,
+) -> Result<BTreeMap<String, JsonValue>> {
     let raw =
         std::fs::read(path).with_context(|| format!("reading var file {}", path.display()))?;
-    let bytes: Vec<u8> = if vault::is_vault(&raw) {
+    // Provenance, not shape, is what makes this file's contents secret — and
+    // this is the only point in the process that knows it. Everything below is
+    // indistinguishable from plaintext config a few frames up the stack.
+    let was_vaulted = vault::is_vault(&raw);
+    let bytes: Vec<u8> = if was_vaulted {
         match vault_password {
             Some(pw) => vault::decrypt(&raw, pw)
                 .with_context(|| format!("decrypting vault file {}", path.display()))?,
@@ -669,7 +688,18 @@ fn load_var_file(path: &Path, vault_password: Option<&str>) -> Result<BTreeMap<S
                 path.display()
             ),
         };
-        out.insert(key, yaml_to_json(v)?);
+        let value = yaml_to_json(v)?;
+        if was_vaulted {
+            secrets.learn(&value);
+        }
+        out.insert(key, value);
+    }
+    if was_vaulted {
+        tracing::debug!(
+            file = %path.display(),
+            secrets = secrets.len(),
+            "learned vault values for diff redaction",
+        );
     }
     Ok(out)
 }
@@ -975,7 +1005,7 @@ all:
         fs::create_dir_all(&hv).unwrap();
         fs::write(hv.join("h1.yml"), "instance_marker: alpha\n").unwrap();
 
-        let (_inv, vars) = load_with_vars(&inv_path, None).unwrap();
+        let (_inv, vars, _secrets) = load_with_vars(&inv_path, None).unwrap();
         assert_eq!(
             vars.group_vars["all"]
                 .get("region")
@@ -1015,24 +1045,95 @@ all:
         .unwrap();
         let gv = dir.path().join("group_vars").join("web");
         fs::create_dir_all(&gv).unwrap();
-        let ct = crate::vault::encrypt_for_test(b"secret: hunter2\n", "pw", &[7u8; 32]);
+        let ct = crate::vault::encrypt_for_test(b"secret: hunter2-and-more\n", "pw", &[7u8; 32]);
         fs::write(gv.join("vault.yml"), &ct).unwrap();
 
         // Without password — skipped, no entry.
-        let (_inv, vars_no) = load_with_vars(&inv_path, None).unwrap();
+        let (_inv, vars_no, secrets_no) = load_with_vars(&inv_path, None).unwrap();
         assert!(vars_no
             .group_vars
             .get("web")
             .map(|m| m.is_empty())
             .unwrap_or(true));
+        // Nothing was decrypted, so nothing is known to be secret.
+        assert!(secrets_no.is_empty());
 
         // With password — decrypted.
-        let (_inv, vars_yes) = load_with_vars(&inv_path, Some("pw")).unwrap();
+        let (_inv, vars_yes, secrets_yes) = load_with_vars(&inv_path, Some("pw")).unwrap();
         assert_eq!(
             vars_yes.group_vars["web"]
                 .get("secret")
                 .and_then(|v| v.as_str()),
-            Some("hunter2")
+            Some("hunter2-and-more")
         );
+        // ...and the value is now redactable wherever it later shows up.
+        assert_eq!(secrets_yes.values(), vec!["hunter2-and-more"]);
+        assert!(!secrets_yes
+            .redact_text("password = hunter2-and-more")
+            .contains("hunter2-and-more"));
+    }
+
+    #[test]
+    fn plaintext_var_files_teach_the_registry_nothing() {
+        // Provenance is the whole signal: an identical value sitting in a
+        // plaintext group_vars file is, as far as this code can tell, ordinary
+        // config. Documented in `crate::secrets` as a known gap.
+        let dir = tempfile::tempdir().unwrap();
+        let inv_path = dir.path().join("inv.yml");
+        fs::write(
+            &inv_path,
+            r#"
+all:
+  vars:
+    ansible_user: deploy
+  children:
+    web:
+      hosts:
+        h1: { ansible_host: 1.1.1.1 }
+"#,
+        )
+        .unwrap();
+        let gv = dir.path().join("group_vars");
+        fs::create_dir_all(&gv).unwrap();
+        fs::write(gv.join("web.yml"), "secret: hunter2-and-more\n").unwrap();
+
+        let (_inv, vars, secrets) = load_with_vars(&inv_path, Some("pw")).unwrap();
+        assert_eq!(
+            vars.group_vars["web"]
+                .get("secret")
+                .and_then(|v| v.as_str()),
+            Some("hunter2-and-more")
+        );
+        assert!(secrets.is_empty());
+    }
+
+    #[test]
+    fn short_vault_values_are_below_the_redaction_floor() {
+        // Pinning the documented gap so it can't change silently: a vault value
+        // shorter than `secrets::MIN_SECRET_LEN` is not learned, because
+        // substring-redacting something like "prod" would corrupt every diff
+        // that mentions it. See `crate::secrets::MIN_SECRET_LEN`.
+        let dir = tempfile::tempdir().unwrap();
+        let inv_path = dir.path().join("inv.yml");
+        fs::write(
+            &inv_path,
+            r#"
+all:
+  vars:
+    ansible_user: deploy
+  children:
+    web:
+      hosts:
+        h1: { ansible_host: 1.1.1.1 }
+"#,
+        )
+        .unwrap();
+        let gv = dir.path().join("group_vars");
+        fs::create_dir_all(&gv).unwrap();
+        let ct = crate::vault::encrypt_for_test(b"env: prod\npw: short\n", "pw", &[7u8; 32]);
+        fs::write(gv.join("all.yml"), &ct).unwrap();
+
+        let (_inv, _vars, secrets) = load_with_vars(&inv_path, Some("pw")).unwrap();
+        assert!(secrets.is_empty());
     }
 }

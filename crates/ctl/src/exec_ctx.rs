@@ -142,6 +142,11 @@ pub struct HostCtx {
     /// The per-task emission funnel (`apply_per_host_result`) reads it off the
     /// originating host's ctx.
     pub reporter: Arc<dyn crate::report::Reporter>,
+    /// Run-shared registry of literal secret values decrypted out of vault
+    /// files, consulted at the emission funnel to redact diffs and failure
+    /// text. Same Arc-everywhere pattern; empty (a no-op passthrough) when the
+    /// run used no vault, so `HostCtx::new` stands alone in tests.
+    pub secrets: Arc<crate::secrets::SecretRegistry>,
     /// Summary of the most recent task body run on this host, reset to `None`
     /// at each task's entry and set on completion. Read at the emission funnel
     /// to enrich the [`crate::report::TaskReport`] with rc/duration/diff that
@@ -175,6 +180,7 @@ impl HostCtx {
             run_metrics: Arc::new(RunMetrics::default()),
             timing: crate::timing::TaskTimingAggregator::new(),
             reporter: Arc::new(crate::report::NullReporter),
+            secrets: Arc::new(crate::secrets::SecretRegistry::new()),
             last_summary: None,
         }
     }

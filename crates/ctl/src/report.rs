@@ -62,7 +62,18 @@ pub struct TaskRunSummary {
     pub diff: Option<String>,
 }
 
+/// Stand-in for any text a `no_log: true` task produced.
+///
+/// Deliberately the same string gothab's own ansible callback plugin emits, so
+/// a run reported by either client reads identically in the deployments UI.
+pub const CENSORED: &str = "censored (no_log)";
+
 /// One structured (host, task) result event.
+///
+/// Every field here crosses a trust boundary — to a JSONL file, to gothab, or
+/// to the terminal — so a `no_log: true` task's `diff` and `reason` are blanked
+/// at the emission funnel (`apply_per_host_result`) rather than at each sink.
+/// One chokepoint means a future reporter cannot forget to censor.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskReport {
     /// The `name:` of the play this task ran under.

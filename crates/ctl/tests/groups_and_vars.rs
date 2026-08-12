@@ -86,7 +86,8 @@ async fn three_container_groups_and_vars_run() -> Result<()> {
     // borrow only the on-disk vars. So load both: throw away the on-disk
     // inv, keep the vars.
     let dummy_inv_path = inv_dir.join("groups_and_vars.inventory.yml");
-    let (_disk_inv, inv_vars) = inventory::load_with_vars(&dummy_inv_path, Some(&vault_pw))?;
+    let (_disk_inv, inv_vars, _secrets) =
+        inventory::load_with_vars(&dummy_inv_path, Some(&vault_pw))?;
 
     let pb_path = inv_dir.join("groups_and_vars.yaml");
     let pb = playbook::load(&pb_path).with_context(|| format!("loading {}", pb_path.display()))?;

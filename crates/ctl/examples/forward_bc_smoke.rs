@@ -33,12 +33,13 @@ async fn main() -> anyhow::Result<()> {
 
     let user = std::env::var("USER").unwrap_or_else(|_| "bart".into());
     let inv_path = std::path::PathBuf::from("/tmp/forward-bc-smoke-inv.yml");
-    let (inv, inv_vars) = inventory::load_with_vars(&inv_path, None)?;
+    let (inv, inv_vars, vault_secrets) = inventory::load_with_vars(&inv_path, None)?;
     let args = ForwardArgs {
         playbook_path: "/tmp/forward-bc-smoke-pb.yml".into(),
         inventory_path: inv_path,
         inventory: inv,
         inventory_vars: inv_vars,
+        vault_secrets: vault_secrets.values(),
         ctl_binary_path: "target/release/rsansible".into(),
         agent_binary_path: "target/release/rsansible-agent".into(),
         forwarder: ForwarderTarget {

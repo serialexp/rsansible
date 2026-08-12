@@ -82,6 +82,17 @@ pub struct WorkflowPayload {
     /// laptop. Includes plaintext values from any `vault.yml` we kept
     /// off the forwarder's disk.
     pub inventory_vars: InventoryVars,
+    /// Literal vault-decrypted values, for redacting diffs and failure text
+    /// on the forwarder (see [`crate::secrets`]).
+    ///
+    /// This has to ride along: the laptop does the decryption and ships the
+    /// resolved vars, so the forwarder never calls `load_with_vars` and would
+    /// otherwise start with an empty registry — silently losing redaction for
+    /// exactly the runs most likely to be reported to gothab. Carrying it adds
+    /// no exposure this payload does not already have; `inventory_vars` right
+    /// above contains the same plaintext.
+    #[serde(default)]
+    pub vault_secrets: Vec<String>,
     /// `--extra-vars` (`-e`) overrides from the CLI. Becomes the
     /// `extra_vars` seed on every `HostCtx`.
     #[serde(default)]
@@ -200,6 +211,12 @@ pub async fn cmd_remote_run(
 
     let mut spec = RunSpec::new(inv, pb, agent_bytes);
     spec.inventory_vars = inv_vars;
+    // The forwarder never runs the inventory loader (the laptop already
+    // decrypted and shipped the vars), so without this the registry would be
+    // empty here and remote runs would report unredacted diffs.
+    spec.secrets = std::sync::Arc::new(crate::secrets::SecretRegistry::from_values(
+        payload.vault_secrets.clone(),
+    ));
     spec.max_concurrent_hosts = payload.max_concurrent_hosts.max(1);
     spec.extra_vars = payload.extra_vars;
     spec.tags = payload.tags;
@@ -476,6 +493,10 @@ pub struct ForwardArgs {
     pub inventory: Inventory,
     /// Laptop-resolved on-disk var files. Same logic as `inventory`.
     pub inventory_vars: InventoryVars,
+    /// Literal vault-decrypted values learned during inventory load, forwarded
+    /// so the remote orchestrator can redact them. See
+    /// [`WorkflowPayload::vault_secrets`].
+    pub vault_secrets: Vec<String>,
     /// Path to a musl-static `rsansible` binary on the local machine.
     /// Shipped to the forwarder and exec'd there as `remote-run`. Falls
     /// back to argv[0] when the operator's running rsansible binary is
@@ -647,6 +668,7 @@ pub async fn run_forwarded(mut args: ForwardArgs) -> Result<RunReport> {
         inventory_relative_path: inv_rel,
         inventory: args.inventory,
         inventory_vars: args.inventory_vars,
+        vault_secrets: args.vault_secrets,
         extra_vars: args.extra_vars,
         tags: args.tags,
         skip_tags: args.skip_tags,
@@ -1310,6 +1332,7 @@ mod tests {
             inventory_relative_path: "inventory/inventory.yml".into(),
             inventory: inv,
             inventory_vars: inv_vars,
+            vault_secrets: vec!["hunter2-and-then-some".into()],
             extra_vars: {
                 let mut m = BTreeMap::new();
                 m.insert(

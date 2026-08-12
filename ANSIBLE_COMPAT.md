@@ -627,6 +627,58 @@ matching a loaded `loopback_target`.
 
 ---
 
+## 14. `no_log:` hides output but keeps rc/duration, and vault values are redacted everywhere
+
+| Aspect | Ansible | rsansible |
+|---|---|---|
+| What `no_log: true` hides | The whole result dict, replaced by `{"censored": "the output has been hidden…"}` | The failure reason and the file diff, replaced by `censored (no_log)` |
+| What survives `no_log:` | `changed` only | `changed`, ok/changed/failed status, `rc`, `duration_ms` |
+| Vault values in `--diff` output | Printed verbatim — a templated vault secret lands in the terminal and in any callback | Replaced by `<redacted: vault value>` by exact match, whether or not the task set `no_log:` |
+| Where censoring happens | Per-callback, at display time | Once, at the emission funnel every sink is downstream of |
+
+**Why keep rc/duration/status visible.** Ansible's censored result is
+opaque enough that the usual debugging move is to *remove* `no_log:`
+and re-run — precisely when you shouldn't. None of rc, duration, or
+the ok/changed/failed verdict carries module output, so blanking them
+buys no secrecy and costs the operator the ability to see that a
+secret-handling task failed at all. The diff has no such safe partial
+form (it is literally file content), so `no_log:` drops it outright
+rather than truncating it.
+
+**Why redact vault values regardless of `no_log:`.** `no_log:` is
+opt-in per task, and the failure mode is silent: nobody notices the
+missing flag until the password is already in a log. rsansible renders
+templates controller-side, so at report time it still holds every
+string it decrypted out of a vault file, and can replace occurrences by
+**exact match** — no pattern matching, no guessing, no false positives.
+That is a strict superset of what a callback plugin consuming rendered
+output could do, and it is why the redaction lives here rather than in
+a downstream reporter.
+
+It is defence in depth, not a substitute for `no_log:`. It cannot see
+a secret that never came from a vault file, one shorter than
+`secrets::MIN_SECRET_LEN`, or one the module transformed (hashed,
+base64'd, split) before echoing it. `crates/ctl/src/secrets.rs`
+documents the full list of blind spots.
+
+### Code pointers
+
+- `crates/ctl/src/orchestrator.rs` — `apply_per_host_result`, the
+  single funnel: stderr render, `--report` JSONL, the HTTP push to
+  gothab, and the end-of-run recap are all downstream of it. Censoring
+  per-sink instead would leave each new reporter one forgotten line
+  away from leaking.
+- `crates/ctl/src/secrets.rs` — `SecretRegistry`: longest-first
+  substring redaction for plain text, and a JSON-parsing pass for diff
+  payloads (a substring pass would miss a secret containing a quote or
+  newline, since JSON escaping changes its bytes).
+- `crates/ctl/src/inventory.rs` — `load_with_vars` learns values only
+  from files that were actually vault-encrypted.
+- `crates/ctl/src/forward.rs` — `WorkflowPayload.vault_secrets` carries
+  the registry to the remote controller, so forwarded runs redact too.
+
+---
+
 ## When you add a new divergence
 
 1. **Document it here first.** Add a `## N. <one-line summary>`

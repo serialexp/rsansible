@@ -401,7 +401,7 @@ async fn cmd_validate(
         .map(|p| inventory::load_with_vars(p, vault_pw.as_deref()))
         .transpose()
         .with_context(|| format!("loading inventory {:?}", inv_path))?;
-    let inv = inv_pair.as_ref().map(|(inv, _)| inv);
+    let inv = inv_pair.as_ref().map(|(inv, _, _)| inv);
     playbook::validate(&pb, inv)?;
     template::precompile_all(&pb)?;
     println!(
@@ -549,7 +549,7 @@ async fn cmd_run(
     let pb = playbook::load(&pb_path)
         .with_context(|| format!("loading playbook {}", pb_path.display()))?;
     let vault_pw = vault::resolve_password_from(vault_pw_path.as_deref())?;
-    let (inv, inv_vars) = inventory::load_with_vars(&inv_path, vault_pw.as_deref())
+    let (inv, inv_vars, vault_secrets) = inventory::load_with_vars(&inv_path, vault_pw.as_deref())
         .with_context(|| format!("loading inventory {}", inv_path.display()))?;
     playbook::validate(&pb, Some(&inv))?;
     template::precompile_all(&pb)?;
@@ -581,6 +581,7 @@ async fn cmd_run(
             agent_binary_path,
             inv,
             inv_vars,
+            vault_secrets.values(),
             forward_host,
             extra,
             tags,
@@ -656,6 +657,18 @@ async fn cmd_run(
             Arc::new(rsansible_ctl::report_http::MultiReporter::new(reporters))
         };
     }
+    // Vault values learned during inventory load, so the emission funnel can
+    // redact them out of diffs and failure text before any sink sees them.
+    // Wired unconditionally rather than only under `--diff`/`--report`: an
+    // empty registry is a passthrough, and gating it would mean the redaction
+    // quietly failed to apply on whichever output path someone added next.
+    if !vault_secrets.is_empty() {
+        eprintln!(
+            "vault: {} value(s) will be redacted from diffs and failure output",
+            vault_secrets.len()
+        );
+    }
+    spec.secrets = Arc::new(vault_secrets);
     let report = orchestrator::run(spec)
         .await
         .context("orchestrator failed")?;
@@ -763,6 +776,9 @@ async fn cmd_run_forwarded(
     agent_binary_path: PathBuf,
     inv: rsansible_ctl::inventory::Inventory,
     inv_vars: rsansible_ctl::inventory::InventoryVars,
+    // Literal vault values the laptop decrypted. Forwarded so the remote
+    // orchestrator redacts them too — it never runs the inventory loader.
+    vault_secrets: Vec<String>,
     cli_forward_host: Option<String>,
     extra_vars_parsed: std::collections::BTreeMap<String, serde_json::Value>,
     tags: Vec<String>,
@@ -805,6 +821,7 @@ async fn cmd_run_forwarded(
         inventory_path: inv_path,
         inventory: inv,
         inventory_vars: inv_vars,
+        vault_secrets,
         ctl_binary_path: ctl_self_path,
         agent_binary_path,
         forwarder,

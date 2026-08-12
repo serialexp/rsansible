@@ -240,15 +240,24 @@ pub struct Task {
     /// **Parsed but not yet honored** — see CLAUDE.md "Retry loop"
     /// section, rule 7, for the integration point.
     pub failed_when: Option<String>,
-    /// `no_log: true|false` — when true, the task's args and output
-    /// must not be logged (used for secrets).
+    /// `no_log: true|false` — when true, the task handled secrets and
+    /// nothing derived from its module output may leave the process.
     ///
-    /// **Parsed but not yet honored** — the orchestrator logs every
-    /// task uniformly. A load-time warning fires if any task sets
-    /// `no_log: true` so users running with secrets are not silently
-    /// surprised. Tracked separately from changed_when/failed_when
-    /// because the cost of getting it wrong is leaking secrets, not
-    /// just an incorrect changed flag.
+    /// Honored at the single reporting funnel
+    /// (`orchestrator::apply_per_host_result`), which every sink is
+    /// downstream of: the `--diff` stderr render, the JSONL `--report`
+    /// file, the HTTP push to gothab, and the end-of-run recap. The
+    /// task's `diff` is dropped entirely (a diff is literal file
+    /// content — there is no partial form of it that is safe) and its
+    /// failure `reason` becomes [`crate::report::CENSORED`].
+    ///
+    /// Deliberately *not* censored: `rc`, `duration_ms` and the
+    /// ok/changed/failed status. Those carry no module output, and
+    /// hiding them would leave an operator unable to see that a
+    /// secret-handling task failed at all — which is how people end up
+    /// deleting `no_log` to debug, at exactly the wrong moment. Ansible
+    /// hides those too; see ANSIBLE_COMPAT.md §14 for the rationale, and
+    /// for the vault-value redaction that runs underneath this flag.
     pub no_log: Option<bool>,
     /// `vars:` — per-task variable scope. Rendered against the host's
     /// view immediately before the body dispatches; each rendered value
