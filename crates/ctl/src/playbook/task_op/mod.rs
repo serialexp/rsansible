@@ -610,6 +610,7 @@ const BODY_KEYS: &[&str] = &[
     "set_fact",
     "import_tasks",
     "include_role",
+    "import_role",
     "meta",
     "block",
 ];
@@ -893,9 +894,10 @@ impl<'de> Deserialize<'de> for Task {
                 )));
             }
         };
-        // `vars:` only has meaning on `include_role:` today. We strip it
-        // here so it doesn't trigger the unknown-key check, then enforce
-        // the include_role-only restriction once the body kind is known.
+        // `vars:` on a static role directive (`include_role:` or
+        // `import_role:`) becomes the role invocation's variable overrides.
+        // Strip it before the unknown-key check, then route it once the body
+        // kind is known.
         let task_vars: Option<BTreeMap<String, serde_yaml::Value>> = match map.remove("vars") {
             None => None,
             Some(serde_yaml::Value::Mapping(m)) => {
@@ -1225,13 +1227,15 @@ impl<'de> Deserialize<'de> for Task {
                 let path: String = serde_yaml::from_value(body_yaml).map_err(D::Error::custom)?;
                 TaskBody::ImportTasks(PathBuf::from(path))
             }
-            "include_role" => {
-                // include_role body is itself a mapping: { name, tasks_from? }.
+            directive @ ("include_role" | "import_role") => {
+                // Both directives use the same statically-expanded supported
+                // subset: { name, tasks_from? }. Keeping one representation
+                // ensures parsing aliases cannot drift into separate loaders.
                 let mut body_map = match body_yaml {
                     serde_yaml::Value::Mapping(m) => m,
                     other => {
                         return Err(D::Error::custom(format!(
-                            "task {name:?}: include_role body must be a mapping, got: {other:?}"
+                            "task {name:?}: {directive} body must be a mapping, got: {other:?}"
                         )));
                     }
                 };
@@ -1239,12 +1243,12 @@ impl<'de> Deserialize<'de> for Task {
                     Some(serde_yaml::Value::String(s)) => s,
                     Some(other) => {
                         return Err(D::Error::custom(format!(
-                            "task {name:?}: include_role.name must be a string, got: {other:?}"
+                            "task {name:?}: {directive}.name must be a string, got: {other:?}"
                         )));
                     }
                     None => {
                         return Err(D::Error::custom(format!(
-                            "task {name:?}: include_role missing required `name`"
+                            "task {name:?}: {directive} missing required `name`"
                         )));
                     }
                 };
@@ -1253,7 +1257,7 @@ impl<'de> Deserialize<'de> for Task {
                     Some(serde_yaml::Value::String(s)) => s,
                     Some(other) => {
                         return Err(D::Error::custom(format!(
-                            "task {name:?}: include_role.tasks_from must be a string, got: {other:?}"
+                            "task {name:?}: {directive}.tasks_from must be a string, got: {other:?}"
                         )));
                     }
                 };
@@ -1267,7 +1271,7 @@ impl<'de> Deserialize<'de> for Task {
                         })
                         .collect();
                     return Err(D::Error::custom(format!(
-                        "task {name:?}: include_role: unknown field(s) {unknown:?}; \
+                        "task {name:?}: {directive}: unknown field(s) {unknown:?}; \
                          expected [name, tasks_from]"
                     )));
                 }
@@ -1331,8 +1335,8 @@ impl<'de> Deserialize<'de> for Task {
             _ => unreachable!("body key not in BODY_KEYS dispatch"),
         };
 
-        // `vars:` on an `include_role:` is consumed by the include_role
-        // arm above (becomes `IncludeRoleSpec.vars`). For every other
+        // `vars:` on a static role directive is consumed by the role arm
+        // above (becomes `IncludeRoleSpec.vars`). For every other
         // body kind, it becomes the task-level scoped vars layered into
         // `ctx.task_vars` at dispatch time.
         let task_level_vars: BTreeMap<String, serde_yaml::Value> =
@@ -2575,6 +2579,27 @@ include_role:
     }
 
     #[test]
+    fn parses_import_role_minimal_and_fqcn() {
+        for directive in ["import_role", "ansible.builtin.import_role"] {
+            let t = parse_task(&format!(
+                r#"
+name: import role
+{directive}:
+  name: blackbox-probes
+"#
+            ));
+            match t.body {
+                TaskBody::IncludeRole(ir) => {
+                    assert_eq!(ir.name, "blackbox-probes");
+                    assert_eq!(ir.tasks_from, "main");
+                    assert!(ir.vars.is_empty());
+                }
+                other => panic!("{directive}: got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn parses_include_role_with_tasks_from_and_vars() {
         let t = parse_task(
             r#"
@@ -2614,6 +2639,53 @@ include_role:
         .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("name"), "got: {msg}");
+    }
+
+    #[test]
+    fn import_role_parses_tasks_from_and_vars() {
+        let t = parse_task(
+            r#"
+name: install probes
+import_role:
+  name: blackbox-probes
+  tasks_from: public-paths
+vars:
+  probe_group: production
+"#,
+        );
+        match t.body {
+            TaskBody::IncludeRole(ir) => {
+                assert_eq!(ir.name, "blackbox-probes");
+                assert_eq!(ir.tasks_from, "public-paths");
+                assert_eq!(
+                    ir.vars.get("probe_group").and_then(|v| v.as_str()),
+                    Some("production")
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(t.vars.is_empty());
+    }
+
+    #[test]
+    fn import_role_rejects_missing_name_and_unknown_field() {
+        for yaml in [
+            r#"
+name: missing
+import_role:
+  tasks_from: setup
+"#,
+            r#"
+name: unknown
+import_role:
+  name: web
+  defaults_from: production
+"#,
+        ] {
+            let err = try_parse_task(yaml).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("import_role"), "got: {msg}");
+        }
     }
 
     #[test]

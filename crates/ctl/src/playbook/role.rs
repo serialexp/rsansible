@@ -111,9 +111,10 @@ pub fn flatten_playbook(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Expand every `TaskBody::IncludeRole` in the playbook in place.
+/// Expand every static role directive in the playbook in place.
 ///
-/// For each include site:
+/// `include_role:` and `import_role:` share `TaskBody::IncludeRole` because
+/// rsansible resolves both before host execution. For each directive site:
 ///   - resolve `roles/<name>/` against `base_dir`
 ///   - merge `defaults/main.yml` into `play.role_defaults`
 ///     (later-wins, same as the `roles:` flatten)
@@ -150,7 +151,7 @@ pub fn expand_include_roles(pb: &mut Playbook, base_dir: &Path) -> Result<()> {
             &mut visited,
             0,
         )
-        .with_context(|| format!("expanding include_role in play {:?}", play.name))?;
+        .with_context(|| format!("expanding static role directives in play {:?}", play.name))?;
         play.tasks = expanded;
     }
     Ok(())
@@ -1029,6 +1030,50 @@ port: 80
         assert_eq!(pb.plays[0].tasks[0].tags, vec!["outer"]);
         assert_eq!(pb.plays[0].tasks[1].name, "own");
         assert_eq!(pb.plays[0].tasks[1].tags, vec!["existing", "outer"]);
+    }
+
+    #[test]
+    fn import_role_expands_in_place_with_tags_when_and_tasks_from() {
+        let dir = TempDir::new().unwrap();
+        let role = dir.path().join("roles/blackbox-probes");
+        write(
+            &role.join("tasks/public-paths.yml"),
+            r#"
+- name: install probe
+  tags: [role]
+  shell: "echo probe"
+"#,
+        );
+        let pb_path = dir.path().join("playbook.yml");
+        write(
+            &pb_path,
+            r#"
+- name: p
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: before
+      shell: "echo before"
+    - name: import probes
+      import_role:
+        name: blackbox-probes
+        tasks_from: public-paths
+      tags: [outer]
+      when: probes_enabled
+    - name: after
+      shell: "echo after"
+"#,
+        );
+
+        let pb = playbook::load(&pb_path).unwrap();
+        let tasks = &pb.plays[0].tasks;
+        assert_eq!(
+            tasks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["before", "install probe", "after"]
+        );
+        assert_eq!(tasks[1].tags, vec!["outer", "role"]);
+        assert_eq!(tasks[1].when.as_deref(), Some("probes_enabled"));
+        assert_eq!(tasks[1].role_dir.as_deref(), Some(role.as_path()));
     }
 
     #[test]
