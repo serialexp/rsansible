@@ -3765,16 +3765,50 @@ async fn run_op_body(
             if exec.done.exit_code == 0 {
                 let changed = exec.done.changed != 0;
                 let skipped = exec.done.skipped != 0;
-                info!(
-                    host = %label,
-                    task = %task.name,
-                    seq,
-                    exit = exec.done.exit_code,
-                    changed,
-                    skipped,
-                    took_ms,
-                    "ok",
-                );
+                // `changed` here is only what the MODULE reported. A
+                // `changed_when:` / `failed_when:` on this task can still
+                // flip it — that happens in apply_changed_failed_when,
+                // after this dispatch returns — and the run summary
+                // counts the post-override value.
+                //
+                // Emitting the raw flag as `changed=` regardless meant
+                // the per-task lines and the summary disagreed: a run
+                // whose summary said `changed=0` still had a dozen
+                // `changed=true` task lines above it, every one of them
+                // a task that declares `changed_when: false`. Grepping
+                // the log for what a run actually did gave the wrong
+                // answer, which is exactly what a log is for.
+                //
+                // So `changed=` is emitted exactly once per task, by
+                // whoever holds the final answer: here when nothing can
+                // override it, and by apply_changed_failed_when when
+                // something can. The field name below deliberately does
+                // not end in `changed` so that grepping for `changed=`
+                // cannot match this provisional line.
+                let override_pending = task.changed_when.is_some() || task.failed_when.is_some();
+                if override_pending {
+                    info!(
+                        host = %label,
+                        task = %task.name,
+                        seq,
+                        exit = exec.done.exit_code,
+                        module_reported_change = changed,
+                        skipped,
+                        took_ms,
+                        "ok (change flag pending changed_when)",
+                    );
+                } else {
+                    info!(
+                        host = %label,
+                        task = %task.name,
+                        seq,
+                        exit = exec.done.exit_code,
+                        changed,
+                        skipped,
+                        took_ms,
+                        "ok",
+                    );
+                }
                 // Surface per-task check-mode markers on stderr so the
                 // operator can see at a glance what happened. Real runs
                 // stay quiet — the existing summary line carries the count.
@@ -4491,7 +4525,19 @@ fn run_assert_body(
     env: &Environment<'static>,
     world: &WorldVars,
 ) -> BodyResult {
-    let view = build_template_ctx(ctx, world);
+    // build_eval_ctx, not build_template_ctx: `that:` expressions are
+    // evaluated natively, so a var whose value is a template must be
+    // expanded first. See build_eval_ctx for what this cost us.
+    let view = match build_eval_ctx(env, ctx, world) {
+        Ok(v) => v,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("assert: resolving variables: {e}"),
+                register: None,
+                conn_alive: true,
+            }
+        }
+    };
     for (i, expr) in a.that.iter().enumerate() {
         let prepared = crate::template::prepare_jinja_source(expr);
         match env.compile_expression(&prepared) {
@@ -7490,6 +7536,54 @@ fn resolve_strings_in_value(
     Ok(())
 }
 
+/// Build the per-host view for **native expression evaluation** —
+/// `when:`, `until:`, `assert.that:`, `changed_when:`, `failed_when:`
+/// and `loop:` — with vars-of-vars already expanded.
+///
+/// Every one of those clauses is handed to `compile_expression` and
+/// evaluated as data, not rendered to a string. That distinction is the
+/// whole reason this function exists. `render_str` expands a variable
+/// whose *value* is itself a template before rendering; native
+/// evaluation has no such step, so a bare `build_template_ctx` view
+/// hands the evaluator the stored text — braces and all.
+///
+/// Concretely, with
+///
+/// ```yaml
+/// pgbackrest_archive_push_wrapper: /usr/local/bin/pgbackrest-archive-push
+/// pgbackrest_archive_command: "{{ pgbackrest_archive_push_wrapper }} %p"
+/// ```
+///
+/// `debug:` printed `/usr/local/bin/pgbackrest-archive-push %p` while
+/// `when: pgbackrest_archive_command == '/usr/local/bin/pgbackrest-archive-push %p'`
+/// compared against the literal `{{ pgbackrest_archive_push_wrapper }} %p`
+/// and was false. That is a silent wrong answer in both directions: a
+/// guarded task skipped when it should run, and a task guarded OFF with
+/// `!=` running anyway. An `assert` failed on a correctly configured
+/// production cluster while its own `fail_msg` — which goes through the
+/// rendering path — printed the two sides as identical strings.
+///
+/// The same class was already found and fixed on the rendering side
+/// (see the vmalert note in [`render_str`]); the evaluation side simply
+/// never got it. Route every native-eval site through here so there is
+/// one place to be right rather than five.
+///
+/// Cost: this is called once per clause per task, never per field, and
+/// `resolve_view_var_templates` returns `Owned` whenever the view
+/// actually contains templates — which is the case on any real
+/// inventory, making the `into_owned` free exactly when it matters. On
+/// a view with no templates at all it costs one extra map clone, of the
+/// same order as the clone-per-layer `build_template_ctx` already did
+/// to produce the view in the first place.
+fn build_eval_ctx(
+    env: &Environment<'static>,
+    ctx: &HostCtx,
+    world: &WorldVars,
+) -> Result<BTreeMap<String, JsonValue>> {
+    let view = build_template_ctx(ctx, world);
+    Ok(resolve_view_var_templates(env, &view)?.into_owned())
+}
+
 fn eval_when(
     env: &Environment<'static>,
     expr: Option<&str>,
@@ -7501,7 +7595,7 @@ fn eval_when(
     let compiled = env
         .compile_expression(&prepared)
         .map_err(|e| anyhow!("compile: {e}"))?;
-    let view = build_template_ctx(ctx, world);
+    let view = build_eval_ctx(env, ctx, world)?;
     let val = compiled.eval(&view).map_err(|e| anyhow!("eval: {e}"))?;
     Ok(val.is_true())
 }
@@ -7572,7 +7666,22 @@ fn apply_changed_failed_when(
         BodyResult::Failed { register, .. } => register.clone(),
     };
 
-    let mut view = build_template_ctx(ctx, world);
+    // build_eval_ctx, not build_template_ctx: changed_when/failed_when
+    // are evaluated natively. The register overlay below is applied
+    // AFTER resolution on purpose — register fields are results captured
+    // from a host (command stdout, file contents), not playbook-authored
+    // vars, so they must never be re-interpreted as Jinja. A stdout that
+    // happens to contain `{{ ... }}` is data, not a template.
+    let mut view = match build_eval_ctx(env, ctx, world) {
+        Ok(v) => v,
+        Err(e) => {
+            return BodyResult::Failed {
+                reason: format!("resolving variables for changed_when/failed_when: {e}"),
+                register: body_register,
+                conn_alive: true,
+            }
+        }
+    };
     if let Some(rv) = &body_register {
         let rv_json = rv.to_json();
         // Overlay the body's register under its user-declared name
@@ -7671,7 +7780,7 @@ fn apply_changed_failed_when(
     };
 
     // ---- Step 2: changed_when (changed-flag override) ----
-    if let Some(expr) = task.changed_when.as_deref() {
+    let result = if let Some(expr) = task.changed_when.as_deref() {
         match eval_bool_with_view(env, expr, &view) {
             Ok(c) => match result {
                 BodyResult::Ok {
@@ -7702,7 +7811,30 @@ fn apply_changed_failed_when(
         }
     } else {
         result
-    }
+    };
+
+    // This function is only reached when the task declares
+    // changed_when: and/or failed_when: (see the early return at the
+    // top), which is exactly the condition under which the dispatch
+    // site suppressed its own `changed=` field. So emit the
+    // authoritative one here — including when only `failed_when:` was
+    // set, which does not touch the flag but did suppress it upstream.
+    // Exactly one `changed=` per task, always the value the run summary
+    // will count.
+    let final_changed = match &result {
+        BodyResult::Ok { changed, .. } => *changed,
+        BodyResult::Failed { register, .. } => {
+            register.as_ref().map(|r| r.changed).unwrap_or(false)
+        }
+    };
+    info!(
+        host = %ctx.host_name,
+        task = %task.name,
+        changed = final_changed,
+        "change flag settled by changed_when/failed_when",
+    );
+
+    result
 }
 
 fn resolve_loop_items(
@@ -7733,7 +7865,11 @@ fn resolve_loop_items(
                 .collect::<Result<Vec<_>>>()
         }
         LoopSpec::Expr(s) => {
-            let view = build_template_ctx(ctx, world);
+            // build_eval_ctx: this path compiles the loop source as an
+            // expression to keep list types intact, so it needs the same
+            // var-of-var expansion as when:/assert:. The Items arm above
+            // goes through render_str, which already resolves.
+            let view = build_eval_ctx(env, ctx, world)?;
             // Render as a template, then re-parse the resulting string
             // as JSON-ish. This handles `{{ list }}`, where minijinja
             // renders a Python-style repr; safer is to compile as an
@@ -9664,6 +9800,125 @@ mod tests {
                 assert_eq!(e.env.get("LEVEL").map(String::as_str), Some("debug"));
             }
             _ => panic!(),
+        }
+    }
+
+    /// Build a ctx holding the two-level indirection that exposed this
+    /// bug in production: a leaf literal, and a var whose *value* is a
+    /// template referencing it.
+    fn ctx_with_var_of_var() -> HostCtx {
+        let mut ctx = HostCtx::new("h".into());
+        ctx.inventory_vars
+            .insert("wrapper".into(), serde_json::json!("/usr/local/bin/push"));
+        ctx.inventory_vars
+            .insert("archive_command".into(), serde_json::json!("{{ wrapper }} %p"));
+        ctx
+    }
+
+    /// A var whose value is a template must compare as its expanded
+    /// value inside `assert.that:`, not as the raw `{{ ... }}` text.
+    ///
+    /// Pre-fix this assertion failed against a correctly configured
+    /// cluster, and the `fail_msg` — which renders, so it DOES expand —
+    /// printed the expected and actual sides as identical strings.
+    #[test]
+    fn assert_expands_vars_whose_values_are_templates() {
+        let env = template::make_env();
+        let ctx = ctx_with_var_of_var();
+        let a = AssertTask {
+            that: vec!["archive_command == '/usr/local/bin/push %p'".into()],
+            fail_msg: None,
+        };
+        let r = run_assert_body(&a, &ctx, &env, &WorldVars::default());
+        let reason = match &r {
+            BodyResult::Failed { reason, .. } => reason.clone(),
+            _ => String::new(),
+        };
+        assert!(
+            matches!(r, BodyResult::Ok { .. }),
+            "assert compared against unexpanded template source: {reason}"
+        );
+    }
+
+    /// The same hole in `when:`, which is worse because it fails
+    /// silently in BOTH directions — a guarded task skipped when it
+    /// should run, and a task guarded off with `!=` running anyway.
+    #[test]
+    fn when_expands_vars_whose_values_are_templates() {
+        let env = template::make_env();
+        let ctx = ctx_with_var_of_var();
+        let world = WorldVars::default();
+
+        assert!(
+            eval_when(
+                &env,
+                Some("archive_command == '/usr/local/bin/push %p'"),
+                &ctx,
+                &world
+            )
+            .unwrap(),
+            "a task guarded by == on an indirection var was silently skipped"
+        );
+        assert!(
+            !eval_when(
+                &env,
+                Some("archive_command != '/usr/local/bin/push %p'"),
+                &ctx,
+                &world
+            )
+            .unwrap(),
+            "a task guarded OFF by != on an indirection var ran anyway"
+        );
+    }
+
+    /// Pins the property this fix is actually about: the evaluating
+    /// clauses and the rendering clauses must agree about what a
+    /// variable's value IS. Disagreement is what made an assert fail
+    /// while its own fail_msg printed both sides as identical.
+    ///
+    /// Note what this test does NOT claim. Register values — remote
+    /// command output — are expanded here too, because they sit in the
+    /// same view. Ansible marks host output `unsafe` precisely so it is
+    /// never templated; rsansible has no such marking, so stdout
+    /// containing `{{ ... }}` is expanded on BOTH paths. That is a
+    /// pre-existing gap on the rendering side, not something introduced
+    /// here, and closing it means adding an unsafe-marking concept
+    /// rather than special-casing this function. Asserting the two
+    /// paths agree keeps that gap visible in one place instead of
+    /// letting eval and render drift apart again.
+    #[test]
+    fn eval_and_render_agree_on_variable_values() {
+        let env = template::make_env();
+        let mut ctx = ctx_with_var_of_var();
+        ctx.registers.insert(
+            "r".into(),
+            RegisterValue {
+                stdout: "{{ wrapper }}".into(),
+                ..RegisterValue::default()
+            },
+        );
+        let world = WorldVars::default();
+
+        // What the rendering path believes each value is.
+        let view = build_template_ctx(&ctx, &world);
+        let rendered_cmd = render_str(&env, "{{ archive_command }}", &view).unwrap();
+        let rendered_stdout = render_str(&env, "{{ r.stdout }}", &view).unwrap();
+
+        // The evaluating path must reach the same conclusion.
+        for (expr_value, label) in [
+            (rendered_cmd.as_str(), "archive_command"),
+            (rendered_stdout.as_str(), "r.stdout"),
+        ] {
+            let lhs = if label == "archive_command" {
+                "archive_command"
+            } else {
+                "r.stdout"
+            };
+            let expr = format!("{lhs} == {expr_value:?}");
+            assert!(
+                eval_when(&env, Some(&expr), &ctx, &world).unwrap(),
+                "eval and render disagree about {label}: render said {expr_value:?}"
+            );
         }
     }
 
