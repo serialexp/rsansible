@@ -113,8 +113,7 @@ fn current_hostname(bins: &Bins) -> Result<String, HostnameError> {
             }
         }
     }
-    let out = Command::new(&bins.hostname)
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(&bins.hostname, &[] as &[&str])
         .map_err(|e| HostnameError::Spawn(format!("spawn {}: {e}", bins.hostname)))?;
     if !out.status.success() {
         return Err(HostnameError::Io(format!(
@@ -131,9 +130,10 @@ fn set_hostname(bins: &Bins, name: &str) -> Result<(), HostnameError> {
     // Prefer hostnamectl — single call handles /etc/hostname + kernel
     // name + (where supported) pretty/static names.
     if which(&bins.hostnamectl) {
-        let out = Command::new(&bins.hostnamectl)
-            .args(["set-hostname", name])
-            .output()
+        let out = crate::modules::spawn_with_etxtbsy_retry(
+            &bins.hostnamectl,
+            &["set-hostname", name],
+        )
             .map_err(|e| HostnameError::Spawn(format!("spawn {}: {e}", bins.hostnamectl)))?;
         if !out.status.success() {
             return Err(HostnameError::Io(format!(
@@ -149,9 +149,7 @@ fn set_hostname(bins: &Bins, name: &str) -> Result<(), HostnameError> {
     // the `hostname` binary so the change takes effect immediately.
     std::fs::write(&bins.etc_hostname, format!("{name}\n"))
         .map_err(|e| HostnameError::Io(format!("write {}: {e}", bins.etc_hostname)))?;
-    let out = Command::new(&bins.hostname)
-        .arg(name)
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(&bins.hostname, &[name])
         .map_err(|e| HostnameError::Spawn(format!("spawn {}: {e}", bins.hostname)))?;
     if !out.status.success() {
         return Err(HostnameError::Io(format!(

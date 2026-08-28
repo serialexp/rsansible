@@ -18,7 +18,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
 
 use rsansible_wire::generated::OpAuthorizedKeyOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
@@ -281,9 +280,7 @@ fn compute_desired(
 }
 
 fn resolve_home(getent: &str, user: &str) -> Result<std::path::PathBuf, AuthorizedKeyError> {
-    let out = Command::new(getent)
-        .args(["passwd", user])
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(getent, &["passwd", user])
         .map_err(|e| AuthorizedKeyError::Spawn(format!("spawn {getent}: {e}")))?;
     match out.status.code() {
         Some(0) => {}
@@ -321,10 +318,12 @@ fn resolve_home(getent: &str, user: &str) -> Result<std::path::PathBuf, Authoriz
 fn chown(chown_bin: &str, path: &Path, user: &str) -> Result<(), AuthorizedKeyError> {
     // `chown user: <path>` sets owner=user and group=user's primary.
     let arg = format!("{user}:");
-    let out = Command::new(chown_bin)
-        .arg(&arg)
-        .arg(path)
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(
+        chown_bin,
+        // OsStr, not &str: `path` is a real filesystem path and must
+        // survive not being valid UTF-8.
+        &[std::ffi::OsStr::new(arg.as_str()), path.as_os_str()],
+    )
         .map_err(|e| AuthorizedKeyError::Spawn(format!("spawn {chown_bin}: {e}")))?;
     if !out.status.success() {
         return Err(AuthorizedKeyError::Io(format!(

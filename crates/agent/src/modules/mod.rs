@@ -131,9 +131,15 @@ pub async fn emit_error(ctx: &Context, seq: u32, code: u8, message: impl Into<St
 /// rewrite+rename ordering + a 5-80ms backoff is sufficient to clear
 /// it. Always doing the retry is harmless: the slow path is gated on a
 /// specific errno that production never hits.
-pub(crate) fn spawn_with_etxtbsy_retry(
+///
+/// `args` is generic over `AsRef<OsStr>` so callers can pass `&Path`
+/// arguments (filenames) without a lossy `to_string_lossy` round trip
+/// through `&str`, which would corrupt a path that isn't valid UTF-8.
+/// Pass `&[] as &[&str]` for the no-argument case — a bare `&[]` cannot
+/// infer the element type.
+pub(crate) fn spawn_with_etxtbsy_retry<S: AsRef<std::ffi::OsStr>>(
     bin: &str,
-    args: &[&str],
+    args: &[S],
 ) -> std::io::Result<std::process::Output> {
     use std::io::ErrorKind;
     use std::process::Command;

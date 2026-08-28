@@ -23,7 +23,6 @@
 //! See ANSIBLE_COMPAT.md §13 for the full rationale.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use rsansible_wire::generated::OpModprobeOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
@@ -154,15 +153,17 @@ fn is_loaded(bins: &Bins, name: &str) -> Result<bool, ModprobeError> {
 }
 
 fn load(bins: &Bins, name: &str, params: &str) -> Result<(), ModprobeError> {
-    let mut cmd = Command::new(&bins.modprobe);
-    cmd.arg(name);
     // Parameters are space-separated `key=value` tokens; pass each as its
     // own argv entry so we never hand a shell anything to re-split.
-    for p in params.split_whitespace() {
-        cmd.arg(p);
-    }
-    let out = cmd
-        .output()
+    let mut args: Vec<&str> = vec![name];
+    args.extend(params.split_whitespace());
+    // Routed through spawn_with_etxtbsy_retry rather than
+    // Command::output(): the unit tests point `bins` at stub scripts
+    // they just wrote, and under parallel cargo test another test's
+    // fork can inherit the still-open write fd, so execve reports the
+    // file busy. Production execs real system binaries and never takes
+    // the retry path.
+    let out = crate::modules::spawn_with_etxtbsy_retry(&bins.modprobe, &args)
         .map_err(|e| ModprobeError::Spawn(format!("spawn {}: {e}", bins.modprobe)))?;
     if !out.status.success() {
         return Err(ModprobeError::Io(format!(
@@ -176,9 +177,7 @@ fn load(bins: &Bins, name: &str, params: &str) -> Result<(), ModprobeError> {
 }
 
 fn unload(bins: &Bins, name: &str) -> Result<(), ModprobeError> {
-    let out = Command::new(&bins.modprobe)
-        .args(["-r", name])
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(&bins.modprobe, &["-r", name])
         .map_err(|e| ModprobeError::Spawn(format!("spawn {}: {e}", bins.modprobe)))?;
     if !out.status.success() {
         // The common failure is "Module ... is in use" — surface the

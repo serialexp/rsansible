@@ -108,10 +108,10 @@ fn current_timezone(bins: &Bins) -> Option<String> {
     // symlink target, which timedatectl writes anyway. /etc/timezone
     // is Debian/Ubuntu-specific so use it only as a last resort.
     if which(&bins.timedatectl) {
-        if let Ok(out) = Command::new(&bins.timedatectl)
-            .args(["show", "--property=Timezone", "--value"])
-            .output()
-        {
+        if let Ok(out) = crate::modules::spawn_with_etxtbsy_retry(
+            &bins.timedatectl,
+            &["show", "--property=Timezone", "--value"],
+        ) {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !s.is_empty() {
@@ -157,9 +157,10 @@ fn set_timezone(bins: &Bins, name: &str) -> Result<(), TimezoneError> {
     // Prefer timedatectl — single call handles /etc/localtime,
     // /etc/timezone (where present), and the kernel time-of-day state.
     if which(&bins.timedatectl) {
-        let out = Command::new(&bins.timedatectl)
-            .args(["set-timezone", name])
-            .output()
+        let out = crate::modules::spawn_with_etxtbsy_retry(
+            &bins.timedatectl,
+            &["set-timezone", name],
+        )
             .map_err(|e| TimezoneError::Spawn(format!("spawn {}: {e}", bins.timedatectl)))?;
         if !out.status.success() {
             return Err(TimezoneError::Io(format!(

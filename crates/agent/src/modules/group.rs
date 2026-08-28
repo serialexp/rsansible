@@ -1,7 +1,6 @@
 //! `OpGroup` — unix group management via `groupadd` / `groupdel`,
 //! idempotent via a `getent group <name>` probe.
 
-use std::process::Command;
 
 use rsansible_wire::generated::OpGroupOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
@@ -102,9 +101,7 @@ pub(crate) fn apply_with_bins(
 
 fn probe_exists(getent: &str, name: &str) -> Result<bool, GroupError> {
     // `getent group <name>` exits 0 if found, 2 if not found, other on error.
-    let out = Command::new(getent)
-        .args(["group", name])
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(getent, &["group", name])
         .map_err(|e| GroupError::Spawn(format!("spawn {getent}: {e}")))?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -120,9 +117,7 @@ fn probe_exists(getent: &str, name: &str) -> Result<bool, GroupError> {
 }
 
 fn run_cmd(bin: &str, args: &[&str]) -> Result<(), GroupError> {
-    let out = Command::new(bin)
-        .args(args)
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(bin, args)
         .map_err(|e| GroupError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
         return Err(GroupError::Io(format!(

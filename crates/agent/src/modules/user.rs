@@ -8,7 +8,6 @@
 //! run at all. Matches Ansible's contract: re-runs of an unchanged
 //! playbook report no change.
 
-use std::process::Command;
 
 use rsansible_wire::generated::OpUserOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
@@ -147,9 +146,7 @@ pub(crate) fn apply_with_bins(
 
 fn probe(bins: &Bins, name: &str) -> Result<Option<Existing>, UserError> {
     // `getent passwd <name>` → name:x:uid:gid:gecos:home:shell
-    let out = Command::new(&bins.getent)
-        .args(["passwd", name])
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(&bins.getent, &["passwd", name])
         .map_err(|e| UserError::Spawn(format!("spawn {}: {e}", bins.getent)))?;
     match out.status.code() {
         Some(0) => {}
@@ -185,9 +182,7 @@ fn probe(bins: &Bins, name: &str) -> Result<Option<Existing>, UserError> {
     let shell = parts[6].to_string();
 
     // Resolve gid → primary group name.
-    let primary_group = match Command::new(&bins.getent)
-        .args(["group", &gid])
-        .output()
+    let primary_group = match crate::modules::spawn_with_etxtbsy_retry(&bins.getent, &["group", &gid])
         .map_err(|e| UserError::Spawn(format!("spawn {}: {e}", bins.getent)))?
     {
         out if out.status.success() => String::from_utf8_lossy(&out.stdout)
@@ -202,9 +197,7 @@ fn probe(bins: &Bins, name: &str) -> Result<Option<Existing>, UserError> {
     };
 
     // `id -nG <user>` → space-separated group names (primary first).
-    let id_out = Command::new(&bins.id)
-        .args(["-nG", name])
-        .output()
+    let id_out = crate::modules::spawn_with_etxtbsy_retry(&bins.id, &["-nG", name])
         .map_err(|e| UserError::Spawn(format!("spawn {}: {e}", bins.id)))?;
     if !id_out.status.success() {
         return Err(UserError::Io(format!(
@@ -307,9 +300,7 @@ fn compute_usermod_args(op: &OpUserOutput, existing: &Existing) -> Vec<String> {
 }
 
 fn run_cmd(bin: &str, args: &[&str]) -> Result<(), UserError> {
-    let out = Command::new(bin)
-        .args(args)
-        .output()
+    let out = crate::modules::spawn_with_etxtbsy_retry(bin, args)
         .map_err(|e| UserError::Spawn(format!("spawn {bin} {args:?}: {e}")))?;
     if !out.status.success() {
         return Err(UserError::Io(format!(

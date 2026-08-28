@@ -37,7 +37,6 @@
 //!     idempotent enough).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rsansible_wire::generated::OpPackageOutput;
 
@@ -230,9 +229,13 @@ fn create_venv(bins: &Bins, venv: &str, command: &str) -> Result<(), PackageErro
     };
     let bin = argv[0].clone();
     let rest: Vec<&str> = argv[1..].iter().map(|s| s.as_str()).collect();
-    let out = Command::new(&bin)
-        .args(&rest)
-        .output()
+    // spawn_with_etxtbsy_retry, not Command::output(): the unit tests
+    // exec stub `python`/`pip` scripts they just wrote, and under
+    // parallel cargo test another test's fork can inherit the still-open
+    // write fd, so execve reports the file busy. Same reasoning as the
+    // systemd/ufw/apt/getent modules, which already route through this
+    // helper; production execs real interpreters and never retries.
+    let out = crate::modules::spawn_with_etxtbsy_retry(&bin, &rest)
         .map_err(|e| PackageError::Spawn(format!("spawn {bin}: {e}")))?;
     if !out.status.success() {
         return Err(PackageError::Io(format!(
@@ -249,10 +252,11 @@ fn create_venv(bins: &Bins, venv: &str, command: &str) -> Result<(), PackageErro
 /// "WARNING: Package(s) not found" on stderr). Other failures bubble.
 fn pip_show_version(inv: &PipInvocation, name: &str) -> Result<Option<String>, PackageError> {
     let (bin, args) = inv.argv("show", &[name.to_string()]);
-    let out = Command::new(&bin)
-        .args(args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .output()
-        .map_err(|e| PackageError::Spawn(format!("spawn {bin}: {e}")))?;
+    let out = crate::modules::spawn_with_etxtbsy_retry(
+        &bin,
+        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    )
+    .map_err(|e| PackageError::Spawn(format!("spawn {bin}: {e}")))?;
     if !out.status.success() {
         // Not installed → exit 1 with empty stdout. Treat as "missing"
         // rather than an error; install path will handle it.
@@ -269,10 +273,11 @@ fn pip_show_version(inv: &PipInvocation, name: &str) -> Result<Option<String>, P
 
 fn run_pip(inv: &PipInvocation, subcmd: &str, args: &[String]) -> Result<(), PackageError> {
     let (bin, full_args) = inv.argv(subcmd, args);
-    let out = Command::new(&bin)
-        .args(full_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .output()
-        .map_err(|e| PackageError::Spawn(format!("spawn {bin}: {e}")))?;
+    let out = crate::modules::spawn_with_etxtbsy_retry(
+        &bin,
+        &full_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    )
+    .map_err(|e| PackageError::Spawn(format!("spawn {bin}: {e}")))?;
     if !out.status.success() {
         return Err(PackageError::Io(format!(
             "{bin} {full_args:?} failed ({:?}): stderr={:?}",

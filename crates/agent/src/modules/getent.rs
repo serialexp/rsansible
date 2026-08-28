@@ -29,7 +29,6 @@
 //!   3 — `enumeration not supported` (we treat as BAD_REQUEST)
 //!   other — surfaced as IO with stderr attached.
 
-use std::process::Command;
 
 use rsansible_wire::generated::OpGetentOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
@@ -94,9 +93,13 @@ pub(crate) fn apply(op: &OpGetentOutput) -> Result<Value, GetentError> {
 pub(crate) fn apply_with_bin(getent: &str, op: &OpGetentOutput) -> Result<Value, GetentError> {
     let split = resolve_split(&op.database, &op.split)?;
 
-    let out = Command::new(getent)
-        .args([&op.database, &op.key])
-        .output()
+    // spawn_with_etxtbsy_retry, not Command::output(): the unit tests
+    // exec a `#!/bin/sh` stub they just wrote, and under parallel cargo
+    // test another test's fork can inherit the still-open write fd,
+    // making execve report the file busy. Same reasoning as systemd/
+    // ufw/apt, which already route through this helper. Production
+    // execs `getent` from PATH and never takes the retry path.
+    let out = super::spawn_with_etxtbsy_retry(getent, &[&op.database, &op.key])
         .map_err(|e| GetentError::Spawn(format!("spawn {getent}: {e}")))?;
 
     match out.status.code() {
