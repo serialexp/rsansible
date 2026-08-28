@@ -77,6 +77,12 @@
       become_user: root
 
     # ── 1. SELECT (read-only) ──────────────────────────────────────
+    # Deliberately does NOT set `autocommit`. The default is false, so
+    # this is the wrapped BEGIN/query/COMMIT path — the one that used to
+    # return zero rows for every read, because the trailing COMMIT's
+    # CommandComplete overwrote the rows the SELECT had just produced.
+    # Adding `autocommit: yes` here would make the task pass while
+    # testing the path that never had the bug. Leave it off.
     - name: select numeric expression
       postgresql_query:
         query: "SELECT 42 AS answer, 'hello'::text AS greeting"

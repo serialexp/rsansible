@@ -243,12 +243,26 @@ async fn execute_simple(client: &Client, query: &str, autocommit: bool) -> Resul
         .await
         .map_err(|e| format!("postgres error: {}", format_pg_err(&e)))?;
 
-    let mut rows = Vec::new();
-    let mut statusmessage = String::new();
-    // simple_query returns a flat list; we only surface the LAST
-    // statement's rows (matches Ansible's "single-statement is the
-    // primary use case" pattern). If a BEGIN/COMMIT wrapper is added
-    // we naturally skip those CommandComplete entries.
+    // Accumulate one entry per statement the server completed, in
+    // order, instead of folding into a single "last seen" slot as we go.
+    //
+    // The fold was wrong whenever we added the BEGIN/COMMIT wrapper
+    // above, and wrong in the silent direction. `simple_query` returns a
+    // flat message list covering ALL statements, so a wrapped SELECT
+    // produces CommandComplete for BEGIN, then for the SELECT, then for
+    // COMMIT. Taking the rows on every CommandComplete meant the
+    // SELECT's rows were collected correctly and then immediately
+    // overwritten by COMMIT's — which has no RowDescription, so it
+    // replaced them with an empty vec and set statusmessage to "OK 0".
+    // Every read query returned `query_result: []`, `rowcount: 0`, rc=0:
+    // a successful task with no data. The old comment here claimed the
+    // wrapper's entries were "naturally skipped"; nothing skipped them.
+    //
+    // That shape is dangerous because it cannot fail loudly. A playbook
+    // asserting on the result sees empty strings and either fails while
+    // blaming the database, or — with a laxer assertion — passes while
+    // checking nothing at all.
+    let mut statements: Vec<(Vec<Map<String, Value>>, String)> = Vec::new();
     let mut current_columns: Vec<String> = Vec::new();
     let mut current_rows: Vec<Map<String, Value>> = Vec::new();
     for msg in messages {
@@ -274,23 +288,51 @@ async fn execute_simple(client: &Client, query: &str, autocommit: bool) -> Resul
                 // u64 count. Synthesise a tag from what we know:
                 // SELECT N when this result set had columns, OK N
                 // otherwise (DML / DDL).
-                statusmessage = if !current_columns.is_empty() {
+                let statusmessage = if !current_columns.is_empty() {
                     format!("SELECT {}", current_rows.len())
                 } else {
                     format!("OK {n}")
                 };
-                // Treat each CommandComplete as the end of a result set;
-                // the LAST one becomes the final answer (matches the
-                // single-statement common case + ignores BEGIN/COMMIT
-                // wrappers we added).
-                rows = std::mem::take(&mut current_rows);
+                statements.push((std::mem::take(&mut current_rows), statusmessage));
                 current_columns.clear();
             }
             _ => {}
         }
     }
 
+    let (rows, statusmessage) = pick_user_statement(statements, autocommit);
+
     Ok(envelope_query(rows, statusmessage))
+}
+
+/// Pick the statement whose result the caller actually asked for, out
+/// of every statement the server reported.
+///
+/// Split out of [`execute_simple`] so the wrapper-stripping decision is
+/// testable without a live server: `SimpleQueryMessage` is opaque and
+/// cannot be constructed in a unit test, but this — the part that was
+/// wrong — is just data.
+///
+/// The wrapper's statements are dropped **by position**, not by
+/// inspecting their contents. We know exactly what was prepended and
+/// appended, so the first and last entries are ours and everything
+/// between them is the caller's. Deciding from content instead (say,
+/// "skip entries that had no columns") would also throw away a caller's
+/// trailing `UPDATE`, which is a legitimate answer.
+fn pick_user_statement(
+    mut statements: Vec<(Vec<Map<String, Value>>, String)>,
+    autocommit: bool,
+) -> (Vec<Map<String, Value>>, String) {
+    if !autocommit {
+        statements.pop(); // our COMMIT
+        if !statements.is_empty() {
+            statements.remove(0); // our BEGIN
+        }
+    }
+    // The LAST remaining statement is the answer, matching Ansible's
+    // "a single statement is the primary use case" behaviour while
+    // still doing something defensible for a multi-statement query.
+    statements.pop().unwrap_or_default()
 }
 
 /// Execute a query WITH parameters via the typed `query` path. Types
@@ -764,6 +806,78 @@ fn whoami_for_uid(uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the per-statement shape `execute_simple` accumulates:
+    /// `(rows, statusmessage)`, one entry per CommandComplete.
+    fn stmt(tag: &str, rows: usize) -> (Vec<Map<String, Value>>, String) {
+        let rows = (0..rows)
+            .map(|i| {
+                let mut m = Map::new();
+                m.insert("n".into(), Value::from(i as i64));
+                m
+            })
+            .collect();
+        (rows, tag.to_string())
+    }
+
+    /// The bug: a wrapped SELECT reported zero rows because the
+    /// trailing COMMIT's CommandComplete overwrote the rows the SELECT
+    /// had just produced. Every read query returned an empty
+    /// `query_result` with rc=0 — success, no data, no error.
+    #[test]
+    fn wrapped_select_keeps_its_rows_not_the_commits() {
+        let statements = vec![stmt("OK 0", 0), stmt("SELECT 2", 2), stmt("OK 0", 0)];
+        let (rows, status) = pick_user_statement(statements, /*autocommit=*/ false);
+        assert_eq!(rows.len(), 2, "COMMIT's empty result must not win");
+        assert_eq!(status, "SELECT 2");
+    }
+
+    /// A SELECT that legitimately matches nothing must stay
+    /// distinguishable from the bug above: zero rows, but the SELECT's
+    /// own status tag rather than the COMMIT's `OK 0`.
+    #[test]
+    fn wrapped_select_with_no_matches_reports_the_selects_tag() {
+        let statements = vec![stmt("OK 0", 0), stmt("SELECT 0", 0), stmt("OK 0", 0)];
+        let (rows, status) = pick_user_statement(statements, false);
+        assert!(rows.is_empty());
+        assert_eq!(status, "SELECT 0");
+    }
+
+    /// With `autocommit: true` nothing was wrapped, so no statement
+    /// belongs to us and the caller's only statement is the answer.
+    #[test]
+    fn autocommit_keeps_the_only_statement() {
+        let statements = vec![stmt("SELECT 3", 3)];
+        let (rows, status) = pick_user_statement(statements, true);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(status, "SELECT 3");
+    }
+
+    /// Multi-statement queries answer with the LAST caller statement —
+    /// and the wrapper must not shift which one that is.
+    #[test]
+    fn multi_statement_answers_with_the_last_caller_statement() {
+        let statements = vec![
+            stmt("OK 0", 0),     // BEGIN
+            stmt("SELECT 5", 5), // caller
+            stmt("OK 1", 0),     // caller's trailing UPDATE
+            stmt("OK 0", 0),     // COMMIT
+        ];
+        let (rows, status) = pick_user_statement(statements, false);
+        assert!(rows.is_empty(), "the UPDATE returned no rows");
+        assert_eq!(status, "OK 1", "a trailing DML statement is a real answer");
+    }
+
+    /// Degenerate input (server returned fewer statements than the
+    /// wrapper implies) must not panic or underflow.
+    #[test]
+    fn wrapper_stripping_survives_short_message_lists() {
+        assert_eq!(pick_user_statement(vec![], false), (vec![], String::new()));
+        assert_eq!(
+            pick_user_statement(vec![stmt("OK 0", 0)], false),
+            (vec![], String::new())
+        );
+    }
 
     #[test]
     fn create_ext_sql_basic() {
