@@ -3266,6 +3266,76 @@ async fn run_body_with_retries(
 
 // ---------- body kinds ----------
 
+/// Emit the per-task outcome line for a composite op.
+///
+/// The generic dispatch path logs `ok ... changed=` once per task from a
+/// single place; composites return before reaching it, so they need
+/// their own emission or they simply never appear. Same rules as the
+/// generic path: a task carrying `changed_when:`/`failed_when:` gets the
+/// provisional line under a *different* field name, because the
+/// authoritative `changed=` for those comes later from
+/// `apply_changed_failed_when` and two lines claiming to be the answer
+/// is the thing we are trying not to do.
+///
+/// No `seq`: a composite has no single wire op to number — its
+/// sub-operations each take their own from the same counter, and they
+/// are already logged individually.
+///
+/// Failures are left to the caller, which records the host outcome and
+/// prints the failing task and reason in the run summary.
+fn log_composite_outcome(
+    task: &Task,
+    ctx: &HostCtx,
+    result: &BodyResult,
+    took: std::time::Duration,
+) {
+    let BodyResult::Ok {
+        changed, skipped, ..
+    } = result
+    else {
+        return;
+    };
+    let took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+    if task.changed_when.is_some() || task.failed_when.is_some() {
+        info!(
+            host = %ctx.host_name,
+            task = %task.name,
+            exit = 0,
+            module_reported_change = *changed,
+            skipped = *skipped,
+            took_ms,
+            "ok (change flag pending changed_when)",
+        );
+    } else {
+        info!(
+            host = %ctx.host_name,
+            task = %task.name,
+            exit = 0,
+            changed = *changed,
+            skipped = *skipped,
+            took_ms,
+            "ok",
+        );
+    }
+    // Check-mode markers go to stderr for the same reason they do on the
+    // generic path: `--check` is read for its per-task verdicts, and a
+    // composite silently omitting its own is the same gap in miniature.
+    if task.check_mode.unwrap_or(ctx.check_mode) {
+        let marker = if *skipped {
+            "[CHECK]"
+        } else if *changed {
+            "[WOULD CHANGE]"
+        } else {
+            "[CHECK OK]"
+        };
+        eprintln!(
+            "  {marker} {host}: {name}",
+            host = ctx.host_name,
+            name = task.name
+        );
+    }
+}
+
 async fn run_op_body(
     task: &Task,
     op: &TaskOp,
@@ -3429,29 +3499,40 @@ async fn run_op_body(
     // We intercept BEFORE `become_::apply` (no argv to wrap) and
     // BEFORE `to_wire_op` (which deliberately errors for these
     // variants — see task_op.rs's to_wire_op match arms).
-    match &rendered {
+    //
+    // Each of them returns from here, which means none of them ever
+    // reaches the generic dispatch site's `ok ... changed=` line further
+    // down. That gap is why `postgresql_user` tasks that really did
+    // alter a role appeared in the run summary's changed count and
+    // nowhere else: the operator got a number with nothing to attribute
+    // it to, and grepping the log for `changed=true` — the documented
+    // way to find out what a run did — returned nothing at all. So the
+    // outcome is logged here, on the way out, keeping the invariant of
+    // exactly one `changed=` per task.
+    let composite_started = Instant::now();
+    let composite = match &rendered {
         TaskOp::OpenSslPrivkey(p) => {
-            return run_privkey_composite(task, p, target_conn, ctx, next_seq).await;
+            Some(run_privkey_composite(task, p, target_conn, ctx, next_seq).await)
         }
         TaskOp::OpenSslCsrPipe(c) => {
-            return synth_csr_pipe(c, ctx, target_conn, next_seq, task).await;
+            Some(synth_csr_pipe(c, ctx, target_conn, next_seq, task).await)
         }
-        TaskOp::X509CertificatePipe(c) => {
-            return synth_cert_pipe(c);
-        }
-        TaskOp::Tempfile(t) => {
-            return synth_tempfile(t);
-        }
+        TaskOp::X509CertificatePipe(c) => Some(synth_cert_pipe(c)),
+        TaskOp::Tempfile(t) => Some(synth_tempfile(t)),
         TaskOp::PostgresqlUser(u) => {
-            return run_postgresql_user_composite(task, u, target_conn, ctx, next_seq).await;
+            Some(run_postgresql_user_composite(task, u, target_conn, ctx, next_seq).await)
         }
         TaskOp::PostgresqlDb(d) => {
-            return run_postgresql_db_composite(task, d, target_conn, ctx, next_seq).await;
+            Some(run_postgresql_db_composite(task, d, target_conn, ctx, next_seq).await)
         }
         TaskOp::PostgresqlMembership(m) => {
-            return run_postgresql_membership_composite(task, m, target_conn, ctx, next_seq).await;
+            Some(run_postgresql_membership_composite(task, m, target_conn, ctx, next_seq).await)
         }
-        _ => {}
+        _ => None,
+    };
+    if let Some(result) = composite {
+        log_composite_outcome(task, ctx, &result, composite_started.elapsed());
+        return result;
     }
     // `become:` is honored at the transport layer now — the task's
     // wire op is dispatched against the pool slot keyed by its
@@ -12034,6 +12115,123 @@ all:
             duration_ms: 42,
             diff,
         })
+    }
+
+    /// Runs `f` with a subscriber whose output we keep, so tests can
+    /// assert on what an operator would actually see in the log rather
+    /// than on an internal flag that may or may not reach them.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Shared(buf.clone());
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn composite_ok(changed: bool) -> BodyResult {
+        BodyResult::Ok {
+            register: RegisterValue::default(),
+            changed,
+            skipped: false,
+        }
+    }
+
+    /// Composite ops (postgresql_user, openssl_privatekey, …) return
+    /// before the generic dispatch site, so without their own emission
+    /// they land in the run summary's changed count with no line to
+    /// attribute it to — a number the operator cannot chase.
+    #[test]
+    fn a_composite_ok_emits_exactly_one_changed_line() {
+        let out = capture_logs(|| {
+            let t = plain_task(
+                "Create Postgres login role",
+                TaskBody::Debug(DebugTask {
+                    msg: None,
+                    var: None,
+                }),
+            );
+            let ctx = HostCtx::new("db-1".into());
+            log_composite_outcome(
+                &t,
+                &ctx,
+                &composite_ok(true),
+                std::time::Duration::from_millis(7),
+            );
+        });
+        assert!(out.contains("changed=true"), "out={out:?}");
+        assert_eq!(out.matches("changed=").count(), 1, "out={out:?}");
+        assert!(out.contains("Create Postgres login role"), "out={out:?}");
+        assert!(out.contains("host=db-1"), "out={out:?}");
+    }
+
+    /// A composite carrying `changed_when:` must NOT print `changed=`
+    /// here — the authoritative value comes later from
+    /// `apply_changed_failed_when`, and two lines both claiming to be
+    /// the answer is the bug this whole convention exists to avoid.
+    #[test]
+    fn a_composite_with_changed_when_leaves_the_flag_to_the_override() {
+        let out = capture_logs(|| {
+            let mut t = plain_task(
+                "probe something",
+                TaskBody::Debug(DebugTask {
+                    msg: None,
+                    var: None,
+                }),
+            );
+            t.changed_when = Some("false".into());
+            let ctx = HostCtx::new("db-1".into());
+            log_composite_outcome(
+                &t,
+                &ctx,
+                &composite_ok(true),
+                std::time::Duration::from_millis(1),
+            );
+        });
+        assert!(
+            !out.contains("changed="),
+            "the provisional line must not be greppable as the answer: out={out:?}"
+        );
+        assert!(out.contains("module_reported_change=true"), "out={out:?}");
+    }
+
+    /// An unchanged composite still logs, so "this task ran and did
+    /// nothing" is visible rather than indistinguishable from "this task
+    /// never ran".
+    #[test]
+    fn an_unchanged_composite_still_logs() {
+        let out = capture_logs(|| {
+            let t = plain_task(
+                "role already correct",
+                TaskBody::Debug(DebugTask {
+                    msg: None,
+                    var: None,
+                }),
+            );
+            let ctx = HostCtx::new("db-2".into());
+            log_composite_outcome(
+                &t,
+                &ctx,
+                &composite_ok(false),
+                std::time::Duration::from_millis(0),
+            );
+        });
+        assert!(out.contains("changed=false"), "out={out:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
