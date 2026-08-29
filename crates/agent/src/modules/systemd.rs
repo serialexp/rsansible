@@ -117,8 +117,27 @@ fn apply(bin: &str, op: &OpSystemdOutput, check_mode: bool) -> Result<bool, Syst
 
     if op.daemon_reload != 0 {
         do_mutate(&["daemon-reload"])?;
-        // daemon-reload itself counts as changed per Ansible.
-        changed = true;
+        // Deliberately does NOT set `changed`. The comment here used to
+        // claim daemon-reload "counts as changed per Ansible"; Ansible's
+        // systemd module does the opposite — it runs the reload and
+        // leaves `result['changed']` alone, so only an actual
+        // enable/mask/state transition marks the task changed
+        // (lib/ansible/modules/systemd_service.py, "Run daemon-reload
+        // first, if requested").
+        //
+        // The distinction is not pedantic. `daemon_reload: true` is
+        // idiomatic on any "enable and start X" task — it is what makes
+        // a unit-file edit earlier in the play take effect — so treating
+        // it as a change made every such task report changed on every
+        // run, forever. On a converged fleet that was two dozen false
+        // changes per run, which is enough noise that a real change
+        // hides in it and "the deploy reported nothing changed" stops
+        // being a signal anyone can use.
+        //
+        // Reloading is also genuinely not a change: it re-reads unit
+        // files into systemd's memory. If nothing on disk differs, the
+        // reload is a no-op, and if something does differ the task that
+        // wrote it already reported the change.
     }
 
     // mask / unmask
@@ -522,6 +541,61 @@ esac
         let dr_pos = log.find("daemon-reload").unwrap();
         let start_pos = log.find("start foo.service").unwrap();
         assert!(dr_pos < start_pos, "daemon-reload must come first: {log}");
+    }
+
+    #[test]
+    fn daemon_reload_alone_is_not_a_change() {
+        // The exact shape of a converged "enable and start X" task:
+        //
+        //     ansible.builtin.systemd:
+        //       name: node-exporter
+        //       enabled: true
+        //       state: started
+        //       daemon_reload: true
+        //
+        // run against a host where the unit is already enabled and
+        // already running. Nothing about the system moves, so nothing
+        // should be reported as changed.
+        //
+        // This used to report changed unconditionally because
+        // daemon-reload set the flag. Every task of this shape — and
+        // there are ~15 of them across the roles in gothab alone —
+        // therefore claimed a change on every run of a fully converged
+        // fleet, which is how an idempotent playbook stops being able to
+        // tell you it is idempotent.
+        let stub = Stub::new("dr-noop", Some("active"), Some("enabled"));
+        let mut o = op("node-exporter.service", STATE_STARTED);
+        o.has_enabled = 1;
+        o.enabled = 1;
+        o.daemon_reload = 1;
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
+        assert!(
+            !changed,
+            "converged unit with daemon_reload must not report changed; log={:?}",
+            stub.log()
+        );
+        // The reload must still have happened — suppressing the *report*
+        // is not the same as skipping the work, and a unit-file edit
+        // earlier in the play depends on it.
+        assert!(
+            stub.log().contains("daemon-reload"),
+            "daemon-reload must still run; log={:?}",
+            stub.log()
+        );
+    }
+
+    #[test]
+    fn daemon_reload_does_not_mask_a_real_change() {
+        // The inverse: daemon_reload must not suppress a change either.
+        // Same task, but the unit is stopped, so starting it is a real
+        // transition and has to be reported.
+        let stub = Stub::new("dr-real", Some("inactive"), Some("enabled"));
+        let mut o = op("node-exporter.service", STATE_STARTED);
+        o.has_enabled = 1;
+        o.enabled = 1;
+        o.daemon_reload = 1;
+        let changed = apply(stub.path().to_str().unwrap(), &o, false).unwrap();
+        assert!(changed, "starting a stopped unit is a change");
     }
 
     #[test]

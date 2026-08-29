@@ -485,6 +485,111 @@ exit 0
     const STATUS_ACTIVE_22: &str =
         "Status: active\nLogging: on (low)\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW IN    Anywhere\n";
 
+    /// Verbatim `ufw status verbose` from a real host (gothab's db-1), as
+    /// opposed to the hand-written one above. Two differences matter and
+    /// neither is cosmetic:
+    ///
+    ///   - every rule has a real source (a CIDR or a bare IP), not
+    ///     `Anywhere`. The `Anywhere` fixture exercises the branch where
+    ///     `from_ip` is empty and the source comparison is skipped
+    ///     entirely, so it cannot catch a source mismatch.
+    ///   - lines carry a trailing `# comment`, and several rules share
+    ///     the same port while differing only in source.
+    ///
+    /// A host with a firewall worth having looks like this, not like the
+    /// fixture above.
+    const STATUS_REAL_HOST: &str = "\
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+Anywhere                   ALLOW IN    10.10.0.0/16               # vSwitch private network (trusted)
+22/tcp                     ALLOW IN    147.192.23.66              # SSH from operator
+22/tcp                     ALLOW IN    139.162.110.118            # SSH from operator
+22/tcp                     ALLOW IN    5.78.85.233                # SSH from operator
+2379/tcp                   ALLOW IN    10.10.0.0/16               # etcd client (Patroni -> etcd)
+2380/tcp                   ALLOW IN    10.10.0.0/16               # etcd peer (etcd <-> etcd raft)
+5432/tcp                   ALLOW IN    10.10.0.0/16               # Postgres (gothab-server -> primary)
+8008/tcp                   ALLOW IN    10.10.0.0/16               # Patroni REST API
+";
+
+    /// The op an Ansible task of this shape produces — `src:` maps to
+    /// `from_ip`, `port:` to `to_port` (see ctl's ufw field aliases):
+    ///
+    ///     - community.general.ufw:
+    ///         rule: allow
+    ///         port: "22"
+    ///         proto: tcp
+    ///         src: "{{ item }}"
+    fn rule_op_from(verb: &str, port: &str, proto: &str, src: &str) -> OpUfwOutput {
+        OpUfwOutput {
+            from_ip: src.into(),
+            ..rule_op(verb, port, proto)
+        }
+    }
+
+    #[test]
+    fn sourced_rule_is_idempotent_against_real_status_output() {
+        // This is the exact task gothab runs per operator CIDR. It was
+        // suspected of reporting changed on every run; it does not, and
+        // this pins that so the matcher cannot regress into re-adding a
+        // rule that is already there (ufw would accept the duplicate).
+        let stub = Stub::new("rule-real-noop", STATUS_REAL_HOST);
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &rule_op_from("allow", "22", "tcp", "139.162.110.118"),
+            false,
+        )
+        .unwrap();
+        assert!(!changed, "rule already present should not report changed");
+        let log = stub.log();
+        let mutating: Vec<_> = log.lines().filter(|l| !l.contains("status")).collect();
+        assert!(
+            mutating.is_empty(),
+            "expected no mutating ufw calls: {mutating:?}"
+        );
+    }
+
+    #[test]
+    fn same_port_different_source_is_a_different_rule() {
+        // The inverse, and the reason the source comparison has to
+        // happen at all: 22/tcp is already allowed from three operator
+        // IPs, so a matcher that only looked at port and verb would
+        // decide a fourth operator needs no rule and silently lock them
+        // out.
+        let stub = Stub::new("rule-real-newsrc", STATUS_REAL_HOST);
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &rule_op_from("allow", "22", "tcp", "62.238.0.228"),
+            false,
+        )
+        .unwrap();
+        assert!(changed, "a new source for an existing port must be added");
+        assert!(
+            stub.log().lines().any(|l| l.starts_with("allow")),
+            "expected an allow call: {:?}",
+            stub.log()
+        );
+    }
+
+    #[test]
+    fn cidr_sourced_rule_is_idempotent() {
+        // The vSwitch rules use a CIDR rather than a bare IP, and the
+        // first line has `Anywhere` in the To column rather than a port
+        // — a shape the hand-written fixture never produces.
+        let stub = Stub::new("rule-real-cidr", STATUS_REAL_HOST);
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &rule_op_from("allow", "2379", "tcp", "10.10.0.0/16"),
+            false,
+        )
+        .unwrap();
+        assert!(!changed, "CIDR-sourced rule already present");
+    }
+
     #[test]
     fn rule_added_when_missing_changes_state() {
         let stub = Stub::new("rule-add", STATUS_INACTIVE);
