@@ -5222,30 +5222,15 @@ fn parse_pg_authid_row(env: &JsonValue) -> Result<Option<PgAuthidRow>> {
     }))
 }
 
-/// Decide whether the requested plaintext `password` should trigger
-/// an ALTER ROLE PASSWORD given the role's current `rolpassword`
-/// value.
+/// Decide whether the requested plaintext `password` should trigger an
+/// ALTER ROLE PASSWORD given the role's current `rolpassword` value.
 ///
-/// v1 strategy: if password is set, **always emit ALTER** (returns
-/// true). This matches Ansible's behaviour on SCRAM-SHA-256 hashed
-/// roles (the default in PG 14+), where the stored hash includes a
-/// random salt and there's no way to tell client-side whether the
-/// plaintext matches without doing the SCRAM PBKDF2 dance.
-/// Consequence: `changed=true` is reported on every run that has
-/// `password:` set. Operators who want strict idempotency set
-/// `no_password_changes: true` after the role is provisioned.
-///
-/// Documented as a follow-up in TODO.md: we could implement the
-/// SCRAM-SHA-256 client-side comparison (extract salt + iter count
-/// from the stored `SCRAM-SHA-256$<iters>:<salt>$<storedkey>:<serverkey>`
-/// envelope, PBKDF2 the plaintext, compare keys) but the dependency
-/// footprint (pbkdf2 + hmac + base64) and complexity isn't worth it
-/// for v1. Also md5-hashed roles still hit this path and over-report;
-/// adding md5 client-side comparison is a smaller follow-up.
-fn decide_password_alter(password: &str, _username: &str, _cur_rolpassword: Option<&str>) -> bool {
-    // v1: always re-set when password is provided. See doc comment
-    // above for the SCRAM-vs-md5 hash-comparison follow-up.
-    !password.is_empty()
+/// The work is in `crate::pg_password`: Postgres stores a salted
+/// verifier, but it stores the salt alongside it, so the verifier can be
+/// recomputed from the plaintext and compared. Anything we cannot verify
+/// resolves to "change it", which is the old always-alter behaviour.
+fn decide_password_alter(password: &str, username: &str, cur_rolpassword: Option<&str>) -> bool {
+    crate::pg_password::needs_password_change(password, username, cur_rolpassword)
 }
 
 /// `postgresql_user:` composite. See the doc comment on
@@ -9810,8 +9795,10 @@ mod tests {
         let mut ctx = HostCtx::new("h".into());
         ctx.inventory_vars
             .insert("wrapper".into(), serde_json::json!("/usr/local/bin/push"));
-        ctx.inventory_vars
-            .insert("archive_command".into(), serde_json::json!("{{ wrapper }} %p"));
+        ctx.inventory_vars.insert(
+            "archive_command".into(),
+            serde_json::json!("{{ wrapper }} %p"),
+        );
         ctx
     }
 
@@ -10645,8 +10632,11 @@ all:
     }
 
     #[test]
-    fn decide_password_alter_emits_when_password_set() {
-        // v1: always re-set when password is provided (SCRAM-faithful).
+    fn decide_password_alter_emits_when_the_stored_verifier_cannot_be_checked() {
+        // No password at all, a malformed md5 verifier, and a SCRAM
+        // envelope whose keys aren't valid base64 — none can be shown to
+        // match, so all three alter. `crate::pg_password` owns the
+        // matching cases and the derivation itself.
         assert!(decide_password_alter("pw", "user", None));
         assert!(decide_password_alter("pw", "user", Some("md5deadbeef")));
         assert!(decide_password_alter(
@@ -10654,6 +10644,16 @@ all:
             "user",
             Some("SCRAM-SHA-256$4096:salt$storedkey:serverkey")
         ));
+    }
+
+    /// The point of the change: a role whose stored verifier really is
+    /// this password reports no change, so the task stops claiming to
+    /// have done work on every run.
+    #[test]
+    fn decide_password_alter_is_quiet_when_the_password_already_matches() {
+        let verifier =
+            crate::pg_password::test_support::scram_verifier("pw", b"sixteenbytesalt!", 4096);
+        assert!(!decide_password_alter("pw", "user", Some(&verifier)));
     }
 
     #[test]

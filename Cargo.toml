@@ -62,6 +62,8 @@ aes = "0.8"
 ctr = "0.9"
 pbkdf2 = { version = "0.12", default-features = false }
 hmac = "0.12"
+# Legacy Postgres password verifiers (`md5<hex>`) — see crates/ctl/src/pg_password.rs.
+md-5 = "0.10"
 subtle = "2"
 hex = "0.4"
 

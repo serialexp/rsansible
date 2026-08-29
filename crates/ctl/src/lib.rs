@@ -18,6 +18,7 @@ pub mod limit;
 pub mod local;
 pub mod local_agent;
 pub mod orchestrator;
+pub mod pg_password;
 pub mod playbook;
 pub mod pool;
 pub mod report;

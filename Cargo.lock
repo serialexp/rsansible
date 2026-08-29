@@ -2769,6 +2769,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "hyper",
+ "md-5 0.10.6",
  "minijinja",
  "minijinja-contrib",
  "pbkdf2 0.12.2",
