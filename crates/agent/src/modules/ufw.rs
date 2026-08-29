@@ -335,7 +335,10 @@ fn line_has_source(line: &str, want: &str) -> bool {
         return true;
     }
     // ufw elides only a full-host mask; anything else is displayed as-is.
-    match want.strip_suffix("/32").or_else(|| want.strip_suffix("/128")) {
+    match want
+        .strip_suffix("/32")
+        .or_else(|| want.strip_suffix("/128"))
+    {
         Some(bare) => line.contains(bare),
         None => false,
     }

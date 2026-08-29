@@ -1,7 +1,6 @@
 //! `OpGroup` — unix group management via `groupadd` / `groupdel`,
 //! idempotent via a `getent group <name>` probe.
 
-
 use rsansible_wire::generated::OpGroupOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
 

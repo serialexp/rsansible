@@ -324,7 +324,7 @@ fn chown(chown_bin: &str, path: &Path, user: &str) -> Result<(), AuthorizedKeyEr
         // survive not being valid UTF-8.
         &[std::ffi::OsStr::new(arg.as_str()), path.as_os_str()],
     )
-        .map_err(|e| AuthorizedKeyError::Spawn(format!("spawn {chown_bin}: {e}")))?;
+    .map_err(|e| AuthorizedKeyError::Spawn(format!("spawn {chown_bin}: {e}")))?;
     if !out.status.success() {
         return Err(AuthorizedKeyError::Io(format!(
             "{chown_bin} {arg} {}: failed ({:?}): stderr={:?}",

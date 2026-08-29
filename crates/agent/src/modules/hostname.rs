@@ -130,11 +130,9 @@ fn set_hostname(bins: &Bins, name: &str) -> Result<(), HostnameError> {
     // Prefer hostnamectl — single call handles /etc/hostname + kernel
     // name + (where supported) pretty/static names.
     if which(&bins.hostnamectl) {
-        let out = crate::modules::spawn_with_etxtbsy_retry(
-            &bins.hostnamectl,
-            &["set-hostname", name],
-        )
-            .map_err(|e| HostnameError::Spawn(format!("spawn {}: {e}", bins.hostnamectl)))?;
+        let out =
+            crate::modules::spawn_with_etxtbsy_retry(&bins.hostnamectl, &["set-hostname", name])
+                .map_err(|e| HostnameError::Spawn(format!("spawn {}: {e}", bins.hostnamectl)))?;
         if !out.status.success() {
             return Err(HostnameError::Io(format!(
                 "{} set-hostname {name}: exit {:?} stderr={:?}",

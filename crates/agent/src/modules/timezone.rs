@@ -157,11 +157,9 @@ fn set_timezone(bins: &Bins, name: &str) -> Result<(), TimezoneError> {
     // Prefer timedatectl — single call handles /etc/localtime,
     // /etc/timezone (where present), and the kernel time-of-day state.
     if which(&bins.timedatectl) {
-        let out = crate::modules::spawn_with_etxtbsy_retry(
-            &bins.timedatectl,
-            &["set-timezone", name],
-        )
-            .map_err(|e| TimezoneError::Spawn(format!("spawn {}: {e}", bins.timedatectl)))?;
+        let out =
+            crate::modules::spawn_with_etxtbsy_retry(&bins.timedatectl, &["set-timezone", name])
+                .map_err(|e| TimezoneError::Spawn(format!("spawn {}: {e}", bins.timedatectl)))?;
         if !out.status.success() {
             return Err(TimezoneError::Io(format!(
                 "{} set-timezone {name}: exit {:?} stderr={:?}",

@@ -8,7 +8,6 @@
 //! run at all. Matches Ansible's contract: re-runs of an unchanged
 //! playbook report no change.
 
-
 use rsansible_wire::generated::OpUserOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
 
@@ -182,19 +181,20 @@ fn probe(bins: &Bins, name: &str) -> Result<Option<Existing>, UserError> {
     let shell = parts[6].to_string();
 
     // Resolve gid → primary group name.
-    let primary_group = match crate::modules::spawn_with_etxtbsy_retry(&bins.getent, &["group", &gid])
-        .map_err(|e| UserError::Spawn(format!("spawn {}: {e}", bins.getent)))?
-    {
-        out if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
-    };
+    let primary_group =
+        match crate::modules::spawn_with_etxtbsy_retry(&bins.getent, &["group", &gid])
+            .map_err(|e| UserError::Spawn(format!("spawn {}: {e}", bins.getent)))?
+        {
+            out if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        };
 
     // `id -nG <user>` → space-separated group names (primary first).
     let id_out = crate::modules::spawn_with_etxtbsy_retry(&bins.id, &["-nG", name])

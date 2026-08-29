@@ -93,6 +93,11 @@ pub(crate) enum ModprobeError {
 pub(crate) struct Bins {
     pub modprobe: String,
     pub proc_modules: PathBuf,
+    /// `modules.builtin` for the running kernel. Modules compiled into
+    /// the kernel image are listed here and never appear in
+    /// `/proc/modules`, so this is the only way to tell "absent" from
+    /// "present, but not as a loadable module".
+    pub modules_builtin: PathBuf,
 }
 
 impl Bins {
@@ -102,6 +107,21 @@ impl Bins {
             proc_modules: std::env::var_os("RSANSIBLE_PROC_MODULES")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/proc/modules")),
+            modules_builtin: std::env::var_os("RSANSIBLE_MODULES_BUILTIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    // /proc/modules is absolute in production but is a
+                    // stub path under test; deriving this from uname
+                    // keeps the two independent.
+                    let release = std::process::Command::new("uname")
+                        .arg("-r")
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    PathBuf::from(format!("/lib/modules/{release}/modules.builtin"))
+                }),
         }
     }
 }
@@ -138,18 +158,56 @@ pub(crate) fn apply_with_bins(
     Ok(true)
 }
 
-/// Whether `name` appears in `/proc/modules`.
+/// Whether `name` is already present in the kernel — either loaded as a
+/// module, or compiled into the kernel image.
 ///
-/// Each line is `name size refcount deps state offset`; we only need the
-/// first field.
+/// The built-in case is not an edge case. `loop` is built in on plenty
+/// of distro kernels, and a built-in module can never appear in
+/// `/proc/modules`, so checking only that file concludes "absent",
+/// re-runs `modprobe` (which succeeds trivially, because the
+/// functionality genuinely is there), and reports `changed` on every
+/// single run forever. The feature works the whole time; only the
+/// reporting is wrong, which is exactly the kind of noise that makes an
+/// idempotent playbook unable to prove it is idempotent.
+///
+/// `state: absent` on a built-in module is a separate matter: `modprobe
+/// -r` cannot unload something compiled in, and will say so. We report
+/// it as present, so a removal request proceeds and fails loudly rather
+/// than being silently skipped as "already absent".
 fn is_loaded(bins: &Bins, name: &str) -> Result<bool, ModprobeError> {
     let want = normalize(name);
     let contents = std::fs::read_to_string(&bins.proc_modules)
         .map_err(|e| ModprobeError::Io(format!("read {}: {e}", bins.proc_modules.display())))?;
-    Ok(contents
+    if contents
         .lines()
         .filter_map(|l| l.split_whitespace().next())
-        .any(|m| normalize(m) == want))
+        .any(|m| normalize(m) == want)
+    {
+        return Ok(true);
+    }
+    Ok(is_builtin(bins, &want))
+}
+
+/// Whether `want` (already normalised) is listed in `modules.builtin`.
+///
+/// Lines are kernel-relative object paths such as
+/// `kernel/drivers/block/loop.ko`, so the module name is the file stem.
+/// A missing or unreadable file is not an error — a kernel need not ship
+/// one, and the honest answer then is "not known to be built in", which
+/// degrades to the previous /proc/modules-only behaviour rather than
+/// failing a task over a missing index.
+fn is_builtin(bins: &Bins, want: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(&bins.modules_builtin) else {
+        return false;
+    };
+    contents.lines().any(|line| {
+        let stem = line
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.split('.').next())
+            .unwrap_or("");
+        normalize(stem) == want
+    })
 }
 
 fn load(bins: &Bins, name: &str, params: &str) -> Result<(), ModprobeError> {
@@ -213,6 +271,12 @@ mod tests {
         /// `modprobe` appends its argv to a log and mutates that file so
         /// idempotency can be observed across calls.
         fn new(label: &str, loaded: &[&str]) -> Self {
+            Self::with_builtin(label, loaded, &[])
+        }
+
+        /// As `new`, plus a `modules.builtin` listing `builtin` as
+        /// kernel-relative object paths — the real file's format.
+        fn with_builtin(label: &str, loaded: &[&str], builtin: &[&str]) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "rsansible-modprobe-{label}-{}-{}",
                 std::process::id(),
@@ -250,9 +314,19 @@ exit 0
             perms.set_mode(0o755);
             std::fs::set_permissions(&mp, perms).unwrap();
 
+            // Real modules.builtin lines are kernel-relative object
+            // paths, e.g. "kernel/drivers/block/loop.ko".
+            let modules_builtin = dir.join("modules.builtin");
+            let builtin_body: String = builtin
+                .iter()
+                .map(|m| format!("kernel/drivers/fake/{m}.ko\n"))
+                .collect();
+            std::fs::write(&modules_builtin, builtin_body).unwrap();
+
             let bins = Bins {
                 modprobe: mp.to_string_lossy().into_owned(),
                 proc_modules,
+                modules_builtin,
             };
             Stub { dir, bins }
         }
@@ -388,8 +462,76 @@ exit 0
         let bins = Bins {
             modprobe: stub.dir.join("nope").to_string_lossy().into_owned(),
             proc_modules: stub.bins.proc_modules.clone(),
+            modules_builtin: stub.bins.modules_builtin.clone(),
         };
         let err = apply_with_bins(&bins, &op("kvm_amd", STATE_PRESENT, ""), false).unwrap_err();
         assert!(matches!(err, ModprobeError::Spawn(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn builtin_module_is_already_present() {
+        // `loop` is compiled into plenty of distro kernels, so it never
+        // shows up in /proc/modules no matter how many times you load
+        // it. Checking only that file concluded "absent" every run,
+        // re-ran modprobe (which succeeds, because the functionality is
+        // genuinely there) and reported changed forever. Observed on
+        // gothab's app-2, where /dev/loop-control existed the whole time.
+        let stub = Stub::with_builtin("builtin", &[], &["loop"]);
+        let changed = apply_with_bins(&stub.bins, &op("loop", STATE_PRESENT, ""), false).unwrap();
+        assert!(!changed, "a built-in module is already present");
+        assert!(
+            stub.log().is_empty(),
+            "must not shell out at all; log={:?}",
+            stub.log()
+        );
+    }
+
+    #[test]
+    fn builtin_lookup_matches_the_file_stem_not_a_substring() {
+        // modules.builtin lines are object paths. Matching loosely would
+        // let "loop" match "kernel/drivers/block/loop_extra.ko" — or
+        // worse, a module whose path merely contains the name — and
+        // silently skip a load that was actually needed.
+        let stub = Stub::with_builtin("builtin-stem", &[], &["loopback_extra"]);
+        let changed = apply_with_bins(&stub.bins, &op("loop", STATE_PRESENT, ""), false).unwrap();
+        assert!(
+            changed,
+            "loop is not built in; loopback_extra is a different module"
+        );
+    }
+
+    #[test]
+    fn missing_modules_builtin_degrades_to_proc_modules() {
+        // A kernel need not ship modules.builtin. Absent that file the
+        // honest answer is "not known to be built in" — the previous
+        // behaviour — rather than failing the task over a missing index.
+        let stub = Stub::new("no-builtin-file", &[]);
+        std::fs::remove_file(&stub.bins.modules_builtin).unwrap();
+        let changed =
+            apply_with_bins(&stub.bins, &op("kvm_amd", STATE_PRESENT, ""), false).unwrap();
+        assert!(
+            changed,
+            "unknown module with no builtin index must still load"
+        );
+    }
+
+    #[test]
+    fn builtin_module_is_reported_present_so_removal_fails_loudly() {
+        // `modprobe -r` cannot unload something compiled in. Reporting a
+        // built-in as "already absent" would make `state: absent` a
+        // silent no-op that looks like it worked; reporting it present
+        // lets the removal proceed and fail with the kernel's own
+        // message.
+        let stub = Stub::with_builtin("builtin-absent", &[], &["loop"]);
+        let changed = apply_with_bins(&stub.bins, &op("loop", STATE_ABSENT, ""), false).unwrap();
+        assert!(
+            changed,
+            "removal of a built-in must be attempted, not skipped"
+        );
+        assert!(
+            stub.log().contains("modprobe -r loop"),
+            "log={:?}",
+            stub.log()
+        );
     }
 }

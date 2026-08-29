@@ -29,7 +29,6 @@
 //!   3 — `enumeration not supported` (we treat as BAD_REQUEST)
 //!   other — surfaced as IO with stderr attached.
 
-
 use rsansible_wire::generated::OpGetentOutput;
 use rsansible_wire::msg::{self, err, now_unix_ns};
 use serde_json::{json, Value};
