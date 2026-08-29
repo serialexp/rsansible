@@ -6,6 +6,9 @@
 //!   * **present** — probes each requested package via `dpkg-query`,
 //!     skips packages already installed, calls `apt-get install -y` on
 //!     the remainder. `changed=1` iff anything had to be installed.
+//!     A name that looks missing gets a second look: it may be a
+//!     *virtual* package Provided by something installed, which dpkg
+//!     reports as `not-installed` forever (see `probe_provided`).
 //!   * **absent** — probes each package; calls `apt-get remove -y`
 //!     (`purge` when `purge=1`) on the installed subset.
 //!     `changed=1` iff anything had to be removed.
@@ -28,7 +31,7 @@
 //! carries the union of all backends' knobs; we ignore what we don't
 //! consume.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -73,12 +76,26 @@ pub(crate) fn apply_with_bins(
     match op.state {
         STATE_PRESENT => {
             let installed = probe_installed(dpkg, &op.names)?;
-            let missing: Vec<&str> = op
+            let mut missing: Vec<&str> = op
                 .names
                 .iter()
                 .filter(|n| !installed.contains_key(n.as_str()))
                 .map(String::as_str)
                 .collect();
+            // A name dpkg calls "not-installed" may still be satisfied: it
+            // can be a *virtual* package that an installed real package
+            // Provides. `postgresql-contrib-17` is one — since PG10 the
+            // contrib modules ship inside `postgresql-17`, which Provides
+            // the old name for compatibility. dpkg-query reports the
+            // virtual name as `not-installed` forever, so without this we
+            // shell out to `apt-get install` on every single run, apt
+            // resolves the virtual to its already-installed provider, does
+            // nothing, and we report changed. Forever. (Ansible doesn't hit
+            // this because python-apt's cache resolves virtuals for it.)
+            if !missing.is_empty() {
+                let provided = probe_provided(dpkg, &missing)?;
+                missing.retain(|n| !provided.contains(*n));
+            }
             if !missing.is_empty() {
                 if !check_mode {
                     let mut args: Vec<String> = vec!["install".into(), "-y".into()];
@@ -316,6 +333,50 @@ fn probe_installed(dpkg: &str, names: &[String]) -> Result<BTreeMap<String, Stri
     Ok(map)
 }
 
+/// Which of `wanted` are virtual names Provided by some *installed*
+/// package.
+///
+/// Asks dpkg for every package's status and Provides field in one shot —
+/// there is no way to query "who provides X" per-name, and doing it
+/// per-name would be one process spawn per miss anyway. The caller only
+/// reaches here when something looked missing, so the happy path (fully
+/// converged host) never pays for it.
+///
+/// Provides entries are comma-separated and may carry a version
+/// (`postgresql-17-jit-llvm (= 19)`), which we strip — a virtual name is
+/// satisfied or it isn't; apt does the version resolution itself when it
+/// actually installs.
+///
+/// Only `installed` providers count. A package in `config-files` state
+/// has been removed and its files are gone, so its Provides are not
+/// satisfied by anything.
+fn probe_provided(dpkg: &str, wanted: &[&str]) -> Result<BTreeSet<String>, PackageError> {
+    let mut found = BTreeSet::new();
+    if wanted.is_empty() {
+        return Ok(found);
+    }
+    let argv = ["-W", "-f", "${db:Status-Status}\t${Provides}\n"];
+    let out = spawn_with_etxtbsy_retry(dpkg, &argv)
+        .map_err(|e| PackageError::Spawn(format!("spawn {dpkg} {argv:?}: {e}")))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let Some((status, provides)) = line.split_once('\t') else {
+            continue;
+        };
+        if status != "installed" || provides.trim().is_empty() {
+            continue;
+        }
+        for entry in provides.split(',') {
+            // "name (= 1.2)" -> "name"; also drops the surrounding space.
+            let name = entry.split('(').next().unwrap_or("").trim();
+            if !name.is_empty() && wanted.contains(&name) {
+                found.insert(name.to_string());
+            }
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,8 +386,8 @@ mod tests {
 
     /// Stub pair: one apt-get and one dpkg-query script in a temp dir.
     /// The dpkg-query script reads a "DB" file with one line per
-    /// installed pkg as `pkg version`; the apt-get script logs invocation
-    /// and may rewrite the DB.
+    /// installed pkg as `pkg version [provides...]`; the apt-get script
+    /// logs invocation and may rewrite the DB.
     struct Stub {
         dir: PathBuf,
         apt: PathBuf,
@@ -335,18 +396,27 @@ mod tests {
 
     impl Stub {
         fn new(label: &str, db: &[(&str, &str)]) -> Self {
+            let with_provides: Vec<(&str, &str, &str)> =
+                db.iter().map(|(n, v)| (*n, *v, "")).collect();
+            Self::with_provides(label, &with_provides)
+        }
+
+        /// Same, but each installed package also declares a Provides
+        /// list (comma-separated, exactly as dpkg formats it).
+        fn with_provides(label: &str, db: &[(&str, &str, &str)]) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "rsansible-apt-{label}-{}-{}",
                 std::process::id(),
                 now_unix_ns()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            // DB file: one line per installed pkg, `name version`.
+            // DB file: one line per installed pkg, `name version provides`.
+            // Trailing newline matters: the stub's Provides sweep reads it
+            // with `while read`, which discards a final unterminated line.
             let db_text = db
                 .iter()
-                .map(|(n, v)| format!("{n} {v}"))
-                .collect::<Vec<_>>()
-                .join("\n");
+                .map(|(n, v, p)| format!("{n} {v} {p}\n"))
+                .collect::<String>();
             std::fs::write(dir.join("DB"), db_text).unwrap();
             // log file
             std::fs::write(dir.join("log"), "").unwrap();
@@ -393,21 +463,35 @@ esac
                 log = dir.join("log").display(),
             );
 
-            // dpkg-query stub: only honors `-W -f '<fmt>' pkg1 pkg2 ...`
-            // and emits "pkg installed version" if found in DB, nothing
-            // otherwise.
+            // dpkg-query stub. Two shapes, distinguished the same way the
+            // real thing is: by the requested format string.
+            //   * `-W -f '<fmt with Provides>'` with NO package args —
+            //     the whole-DB Provides sweep. Emits `status<TAB>provides`.
+            //   * `-W -f '<fmt>' pkg1 pkg2 ...` — per-package probe. Emits
+            //     "pkg installed version" if found in DB, nothing otherwise.
             let dpkg_script = format!(
                 r#"#!/bin/sh
 DB="{db}"
-# consume -W -f <fmt>
+# consume -W -f <fmt>, keeping the format so we can tell the two apart
 [ "$1" = "-W" ] && shift
-[ "$1" = "-f" ] && shift 2
-for pkg in "$@"; do
-  ver=$(grep "^$pkg " "$DB" | head -n1 | cut -d' ' -f2)
-  if [ -n "$ver" ]; then
-    echo "$pkg installed $ver"
-  fi
-done
+fmt=""
+if [ "$1" = "-f" ]; then fmt="$2"; shift 2; fi
+case "$fmt" in
+  *Provides*)
+    while read -r name ver prov; do
+      [ -z "$name" ] && continue
+      printf 'installed\t%s\n' "$prov"
+    done < "$DB"
+    ;;
+  *)
+    for pkg in "$@"; do
+      ver=$(grep "^$pkg " "$DB" | head -n1 | cut -d' ' -f2)
+      if [ -n "$ver" ]; then
+        echo "$pkg installed $ver"
+      fi
+    done
+    ;;
+esac
 "#,
                 db = dir.join("DB").display(),
             );
@@ -507,6 +591,116 @@ done
         // Only nginx should be installed; curl should NOT appear.
         assert!(log.contains("install -y nginx"), "log={log:?}");
         assert!(!log.contains("install -y curl"), "log={log:?}");
+    }
+
+    /// The gothab db-node case: `postgresql-contrib-17` has not been a
+    /// real package since PG10 — `postgresql-17` Provides the name. dpkg
+    /// calls it not-installed, so before the Provides sweep this shelled
+    /// out to apt and reported changed on every run of the fleet.
+    #[test]
+    fn virtual_package_provided_by_an_installed_package_is_present() {
+        let stub = Stub::with_provides(
+            "present-virtual",
+            &[(
+                "postgresql-17",
+                "17.11-1.pgdg24.04+2",
+                "postgresql-17-jit-llvm (= 19), postgresql-contrib-17",
+            )],
+        );
+        let changed = run(
+            &stub,
+            &op(&["postgresql-17", "postgresql-contrib-17"], STATE_PRESENT),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert!(
+            !stub.log().contains("install"),
+            "should not have shelled out to apt at all, log={:?}",
+            stub.log()
+        );
+    }
+
+    /// The sweep must not make everything look satisfied: a genuinely
+    /// absent package sharing a run with a satisfied virtual one still
+    /// gets installed, and *only* it.
+    #[test]
+    fn virtual_resolution_does_not_mask_a_genuinely_missing_package() {
+        let stub = Stub::with_provides(
+            "present-virtual-mixed",
+            &[("postgresql-17", "17.11", "postgresql-contrib-17")],
+        );
+        let changed = run(
+            &stub,
+            &op(&["postgresql-contrib-17", "watchdog"], STATE_PRESENT),
+        )
+        .unwrap();
+        assert!(changed);
+        let log = stub.log();
+        assert!(log.contains("install -y watchdog"), "log={log:?}");
+        assert!(!log.contains("postgresql-contrib-17"), "log={log:?}");
+    }
+
+    /// Provides entries carry an optional version qualifier. Comparing
+    /// the raw entry would miss `foo (= 1.2)` and reinstall forever.
+    #[test]
+    fn provides_version_qualifier_is_stripped() {
+        let found = probe_provided_from(
+            "installed\tpostgresql-17-jit-llvm (= 19), postgresql-contrib-17\n",
+            &["postgresql-17-jit-llvm"],
+        );
+        assert!(found.contains("postgresql-17-jit-llvm"));
+    }
+
+    /// A removed-but-not-purged package still has a dpkg entry, and its
+    /// files are gone. Its Provides are gone with them.
+    #[test]
+    fn a_config_files_provider_does_not_satisfy_anything() {
+        let found = probe_provided_from(
+            "config-files\tmail-transport-agent\n",
+            &["mail-transport-agent"],
+        );
+        assert!(found.is_empty(), "found={found:?}");
+    }
+
+    /// Substring accidents: `postgresql-contrib` must not be satisfied by
+    /// a provider offering `postgresql-contrib-17`.
+    #[test]
+    fn provides_matching_is_exact_not_substring() {
+        let found = probe_provided_from(
+            "installed\tpostgresql-contrib-17\n",
+            &["postgresql-contrib"],
+        );
+        assert!(found.is_empty(), "found={found:?}");
+    }
+
+    /// Most installed packages Provide nothing; the field is empty and
+    /// the line must be skipped rather than parsed into an empty name.
+    #[test]
+    fn packages_with_no_provides_contribute_nothing() {
+        let found = probe_provided_from("installed\t\ninstalled\t\n", &["anything"]);
+        assert!(found.is_empty(), "found={found:?}");
+    }
+
+    /// Drives `probe_provided` against a canned dpkg-query fixture, so
+    /// the parser can be tested on statuses and shapes the Stub DB
+    /// (installed packages only) can't express.
+    fn probe_provided_from(fixture: &str, wanted: &[&str]) -> BTreeSet<String> {
+        let dir = std::env::temp_dir().join(format!(
+            "rsansible-apt-provides-{}-{}",
+            std::process::id(),
+            now_unix_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out");
+        std::fs::write(&out, fixture).unwrap();
+        let script = dir.join("dpkg-query");
+        std::fs::write(&script, format!("#!/bin/sh\ncat {}\n", out.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let found = probe_provided(script.to_str().unwrap(), wanted).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        found
     }
 
     #[test]
