@@ -312,6 +312,35 @@ struct RuleKey {
     direction: String,
 }
 
+/// Does this status line's source column name `want`?
+///
+/// Not a plain `contains`, because ufw's status output drops a
+/// host-mask: a rule configured as `147.192.23.66/32` is displayed as
+/// `147.192.23.66`, and `10.10.0.0/16` is displayed verbatim. Only `/32`
+/// (a single IPv4 host) and `/128` (a single IPv6 host) are elided, so
+/// those are the only suffixes that get a bare-address fallback —
+/// stripping any mask would make `10.10.0.0/16` match a rule that only
+/// allowed `10.10.0.0/24`, which is a firewall widening dressed up as a
+/// no-op.
+///
+/// Getting this wrong was invisible in the worst way. `/32` is the
+/// idiomatic way to write a single host in an inventory, so every
+/// `src: "1.2.3.4/32"` rule looked absent on every run, was re-added,
+/// and reported `changed`. ufw itself dedupes ("Skipping adding existing
+/// rule") so no duplicate rules accumulated and nothing broke — the only
+/// symptom was a converged playbook that could never report itself
+/// converged.
+fn line_has_source(line: &str, want: &str) -> bool {
+    if line.contains(want) {
+        return true;
+    }
+    // ufw elides only a full-host mask; anything else is displayed as-is.
+    match want.strip_suffix("/32").or_else(|| want.strip_suffix("/128")) {
+        Some(bare) => line.contains(bare),
+        None => false,
+    }
+}
+
 /// Loose match against a single status-output line. ufw's lines look
 /// like:
 ///   "22/tcp                     ALLOW IN    Anywhere"
@@ -332,7 +361,7 @@ fn line_matches_key(line: &str, key: &RuleKey) -> bool {
             return false;
         }
     }
-    if !key.from_ip.is_empty() && !line.contains(&key.from_ip) {
+    if !key.from_ip.is_empty() && !line_has_source(line, &key.from_ip) {
         return false;
     }
     if !key.direction.is_empty() {
@@ -573,6 +602,74 @@ Anywhere                   ALLOW IN    10.10.0.0/16               # vSwitch priv
             "expected an allow call: {:?}",
             stub.log()
         );
+    }
+
+    #[test]
+    fn host_mask_source_matches_ufws_bare_display() {
+        // The form an inventory actually uses. `ssh_allowed_sources` in
+        // gothab is a list of "1.2.3.4/32" — /32 being the idiomatic way
+        // to write a single host — while ufw's status output prints the
+        // From column as a bare "1.2.3.4". Comparing the configured
+        // string against the displayed one therefore never matched, so
+        // the rule looked absent on every run and was re-added.
+        //
+        // Nothing broke, which is why it survived: ufw dedupes the add
+        // itself, so no duplicate rules accumulated. The only symptom
+        // was a converged playbook unable to report itself converged.
+        //
+        // The earlier tests here used bare IPs taken from the *status*
+        // output, which is the one form that could not expose this.
+        let stub = Stub::new("rule-host-mask", STATUS_REAL_HOST);
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &rule_op_from("allow", "22", "tcp", "139.162.110.118/32"),
+            false,
+        )
+        .unwrap();
+        assert!(
+            !changed,
+            "a /32 source must match ufw's bare display of the same host"
+        );
+    }
+
+    #[test]
+    fn host_mask_source_still_detects_a_genuinely_new_rule() {
+        // The /32 fallback must not make everything match. A host that
+        // is not in the ruleset is still a change, mask or no mask.
+        let stub = Stub::new("rule-host-mask-new", STATUS_REAL_HOST);
+        let changed = apply(
+            stub.path().to_str().unwrap(),
+            &rule_op_from("allow", "22", "tcp", "203.0.113.7/32"),
+            false,
+        )
+        .unwrap();
+        assert!(changed, "an absent /32 source must still be added");
+    }
+
+    #[test]
+    fn non_host_mask_is_not_stripped() {
+        // The dangerous direction. Only /32 and /128 are elided by ufw's
+        // display; a real network mask is shown verbatim. If the
+        // comparison stripped any mask, a rule for 10.10.0.0/8 would
+        // match a line allowing only 10.10.0.0/16 and the play would
+        // skip widening the firewall while reporting success.
+        assert!(
+            !line_has_source(
+                "2379/tcp                   ALLOW IN    10.10.0.0/16",
+                "10.10.0.0/8"
+            ),
+            "a broader mask must not match a narrower existing rule"
+        );
+        // ...while the exact CIDR still matches.
+        assert!(line_has_source(
+            "2379/tcp                   ALLOW IN    10.10.0.0/16",
+            "10.10.0.0/16"
+        ));
+        // IPv6 host masks get the same elision treatment as /32.
+        assert!(line_has_source(
+            "22/tcp                     ALLOW IN    2a01:4f9:c014:f561::1",
+            "2a01:4f9:c014:f561::1/128"
+        ));
     }
 
     #[test]
