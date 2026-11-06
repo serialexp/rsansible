@@ -144,6 +144,15 @@ These don't fit neatly into a phase but should happen alongside the work.
 Done items live in `TODO_DONE.md` (Tags, `--limit`, `ignore_errors:`,
 Vault).
 
+- [ ] **`lineinfile` backrefs: accept Ansible's `\1`.** The agent substitutes
+  Rust regex `$1`/`${1}` only, so an Ansible-style `line: 'name:\1'` with
+  `backrefs: true` writes a literal `\1`. That silently wiped a host's
+  `/etc/subuid` range (sorry-portainer, 2026-11-06). `regex_replace` already
+  translates Ansible backrefs; lineinfile should do the same (or reject `\N`
+  at validate time).
+- [ ] **`set_fact` turns version-like strings into numbers.** A rendered
+  `"26.04"` parses as JSON 26.04, so using it as a dict key misses a
+  `"26.04"` key and yields null. Ansible keeps it a string.
 
 - [x] **`--check` mode** — dry-run; every op reports what it *would* do
   without changing state. Shipped:
