@@ -963,16 +963,8 @@ fn apply_play_vars(
         let view = build_template_ctx(&scratch, world);
         for (k, v) in &play.vars {
             let val = match v {
-                serde_yaml::Value::String(s) => match render_str(env, s, &view) {
-                    Ok(rendered) => {
-                        let trimmed = rendered.trim();
-                        if looks_jsonish(trimmed) {
-                            serde_json::from_str::<JsonValue>(trimmed)
-                                .unwrap_or(JsonValue::String(rendered))
-                        } else {
-                            JsonValue::String(rendered)
-                        }
-                    }
+                serde_yaml::Value::String(s) => match render_typed(env, s, &view) {
+                    Ok(value) => value,
                     Err(e) => {
                         warn!(host = %name, play = %play.name, var = %k, "play.vars render failed: {e:#}");
                         continue;
@@ -1006,15 +998,7 @@ fn apply_task_vars(
         let view = build_template_ctx(ctx, world);
         let val = match v {
             serde_yaml::Value::String(s) => {
-                let rendered =
-                    render_str(env, s, &view).with_context(|| format!("render task var {k:?}"))?;
-                let trimmed = rendered.trim();
-                if looks_jsonish(trimmed) {
-                    serde_json::from_str::<JsonValue>(trimmed)
-                        .unwrap_or(JsonValue::String(rendered))
-                } else {
-                    JsonValue::String(rendered)
-                }
+                render_typed(env, s, &view).with_context(|| format!("render task var {k:?}"))?
             }
             other => {
                 yaml_to_json(other.clone()).with_context(|| format!("coerce task var {k:?}"))?
@@ -4857,24 +4841,11 @@ fn run_set_fact_body(
     for (k, v) in &m.0 {
         let val = match v {
             serde_yaml::Value::String(s) => {
-                // Render the string. If it parses cleanly as JSON afterward
-                // (lets `set_fact: count: "{{ x + 1 }}"` produce a number),
-                // expose it as that. Otherwise keep it as a string.
-                match render_str(env, s, &view) {
-                    Ok(rendered) => {
-                        // Heuristic: only auto-parse when the rendered
-                        // output looks like JSON (starts with `{`, `[`,
-                        // a digit, or the keywords true/false/null). This
-                        // avoids surprises like `"y2k"` getting parsed.
-                        let trimmed = rendered.trim();
-                        let auto = looks_jsonish(trimmed);
-                        if auto {
-                            serde_json::from_str::<JsonValue>(trimmed)
-                                .unwrap_or(JsonValue::String(rendered))
-                        } else {
-                            JsonValue::String(rendered)
-                        }
-                    }
+                // One `{{ expr }}` keeps the expression's type, so
+                // `count: "{{ x + 1 }}"` is a number and `"{{ '26.04' }}"`
+                // stays a string; any other template is a string.
+                match render_typed(env, s, &view) {
+                    Ok(value) => value,
                     Err(e) => {
                         return BodyResult::Failed {
                             reason: format!("set_fact.{k}: {e:#}"),
@@ -4913,20 +4884,6 @@ fn run_set_fact_body(
         changed: false,
         skipped: false,
     }
-}
-
-fn looks_jsonish(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let first = s.chars().next().unwrap();
-    first == '{'
-        || first == '['
-        || first.is_ascii_digit()
-        || first == '-'
-        || s == "true"
-        || s == "false"
-        || s == "null"
 }
 
 // ---------- postgres composite dispatch (controller-side ops) ----------
@@ -7559,6 +7516,21 @@ fn resolve_strings_in_value(
 ) -> Result<()> {
     match val {
         JsonValue::String(s) if s.contains("{{") || s.contains("{%") => {
+            // One `{{ expr }}` takes the expression's type, so a default
+            // `pkgs: "{{ base_pkgs }}"` is the list, not its text.
+            if let Some(compiled) = crate::template::compile_single_expression(env, s) {
+                let names = compiled.undeclared_variables(false);
+                let value = compiled
+                    .eval(slim_view(&names, view))
+                    .map_err(|e| anyhow!("var {path:?} expression eval: {e}"))?;
+                let value =
+                    expression_value_to_json(&value).map_err(|e| anyhow!("var {path:?}: {e}"))?;
+                if value.as_str() != Some(s.as_str()) {
+                    *val = value;
+                    *changed = true;
+                }
+                return Ok(());
+            }
             let prepared = crate::template::prepare_jinja_source(s);
             let tmpl = env
                 .template_from_str(&prepared)
@@ -7941,14 +7913,20 @@ fn resolve_loop_items(
             // renders a Python-style repr; safer is to compile as an
             // expression and convert the resulting Value.
             // We use compile_expression to keep types intact.
-            let prepared = crate::template::prepare_jinja_source(s);
-            let trimmed_prepared = crate::template::prepare_jinja_source(
-                s.trim_start_matches("{{").trim_end_matches("}}").trim(),
-            );
-            let compiled = env
-                .compile_expression(&trimmed_prepared)
-                .or_else(|_| env.compile_expression(&prepared))
-                .map_err(|e| anyhow!("loop expr compile: {e}"))?;
+            // A bare expression (`loop: my_list`) compiles as written; a
+            // stray `}}` would panic minijinja's compiler, so that is
+            // refused first (see template::single_expression_candidate).
+            let compiled = match crate::template::compile_single_expression(env, s) {
+                Some(compiled) => compiled,
+                None if !crate::template::braces_balance(s) => {
+                    bail!(
+                        "loop expression {s:?} is neither one {{{{ expr }}}} nor a bare expression"
+                    )
+                }
+                None => env
+                    .compile_expression_owned(crate::template::prepare_jinja_source(s).into_owned())
+                    .map_err(|e| anyhow!("loop expr compile: {e}"))?,
+            };
             let val = compiled
                 .eval(&view)
                 .map_err(|e| anyhow!("loop expr eval: {e}"))?;
@@ -7994,8 +7972,54 @@ fn render_json_strings(
 }
 
 fn mjvalue_to_json(v: &minijinja::Value) -> Result<JsonValue> {
-    let s = serde_json::to_string(v).map_err(|e| anyhow!("serialize loop value: {e}"))?;
-    serde_json::from_str::<JsonValue>(&s).map_err(|e| anyhow!("re-parse loop value: {e}"))
+    let s = serde_json::to_string(v).map_err(|e| anyhow!("serialize expression value: {e}"))?;
+    serde_json::from_str::<JsonValue>(&s).map_err(|e| anyhow!("re-parse expression value: {e}"))
+}
+
+/// A variable's value from a native expression result. Undefined is the
+/// empty string and `omit` collapses to it, as when the same value is
+/// rendered (the environment's undefined is Chainable).
+fn expression_value_to_json(v: &minijinja::Value) -> Result<JsonValue> {
+    if v.is_undefined() {
+        return Ok(JsonValue::String(String::new()));
+    }
+    if v.as_str() == Some(crate::template::OMIT_SENTINEL) {
+        return Ok(JsonValue::String(String::new()));
+    }
+    mjvalue_to_json(v)
+}
+
+/// The entries of `view` an expression names: evaluating against the
+/// whole view would convert all of it (hostvars included) into
+/// minijinja values first.
+fn slim_view<'a>(
+    names: &'a std::collections::HashSet<String>,
+    view: &'a BTreeMap<String, JsonValue>,
+) -> BTreeMap<&'a str, &'a JsonValue> {
+    names
+        .iter()
+        .filter_map(|n| view.get(n).map(|v| (n.as_str(), v)))
+        .collect()
+}
+
+/// A `set_fact:` or `vars:` value as data. A value that is exactly one
+/// `{{ expr }}` keeps the expression's type, as in Ansible 2.19: a string
+/// stays a string even when it looks like a number, a list stays a list.
+/// Any other template renders to a string, never re-parsed.
+fn render_typed(
+    env: &Environment<'static>,
+    src: &str,
+    view: &BTreeMap<String, JsonValue>,
+) -> Result<JsonValue> {
+    let Some(compiled) = crate::template::compile_single_expression(env, src) else {
+        return Ok(JsonValue::String(render_str(env, src, view)?));
+    };
+    let resolved = resolve_view_var_templates(env, view)?;
+    let names = compiled.undeclared_variables(false);
+    let value = compiled
+        .eval(slim_view(&names, resolved.as_ref()))
+        .map_err(|e| anyhow!("expression eval: {e}"))?;
+    expression_value_to_json(&value)
 }
 
 /// Render a list of string sources that may individually be Jinja
@@ -8021,52 +8045,28 @@ fn render_string_or_list_sources(
 ) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::with_capacity(sources.len());
     for src in sources {
-        let trimmed = src.trim();
-        let is_pure_expr = trimmed.starts_with("{{")
-            && trimmed.ends_with("}}")
-            // Reject mixed templates like `"{{ a }}-{{ b }}"` — the
-            // inner closing/opening pair means the source is not a
-            // single expression.
-            && !trimmed[2..trimmed.len() - 2].contains("}}");
-        if is_pure_expr {
-            let inner = trimmed[2..trimmed.len() - 2].trim();
-            let prepared = crate::template::prepare_jinja_source(inner);
-            match env.compile_expression(&prepared) {
-                Ok(compiled) => {
-                    let val = compiled
-                        .eval(view)
-                        .map_err(|e| anyhow!("expression eval for {src:?}: {e}"))?;
-                    let json = mjvalue_to_json(&val)?;
-                    match json {
-                        JsonValue::Array(items) => {
-                            for item in items {
-                                match item {
-                                    JsonValue::String(s) => out.push(s),
-                                    other => out.push(
-                                        serde_json::to_string(&other)
-                                            .unwrap_or_else(|_| String::new()),
-                                    ),
-                                }
-                            }
-                        }
+        // Not one expression: a template, rendered to a string.
+        let Some(compiled) = crate::template::compile_single_expression(env, src.trim()) else {
+            out.push(render_str(env, src, view)?);
+            continue;
+        };
+        let val = compiled
+            .eval(view)
+            .map_err(|e| anyhow!("expression eval for {src:?}: {e}"))?;
+        match mjvalue_to_json(&val)? {
+            JsonValue::Array(items) => {
+                for item in items {
+                    match item {
                         JsonValue::String(s) => out.push(s),
-                        JsonValue::Null => {}
                         other => out
                             .push(serde_json::to_string(&other).unwrap_or_else(|_| String::new())),
                     }
-                    continue;
-                }
-                Err(_) => {
-                    // Not a clean expression — fall back to template
-                    // rendering. e.g. `{{ items | join(',') }}` is
-                    // technically an expression but a template render
-                    // also produces a usable string, so either path
-                    // works; we let the template path handle the
-                    // edge cases.
                 }
             }
+            JsonValue::String(s) => out.push(s),
+            JsonValue::Null => {}
+            other => out.push(serde_json::to_string(&other).unwrap_or_else(|_| String::new())),
         }
-        out.push(render_str(env, src, view)?);
     }
     Ok(out)
 }
@@ -9464,6 +9464,20 @@ mod tests {
         );
     }
 
+    /// A stray `}}` panics minijinja's expression compiler; the loop must
+    /// refuse it with an error instead.
+    #[test]
+    fn resolve_loop_items_rejects_a_stray_closing_brace() {
+        let env = template::make_env();
+        let ctx = HostCtx::new("h".into());
+        for src in ["a }}{{ b", "{{ a }}{{ b }}", "xs }}"] {
+            let spec = LoopSpec::Expr(src.into());
+            let err =
+                resolve_loop_items(&env, Some(&spec), &ctx, &WorldVars::default()).expect_err(src);
+            assert!(!err.to_string().is_empty(), "{src}");
+        }
+    }
+
     /// Regression: `apt: { name: "{{ pkg_list }}" }` where
     /// `pkg_list` is a list var must splat into separate package
     /// names, not get rendered as the literal string `'["curl",
@@ -10116,9 +10130,8 @@ mod tests {
             serde_yaml::Value::String("count={{ all_attempts }}".into()),
         );
         apply_task_vars(&vars, &mut ctx, &env, &WorldVars::default()).unwrap();
-        // Numeric-looking rendered output is coerced (looks_jsonish path);
-        // the non-numeric chained reference stays a string but with the
-        // chained value substituted in.
+        // One `{{ n }}` keeps n's type (an int); the mixed template is a
+        // string with the chained value substituted in.
         assert_eq!(ctx.task_vars["all_attempts"], serde_json::json!(3));
         assert_eq!(
             ctx.task_vars["writer_aggregate_data"],
@@ -10191,6 +10204,129 @@ mod tests {
             Some(&serde_json::json!("hello ed"))
         );
         assert_eq!(ctx.set_facts.get("count"), Some(&serde_json::json!(3)));
+    }
+
+    fn set_fact_values(
+        facts: serde_json::Value,
+        values: &[(&str, &str)],
+    ) -> BTreeMap<String, JsonValue> {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        for (k, v) in facts.as_object().unwrap() {
+            ctx.set_facts.insert(k.clone(), v.clone());
+        }
+        let mut m: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        for (k, v) in values {
+            m.insert((*k).into(), serde_yaml::Value::String((*v).into()));
+        }
+        let r = run_set_fact_body(&SetFactMap(m), &mut ctx, &env, &WorldVars::default());
+        assert!(matches!(r, BodyResult::Ok { .. }), "set_fact failed");
+        values
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), ctx.set_facts[*k].clone()))
+            .collect()
+    }
+
+    /// A version string such as "26.04" used to come back from set_fact
+    /// as the number 26.04 (the rendered text was re-parsed as JSON), so
+    /// indexing a dict keyed "26.04" with it gave null. One `{{ expr }}`
+    /// now keeps the expression's type, as in Ansible 2.19.
+    #[test]
+    fn set_fact_single_expression_keeps_its_type() {
+        let got = set_fact_values(
+            serde_json::json!({
+                "release": "26.04",
+                "minor": "1.10",
+                "n": 3,
+                "pkgs": ["a", "b"],
+                "by_release": {"26.04": ["podman"]},
+            }),
+            &[
+                ("literal_version", "{{ '26.04' }}"),
+                ("var_version", "{{ release }}"),
+                ("lossy_version", "{{ minor }}"),
+                ("sum", "{{ n + 1 }}"),
+                ("list", "{{ pkgs }}"),
+                ("lookup", "{{ by_release[release] }}"),
+                ("nested_dict", "{{ {'a': {'b': 1}} }}"),
+                ("bool", "{{ n > 2 }}"),
+                ("null", "{{ none }}"),
+                ("trimmed", "{{- release -}}"),
+                ("undefined", "{{ no_such_var }}"),
+                ("omitted", "{{ no_such_var | default(omit) }}"),
+            ],
+        );
+        assert_eq!(got["literal_version"], serde_json::json!("26.04"));
+        assert_eq!(got["var_version"], serde_json::json!("26.04"));
+        assert_eq!(got["lossy_version"], serde_json::json!("1.10"));
+        assert_eq!(got["sum"], serde_json::json!(4));
+        assert_eq!(got["list"], serde_json::json!(["a", "b"]));
+        assert_eq!(got["lookup"], serde_json::json!(["podman"]));
+        assert_eq!(got["nested_dict"], serde_json::json!({"a": {"b": 1}}));
+        assert_eq!(got["bool"], serde_json::json!(true));
+        assert_eq!(got["null"], JsonValue::Null);
+        assert_eq!(got["trimmed"], serde_json::json!("26.04"));
+        // Undefined renders empty under the Chainable environment; the
+        // native path agrees, and omit collapses the same way.
+        assert_eq!(got["undefined"], serde_json::json!(""));
+        assert_eq!(got["omitted"], serde_json::json!(""));
+    }
+
+    /// Anything but one `{{ expr }}` is a template and stays a string,
+    /// even when the text looks like JSON.
+    #[test]
+    fn set_fact_template_is_always_a_string() {
+        let got = set_fact_values(
+            serde_json::json!({"a": 1, "b": 2}),
+            &[
+                ("two_exprs", "{{ a }}{{ b }}"),
+                ("json_text", "[{{ a }}, {{ b }}]"),
+                ("trailing_newline", "{{ a }}\n"),
+                ("leading_space", " {{ a }}"),
+                ("block", "{% if a %}1{% endif %}"),
+                ("plain_number", "26.04"),
+                ("plain_bool", "true"),
+            ],
+        );
+        assert_eq!(got["two_exprs"], serde_json::json!("12"));
+        assert_eq!(got["json_text"], serde_json::json!("[1, 2]"));
+        assert_eq!(got["trailing_newline"], serde_json::json!("1\n"));
+        assert_eq!(got["leading_space"], serde_json::json!(" 1"));
+        assert_eq!(got["block"], serde_json::json!("1"));
+        assert_eq!(got["plain_number"], serde_json::json!("26.04"));
+        assert_eq!(got["plain_bool"], serde_json::json!("true"));
+    }
+
+    /// A variable whose value is one `{{ expr }}` (role default,
+    /// inventory, vars_files) takes the expression's type when resolved,
+    /// so a default naming a list is that list rather than its text.
+    #[test]
+    fn var_of_var_single_expression_keeps_its_type() {
+        let env = template::make_env();
+        let mut ctx = HostCtx::new("h".into());
+        for (k, v) in [
+            ("base_pkgs", serde_json::json!(["curl", "git"])),
+            ("pkgs", serde_json::json!("{{ base_pkgs }}")),
+            ("base_port", serde_json::json!(5432)),
+            ("port", serde_json::json!("{{ base_port }}")),
+            ("port_text", serde_json::json!("p{{ base_port }}")),
+            ("release", serde_json::json!("26.04")),
+            ("chained_release", serde_json::json!("{{ release_alias }}")),
+            ("release_alias", serde_json::json!("{{ release }}")),
+            ("deep", serde_json::json!({"ports": ["{{ base_port }}"]})),
+        ] {
+            ctx.role_defaults.insert(k.into(), v);
+        }
+        let view = build_template_ctx(&ctx, &WorldVars::default());
+        let resolved = resolve_view_var_templates(&env, &view).unwrap();
+        assert_eq!(resolved["pkgs"], serde_json::json!(["curl", "git"]));
+        assert_eq!(resolved["port"], serde_json::json!(5432));
+        assert_eq!(resolved["port_text"], serde_json::json!("p5432"));
+        assert_eq!(resolved["chained_release"], serde_json::json!("26.04"));
+        assert_eq!(resolved["deep"], serde_json::json!({"ports": [5432]}));
+        // A loop over the default sees the list.
+        let out = render_str(&env, "{% for p in pkgs %}{{ p }};{% endfor %}", &view).unwrap();
+        assert_eq!(out, "curl;git;");
     }
 
     #[test]

@@ -150,9 +150,22 @@ Vault).
   `/etc/subuid` range (sorry-portainer, 2026-11-06). `regex_replace` already
   translates Ansible backrefs; lineinfile should do the same (or reject `\N`
   at validate time).
-- [ ] **`set_fact` turns version-like strings into numbers.** A rendered
-  `"26.04"` parses as JSON 26.04, so using it as a dict key misses a
-  `"26.04"` key and yields null. Ansible keeps it a string.
+- [x] **`set_fact` turns version-like strings into numbers.** A rendered
+  `"26.04"` parsed as JSON 26.04, so using it as a dict key missed a
+  `"26.04"` key and yielded null. Fixed the Ansible 2.19 way: a value that
+  is exactly one `{{ expr }}` keeps the expression's type, and any other
+  template is a string, never re-parsed. This covers set_fact, play and task
+  vars, and var-of-var resolution (`template::compile_single_expression`,
+  `orchestrator::render_typed`).
+- [ ] **Report minijinja's `compile_expression` panic upstream.** minijinja
+  2.19 panics with "empty lexer stack" on a stray `}}` in an expression
+  (`a }}{{ b`). `template::braces_balance` refuses those before compiling;
+  drop that guard once upstream returns an error instead.
+- [ ] **Record (or remove) the lenient-undefined divergence.** Templates use
+  a Chainable undefined, so an undefined variable renders as `""` (and a
+  single-expression set_fact stores `""`). Ansible fails the task. That is
+  a deliberate-looking divergence missing from `ANSIBLE_COMPAT.md`; decide
+  whether to keep it (and document it) or make undefined fail.
 
 - [x] **`--check` mode** — dry-run; every op reports what it *would* do
   without changing state. Shipped:

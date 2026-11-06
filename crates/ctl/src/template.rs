@@ -67,6 +67,84 @@ use crate::playbook::{AssertTask, ExecOp, LoopSpec, Playbook, ShellOp, Task, Tas
 /// their YAML can confuse the engine. They shouldn't.
 pub const OMIT_SENTINEL: &str = "__rsansible_omit_placeholder_8c0a9f2d4b1e3a6d5c7f8b9a0c1d2e3f__";
 
+/// The candidate expression of a value written as one `{{ expr }}`.
+///
+/// A value that is exactly one `{{ expr }}` keeps its expression's type
+/// instead of being rendered to text, as in Ansible 2.19: `"{{ '26.04' }}"`
+/// is a string, `"{{ 1 + 1 }}"` an int, `"{{ pkgs }}"` a list. Anything
+/// else, text around the braces (a trailing newline included), several
+/// `{{ }}`, or a `{% %}` block, is a template and renders to a string.
+///
+/// This strips the outer braces and whitespace-control markers (`{{-`,
+/// `-}}`) and rejects text whose braces don't balance outside string
+/// literals: in `a }}{{ b` the first `}` closes nothing, while the dict
+/// literal `{'a': {'b': 1}}` balances. That check is needed, not just
+/// tidy: minijinja's expression compiler panics ("empty lexer stack") on
+/// a stray `}}` instead of returning an error. What passes is confirmed
+/// by compiling it, see [`compile_single_expression`].
+pub fn single_expression_candidate(src: &str) -> Option<&str> {
+    let inner = src.strip_prefix("{{")?.strip_suffix("}}")?;
+    let inner = inner.strip_prefix('-').unwrap_or(inner);
+    let inner = inner.strip_suffix('-').unwrap_or(inner);
+    let expr = inner.trim();
+    if expr.is_empty() || !braces_balance(expr) {
+        return None;
+    }
+    Some(expr)
+}
+
+/// Whether `{`/`}` balance in `expr` outside quoted string literals, with
+/// no `{%` or `{#` (which only begin template tags).
+pub fn braces_balance(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut depth: usize = 0;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 1;
+                } else if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'{' => {
+                    if matches!(bytes.get(i + 1), Some(b'%') | Some(b'#')) {
+                        return false;
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    depth == 0 && quote.is_none()
+}
+
+/// Compile `src` as one expression if it is written as one `{{ expr }}`
+/// that parses as an expression; `None` means it is a template.
+pub fn compile_single_expression<'env>(
+    env: &'env minijinja::Environment<'static>,
+    src: &str,
+) -> Option<minijinja::Expression<'env, 'static>> {
+    // The `.0` → `[0]` rewrite only applies inside `{{ }}`, so it runs
+    // before the braces come off.
+    let prepared = prepare_jinja_source(src);
+    let expr = single_expression_candidate(&prepared)?;
+    env.compile_expression_owned(expr.to_string()).ok()
+}
+
 /// Rewrite a Jinja source string so attribute-style numeric subscripts
 /// like `item.0.name` become bracket subscripts `item[0].name`.
 ///
@@ -2084,6 +2162,52 @@ fn check_assert(env: &Environment, a: &AssertTask) -> Result<()> {
 }
 
 #[cfg(test)]
+mod single_expression_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_strips_only_the_outer_braces() {
+        assert_eq!(single_expression_candidate("{{ x }}"), Some("x"));
+        assert_eq!(single_expression_candidate("{{- x -}}"), Some("x"));
+        assert_eq!(single_expression_candidate("{{x}}"), Some("x"));
+        assert_eq!(single_expression_candidate("{{ }}"), None);
+        assert_eq!(single_expression_candidate("x {{ y }}"), None);
+        assert_eq!(single_expression_candidate("{{ y }}\n"), None);
+        assert_eq!(single_expression_candidate("{% if x %}{% endif %}"), None);
+    }
+
+    #[test]
+    fn compiling_decides_whether_it_is_one_expression() {
+        let env = make_env();
+        for one in [
+            "{{ x }}",
+            "{{ {'a': {'b': 1}} }}",
+            "{{ '}}{{' ~ x }}",
+            "{{ item.0.name }}",
+        ] {
+            assert!(compile_single_expression(&env, one).is_some(), "{one}");
+        }
+        for many in [
+            "{{ a }}{{ b }}",
+            "{{ a }} and {{ b }}",
+            "{{ a }}-{{ b }}",
+            "{{ a ~ }}",
+            "{{ {'a': 1 }}",
+            "{{ 'unterminated }}",
+            "{{ {% if %} }}",
+        ] {
+            assert!(compile_single_expression(&env, many).is_none(), "{many}");
+        }
+    }
+
+    #[test]
+    fn compile_expression_on_a_template_errors_without_panicking() {
+        let env = make_env();
+        assert!(env.compile_expression("{{ a }}{{ b }}").is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use minijinja::context;
@@ -2938,7 +3062,9 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
     fn regex_replace_named_group_backref() {
         let env = make_env();
         let tmpl = env
-            .template_from_str(r#"{{ s | regex_replace('(?P<a>\d+)-(?P<b>\d+)', '\\g<b>:\\g<a>') }}"#)
+            .template_from_str(
+                r#"{{ s | regex_replace('(?P<a>\d+)-(?P<b>\d+)', '\\g<b>:\\g<a>') }}"#,
+            )
             .unwrap();
         let out = tmpl.render(context! { s => "12-34" }).unwrap();
         assert_eq!(out, "34:12");
@@ -2951,7 +3077,10 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
             .template_from_str(r#"{{ s | regex_replace('(a)', '\1') }}"#)
             .unwrap();
         let err = tmpl.render(context! { s => "a" }).unwrap_err();
-        assert!(format!("{err:?}").contains("control character"), "got: {err:?}");
+        assert!(
+            format!("{err:?}").contains("control character"),
+            "got: {err:?}"
+        );
     }
 
     #[test]
