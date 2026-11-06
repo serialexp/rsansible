@@ -741,8 +741,9 @@ fn to_json_filter(value: MjValue) -> Result<MjValue, MjError> {
 
 /// `value | regex_replace(pattern, replacement)` — `regex::Regex::replace_all`
 /// applied to a string. Pattern is Rust regex syntax (close to PCRE for
-/// the cases acme uses); replacement supports `$1` / `${name}`
-/// backrefs.
+/// the cases acme uses); replacement supports `$1` / `${name}` and the
+/// Ansible forms `\\1` / `\\g<name>` (see `translate_replacement`). A bare
+/// `'\1'` in the template is an error, not a silent control character.
 ///
 /// Ansible's filter also accepts an optional `multiline` / `ignorecase`
 /// flag; we don't yet (acme doesn't use them). Easy to add via the
@@ -959,9 +960,85 @@ fn regex_replace_filter(
             format!("regex_replace: invalid pattern {pattern:?}: {e}"),
         )
     })?;
+    let replacement = translate_replacement(&replacement)?;
     Ok(MjValue::from(
         re.replace_all(s, replacement.as_str()).into_owned(),
     ))
+}
+
+/// Convert an Ansible/Python-style replacement into the `regex` crate's
+/// syntax: `\N` becomes `${N}`, `\g<name>` becomes `${name}` and `\\`
+/// becomes a single backslash. `$1` / `${name}` pass through untouched.
+///
+/// A control character U+0001..U+0008 in the replacement is rejected: it is
+/// what a bare `'\1'` turns into, because the template string literal
+/// consumes the escape before this filter runs. Silently substituting that
+/// byte is the footgun this guards against.
+fn translate_replacement(rep: &str) -> Result<String, MjError> {
+    let mut out = String::with_capacity(rep.len());
+    let mut chars = rep.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1}'..='\u{8}' => {
+                return Err(MjError::new(
+                    MjKind::InvalidOperation,
+                    format!(
+                        "regex_replace: replacement contains control character U+{:04X}, \
+                         which is what a bare '\\{}' becomes in a string literal; \
+                         write '\\\\{}' or '${}' for a backreference",
+                        c as u32, c as u32, c as u32, c as u32
+                    ),
+                ));
+            }
+            '\\' => match chars.peek().copied() {
+                Some(d) if d.is_ascii_digit() => {
+                    let mut num = String::new();
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() {
+                            num.push(d);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    out.push_str("${");
+                    out.push_str(&num);
+                    out.push('}');
+                }
+                Some('g') => {
+                    chars.next();
+                    if chars.peek() == Some(&'<') {
+                        chars.next();
+                        let mut name = String::new();
+                        loop {
+                            match chars.next() {
+                                Some('>') => break,
+                                Some(n) => name.push(n),
+                                None => {
+                                    return Err(MjError::new(
+                                        MjKind::InvalidOperation,
+                                        "regex_replace: unterminated \\g<name> in replacement",
+                                    ));
+                                }
+                            }
+                        }
+                        out.push_str("${");
+                        out.push_str(&name);
+                        out.push('}');
+                    } else {
+                        out.push_str("\\g");
+                    }
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                _ => out.push('\\'),
+            },
+            other => out.push(other),
+        }
+    }
+    Ok(out)
 }
 
 // =========================================================================
@@ -2844,6 +2921,37 @@ ESCAPED=\"literal \\$NOT_EXPANDED\"
             .unwrap();
         let out = tmpl.render(context! { s => "12-34" }).unwrap();
         assert_eq!(out, "34/12");
+    }
+
+    #[test]
+    fn regex_replace_ansible_style_backrefs() {
+        let env = make_env();
+        // `\\1` in the template literal is the two characters `\1`.
+        let tmpl = env
+            .template_from_str(r#"{{ s | regex_replace('(\d+)-(\d+)', '\\2/\\1') }}"#)
+            .unwrap();
+        let out = tmpl.render(context! { s => "12-34" }).unwrap();
+        assert_eq!(out, "34/12");
+    }
+
+    #[test]
+    fn regex_replace_named_group_backref() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ s | regex_replace('(?P<a>\d+)-(?P<b>\d+)', '\\g<b>:\\g<a>') }}"#)
+            .unwrap();
+        let out = tmpl.render(context! { s => "12-34" }).unwrap();
+        assert_eq!(out, "34:12");
+    }
+
+    #[test]
+    fn regex_replace_bare_backslash_digit_is_an_error() {
+        let env = make_env();
+        let tmpl = env
+            .template_from_str(r#"{{ s | regex_replace('(a)', '\1') }}"#)
+            .unwrap();
+        let err = tmpl.render(context! { s => "a" }).unwrap_err();
+        assert!(format!("{err:?}").contains("control character"), "got: {err:?}");
     }
 
     #[test]
