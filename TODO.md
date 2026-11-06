@@ -157,6 +157,11 @@ Vault).
   template is a string, never re-parsed. This covers set_fact, play and task
   vars, and var-of-var resolution (`template::compile_single_expression`,
   `orchestrator::render_typed`).
+- [ ] **`ansible_check_mode` magic variable.** Missing, so a role can't skip a
+  task in check mode. It matters for `become_user` tasks: the become channel
+  opens before the check-mode skip, so a task as an account that an earlier
+  (check-skipped) task would create fails in check mode, as in Ansible. The
+  sorry-portainer agent role works around it with a getent lookup.
 - [ ] **Report minijinja's `compile_expression` panic upstream.** minijinja
   2.19 panics with "empty lexer stack" on a stray `}}` in an expression
   (`a }}{{ b`). `template::braces_balance` refuses those before compiling;
